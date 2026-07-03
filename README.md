@@ -114,13 +114,14 @@ demo/
 ├── prompts/DOCTRINE.md     # doctrine inlined into every agent envelope
 ├── tests/                  # `cairn test` furniture: fixtures, stub replays, the pipeline matrix
 ├── allowlist.yaml          # named command fragments agents are permitted to run
-└── runs/                   # every execution, self-describing (gitignored)
+└── runs/                   # created on first run — every execution, self-describing (gitignored)
 ```
 
 ### A run directory
 
 Each execution is one self-describing directory — the isolation boundary, the resume source of
-truth, and a complete post-mortem with no external service:
+truth, and a complete post-mortem with no external service (abridged — omits internal bookkeeping
+like `.cairn/` and the lock file):
 
 ```
 runs/hello-world-<date>/
