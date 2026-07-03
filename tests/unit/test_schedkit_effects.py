@@ -208,3 +208,27 @@ def test_run_schedule_passes_argv_verbatim_never_injects_flags():
     run_schedule({"cleanup": gc}, "cleanup", workspace_dir=WS, runner=runner)
     assert runner.calls[-1]["argv"] == ["cairn", "gc", "--keep-days", "30"]
     assert "--headless" not in runner.calls[-1]["argv"]
+
+
+def test_run_schedule_reemits_captured_streams_to_injected_buffers():
+    # A halted firing (NEEDS_HUMAN=6) captures output in the Runner — re-emit it so cron mails
+    # it instead of silently rotting (SCHEDULING.md §4). Resume hint on stderr must survive too.
+    import io
+
+    runner = FakeRunner(
+        {("cairn", "run"): RunResult(6, "run halted at gate\n", "resume: cairn resume acme-x\n")}
+    )
+    out, err = io.StringIO(), io.StringIO()
+    code = run_schedule(
+        {"weekly": _sched()}, "weekly", workspace_dir=WS, runner=runner, out=out, err=err
+    )
+    assert code == 6
+    assert out.getvalue() == "run halted at gate\n"
+    assert err.getvalue() == "resume: cairn resume acme-x\n"
+
+
+def test_run_schedule_stays_silent_when_no_buffers_given():
+    # backward compat: without out/err, the captured streams are simply not re-emitted
+    runner = FakeRunner({("cairn", "run"): RunResult(6, "noisy stdout", "noisy stderr")})
+    code = run_schedule({"weekly": _sched()}, "weekly", workspace_dir=WS, runner=runner)
+    assert code == 6  # return semantics unchanged, no exception, nothing written anywhere

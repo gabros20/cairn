@@ -39,7 +39,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, NoReturn, Protocol
+from typing import Any, NoReturn, Protocol, TextIO
 
 import yaml
 
@@ -773,6 +773,8 @@ def run_schedule(
     workspace_dir: Path,
     runner: Runner,
     cairn_bin: str = "cairn",
+    out: TextIO | None = None,
+    err: TextIO | None = None,
 ) -> int:
     """Execute one schedule's action NOW, returning the child cairn's exit code.
 
@@ -780,6 +782,13 @@ def run_schedule(
     injected ``runner`` — this is also exactly what the host timer calls (SCHEDULING.md §2).
     The argv is verbatim from schedules.yaml: ``--idempotent`` / ``--headless`` are opt-in there,
     never injected here (§3). Pinned shape: ``[cairn_bin] + list(schedule.run)``.
+
+    The Runner captures the child's stdout/stderr, so a firing that halts (e.g. NEEDS_HUMAN=6
+    with a resume hint) would otherwise produce ZERO output and the host mailer would send
+    nothing — silently rotting, which §4 forbids. When ``out``/``err`` are provided, the
+    captured streams are re-emitted VERBATIM to them after the child completes, so cron mails
+    the halt reason and the resume hint. When they are None, nothing is re-emitted (the prior
+    silent behavior, kept for backward compatibility). Return-code semantics are unchanged.
     """
     if name not in schedules:
         raise ConfigError(
@@ -787,7 +796,12 @@ def run_schedule(
             findings=[Finding("error", f"unknown schedule {name!r}")],
         )
     argv = [cairn_bin, *schedules[name].run]
-    return runner.run(argv, cwd=Path(workspace_dir)).returncode
+    result = runner.run(argv, cwd=Path(workspace_dir))
+    if out is not None and result.stdout:
+        out.write(result.stdout)
+    if err is not None and result.stderr:
+        err.write(result.stderr)
+    return result.returncode
 
 
 def _bad_backend(backend: str) -> NoReturn:
