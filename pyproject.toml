@@ -1,6 +1,7 @@
 [project]
 name = "cairn"
-version = "0.1.0.dev0"
+# Single-sourced: hatch reads __version__ from cairn/__init__.py (see [tool.hatch.version]).
+dynamic = ["version"]
 description = "Artifact-native pipeline orchestrator that delegates steps to coding-agent CLIs"
 requires-python = ">=3.11"
 dependencies = ["pyyaml", "jsonschema"]
@@ -21,6 +22,9 @@ dev = ["pytest"]
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "cairn/__init__.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["cairn"]
