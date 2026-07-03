@@ -1,0 +1,344 @@
+"""Unit tests for the empirical hook-firing probe (cairn/kernel/hookprobe.py, C4).
+
+The engine is driven against FAKE vendor binaries — small python scripts standing in for
+``claude``/``codex``. A fake is *faithful*: in the firing modes it reads the canary's real hook
+config (the one ``write_canary`` produced), runs the ``PreToolUse`` hook command (which writes the
+marker), and honors/ignores the deny — so these tests exercise the recipe's canary wiring, not
+just the classifier. Modes are steered by ``PROBE_FAKE_MODE`` (passed via the probe's test-only
+``extra_env`` seam).
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import stat
+from pathlib import Path
+
+import pytest
+
+from cairn.kernel import hookprobe
+from cairn.kernel.hookprobe import (
+    ClaudeHookRecipe,
+    CodexHookRecipe,
+    ProbeResult,
+    build_probe_env,
+    probe,
+    render,
+)
+
+# --------------------------------------------------------------------------- #
+# Fake vendor CLIs.
+# --------------------------------------------------------------------------- #
+
+# A faithful fake `claude`. --version prints a canned string. Otherwise it reads PROBE_FAKE_MODE
+# and the canary's real .claude/settings.json, actually RUNS the PreToolUse hook command (writing
+# the marker), then decides whether the "tool" runs (creates the sidecar) per mode.
+_FAKE_CLAUDE = r'''#!/usr/bin/env python3
+import json, os, subprocess, sys, time
+if "--version" in sys.argv:
+    print("claude 2.1.199 (fake)"); sys.exit(0)
+mode = os.environ.get("PROBE_FAKE_MODE", "fires_blocks")
+cwd = os.getcwd()
+sidecar = os.path.join(cwd, ".cairn-probe", "sidecar")
+if mode == "auth_fail":
+    print("Invalid API key. Please run /login"); sys.exit(1)
+if mode == "slow":
+    time.sleep(5); sys.exit(0)
+if mode == "idle":
+    sys.exit(0)  # the agent used no tool: no marker, no sidecar
+if mode == "no_fire":
+    open(sidecar, "w").close(); sys.exit(0)  # hook never runs; tool runs unguarded
+# firing modes: run the real hook command from the canary settings
+settings = json.load(open(os.path.join(cwd, ".claude", "settings.json")))
+cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+p = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True)
+blocked = '"permissionDecision": "deny"' in p.stdout or '"permissionDecision":"deny"' in p.stdout
+if mode == "fires_no_block":
+    blocked = False
+if not blocked:
+    open(sidecar, "w").close()
+sys.exit(0)
+'''
+
+# A faithful fake `codex`. Same idea but reads $CODEX_HOME/hooks.json.
+_FAKE_CODEX = r'''#!/usr/bin/env python3
+import json, os, subprocess, sys
+if "--version" in sys.argv:
+    print("codex-cli 0.142.5 (fake)"); sys.exit(0)
+mode = os.environ.get("PROBE_FAKE_MODE", "fires_blocks")
+cwd = os.getcwd()
+sidecar = os.path.join(cwd, ".cairn-probe", "sidecar")
+if mode == "no_fire":
+    open(sidecar, "w").close(); sys.exit(0)
+home = os.environ["CODEX_HOME"]
+hooks = json.load(open(os.path.join(home, "hooks.json")))
+cmd = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+p = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True)
+blocked = '"permissionDecision": "deny"' in p.stdout or '"permissionDecision":"deny"' in p.stdout
+if mode == "fires_no_block":
+    blocked = False
+if not blocked:
+    open(sidecar, "w").close()
+sys.exit(0)
+'''
+
+
+@pytest.fixture
+def fakebin(tmp_path: Path, monkeypatch) -> Path:
+    """A bindir with fake claude/codex on PATH."""
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    for name, body in (("claude", _FAKE_CLAUDE), ("codex", _FAKE_CODEX)):
+        f = bindir / name
+        f.write_text(body, encoding="utf-8")
+        f.chmod(f.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    return bindir
+
+
+def _run(recipe, mode: str, ws: Path, **kw) -> ProbeResult:
+    return probe(recipe, workspace_dir=ws, extra_env={"PROBE_FAKE_MODE": mode}, **kw)
+
+
+# --------------------------------------------------------------------------- #
+# The four classifications (claude).
+# --------------------------------------------------------------------------- #
+
+
+def test_claude_fires_blocks(fakebin, tmp_path):
+    r = _run(ClaudeHookRecipe(), "fires_blocks", tmp_path)
+    assert r.outcome == "fires_blocks"
+    assert r.executor == "claude"
+    assert r.cli_version and "2.1.199" in r.cli_version
+
+
+def test_claude_fires_no_block(fakebin, tmp_path):
+    assert _run(ClaudeHookRecipe(), "fires_no_block", tmp_path).outcome == "fires_no_block"
+
+
+def test_claude_no_fire(fakebin, tmp_path):
+    assert _run(ClaudeHookRecipe(), "no_fire", tmp_path).outcome == "no_fire"
+
+
+def test_claude_idle_is_inconclusive(fakebin, tmp_path):
+    # Agent attempted no tool → neither file → inconclusive, not a false "no_fire".
+    assert _run(ClaudeHookRecipe(), "idle", tmp_path).outcome == "inconclusive"
+
+
+# --------------------------------------------------------------------------- #
+# Inconclusive paths: auth, timeout, missing CLI.
+# --------------------------------------------------------------------------- #
+
+
+def test_auth_failure_is_inconclusive(fakebin, tmp_path):
+    r = _run(ClaudeHookRecipe(), "auth_fail", tmp_path)
+    assert r.outcome == "inconclusive"
+    assert "auth" in r.detail.lower()
+
+
+def test_timeout_is_inconclusive(fakebin, tmp_path):
+    r = _run(ClaudeHookRecipe(), "slow", tmp_path, timeout_s=1)
+    assert r.outcome == "inconclusive"
+    assert "timed out" in r.detail
+
+
+def test_missing_cli_is_inconclusive(tmp_path, monkeypatch):
+    # PATH without any fake → CLI not found.
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    r = probe(ClaudeHookRecipe(), workspace_dir=tmp_path)
+    assert r.outcome == "inconclusive"
+    assert "not found" in r.detail
+
+
+# --------------------------------------------------------------------------- #
+# Codex recipe against its fake (isolated CODEX_HOME).
+# --------------------------------------------------------------------------- #
+
+
+def test_codex_fires_blocks(fakebin, tmp_path):
+    assert _run(CodexHookRecipe(), "fires_blocks", tmp_path).outcome == "fires_blocks"
+
+
+def test_codex_no_fire(fakebin, tmp_path):
+    assert _run(CodexHookRecipe(), "no_fire", tmp_path).outcome == "no_fire"
+
+
+# --------------------------------------------------------------------------- #
+# Exit-policy matrix: (capabilities.blocking_hooks) × outcome → level.
+# --------------------------------------------------------------------------- #
+
+
+def _result(outcome: str) -> ProbeResult:
+    return ProbeResult("claude", outcome, "d", "v", "under bypassPermissions", "deny-JSON")
+
+
+@pytest.mark.parametrize(
+    "blocking,outcome,level",
+    [
+        # True is an asserted claim: only fires_blocks is ok; a falsification is an error.
+        (True, "fires_blocks", "ok"),
+        (True, "fires_no_block", "error"),
+        (True, "no_fire", "error"),
+        (True, "no_mechanism", "error"),
+        (True, "inconclusive", "warning"),
+        # None: the probe decides; every concrete outcome is informational, never an error.
+        (None, "fires_blocks", "info"),
+        (None, "fires_no_block", "info"),
+        (None, "no_fire", "info"),
+        (None, "inconclusive", "warning"),
+        (False, "no_fire", "info"),
+    ],
+)
+def test_render_policy_matrix(blocking, outcome, level):
+    lvl, line = render(_result(outcome), blocking)
+    assert lvl == level
+    assert "hook probe claude" in line
+
+
+def test_render_lines_are_legible():
+    assert "fires+blocks under bypassPermissions → hook-primary" in render(_result("fires_blocks"), True)[1]
+    assert "did NOT fire" in render(_result("no_fire"), True)[1]
+    assert render(_result("fires_blocks"), True)[1].startswith("✔")
+    assert render(_result("no_fire"), True)[1].startswith("✗")
+
+
+# --------------------------------------------------------------------------- #
+# Env fidelity + canary hygiene.
+# --------------------------------------------------------------------------- #
+
+
+def test_build_probe_env_mirrors_walker_baseline(tmp_path, monkeypatch):
+    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USER", "probeuser")
+    monkeypatch.setenv("LOGNAME", "probeuser")
+    monkeypatch.setenv("SECRET_LEAK", "nope")  # not in the allowlist → must not pass through
+    canary = tmp_path / "canary"
+    env = build_probe_env(canary, tmp_path)
+    # The passthrough allowlist (mirrors walk.py::_build_env) — identity + locale, no secrets.
+    assert env["PATH"] == "/usr/bin"
+    assert env["USER"] == "probeuser" and env["LOGNAME"] == "probeuser"
+    assert "SECRET_LEAK" not in env
+    # The CAIRN_* / project pointers point at the canary (it IS the project for the probe).
+    assert env["CAIRN_RUN_DIR"] == str(canary)
+    assert env["CAIRN_STEP"] == "doctor-hook-probe"
+    assert env["CLAUDE_PROJECT_DIR"] == str(canary)
+
+
+def test_canary_dir_is_cleaned_up(fakebin, tmp_path, monkeypatch):
+    created: list[Path] = []
+    real_mkdtemp = hookprobe.tempfile.mkdtemp
+
+    def spy(*a, **k):
+        d = real_mkdtemp(*a, **k)
+        if str(k.get("prefix", "")).startswith("cairn-hookprobe"):
+            created.append(Path(d))
+        return d
+
+    monkeypatch.setattr(hookprobe.tempfile, "mkdtemp", spy)
+    _run(ClaudeHookRecipe(), "fires_blocks", tmp_path)
+    assert created, "probe should have created a canary tempdir"
+    assert not created[0].exists(), "the canary tempdir must be removed after the probe"
+
+
+# --------------------------------------------------------------------------- #
+# The recipes emit valid, firing hook config.
+# --------------------------------------------------------------------------- #
+
+
+def test_claude_recipe_emits_firing_deny_hook(tmp_path):
+    canary = tmp_path / "c"
+    (canary / ".cairn-probe").mkdir(parents=True)
+    marker = canary / ".cairn-probe" / "marker"
+    sidecar = canary / ".cairn-probe" / "sidecar"
+    ClaudeHookRecipe().write_canary(canary, marker, sidecar)
+    settings = json.loads((canary / ".claude" / "settings.json").read_text())
+    entry = settings["hooks"]["PreToolUse"][0]
+    assert entry["matcher"] == "Bash"
+    cmd = entry["hooks"][0]["command"]
+    # Running the hook command must create the marker AND print the deny decision.
+    import subprocess
+
+    p = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True)
+    assert marker.exists()
+    assert '"permissionDecision": "deny"' in p.stdout or '"permissionDecision":"deny"' in p.stdout
+
+
+def test_codex_recipe_emits_hooks_json_under_codex_home(tmp_path):
+    canary = tmp_path / "c"
+    (canary / ".cairn-probe").mkdir(parents=True)
+    marker = canary / ".cairn-probe" / "marker"
+    CodexHookRecipe().write_canary(canary, marker, canary / ".cairn-probe" / "sidecar")
+    hooks = json.loads((canary / ".codex" / "hooks.json").read_text())
+    assert "PreToolUse" in hooks["hooks"]
+    assert (canary / ".codex" / "config.toml").exists()
+    # CODEX_HOME is relocated to the canary, keeping the user's ~/.codex untouched.
+    assert CodexHookRecipe().extra_env(canary)["CODEX_HOME"] == str(canary / ".codex")
+
+
+def test_claude_invocation_carries_bypass_permissions(tmp_path):
+    argv, stdin_text = ClaudeHookRecipe().build_invocation(tmp_path, "PROMPT", "haiku")
+    assert argv[0] == "claude" and stdin_text is None
+    assert "--permission-mode" in argv and "bypassPermissions" in argv
+    assert "haiku" in argv
+
+
+# --------------------------------------------------------------------------- #
+# Doctor wiring: probe lines appear only with probe_hooks=True.
+# --------------------------------------------------------------------------- #
+
+
+def _hello_ws(tmp_path):
+    from cairn.kernel import newkit
+
+    return newkit.new_workspace("demo", tmp_path)
+
+
+def test_doctor_probe_lines_only_with_flag(tmp_path, monkeypatch):
+    ws = _hello_ws(tmp_path)
+    # Stub the probe so this stays hermetic (no subprocess); assert wiring, not mechanics.
+    monkeypatch.setattr(
+        hookprobe, "probe",
+        lambda recipe, **kw: ProbeResult("claude", "fires_blocks", "d", "v", "under bypassPermissions", "deny"),
+    )
+    from cairn.kernel.doctor import run_doctor
+
+    lines_off: list[str] = []
+    run_doctor(ws, probe_hooks=False, out=lines_off.append)
+    assert not any("hook probe" in ln for ln in lines_off)
+
+    lines_on: list[str] = []
+    run_doctor(ws, probe_hooks=True, out=lines_on.append)
+    assert any("hook probe claude" in ln and "fires+blocks" in ln for ln in lines_on)
+
+
+def test_doctor_probe_falsification_fails_exit(tmp_path, monkeypatch):
+    ws = _hello_ws(tmp_path)
+    # blocking_hooks=True but the probe says hooks don't fire → error → non-zero exit.
+    monkeypatch.setattr(
+        hookprobe, "probe",
+        lambda recipe, **kw: ProbeResult("claude", "no_fire", "d", "v", "under bypassPermissions", "deny"),
+    )
+    from cairn.kernel.doctor import run_doctor
+    from cairn.kernel.types import ExitCode
+
+    lines: list[str] = []
+    rc = run_doctor(ws, probe_hooks=True, out=lines.append)
+    assert rc == int(ExitCode.CONFIG)
+    assert any("✗ hook probe claude" in ln for ln in lines)
+
+
+def test_doctor_probe_inconclusive_only_warns(tmp_path, monkeypatch):
+    ws = _hello_ws(tmp_path)
+    monkeypatch.setattr(
+        hookprobe, "probe",
+        lambda recipe, **kw: ProbeResult("claude", "inconclusive", "no auth", "v", "under bypassPermissions", "deny"),
+    )
+    from cairn.kernel.doctor import run_doctor
+    from cairn.kernel.types import ExitCode
+
+    lines: list[str] = []
+    rc = run_doctor(ws, probe_hooks=True, out=lines.append)
+    assert rc == int(ExitCode.OK)  # inconclusive never fails the exit
+    assert any("inconclusive" in ln for ln in lines)

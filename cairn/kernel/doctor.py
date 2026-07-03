@@ -134,9 +134,38 @@ def run_doctor(
         out(f"{_BAD} guard runner    cannot import — guarded commands will fail closed")
 
     if probe_hooks:
-        out("  hook probe: not implemented (C4)")
+        errors += _doctor_probe_hooks(scope, workspace_dir, out)
 
     return int(ExitCode.CONFIG) if errors else int(ExitCode.OK)
+
+
+def _doctor_probe_hooks(scope: list[str], workspace_dir: Path, out: Callable[[str], None]) -> int:
+    """Empirically probe hook firing for each in-scope executor (docs/ARCHITECTURE.md §4).
+
+    Spends a token per executor with a recipe, so it runs ONLY under ``--probe-hooks``. Reads
+    each executor's asserted ``capabilities.blocking_hooks`` (never writes it) and lets
+    :func:`hookprobe.render` decide the level: a probe that *falsifies* a ``True`` claim counts
+    toward the non-zero exit; an inconclusive probe only warns."""
+    from cairn.cli import load_executor_class
+    from cairn.kernel import hookprobe
+
+    errs = 0
+    for name in scope:
+        recipe = hookprobe.RECIPES.get(name)
+        if recipe is None:
+            out(f"  ~ hook probe {name}   no probe recipe (skipped)")
+            continue
+        try:
+            blocking_hooks = load_executor_class(name).capabilities.blocking_hooks
+        except (KeyError, AttributeError):
+            out(f"  ~ hook probe {name}   no such executor plugin (skipped)")
+            continue
+        result = hookprobe.probe(recipe, workspace_dir=workspace_dir)
+        level, line = hookprobe.render(result, blocking_hooks)
+        out(line)
+        if level == "error":
+            errs += 1
+    return errs
 
 
 def _doctor_executor(config: Config, workspace_dir: Path, name: str, out: Callable[[str], None]) -> int:
