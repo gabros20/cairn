@@ -332,9 +332,12 @@ claude:  claude -p "<envelope text>" --model {model} [--effort {effort}] --outpu
               headless `claude -p` under the default mode refuses every tool use and exits 0
               without producing the artifact — cairn's blocking PreToolUse guards are the
               enforcement layer instead of an interactive prompt)
-codex:   codex exec -C {cwd} -m {model} --sandbox workspace-write -a never
+codex:   codex exec -C {cwd} -m {model} --sandbox workspace-write --skip-git-repo-check
              [-c model_reasoning_effort={effort}]  < envelope
-             (prompt on stdin; --output-schema is NOT wired yet — the STEP sentinel is the contract)
+             (prompt on stdin; `-a/--ask-for-approval` is gone from `codex exec` as of codex-cli
+              0.142.5 — exec hardwires approval-never; `--skip-git-repo-check` because codex refuses a
+              non-git/untrusted cwd and cairn's `--sandbox` flag + guards are the enforcement layer;
+              --output-schema is NOT wired yet — the STEP sentinel is the contract)
 grok:    grok -p --cwd {cwd} -m {model} --output-format text --permission-mode dontAsk
              --no-alt-screen --no-auto-update < envelope
              (prompt on stdin; effort is baked into the model alias — no effort flag exists)
@@ -433,6 +436,13 @@ cairn trail <run-dir> [--watch] [--follow --json [--since SEQ]]
 cairn ps [--workspace .] [--json]       # cross-run fleet view (running/gate-waiting/halted) —
                                         # derived from run.json + trail recency; no daemon, no registry
 cairn doctor [--executor X] [--probe-hooks]
+                                        # machine preflight; --probe-hooks additionally spawns a throwaway
+                                        # canary project per executor (native deny-hook + guarded side-effect)
+                                        # and classifies whether its PreToolUse hook fires+blocks headless —
+                                        # fires+blocks / fires-not-blocks / no-fire / inconclusive. Opt-in,
+                                        # never cached (a fresh per-machine fact). Exit policy: a declared
+                                        # blocking_hooks=True that the probe falsifies → error; None + a
+                                        # concrete outcome → informational; inconclusive → warning, never error
 cairn batch <pipeline> --params-file sites.jsonl [-j 8] [--gate NAME=CHOICE]...
                                         # process pool of `cairn run --headless` children, one per JSONL line
 cairn learnings [--since DATE] [--tag TAG]      # aggregate learn events across all runs, ranked

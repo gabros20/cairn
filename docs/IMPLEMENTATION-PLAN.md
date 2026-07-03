@@ -16,24 +16,33 @@ ever debug one new thing at a time.
 
 - **C0 + C1 — complete.** Planner, walker, gatekit, composer, artifacts, trail/runstate, guards,
   expression + template engines, config, the `shell`/`stub` executors, the `cairn test` suite layer,
-  the scaffold, and every C1-scope CLI verb are built and green (623 tests).
+  the scaffold, and every C1-scope CLI verb are built and green (659 tests).
   *Deviation from the strict ordering:* built as parallel module waves with per-module
   implement→review→fix rather than strictly C0-then-C1. The C1 "synthetic-suite" verification bar is
   met by the suite + the offline `hello` end-to-end run + the testkit stub layer (a full
   pipeline replays offline through the `stub` executor).
-- **C2 — partial.** Envelope composer and the `claude`/`codex`/`grok` executors are code-complete and
-  unit-tested against fake binaries; the **`claude` executor is now live-verified** (the first live
-  `claude -p` runs, captured as offline stub regressions in `tests/live/workspace-claude`; this is
-  also what forced `--permission-mode bypassPermissions` and the `USER`/`LOGNAME` env baseline). The
-  `codex`/`grok` live parity runs are still pending.
+- **C2 — mostly complete.** Envelope composer and the `claude`/`codex`/`grok` executors are
+  code-complete and unit-tested against fake binaries; the **`claude` and `codex` executors are now
+  live-verified**. The claude live runs (captured as offline stub regressions in
+  `tests/live/workspace-claude`) forced `--permission-mode bypassPermissions` and the `USER`/`LOGNAME`
+  env baseline; the codex live runs (`tests/live/workspace-codex`) forced dropping `-a/--ask-for-approval`
+  (gone from `codex exec` in codex-cli 0.142.5, which hardwires approval-never) and adding
+  `--skip-git-repo-check`. Only the `grok` live parity run is still pending.
 - **C6 verbs — shipped ahead of sequence.** `cairn batch` (process pool of `cairn run --headless`),
   `cairn learnings` (cross-run `learn`-event aggregation), `cairn gc` (dry-run retention, `--apply`
   to delete), and **first-class scheduling** (`schedules.yaml`, `cairn schedule install|list|run|
   uninstall`, cron/launchd/systemd backends, content-key idempotency) are all built and tested —
   LIVE, no longer stubs. The workspace **`requires`-pin** is enforced at plan time and cairn's
   version is **0.1.0**.
-- **C4 — pending:** the Codex headless-hook (blocking-pretool) probe — now also the empirical
-  confirmation that Claude's PreToolUse hooks still fire+block under `bypassPermissions` (ARCHITECTURE §4).
+- **C4 — complete.** CodexExecutor is live-verified (above), and the doctor hook probe
+  (`cairn doctor --probe-hooks`, `cairn/kernel/hookprobe.py`) has shipped. On the dev machine it
+  returns **hook-primary** for both executors: `claude` PreToolUse fires+blocks under
+  `bypassPermissions` — which **falsifies** ARCHITECTURE §4's open risk that `bypassPermissions` might
+  disable hooks — and `codex` PreToolUse fires+blocks headless under `codex exec` (codex-cli 0.142.5
+  *does* have native blocking hooks), so the "Codex guard posture" decision gate resolves to
+  hook-primary. These are per-machine, per-CLI-version probe results, not universal guarantees. The
+  C4 verify items that depend on brease-factory (P0 / blueprint-parity live runs) are **deferred with
+  the workspace migration**; what C4 proves is the executor live-proof + the probe.
 - **Still ahead:** Grok live setup (C5), the `brease=on` CMS-population branch, `v0.1.0` tag/packaging
   (C7 — packaging this standalone repo, not a repo move), and the brease-factory workspace migration.
 
@@ -94,15 +103,20 @@ art-review runs ≥1 cycle; no-first-pass rule enforced by the validator), **rei
 fires; conditional chain completes). An injected F18 attempt is blocked at the hook layer and the
 shim layer independently. At this point cairn replaces the native orchestrator path for this repo.
 
-## C4 — CodexExecutor
+## C4 — CodexExecutor  *(complete — see Status)*
 
 **Build:** CodexExecutor (`codex exec`, `--output-schema` as bonus), `render_workspace` (AGENTS.md,
 rules/permission bundle), tier table, **doctor's empirical hook probe** (PORT-DESIGN's top risk,
 now a diagnosed per-machine fact; probe result selects hook-primary vs shim-primary guard posture).
+*Shipped:* the executor is live-verified (`tests/live/workspace-codex`), and the probe
+(`cairn doctor --probe-hooks`, `cairn/kernel/hookprobe.py`) returns **hook-primary** for both claude
+and codex on the dev machine.
 
 **Verify:** P0 alone first, then `--to blueprint`, then full static pipeline; all three modes
 (reimagine conditional chain included); guard demonstration under whichever posture the probe
-selected; `redesign` escalates to the codex `reasoning` tier.
+selected; `redesign` escalates to the codex `reasoning` tier. *The pipeline-level verify items
+(P0 / blueprint-parity live runs) run against a real workspace and are deferred with the
+brease-factory migration; the executor live-proof + the hook probe are done.*
 
 ## C5 — GrokExecutor + mixed fleet
 
@@ -148,7 +162,7 @@ mismatch is refused at plan time (**done** — `cairn plan` via `config.check_re
 |---|---|---|
 | C0 start | confirm cairn replaces the straight port (this plan supersedes PORT-DESIGN M0–M7) | yes |
 | C2 | workspace layout migration (skills to root, `.claude/` thins to wrapper+symlinks) | migrate |
-| C4 | Codex guard posture — set by the doctor probe, not by judgment | probe decides |
+| C4 | Codex guard posture — set by the doctor probe, not by judgment | **resolved: hook-primary** (probe, dev machine) |
 | C7 | packaging/tag timing — only when the Executor protocol has survived three real implementations | after C5 |
 
 Risks: PORT-DESIGN §8.1 applies verbatim (Codex hooks/version churn, Grok user-config-only model

@@ -13,11 +13,12 @@ as the only state.
 
 ## Status
 
-**C0–C1 built and green (623 tests).** Implemented: the kernel (planner, walker, gatekit,
+**C0–C1 built and green (659 tests).** Implemented: the kernel (planner, walker, gatekit,
 composer, artifacts, trail/runstate, guards, expression + template engines, config); all five
-executors — `shell` and `stub` live, and the **`claude` executor now live-verified** (the first
-live `claude -p` runs, captured as offline stub regressions in `tests/live/workspace-claude`);
-`codex`/`grok` code-complete and unit-tested against fake binaries but **not yet live-verified**;
+executors — `shell` and `stub` live, and the **`claude` and `codex` executors now live-verified**
+(the first live `claude -p` / `codex exec` runs, captured as offline stub regressions in
+`tests/live/workspace-claude` and `tests/live/workspace-codex`); `grok` code-complete and
+unit-tested against fake binaries but **not yet live-verified**;
 the workspace test layer (`cairn test` — validators/guards/pipelines/envelopes + `record`); the
 full CLI — the `batch`/`learnings`/`gc`/`schedule` verbs are now **LIVE** (no longer stubs), and
 first-class **scheduling has shipped** (`schedules.yaml`, cron/launchd/systemd installers,
@@ -25,9 +26,10 @@ content-key idempotency); and the `cairn new` scaffold. **v0.1.0 packaging is la
 Every module went implement → review → fix. The day-0 pipeline runs end-to-end offline:
 `uv run cairn run hello --headless`.
 
-**Not done yet:** live-model parity for the other executors — the Codex headless-hook probe (C4)
-and Grok live setup (C5) — the CMS-population branch, and the brease-factory workspace migration
-(deferred; it remains cairn's eventual first workspace). Design package in
+**Not done yet:** Grok live setup (C5), the CMS-population branch, and the brease-factory workspace
+migration (deferred; it remains cairn's eventual first workspace). The C4 doctor hook probe
+(`cairn doctor --probe-hooks`) has shipped — on the dev machine it verifies both Claude's and
+Codex's PreToolUse hooks fire and block headlessly. Design package in
 [`docs/`](docs/): start with [`docs/README.md`](docs/README.md), then
 [`docs/CONCEPTS.md`](docs/CONCEPTS.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and the
 build order in [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md) (C0–C7).

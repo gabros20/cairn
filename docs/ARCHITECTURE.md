@@ -129,28 +129,34 @@ Guards declare `enforce:` layers; the engine wires what each executor supports a
 
 | Layer | Claude | Codex | Grok | shell |
 |---|---|---|---|---|
-| `hook` (native pre-tool block) | PreToolUse deny-JSON | PreToolUse *if it fires headless (test at doctor-time)* | PreToolUse exit-2 | n/a |
+| `hook` (native pre-tool block) | PreToolUse deny-JSON | PreToolUse deny-JSON *(hooks.json; fires headless — probe-verified on dev machine)* | PreToolUse exit-2 | n/a |
 | `shim` (PATH wrapper) | ✓ | ✓ | ✓ | ✓ |
 | `post` (validator backstop) | ✓ | ✓ | ✓ | ✓ |
 
-*Status: designed. The `post` (validator backstop) layer is what the built kernel wires today; the
-`hook`/`shim` engine and the empirical hook-firing probe land with the live executors — guard engine
-C3, the doctor hook probe C4 (see IMPLEMENTATION-PLAN).*
+*Status: the `post` (validator backstop) layer is what the built kernel wires today; the `hook`/`shim`
+engine lands with the live executors (guard engine C3), and the empirical hook-firing probe has
+shipped (`cairn doctor --probe-hooks`, C4 — see IMPLEMENTATION-PLAN).*
 
-**The C4 probe carries a specific, now-unavoidable burden.** The `claude` executor runs headless with
+**The C4 probe settles a specific burden.** The `claude` executor runs headless with
 `--permission-mode bypassPermissions` (it must — see API §7 / SECURITY §1.2: the default mode refuses
-every tool use and the guards are the enforcement layer instead of an interactive prompt). That makes
-`Capabilities.blocking_hooks = True` an **asserted design claim, not yet an empirically confirmed
-fact**: the whole containment story depends on PreToolUse hooks *still firing AND still blocking*
-(exit 2) even under `bypassPermissions`. The C4 doctor hook-probe must confirm exactly that —
-`bypassPermissions` bypasses the interactive permission prompt but does **not** disable hooks — on
-each machine. Until the probe runs, treat `blocking_hooks=True` as the design's assumption.
+every tool use and the guards are the enforcement layer instead of an interactive prompt). That made
+`Capabilities.blocking_hooks = True` an **asserted design claim** whose whole containment story depends
+on PreToolUse hooks *still firing AND still blocking* (exit 2) even under `bypassPermissions`. The C4
+doctor hook-probe (`cairn doctor --probe-hooks`) now confirms exactly that empirically — and on the
+dev machine it does: `claude` PreToolUse **fires+blocks** under `bypassPermissions`, so this open risk
+is falsified where probed. `bypassPermissions` bypasses the interactive prompt but does **not** disable
+hooks. This is a per-machine, per-CLI-version fact, not a universal guarantee: treat
+`blocking_hooks=True` as the design's assumption and the probe as the standing per-machine check that
+confirms it. (Codex's `blocking_hooks` stays `None` in code by design — the probe, not the capability
+field, carries codex's per-machine truth.)
 
-`cairn doctor` empirically probes hook firing per executor (spawn a canary invocation that attempts
-a guarded command under the executor's real headless flags, `bypassPermissions` included) and records
-the result — PORT-DESIGN's "highest risk" becomes a diagnosed, per-machine fact instead of an
-assumption. The check script contract is one file, one convention (exit 0/2), reused across all three
-layers.
+`cairn doctor --probe-hooks` empirically probes hook firing per executor — it spawns a throwaway canary
+project carrying a native deny-hook, invokes the vendor CLI headlessly under the executor's real argv
+posture and the walker's exact env baseline, and classifies the outcome (fires+blocks / fires-not-blocks
+/ no-fire / inconclusive) — so PORT-DESIGN's "highest risk" becomes a diagnosed, per-machine fact instead
+of an assumption. On the dev machine both `claude` and `codex` probe **hook-primary** (codex-cli 0.142.5
+*does* ship native PreToolUse blocking hooks). The check script contract is one file, one convention
+(exit 0/2), reused across all three layers.
 
 ## 5. Isolation & environment
 

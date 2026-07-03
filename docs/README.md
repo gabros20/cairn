@@ -227,15 +227,17 @@ resident daemon (the filesystem is the state).
 
 ## Status
 
-**C0–C1 built and green (623 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
+**C0–C1 built and green (659 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
 artifacts, trail/runstate, guards, expression + template engines, config, doctor, scaffold); all
-five executors (`shell`/`stub` live; the **`claude` executor now live-verified** — the first live
-`claude -p` runs recorded as offline stub regressions in `tests/live/workspace-claude`;
-`codex`/`grok` code-complete and unit-tested against fake binaries, **not yet live-verified**); the
+five executors (`shell`/`stub` live; the **`claude` and `codex` executors now live-verified** — the
+first live `claude -p` / `codex exec` runs recorded as offline stub regressions in
+`tests/live/workspace-claude` and `tests/live/workspace-codex`; `grok` code-complete and
+unit-tested against fake binaries, **not yet live-verified**); the
 workspace test layer (`cairn test` + `record`); and the full CLI — the `batch`/`learnings`/`gc`/
 `schedule` verbs are now **LIVE** (no longer stubbed), with first-class **scheduling shipped**
 (`schedules.yaml`, cron/launchd/systemd installers, content-key idempotency). **v0.1.0 packaging is
 landing this wave.** The day-0 pipeline runs end-to-end offline (`cairn run hello --headless`).
-Still ahead, per [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md): the Codex headless-hook probe
-(C4), Grok live setup (C5), the CMS-population branch, and the brease-factory workspace migration
-(deferred — cairn's eventual first workspace).
+The C4 doctor hook probe (`cairn doctor --probe-hooks`) has shipped — on the dev machine it verifies
+both Claude's and Codex's PreToolUse hooks fire and block headlessly. Still ahead, per
+[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md): Grok live setup (C5), the CMS-population branch,
+and the brease-factory workspace migration (deferred — cairn's eventual first workspace).

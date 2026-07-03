@@ -116,14 +116,17 @@ $ cd my-workspace && cairn doctor
 ```
 
 Real order today: version · workspace lint · in-scope executors · `[tools]` · `[secrets]` presence ·
-guard-runner import; `--probe-hooks` adds a `hook probe: not implemented (C4)` line. Rules: doctor
+guard-runner import; `--probe-hooks` adds a per-executor `hook probe` line — it spawns a canary and
+classifies fires+blocks / fires-not-blocks / no-fire / inconclusive (on the dev machine both claude
+and codex report fires+blocks → hook-primary). Rules: doctor
 checks the *default* executor + any named via `--executor`, and only a lint error or a broken
 in-scope executor fails its exit — `[tools]`/`[secrets]`/guard-runner problems are **warnings**
 (a missing vercel prints its `needed_by` scope but blocks nothing). Per-run auth (e.g. `brease
 login` into a run dir) is not doctor's job — it's a `manual:` step in the pipeline (TOOLING §2).
 
 *Status: the per-executor line currently reports `healthy`/its first finding; the richer
-`(version, auth ok, hooks: blocking)` detail arrives as the live executors land (C2/C4). The
+`(version, auth ok, hooks: blocking)` detail arrives as the live executors land (claude + codex done,
+grok is C5), and the `--probe-hooks` hook line has shipped (C4). The
 `requires` pin itself is now enforced — at **plan** time (`cairn plan` refuses an out-of-range
 install, §3); surfacing it as a dedicated `satisfies requires …` line in `doctor` is the remaining
 cosmetic piece.*

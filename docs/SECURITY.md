@@ -47,7 +47,10 @@ stealing. This single default removes the largest secret-exfiltration surface fo
 `USER`/`LOGNAME` are in the baseline deliberately: they are **identity, not secrets**, and the CLI
 executors need them. A headless `claude`/`codex` finds its stored OAuth credential via the macOS
 Keychain, whose lookup keys off `USER`; strip it and every executor reports "Not logged in" (found
-live — the first `claude -p` runs failed exactly this way until the baseline carried `USER`).
+live — the first `claude -p` runs failed exactly this way until the baseline carried `USER`). The
+`doctor --probe-hooks` codex canary follows the same minimal-credential posture: it copies **only**
+`auth.json` (0600) from the real `CODEX_HOME` into a throwaway canary home that dies with the probe —
+never the whole home — and treats absent auth as `inconclusive` rather than reaching for anything else.
 
 ### 1.3 Redaction — kernel-side, literal, everywhere it writes
 
