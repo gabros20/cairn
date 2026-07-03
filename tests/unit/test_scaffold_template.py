@@ -54,6 +54,21 @@ def test_json_files_parse():
         json.loads((TEMPLATE / rel).read_text(encoding="utf-8"))
 
 
+def test_step_return_schema_byte_equals_kernel_resource():
+    # Drift guard: the scaffold ships a copy of the kernel's step-return schema. They
+    # are equal today; this fails the moment they diverge byte-for-byte (raw bytes, not
+    # parsed JSON — so whitespace/key-order drift is caught too). Locally perturbing one
+    # byte in either file makes this go red; restoring it makes it green again.
+    from importlib import resources
+
+    packaged = resources.files("cairn.resources.schemas").joinpath("step-return.schema.json").read_bytes()
+    scaffold = (TEMPLATE / "schemas/step-return.json").read_bytes()
+    assert scaffold == packaged, (
+        "templates/workspace/schemas/step-return.json has drifted from the packaged "
+        "cairn.resources.schemas/step-return.schema.json — re-copy the kernel resource"
+    )
+
+
 def test_cairn_toml_parses_once_placeholder_substituted():
     text = (TEMPLATE / "cairn.toml").read_text(encoding="utf-8")
     assert WORKSPACE_PLACEHOLDER in text, "template must carry the {{WORKSPACE_NAME}} placeholder"
