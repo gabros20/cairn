@@ -38,8 +38,17 @@ def test_argv_shape_prompt_as_arg(tmp_path, monkeypatch):
         "-p", "hello prompt",
         "--model", "opus", "--effort", "high",
         "--output-format", "text",
+        "--permission-mode", "bypassPermissions",
     ]
     assert stdin == ""  # claude gets the prompt as an arg, not on stdin
+
+
+def test_headless_permission_mode_is_bypass(tmp_path, monkeypatch):
+    # Without a permission mode a headless `claude -p` refuses every tool use ("I need your
+    # permission…") and never writes its artifact. cairn's own guards (blocking PreToolUse
+    # hooks) are the enforcement layer, so the executor runs claude fully non-interactive.
+    _, _, argv, _, _ = _invoke(tmp_path, monkeypatch)
+    assert argv[-2:] == ["--permission-mode", "bypassPermissions"]
 
 
 def test_effort_pair_omitted_when_none(tmp_path, monkeypatch):
