@@ -1,0 +1,6 @@
+description: "P3: designs the Brease content model, emits brease.config.json"
+tier: balanced
+effort: medium
+skills: [brease-model-and-populate]
+tools: { allow: [read, write, bash], bash: allowlist.yaml#node-build }
+env: [BREASE_TOKEN]

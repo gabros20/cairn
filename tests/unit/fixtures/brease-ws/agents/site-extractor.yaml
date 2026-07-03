@@ -1,0 +1,5 @@
+description: "Crawls the source site into structured captures/ via crawl4ai"
+tier: balanced
+effort: medium
+skills: [brease-capture-site, crawl4ai]
+tools: { allow: [read, write, edit, bash], bash: allowlist.yaml#capture }

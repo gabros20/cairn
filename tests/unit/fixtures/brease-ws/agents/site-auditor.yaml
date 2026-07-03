@@ -1,0 +1,5 @@
+description: "P1: audits the captured site into a disposition plan"
+tier: balanced
+effort: medium
+skills: [brease-audit-and-decide]
+tools: { allow: [read, write] }

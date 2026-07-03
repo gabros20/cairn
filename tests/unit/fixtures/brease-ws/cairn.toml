@@ -1,0 +1,56 @@
+[workspace]
+name = "brease-factory"
+doctrine = "prompts/DOCTRINE.md"
+runs_dir = "runs"
+default_executor = "claude"
+
+[defaults]
+step_timeout = "30m"
+trail_context = { events = 12, learnings = 5 }
+heartbeat = "20s"
+
+[defaults.budget]
+run_usd = 25
+step_usd = 8
+
+[tools.crawl4ai]
+check = "uv run python -c 'import crawl4ai'"
+install = "uv sync && uv run playwright install chromium"
+
+[tools.vercel]
+check = "vercel whoami"
+install = "pnpm add -g vercel && vercel login"
+needed_by = ["deploy"]
+
+[executors.claude]
+enabled = true
+[executors.claude.tiers]
+reasoning = { model = "opus", effort = "high" }
+balanced = { model = "sonnet", effort = "medium" }
+cheap = { model = "haiku", effort = "low" }
+
+[executors.codex]
+enabled = true
+pin_version = "0.138"
+[executors.codex.tiers]
+reasoning = { model = "gpt-5.5", effort = "high" }
+balanced = { model = "gpt-5.4", effort = "medium" }
+cheap = { model = "gpt-5.4-mini", effort = "low" }
+[executors.codex.flags]
+sandbox = "workspace-write"
+approvals = "never"
+
+[executors.grok]
+enabled = true
+setup = "scripts/setup-grok-config.sh"
+[executors.grok.tiers]
+reasoning = { model = "grok-4.3-high" }
+balanced = { model = "grok-build-med" }
+cheap = { model = "grok-build-low" }
+
+[secrets]
+BREASE_TOKEN = { needed_by = ["model-cms", "populate"] }
+VERCEL_TOKEN = { needed_by = ["deploy"] }
+
+[sinks.webhook]
+url = "https://example.invalid/hook"

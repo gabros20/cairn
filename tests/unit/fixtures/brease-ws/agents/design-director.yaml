@@ -1,0 +1,5 @@
+description: "One mind two jobs: P2 DESIGN.md author, P4.5 section-by-section reviewer"
+tier: reasoning
+effort: high
+skills: [brease-design-md, brease-frontend-design, brease-art-review]
+tools: { allow: [read, write, bash], bash: allowlist.yaml#readonly-plus-screenshot }

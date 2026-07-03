@@ -1,0 +1,5 @@
+description: "P2: target sitemap, nav, footer, per-page section blueprints"
+tier: balanced
+effort: medium
+skills: [brease-blueprint-target]
+tools: { allow: [read, write] }

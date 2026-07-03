@@ -1,0 +1,5 @@
+description: "P5: validates the generated frontend and writes a go/no-go report"
+tier: balanced
+effort: medium
+skills: [brease-qa-and-demo]
+tools: { allow: [read, write, bash], bash: allowlist.yaml#node-build }

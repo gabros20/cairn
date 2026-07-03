@@ -1,0 +1,6 @@
+description: "P3: applies the schema and populates the Brease CMS"
+tier: balanced
+effort: medium
+skills: [brease-model-and-populate]
+tools: { allow: [read, write, bash], bash: allowlist.yaml#node-build }
+env: [BREASE_TOKEN]

@@ -1,0 +1,5 @@
+description: "P2.5: fills the media gap between blueprint slots and captured assets"
+tier: balanced
+effort: medium
+skills: [brease-asset-gen]
+tools: { allow: [read, write, edit, bash], bash: allowlist.yaml#node-build }

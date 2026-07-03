@@ -1,0 +1,6 @@
+description: "P4: scaffolds+builds the Next.js 16 demo, one component per section key"
+tier: balanced
+effort: medium
+escalate: { when: "dims.design != 'reproduce'", tier: reasoning }
+skills: [brease-build-frontend, brease-frontend-next, web-section-design]
+tools: { allow: [read, write, edit, bash], bash: allowlist.yaml#node-build }

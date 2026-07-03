@@ -1,0 +1,7 @@
+capture:
+  - "uv run *"
+readonly-plus-screenshot:
+  - "npx agent-browser *"
+node-build:
+  - "pnpm install*"
+  - "pnpm build*"

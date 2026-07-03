@@ -1,0 +1,6 @@
+description: "P6: publishes the built frontend to GitHub and/or Vercel"
+tier: balanced
+effort: medium
+skills: [brease-deploy]
+tools: { allow: [read, write, bash], bash: allowlist.yaml#node-build }
+env: [VERCEL_TOKEN]
