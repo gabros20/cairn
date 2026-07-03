@@ -6,7 +6,7 @@ coding agent operates cairn. Philosophy lives in the README; this is the mechani
 
 ---
 
-## 1. Package anatomy (post-C7 extraction)
+## 1. Package anatomy
 
 ```
 designatives/cairn                     # the tool's own repo
@@ -29,16 +29,23 @@ designatives/cairn                     # the tool's own repo
 
 Build backend is **hatchling**; the wheel ships `packages = ["cairn"]` and force-includes
 `templates/workspace` → `cairn/_templates/workspace` so `cairn new workspace` works from an
-installed copy (`newkit.templates_dir()` resolves that path first). Until C7, the identical tree
-lives in brease-factory as `cairn/` + `pyproject.toml` (`uv run cairn …`) — same anatomy, no
-publishing.
+installed copy (`newkit.templates_dir()` resolves that path first). This is the standalone repo
+today (`~/Documents/Work/Projects/cairn`, run in place with `uv run cairn …`); C7 packaging just
+adds the tag + wheel, no tree moves.
 
 ## 2. Install channels
 
+A note on lineage, so the phases below read correctly: cairn was **designed inside brease-factory**
+(the pipeline it was distilled from, and its eventual first workspace — README §Lineage), but it has
+been **built as its own standalone repo from day one** (`~/Documents/Work/Projects/cairn`). It has
+never lived *inside* brease-factory as a subtree. So "extraction" (C7) does **not** mean moving a tree
+out of another repo — it means **packaging and tagging** this repo: cutting `v0.1.0`, building the
+wheel, and installing it as a tool instead of running it in place.
+
 | Phase | Channel | Command |
 |---|---|---|
-| Incubation (C0–C6) | in-repo | `uv run cairn …` (brease-factory checkout) |
-| Internal (C7+) | git tag | `uv tool install git+https://github.com/designatives/cairn@v0.1.0` |
+| Development (pre-tag) | in-repo | `uv run cairn …` (this repo, in place) |
+| Internal (C7 packaging) | git tag | `uv tool install git+https://github.com/designatives/cairn@v0.1.0` |
 | Public (if open-sourced) | PyPI | `uv tool install cairn` · zero-install `uvx cairn …` |
 
 Upgrades: `uv tool upgrade cairn` (or install a newer tag). Downgrade = install the older tag —
@@ -58,10 +65,13 @@ Workspace side: `cairn.toml → requires = ">=0.1,<0.2"`, enforced at plan time 
 installed vs required range). `run.json` records the exact tool version, executor versions, and
 pipeline content-hash — so any old run is diagnosable regardless of what's installed today.
 
-*Status: of the three surfaces, only run-dir **pipeline-hash** drift is enforced today — `cairn
-resume` refuses a changed pipeline without `--force`. The `requires`-pin plan-time check and the
-schema/protocol/version gates are parsed-but-not-yet-enforced; they harden with the C7 extraction
-(IMPLEMENTATION-PLAN), when a workspace first pins an installed tool version.*
+*Status: two surfaces are enforced today. Run-dir **pipeline-hash** drift — `cairn resume` (and
+`run --idempotent`'s resume path) refuses a changed pipeline without `--force`. And the workspace
+**`requires`-pin** — `cairn plan` (via `config.check_requires`) now **refuses to plan** when the
+installed cairn falls outside `cairn.toml: requires = …`, naming both the required range and the
+installed version. cairn's own version is **0.1.0** (single-sourced from `cairn/__init__.py`); the
+`v0.1.0` git tag is being cut this wave. The remaining schema-version and executor-protocol gates
+stay parsed-but-not-yet-enforced (IMPLEMENTATION-PLAN).*
 
 Release discipline: a git tag is releasable iff the synthetic suite is green and `cairn plan`
 passes over the example + brease workspaces. CHANGELOG entry per tag; migration notes on any
@@ -95,7 +105,7 @@ kernel copy.
 ```console
 $ uv tool install git+https://github.com/designatives/cairn@v0.1.0
 $ cd my-workspace && cairn doctor
-  ✔ cairn 0.1.0.dev0
+  ✔ cairn 0.1.0
   ✔ workspace lint  3 pipelines plan green
   ✔ executor claude   healthy
   ✗ executor codex    codex not found → npm i -g @openai/codex          # only when --executor codex
@@ -113,8 +123,10 @@ in-scope executor fails its exit — `[tools]`/`[secrets]`/guard-runner problems
 login` into a run dir) is not doctor's job — it's a `manual:` step in the pipeline (TOOLING §2).
 
 *Status: the per-executor line currently reports `healthy`/its first finding; the richer
-`(version, auth ok, hooks: blocking)` detail and the `satisfies requires …` line arrive as the live
-executors and the version-pin check land (C2/C4/C7 — IMPLEMENTATION-PLAN).*
+`(version, auth ok, hooks: blocking)` detail arrives as the live executors land (C2/C4). The
+`requires` pin itself is now enforced — at **plan** time (`cairn plan` refuses an out-of-range
+install, §3); surfacing it as a dedicated `satisfies requires …` line in `doctor` is the remaining
+cosmetic piece.*
 
 ## 6. The operator skill — coding agents driving cairn
 

@@ -13,7 +13,7 @@ as the only state.
 
 ## Status
 
-**C0–C1 built and green (595 tests).** Implemented: the kernel (planner, walker, gatekit,
+**C0–C1 built and green (623 tests).** Implemented: the kernel (planner, walker, gatekit,
 composer, artifacts, trail/runstate, guards, expression + template engines, config); all five
 executors — `shell` and `stub` live, and the **`claude` executor now live-verified** (the first
 live `claude -p` runs, captured as offline stub regressions in `tests/live/workspace-claude`);

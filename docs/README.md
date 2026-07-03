@@ -198,7 +198,7 @@ skill — are specified in [DISTRIBUTION.md](DISTRIBUTION.md).)
 
 | Layer | What | Distributed as |
 |---|---|---|
-| **Tool** | the `cairn` CLI (kernel + built-in executors) | versioned Python package — incubated in-repo (`cairn/` + pyproject, `uv run cairn`), extracted to its own repo at API stability (`uv tool install git+…@v0.1.0`), PyPI only if open-sourced |
+| **Tool** | the `cairn` CLI (kernel + built-in executors) | versioned Python package — its own standalone repo (`cairn/` + pyproject, run in place with `uv run cairn`), packaged + tagged at API stability (`uv tool install git+…@v0.1.0`), PyPI only if open-sourced |
 | **Workspace** | pipelines/agents/skills/validators + `cairn.toml` | a git repo (brease-factory is workspace #1); starter via `cairn new workspace` (a template repo is optional sugar over that) |
 | **Runs** | `runs/<id>/` | gitignored artifacts, never distributed |
 
@@ -227,7 +227,7 @@ resident daemon (the filesystem is the state).
 
 ## Status
 
-**C0–C1 built and green (595 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
+**C0–C1 built and green (623 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
 artifacts, trail/runstate, guards, expression + template engines, config, doctor, scaffold); all
 five executors (`shell`/`stub` live; the **`claude` executor now live-verified** — the first live
 `claude -p` runs recorded as offline stub regressions in `tests/live/workspace-claude`;
