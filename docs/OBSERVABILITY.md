@@ -33,7 +33,7 @@ flowchart LR
   SER -->|flushed + fsynced append| JSONL[("trail.jsonl<br/>sink #0 · the authority")]
   SER -.->|tee · same redacted event| Q["webhook sink<br/>daemon queue · bounded"]
   Q -->|POST NDJSON| WH(("ops endpoint"))
-  Q -.->|queue full → drop + one warning| DROP["dropped<br/>never blocks the run"]
+  Q -.->|"queue full → drop + one warning"| DROP["dropped<br/>never blocks the run"]
 
   JSONL --> TRAIL["cairn trail --follow --json"]
   JSONL --> PS["cairn ps"]
