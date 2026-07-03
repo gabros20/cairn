@@ -177,13 +177,16 @@ Guards declare `enforce:` layers; the engine wires what each executor supports a
 | `shim` (PATH wrapper) | ✓ | ✓ | ✓ | ✓ |
 | `post` (validator backstop) | ✓ | ✓ | ✓ | ✓ |
 
-*Status: `post` (the validator backstop) is the layer that **enforces** on a live run today — it is
-the walker's hard artifact gate, always on. The `hook`/`shim` machinery is **built** (`guards.py`:
-the check chain, `build_shims`, the `--shim-check` entry) and unit-tested at L1 (`cairn test guards`),
-and the empirical hook-firing probe has **shipped** (`cairn doctor --probe-hooks`, C4 — see
-IMPLEMENTATION-PLAN); what is **not yet wired** is the per-executor `install_guards` hook that installs
-those native hooks + PATH shims for a run (the CLI executors' `install_guards` is still a stub), so
-until it lands `post` carries enforcement alone.*
+*Status: **`shim` + `post` enforce on a live run today.** `post` (the validator backstop) is the
+walker's hard artifact gate, always on. `shim` is live too: for any plan carrying `shim`-enforced
+guards, `cairn run`/`resume` builds a fresh per-run shim dir (`.cairn/shims`, via
+`guards.build_shims`) and wraps every executor in a `GuardedExecutor` that prepends that dir to each
+invocation's PATH (`cli.py:_wrap_guards`), so a guarded, PATH-resolved binary is intercepted before it
+runs — independent of the hook layer. The `hook` layer is **built** (the capability flags, `guards.py`'s
+check chain + `--shim-check` entry shared with the shims, and the empirical `cairn doctor --probe-hooks`,
+C4 — see IMPLEMENTATION-PLAN) but its per-executor **install is still a documented no-op**: the inner
+executors' `install_guards` does not yet wire the native pre-tool hooks. So today a guarded command is
+caught by the shim and the post validator, not by a native hook.*
 
 **The C4 probe settles a specific burden.** The `claude` executor runs headless with
 `--permission-mode bypassPermissions` (it must — see API §7 / SECURITY §1.2: the default mode refuses
