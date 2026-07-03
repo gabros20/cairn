@@ -248,3 +248,34 @@ def test_check_requires_names_both_versions(tmp_path):
 
 def test_check_requires_no_pin_is_a_noop(tmp_path):
     check_requires(None, file=tmp_path / "cairn.toml", installed="0.1.0")
+
+
+# --------------------------------------------------------------------------- #
+# version_compat — the cross-version resume gate's classifier (DISTRIBUTION §3).
+# --------------------------------------------------------------------------- #
+
+from cairn.kernel.config import version_compat
+
+
+@pytest.mark.parametrize(
+    ("recorded", "installed", "verdict"),
+    [
+        # same release / patch-only drift within a minor ⇒ silent
+        ("0.1.0", "0.1.0", "ok"),
+        ("0.1.0", "0.1.9", "ok"),
+        ("0.1", "0.1.4", "ok"),
+        # cross-minor within the same major ⇒ warn, never refuse
+        ("0.1.0", "0.2.0", "warn"),
+        ("0.9.0", "0.1.0", "warn"),
+        # cross-major ⇒ refuse (only --force gets through)
+        ("1.0.0", "0.1.0", "refuse"),
+        ("9.0.0", "0.1.0", "refuse"),
+        ("0.1.0", "1.4.0", "refuse"),
+        # unrecorded (legacy) or unparseable ⇒ warn and proceed
+        (None, "0.1.0", "warn"),
+        ("", "0.1.0", "warn"),
+        ("banana", "0.1.0", "warn"),
+    ],
+)
+def test_version_compat_classifies(recorded, installed, verdict):
+    assert version_compat(recorded, installed) == verdict

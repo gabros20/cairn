@@ -161,6 +161,35 @@ def installed_version() -> str:
     return cairn.__version__
 
 
+def version_compat(recorded: str | None, installed: str) -> str:
+    """Classify a run's recorded cairn version against the ``installed`` one for the
+    cross-version resume gate (docs/DISTRIBUTION.md §3, *Run-dir format*):
+
+    - ``"ok"``     — same release, or same major.minor (patch-only drift): resume silently.
+    - ``"warn"``   — cross-minor drift, an *unrecorded* (legacy) version, or an unparseable
+      one: resume with a note, never refuse.
+    - ``"refuse"`` — cross-major drift: run-dir semantics may not carry across a major, so
+      resume only under ``--force``.
+
+    A missing recorded version (``None``/empty) never refuses — it warns and proceeds.
+    """
+    if not recorded:
+        return "warn"
+    try:
+        rec = _parse_version(recorded)[0]
+        inst = _parse_version(installed)[0]
+    except ValueError:
+        return "warn"  # a version we can't parse must not hard-block a resume
+    rec_major, inst_major = (rec[0] if rec else 0), (inst[0] if inst else 0)
+    rec_minor = rec[1] if len(rec) > 1 else 0
+    inst_minor = inst[1] if len(inst) > 1 else 0
+    if rec_major != inst_major:
+        return "refuse"
+    if rec_minor != inst_minor:
+        return "warn"
+    return "ok"
+
+
 def check_requires(
     requires: str | None, *, file: str | Path, installed: str | None = None
 ) -> None:
