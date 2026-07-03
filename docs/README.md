@@ -38,7 +38,8 @@ system.
    There is no database, no checkpointer, no in-memory session to lose. `kill -9` at any moment
    loses at most one step's work.
 2. **Agents are processes.** Every delegation is one fresh headless CLI invocation (`claude -p`,
-   `codex exec`, `grok -p`). Full context isolation is a property of the OS, not a framework promise.
+   `codex exec`, `grok --prompt-file`). Full context isolation is a property of the OS, not a
+   framework promise.
    The CLI is a swappable **executor** — pipelines don't know which one is running, and different
    steps of one run may use different executors ("mixed fleet").
 3. **Contracts over conversation.** A step's interface is `needs` (input artifacts) → `produces`
@@ -227,17 +228,18 @@ resident daemon (the filesystem is the state).
 
 ## Status
 
-**C0–C1 built and green (664 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
+**C0–C1 built and green (681 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
 artifacts, trail/runstate, guards, expression + template engines, config, doctor, scaffold); all
-five executors (`shell`/`stub` live; the **`claude` and `codex` executors now live-verified** — the
-first live `claude -p` / `codex exec` runs recorded as offline stub regressions in
-`tests/live/workspace-claude` and `tests/live/workspace-codex`; `grok` code-complete and
-unit-tested against fake binaries, **not yet live-verified**); the
+five executors (`shell`/`stub` live; the **`claude`, `codex`, and `grok` executors all
+live-verified** — the first live `claude -p` / `codex exec` / `grok --prompt-file` runs recorded as
+offline stub regressions in `tests/live/workspace-claude`, `tests/live/workspace-codex`, and
+`tests/live/workspace-grok` — plus a live-proven **mixed fleet**: one pipeline spanning
+codex → claude → grok, per-step models recorded in `run.json`, in `tests/live/workspace-fleet`); the
 workspace test layer (`cairn test` + `record`); and the full CLI — the `batch`/`learnings`/`gc`/
 `schedule` verbs are now **LIVE** (no longer stubbed), with first-class **scheduling shipped**
 (`schedules.yaml`, cron/launchd/systemd installers, content-key idempotency). **v0.1.0 packaging is
 landing this wave.** The day-0 pipeline runs end-to-end offline (`cairn run hello --headless`).
-The C4 doctor hook probe (`cairn doctor --probe-hooks`) has shipped — on the dev machine it verifies
-both Claude's and Codex's PreToolUse hooks fire and block headlessly. Still ahead, per
-[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md): Grok live setup (C5), the CMS-population branch,
+The doctor hook probe (`cairn doctor --probe-hooks`) has shipped — on the dev machine it verifies
+that Claude's, Codex's, and Grok's PreToolUse hooks all fire and block headlessly. Still ahead, per
+[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md): the CMS-population branch
 and the brease-factory workspace migration (deferred — cairn's eventual first workspace).

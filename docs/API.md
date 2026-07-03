@@ -48,15 +48,15 @@ approvals = "never"
 
 [executors.grok]
 enabled = true
-setup = "scripts/setup-grok-config.sh"   # doctor runs/points to this (BYOK effort aliases)
-[executors.grok.tiers]
-reasoning = { model = "grok-4.3-high" }  # alias bakes effort — Grok has no effort flag
-balanced  = { model = "grok-build-med" }
-cheap     = { model = "grok-build-low" }
+[executors.grok.tiers]                   # native --effort flag (grok 0.2.82) — no alias config
+reasoning = { model = "grok-build",             effort = "high" }
+balanced  = { model = "grok-build",             effort = "medium" }
+cheap     = { model = "grok-composer-2.5-fast", effort = "low" }
 ```
 
-Effort values are the shared enum `low | medium | high | xhigh`; a tier entry may fix effort (alias
-executors like Grok) or accept the agent's `effort:` (flag executors like Claude/Codex).
+Effort values are the shared enum `low | medium | high | xhigh`; a tier entry may fix effort or
+accept the agent's `effort:` — all three vendor executors take it as a flag (Claude/Codex natively;
+Grok since 0.2.82's headless `--effort`, which takes exactly this enum).
 
 ## 2. Pipeline file — `pipelines/<name>.yaml`
 
@@ -323,7 +323,7 @@ class Executor(Protocol):
 ```
 
 Built-in `invoke` shapes (as actually built; flags re-verified at doctor time — vendors drift).
-`[--effort …]`/`[-c …]` appear only when the tier didn't bake effort into the model alias:
+`[--effort …]`/`[-c …]` appear only when the step resolves an effort:
 
 ```
 claude:  claude -p "<envelope text>" --model {model} [--effort {effort}] --output-format text
@@ -338,9 +338,16 @@ codex:   codex exec -C {cwd} -m {model} --sandbox workspace-write --skip-git-rep
               0.142.5 — exec hardwires approval-never; `--skip-git-repo-check` because codex refuses a
               non-git/untrusted cwd and cairn's `--sandbox` flag + guards are the enforcement layer;
               --output-schema is NOT wired yet — the STEP sentinel is the contract)
-grok:    grok -p --cwd {cwd} -m {model} --output-format text --permission-mode dontAsk
-             --no-alt-screen --no-auto-update < envelope
-             (prompt on stdin; effort is baked into the model alias — no effort flag exists)
+grok:    grok --prompt-file {envelope} --cwd {cwd} -m {model} [--effort {effort}]
+             --output-format plain --permission-mode bypassPermissions
+             --no-alt-screen --no-auto-update
+             (grok 0.2.82: headless mode does NOT read stdin — the envelope is delivered via
+              --prompt-file; `--output-format text` is gone (valid: plain|json|streaming-json);
+              bypassPermissions is required — `dontAsk` silently denies file writes (exit 0,
+              empty output, no artifact) and PreToolUse hooks still apply under bypass;
+              `--effort low|medium|high|xhigh` is grok's native headless effort flag — NOT
+              `--reasoning-effort`, a separate per-model knob; native --json-schema exists but
+              is NOT wired — the STEP sentinel is the contract)
 shell:   the run: command verbatim (this executor is how deterministic steps execute)
 stub:    copies tests/stubs/<pipeline>/<step>[.c<cycle>]/ into the run dir + returns a canned
          STEP — the L1 test executor (TESTING.md §5); selectable like any other, so a full

@@ -48,8 +48,10 @@ stealing. This single default removes the largest secret-exfiltration surface fo
 executors need them. A headless `claude`/`codex` finds its stored OAuth credential via the macOS
 Keychain, whose lookup keys off `USER`; strip it and every executor reports "Not logged in" (found
 live — the first `claude -p` runs failed exactly this way until the baseline carried `USER`). The
-`doctor --probe-hooks` codex canary follows the same minimal-credential posture: it copies **only**
-`auth.json` (0600) from the real `CODEX_HOME` into a throwaway canary home that dies with the probe —
+`doctor --probe-hooks` codex and grok canaries follow the same minimal-credential posture: each
+copies **only**
+`auth.json` (0600) from the real `CODEX_HOME`/`GROK_HOME` into a throwaway canary home that dies with
+the probe —
 never the whole home — and treats absent auth as `inconclusive` rather than reaching for anything else.
 
 ### 1.3 Redaction — kernel-side, literal, everywhere it writes
@@ -90,7 +92,8 @@ An injected instruction that a model obeys still cannot exceed the step's cage:
 - **allowlist** — the capture agent can run crawl scripts, not `curl | sh`; the injected command
   simply isn't permitted;
 - **guards** — mutating verbs are checked by code (F18, wrong-CMS) regardless of why the model
-  tried them;
+  tried them (one per-executor caveat: grok's native hook layer fails open on hook crash/timeout/
+  malformed output — ARCHITECTURE §4 — so its shim and post layers carry the backstop);
 - **gates** — the two irreversible crossings (CMS populate, deploy) sit behind human gates, with
   headless defaults of *no*, and the deploy allowlist pins the org;
 - **isolation** — cwd is the run dir; a compromised step cannot reach sibling runs;

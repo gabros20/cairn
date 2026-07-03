@@ -130,8 +130,9 @@ this validator catch?") — each `invalid-*` fixture documents a failure class.
 ```
 (There is no `cairn plan --all` flag — `plan` takes one pipeline; `doctor` is what lints the whole
 workspace, planning every pipeline. `cairn test` also plans each pipeline inside its suites.)
-The cairn repo's own CI additionally runs the C1 synthetic suite and plans both live workspaces
-(`tests/live/workspace-claude`, `tests/live/workspace-codex`), replaying each one's recorded
+The cairn repo's own CI additionally runs the C1 synthetic suite and plans all four live workspaces
+(`tests/live/workspace-claude`, `-codex`, `-grok`, and the mixed-fleet `workspace-fleet`), replaying
+each one's recorded
 offline stub — zero tokens, so the live-verified wiring stays regression-locked in CI. L2–L4 are
 human-triggered by
 design: they need machines, auth, and budget — CI proves *correctness of the workspace*, not *the

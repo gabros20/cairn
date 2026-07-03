@@ -129,7 +129,7 @@ Guards declare `enforce:` layers; the engine wires what each executor supports a
 
 | Layer | Claude | Codex | Grok | shell |
 |---|---|---|---|---|
-| `hook` (native pre-tool block) | PreToolUse deny-JSON | PreToolUse deny-JSON *(hooks.json; fires headless — probe-verified on dev machine)* | PreToolUse exit-2 | n/a |
+| `hook` (native pre-tool block) | PreToolUse deny-JSON | PreToolUse deny-JSON *(hooks.json; fires headless — probe-verified on dev machine)* | PreToolUse deny-JSON or exit 2 *(grok 0.2.82; fires headless — probe-verified on dev machine)* | n/a |
 | `shim` (PATH wrapper) | ✓ | ✓ | ✓ | ✓ |
 | `post` (validator backstop) | ✓ | ✓ | ✓ | ✓ |
 
@@ -154,9 +154,13 @@ field, carries codex's per-machine truth.)
 project carrying a native deny-hook, invokes the vendor CLI headlessly under the executor's real argv
 posture and the walker's exact env baseline, and classifies the outcome (fires+blocks / fires-not-blocks
 / no-fire / inconclusive) — so PORT-DESIGN's "highest risk" becomes a diagnosed, per-machine fact instead
-of an assumption. On the dev machine both `claude` and `codex` probe **hook-primary** (codex-cli 0.142.5
-*does* ship native PreToolUse blocking hooks). The check script contract is one file, one convention
-(exit 0/2), reused across all three layers.
+of an assumption. On the dev machine all three vendor executors probe **hook-primary**: `claude`,
+`codex` (codex-cli 0.142.5 *does* ship native PreToolUse blocking hooks), and `grok` (grok 0.2.82:
+PreToolUse fires+blocks under `bypassPermissions`). One posture caveat is grok-specific: a grok hook
+denies only via `{"decision":"deny"}` on stdout (honored regardless of exit code) or exit 2 — **every
+other hook failure (crash, timeout, malformed output) fails OPEN**, so for grok the shim and `post`
+layers are the backstop against a broken hook, not just a bypassed one. The check script contract is
+one file, one convention (exit 0/2), reused across all three layers.
 
 ## 5. Isolation & environment
 

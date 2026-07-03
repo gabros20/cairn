@@ -16,18 +16,22 @@ ever debug one new thing at a time.
 
 - **C0 + C1 — complete.** Planner, walker, gatekit, composer, artifacts, trail/runstate, guards,
   expression + template engines, config, the `shell`/`stub` executors, the `cairn test` suite layer,
-  the scaffold, and every C1-scope CLI verb are built and green (664 tests).
+  the scaffold, and every C1-scope CLI verb are built and green (681 tests).
   *Deviation from the strict ordering:* built as parallel module waves with per-module
   implement→review→fix rather than strictly C0-then-C1. The C1 "synthetic-suite" verification bar is
   met by the suite + the offline `hello` end-to-end run + the testkit stub layer (a full
   pipeline replays offline through the `stub` executor).
-- **C2 — mostly complete.** Envelope composer and the `claude`/`codex`/`grok` executors are
-  code-complete and unit-tested against fake binaries; the **`claude` and `codex` executors are now
-  live-verified**. The claude live runs (captured as offline stub regressions in
+- **C2 — complete (executor scope).** Envelope composer and the `claude`/`codex`/`grok` executors are
+  code-complete, unit-tested against fake binaries, and **all three are now live-verified**. The
+  claude live runs (captured as offline stub regressions in
   `tests/live/workspace-claude`) forced `--permission-mode bypassPermissions` and the `USER`/`LOGNAME`
   env baseline; the codex live runs (`tests/live/workspace-codex`) forced dropping `-a/--ask-for-approval`
   (gone from `codex exec` in codex-cli 0.142.5, which hardwires approval-never) and adding
-  `--skip-git-repo-check`. Only the `grok` live parity run is still pending.
+  `--skip-git-repo-check`; the grok live runs (`tests/live/workspace-grok`, grok 0.2.82) forced
+  `--output-format plain` (0.2.82 dropped `text`), `--prompt-file` delivery (headless stdin is dead —
+  bare `-p` is an argv error), and `--permission-mode bypassPermissions` (`dontAsk` silently denies
+  writes: exit 0, empty output, no artifact). The C2 pipeline-migration items still run against the
+  deferred brease-factory workspace.
 - **C6 verbs — shipped ahead of sequence.** `cairn batch` (process pool of `cairn run --headless`),
   `cairn learnings` (cross-run `learn`-event aggregation), `cairn gc` (dry-run retention, `--apply`
   to delete), and **first-class scheduling** (`schedules.yaml`, `cairn schedule install|list|run|
@@ -43,8 +47,27 @@ ever debug one new thing at a time.
   hook-primary. These are per-machine, per-CLI-version probe results, not universal guarantees. The
   C4 verify items that depend on brease-factory (P0 / blueprint-parity live runs) are **deferred with
   the workspace migration**; what C4 proves is the executor live-proof + the probe.
-- **Still ahead:** Grok live setup (C5), the `brease=on` CMS-population branch, `v0.1.0` tag/packaging
-  (C7 — packaging this standalone repo, not a repo move), and the brease-factory workspace migration.
+- **C5 — complete.** GrokExecutor is live-verified against grok 0.2.82 (`tests/live/workspace-grok`,
+  model `grok-composer-2.5-fast`, recorded zero-token offline replay; argv facts under C2 above).
+  *Plan deviation:* `setup-grok-config.sh` (the BYOK effort-alias user config) is **obsolete and was
+  never built** — grok 0.2.82 ships a native headless `--effort low|medium|high|xhigh` flag matching
+  cairn's effort enum exactly, so tier effort flows through as a flag like claude/codex, no alias
+  config anywhere. The hook probe grew a grok recipe (`RECIPES["grok"]` in `cairn/kernel/hookprobe.py`)
+  and on the dev machine verdicts **hook-primary**: grok PreToolUse fires+blocks under
+  `bypassPermissions`. Grok's deny mechanism is `{"decision":"deny"}` on stdout — honored regardless
+  of exit code — or exit 2; **any other hook failure (crash, timeout, malformed output) fails OPEN**.
+  Live-only discoveries now encoded in code+tests: grok's shell tool is named `Shell`, not `Bash`
+  (the recipe uses a catch-all matcher), and grok's claude/cursor compat cells load the user's
+  `~/.claude` MCP servers into runs (the canary disables all compat cells). All three executors are
+  now empirically hook-primary on the dev machine. **Mixed fleet proven** — the C5 verify bar:
+  `tests/live/workspace-fleet` runs one pipeline, build (codex/gpt-5.5) → review (claude/haiku) →
+  summarize (grok/grok-composer-2.5-fast), live green first try with per-step models recorded in
+  `run.json` and cross-vendor dataflow asserted by schema; recorded offline replay + all four live
+  workspaces planned and replayed in CI. The C5 parity items that need brease-factory (three-mode
+  parity with C4) are **deferred with the workspace migration**, like C4's.
+- **Still ahead:** the `brease=on` CMS-population branch, `v0.1.0` tag/packaging
+  (C7 — packaging this standalone repo, not a repo move; its "after C5" gate is now satisfiable),
+  and the brease-factory workspace migration (plus the C2–C5 parity runs deferred with it).
 
 ---
 
@@ -110,7 +133,7 @@ rules/permission bundle), tier table, **doctor's empirical hook probe** (PORT-DE
 now a diagnosed per-machine fact; probe result selects hook-primary vs shim-primary guard posture).
 *Shipped:* the executor is live-verified (`tests/live/workspace-codex`), and the probe
 (`cairn doctor --probe-hooks`, `cairn/kernel/hookprobe.py`) returns **hook-primary** for both claude
-and codex on the dev machine.
+and codex on the dev machine (grok joined at C5 — all three now probe hook-primary).
 
 **Verify:** P0 alone first, then `--to blueprint`, then full static pipeline; all three modes
 (reimagine conditional chain included); guard demonstration under whichever posture the probe
@@ -118,14 +141,22 @@ selected; `redesign` escalates to the codex `reasoning` tier. *The pipeline-leve
 (P0 / blueprint-parity live runs) run against a real workspace and are deferred with the
 brease-factory migration; the executor live-proof + the hook probe are done.*
 
-## C5 — GrokExecutor + mixed fleet
+## C5 — GrokExecutor + mixed fleet  *(complete — see Status)*
 
-**Build:** GrokExecutor (`grok -p`), `setup-grok-config.sh` (BYOK effort-alias user config —
-per-machine, like `brease login`), exit-2 guard hook branch, tier aliases.
+**Build:** GrokExecutor — as shipped against grok 0.2.82: `--prompt-file` (headless stdin is dead),
+`--output-format plain`, `--permission-mode bypassPermissions`, and the **native `--effort` flag**
+— plus the grok hook-probe recipe (`RECIPES["grok"]`). *Plan deviations:* this section originally
+called for `setup-grok-config.sh` (a BYOK effort-alias user config — per-machine, like `brease
+login`) and an "exit-2 guard hook branch"; the alias config is **obsolete, never built** (0.2.82's
+native `--effort low|medium|high|xhigh` covers cairn's effort enum exactly), and the exit-2 branch
+became the probe recipe's belt-and-braces deny — grok honors `{"decision":"deny"}` on stdout
+regardless of exit code, and exit 2 alone also denies (everything else fails open).
 
-**Verify:** parity with C4 on the same URL, three modes; `grok inspect`/doctor confirms skills +
-hooks discovered; **mixed-fleet run** — build on Codex, `review` step pinned to Claude — completes
-with per-step models recorded in `run.json`.
+**Verify:** *the mixed-fleet bar is met exactly as specified* — build on Codex, `review` step
+pinned to Claude (plus grok as a third leg: summarize) completes with per-step models recorded in
+`run.json` (`tests/live/workspace-fleet`, live green + offline replay in CI); doctor's probe
+confirms grok's hooks fire+block (hook-primary, dev machine). The three-mode parity runs against
+the brease-rebuild workspace are deferred with the brease-factory migration (as with C4).
 
 ## C6 — Batch + CMS branch
 
@@ -163,9 +194,10 @@ mismatch is refused at plan time (**done** — `cairn plan` via `config.check_re
 | C0 start | confirm cairn replaces the straight port (this plan supersedes PORT-DESIGN M0–M7) | yes |
 | C2 | workspace layout migration (skills to root, `.claude/` thins to wrapper+symlinks) | migrate |
 | C4 | Codex guard posture — set by the doctor probe, not by judgment | **resolved: hook-primary** (probe, dev machine) |
-| C7 | packaging/tag timing — only when the Executor protocol has survived three real implementations | after C5 |
+| C7 | packaging/tag timing — only when the Executor protocol has survived three real implementations | after C5 *(now satisfiable — C5 done, three vendor executors live)* |
 
 Risks: PORT-DESIGN §8.1 applies verbatim (Codex hooks/version churn, Grok user-config-only model
-routing, undocumented Grok schemas, cross-vendor tier quality). One risk is *retired* by this
-ordering: orchestrator-logic bugs can no longer be discovered mid-pipeline-run — C1's synthetic
-suite catches them for free, forever.
+routing, undocumented Grok schemas, cross-vendor tier quality). Two are *retired*: orchestrator-logic
+bugs can no longer be discovered mid-pipeline-run — C1's synthetic suite catches them for free,
+forever — and Grok's user-config-only model routing (grok 0.2.82 takes `-m` plus a native `--effort`
+flag directly; no user-config aliasing needed).

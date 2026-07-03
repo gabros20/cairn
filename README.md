@@ -13,12 +13,14 @@ as the only state.
 
 ## Status
 
-**C0–C1 built and green (664 tests).** Implemented: the kernel (planner, walker, gatekit,
+**C0–C1 built and green (681 tests).** Implemented: the kernel (planner, walker, gatekit,
 composer, artifacts, trail/runstate, guards, expression + template engines, config); all five
-executors — `shell` and `stub` live, and the **`claude` and `codex` executors now live-verified**
-(the first live `claude -p` / `codex exec` runs, captured as offline stub regressions in
-`tests/live/workspace-claude` and `tests/live/workspace-codex`); `grok` code-complete and
-unit-tested against fake binaries but **not yet live-verified**;
+executors — `shell` and `stub` live, and the **`claude`, `codex`, and `grok` executors all
+live-verified** (the first live `claude -p` / `codex exec` / `grok --prompt-file` runs, captured
+as offline stub regressions in `tests/live/workspace-claude`, `tests/live/workspace-codex`, and
+`tests/live/workspace-grok`), plus a **mixed fleet proven live** — one pipeline spanning
+codex → claude → grok with per-step models recorded in `run.json`
+(`tests/live/workspace-fleet`);
 the workspace test layer (`cairn test` — validators/guards/pipelines/envelopes + `record`); the
 full CLI — the `batch`/`learnings`/`gc`/`schedule` verbs are now **LIVE** (no longer stubs), and
 first-class **scheduling has shipped** (`schedules.yaml`, cron/launchd/systemd installers,
@@ -26,10 +28,11 @@ content-key idempotency); and the `cairn new` scaffold. **v0.1.0 packaging is la
 Every module went implement → review → fix. The day-0 pipeline runs end-to-end offline:
 `uv run cairn run hello --headless`.
 
-**Not done yet:** Grok live setup (C5), the CMS-population branch, and the brease-factory workspace
-migration (deferred; it remains cairn's eventual first workspace). The C4 doctor hook probe
-(`cairn doctor --probe-hooks`) has shipped — on the dev machine it verifies both Claude's and
-Codex's PreToolUse hooks fire and block headlessly. Design package in
+**Not done yet:** the CMS-population branch and the brease-factory workspace migration (deferred;
+it remains cairn's eventual first workspace — the C4/C5 pipeline-parity runs against a real
+workspace are deferred with it). The doctor hook probe (`cairn doctor --probe-hooks`) now covers
+all three vendor CLIs — on the dev machine Claude's, Codex's, and Grok's PreToolUse hooks all fire
+and block headlessly (hook-primary; a per-machine, per-CLI-version fact). Design package in
 [`docs/`](docs/): start with [`docs/README.md`](docs/README.md), then
 [`docs/CONCEPTS.md`](docs/CONCEPTS.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and the
 build order in [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md) (C0–C7).

@@ -174,7 +174,8 @@ guards:
     on_error: allow                     # fail-open (this guard's choice; fail-closed available)
 ```
 
-`hook` = the executor's native pre-tool hook (Claude deny-JSON, Grok exit-2, Codex if it fires);
+`hook` = the executor's native pre-tool hook (Claude/Codex deny-JSON, Grok deny-JSON or exit 2 —
+all three probe-verified fires+blocks on the dev machine, `doctor --probe-hooks`);
 `shim` = a PATH wrapper the kernel installs into the step's environment (works on *any* CLI);
 `post` = a validator that catches what slipped through, before the next step can consume it.
 
