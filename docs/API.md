@@ -226,9 +226,9 @@ expressions — misspellings must not quietly produce `acme--20260703`); helpers
 above (no user-defined functions — that's what `run:` steps are for); `{artifact:…}` in
 `artifact.path:` is illegal (paths can't depend on other paths).
 
-**Strict vs lenient contexts.** `run_id`, `artifact.path:`, and `args:` values are rendered
-**strictly**: any `{…}` that isn't a recognized cairn placeholder is a plan-time error, so a
-typo can never slip through. But `run:`/`manual:` command strings embed foreign syntax — a `jq`
+**Strict vs lenient contexts.** `run_id` and `artifact.path:` are rendered **strictly**: any
+`{…}` that isn't a recognized cairn placeholder is a plan-time error, so a typo can never slip
+through. But `run:`/`manual:` command strings and `args:` values embed foreign syntax — a `jq`
 filter, an `awk` program, a Python dict literal — that legitimately contains braces, so they are
 rendered **leniently**: only the recognized cairn placeholders
 (`{params.x}`/`{dims.x}`/`{artifact:x}`/`{gate:x}`/`{run_dir}`/`{cycle}`/`{pipeline}`/helpers) are
