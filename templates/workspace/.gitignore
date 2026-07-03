@@ -1,0 +1,5 @@
+# Every execution ever, self-describing — reproducible from the pipeline, never committed.
+runs/
+
+# Local secrets and machine-specific env.
+.env

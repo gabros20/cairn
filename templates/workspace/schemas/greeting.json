@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cairn:hello/greeting",
+  "title": "hello greeting",
+  "description": "The greeting artifact produced by hello.yaml's `greet` step.",
+  "type": "object",
+  "required": ["name"],
+  "properties": {
+    "name": { "type": "string" },
+    "pipeline": { "type": "string" }
+  }
+}

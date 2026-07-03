@@ -1,0 +1,14 @@
+description: "General-purpose assistant — the workspace's first agent, wired to hello.yaml's commented `elaborate` step."
+
+tier: balanced          # reasoning | balanced | cheap — abstract; resolved to a model per executor in cairn.toml
+effort: medium          # low | medium | high | xhigh (honored by flag executors like Claude/Codex)
+
+skills: []              # capability packs from skills/ this agent should load, e.g. [cairn-operator]
+
+tools:
+  allow: [read, write]  # read | write | edit | bash
+  network: false        # default; executor maps this to its own sandbox
+
+env: []                 # secret names this agent's processes may read — declared in cairn.toml [secrets]
+
+returns: schemas/step-return.json   # the STEP contract every agent must emit (default)

@@ -1,0 +1,52 @@
+# {{WORKSPACE_NAME}}
+
+A [cairn](https://github.com/designatives/cairn) workspace: pipelines, agents, skills, schemas, and
+validators that a coding-agent CLI executes step by step, validating a typed artifact between each.
+Everything here is files — `git clone` reproduces the whole system.
+
+## Day 0 — it runs offline, right now
+
+The `hello` pipeline needs no auth, no API keys, and no model: it is built from `run:` steps plus one
+gate, so it works the moment this workspace exists.
+
+```console
+$ cairn plan hello                 # static-verify: params, dataflow, schemas, validators — zero tokens
+$ cairn run hello                  # writes runs/hello-world-<date>/  (greeting.json + message.txt)
+$ cairn run hello --param name=Ada # override a param
+$ cairn trail runs/hello-<...>     # replay what happened, step by step
+```
+
+`cairn plan` is your typecheck — run it after every edit. When you add an agent step later, it also
+checks that the agent, its skills, and its artifacts all exist before anything runs.
+
+## What's here
+
+| Path | What it is |
+|---|---|
+| `cairn.toml` | workspace config — executors, model tiers, defaults, `[tools]` preflight |
+| `pipelines/hello.yaml` | the day-0 pipeline; grow it by uncommenting the `agent:` step |
+| `agents/assistant.yaml` | a minimal agent, ready for that first agent step |
+| `skills/cairn-operator/` | how a coding agent drives cairn as an operator (ships in every workspace) |
+| `schemas/` · `validators/` | artifact contracts (JSON Schema) and acceptance checks |
+| `prompts/DOCTRINE.md` | the isolation + artifact-authority invariants every agent inherits |
+| `allowlist.yaml` | named command fragments agents may run |
+| `runs/` | every execution, self-describing (gitignored) |
+
+## Growing the workspace — the maturation ladder
+
+Start sparse. Let a real run teach you the next promotion; the framework never punishes sparseness —
+validators, guards, gates, and skills are all *additive* declarations.
+
+| Signal from real runs | Promotion |
+|---|---|
+| the same prompt fragment recurring across steps | → **skill** |
+| you check an output by eye every run | → **validator** (encode the check) |
+| "be careful not to X" appears in a prompt | → **guard** (prompts are not enforcement) |
+| a value you keep editing between runs | → **param** (or a **dim** if mode-shaped) |
+| an agent step that always runs the same command | → **`run:` step** |
+| a mid-run decision you make every time | → **gate** with a `default` |
+| a setup paragraph in this README | → **`[tools]` check** or **`manual:` step** |
+| a run that failed the same way twice | → validator first, then guard if it's dangerous |
+
+Full guide: `docs/TOOLING-AND-GROWTH.md` in the cairn repo. The loop is always **author → plan (static
+verify) → smoke-test a slice (`--from/--to`) → harden (promote checks to validators)**.

@@ -1,0 +1,35 @@
+# cairn workspace config. One file; every relative path resolves against this
+# directory. Full reference: docs/API.md §1 in the cairn repo.
+
+[workspace]
+name             = "{{WORKSPACE_NAME}}"   # the only value `cairn new workspace` substitutes
+doctrine         = "prompts/DOCTRINE.md"  # workspace doctrine, inlined into every agent envelope
+runs_dir         = "runs"                 # where run dirs land (absolute or workspace-relative)
+default_executor = "claude"               # which executor agent: steps use unless overridden
+
+[defaults]
+step_timeout  = "30m"                            # per-step wall clock; a step may override
+trail_context = { events = 12, learnings = 5 }   # how much history an agent envelope carries
+
+# ---------------------------------------------------------------------------
+# Model tiers — the ONLY place vendor model names live. The day-0 `hello`
+# pipeline needs none of this (it runs on `run:` steps alone). Uncomment when
+# you add your first agent: step; an agent picks a tier (reasoning | balanced |
+# cheap) and this maps that tier to a concrete model + effort per executor.
+# ---------------------------------------------------------------------------
+# [executors.claude]
+# enabled = true
+# [executors.claude.tiers]
+# reasoning = { model = "opus",   effort = "high" }
+# balanced  = { model = "sonnet", effort = "medium" }
+# cheap     = { model = "haiku",  effort = "low" }
+
+# ---------------------------------------------------------------------------
+# External tools — machine preflight verified by `cairn doctor`. One example;
+# add a [tools.X] block per CLI a pipeline drives. `check` is a presence+auth
+# probe (exit 0 = ok); `needed_by` scopes a failure to the steps that use it
+# (full doc: docs/TOOLING-AND-GROWTH.md §2).
+# ---------------------------------------------------------------------------
+# [tools.crawl4ai]
+# check   = "uv run python -c 'import crawl4ai'"
+# install = "uv sync && uv run playwright install chromium"

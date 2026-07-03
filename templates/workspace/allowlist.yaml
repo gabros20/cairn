@@ -1,0 +1,19 @@
+# Command allowlist — named fragments referenced by agents as `bash: allowlist.yaml#<name>`.
+# Each executor renders a fragment to its own permission surface (Claude permissions.allow,
+# Codex Rules, Grok [permission]) at workspace render time. A fragment says a command *may*
+# run; a `guards:` entry on top of it is what checks a destructive invocation before it runs.
+#
+# The day-0 `hello` pipeline uses only `run:` steps and needs no fragment. Add one per tool an
+# agent drives, as you promote work from run: to agent:. Examples (uncomment + edit):
+
+# node-build:
+#   - "pnpm install*"
+#   - "pnpm build*"
+#   - "pnpm lint*"
+
+# readonly-plus-screenshot:
+#   - "npx agent-browser *"
+
+# deploy:
+#   - "vercel *"
+#   - "gh repo create *"
