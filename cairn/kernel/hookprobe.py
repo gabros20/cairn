@@ -86,6 +86,11 @@ _GROK_DENY_JSON = json.dumps({"decision": "deny", "reason": "cairn hook probe: b
 # ``~/.cursor`` (they follow $HOME, outside the relocated GROK_HOME) and pulls in their MCP servers,
 # permission rules, and hooks — live-observed to stall headless shutdown past the probe timeout and
 # to let foreign hooks interfere. Every cell off = a hermetic probe of grok's OWN hook.
+#
+# ENUMERATION-FRAGILE: compat cells default ON and grok has NO master off-switch — this list only
+# covers the sources/cells that exist on 0.2.82. A new ``[compat.<source>]`` vendor or a new cell
+# in an existing one silently bypasses it. Re-verify against each new grok version (quick check:
+# re-enable one cell, e.g. ``mcps = true``, and observe the headless shutdown stall return).
 _GROK_COMPAT_OFF_TOML = (
     "[compat.claude]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\n\n"
     "[compat.cursor]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\n"
@@ -190,6 +195,30 @@ class HookRecipe:
         marker proving the hook FIRED, then print the deny-JSON so the tool is BLOCKED."""
         return f": > {shlex.quote(str(marker))}; printf '%s' {shlex.quote(_DENY_JSON)}"
 
+    # -- shared auth seam (codex + grok) ------------------------------------- #
+
+    @staticmethod
+    def _real_home(env_var: str, default_subdir: str) -> Path:
+        """The user's actual vendor home (``$<env_var>`` or ``~/<default_subdir>``) — read for
+        ``auth.json`` ONLY (source stays read-only; isolation is the point)."""
+        override = os.environ.get(env_var)
+        return Path(override) if override else Path(os.path.expanduser(f"~/{default_subdir}"))
+
+    @staticmethod
+    def _copy_auth_into(real_home: Path, canary_home: Path) -> None:
+        """Fail-safe auth seam, ONE implementation (security-sensitive lockstep — perms and
+        failure handling are fixed here for every recipe): copy ``auth.json`` ALONE from the real
+        vendor home into the canary home (0600; it dies with the canary's ``rmtree``) so a live
+        probe can authenticate. Any copy failure degrades to the unauthenticated path
+        (→ inconclusive), NEVER a probe crash."""
+        auth = real_home / "auth.json"
+        try:
+            if auth.is_file():
+                shutil.copyfile(auth, canary_home / "auth.json")
+                (canary_home / "auth.json").chmod(0o600)
+        except OSError:
+            pass
+
 
 class ClaudeHookRecipe(HookRecipe):
     """``claude`` — Anthropic Claude Code. Verified against claude 2.1.199: project settings live
@@ -265,12 +294,6 @@ class CodexHookRecipe(HookRecipe):
     def extra_env(self, canary: Path) -> dict[str, str]:
         return {"CODEX_HOME": str(canary / ".codex")}
 
-    @staticmethod
-    def _real_codex_home() -> Path:
-        """The user's actual CODEX_HOME ($CODEX_HOME or ~/.codex) — read for auth.json ONLY."""
-        override = os.environ.get("CODEX_HOME")
-        return Path(override) if override else Path(os.path.expanduser("~/.codex"))
-
     def write_canary(self, canary: Path, marker: Path, sidecar: Path) -> None:
         home = canary / ".codex"
         home.mkdir(parents=True, exist_ok=True)
@@ -284,16 +307,8 @@ class CodexHookRecipe(HookRecipe):
         (home / "hooks.json").write_text(json.dumps(hooks, indent=2), encoding="utf-8")
         # A present-but-empty config keeps codex from falling back to the user's config.toml.
         (home / "config.toml").write_text("", encoding="utf-8")
-        # Auth seam (fail-safe): copy auth.json alone when the real home has one, so a live
-        # probe can authenticate. Any copy failure degrades to the unauthenticated path
-        # (→ inconclusive), never to a probe crash.
-        auth = self._real_codex_home() / "auth.json"
-        try:
-            if auth.is_file():
-                shutil.copyfile(auth, home / "auth.json")
-                (home / "auth.json").chmod(0o600)
-        except OSError:
-            pass
+        # Auth seam: the shared fail-safe helper (see HookRecipe._copy_auth_into).
+        self._copy_auth_into(self._real_home("CODEX_HOME", ".codex"), home)
 
     def build_invocation(
         self, canary: Path, prompt_text: str, model: str
@@ -331,10 +346,10 @@ class GrokHookRecipe(HookRecipe):
     ``$GROK_HOME/hooks/cairn-probe.json``. Global hooks are ALWAYS trusted, so this sidesteps the
     folder-trust gate that project hooks (``<project>/.grok/hooks``) require (``--trust`` /
     ``/hooks-trust`` / ``GROK_FOLDER_TRUST``) — the probe never has to grant trust. Grok also scans
-    compat sources (``~/.claude/settings.json``, ``~/.cursor/hooks.json``) by default, which live
-    outside GROK_HOME (they follow ``$HOME``, which the probe passes through), so the canary
-    ``config.toml`` disables ``[compat.claude] hooks`` / ``[compat.cursor] hooks`` — the probe
-    measures grok's OWN hook, not whatever the user has under ``~/.claude``.
+    compat sources (``~/.claude``, ``~/.cursor``) by default, which live outside GROK_HOME (they
+    follow ``$HOME``, which the probe passes through), so the canary ``config.toml`` disables EVERY
+    claude/cursor compat cell (``_GROK_COMPAT_OFF_TOML``) — the probe measures grok's OWN hook, not
+    whatever the user has under ``~/.claude`` (whose MCP servers also stall headless shutdown).
 
     Auth seam (mirrors the codex recipe): a relocated GROK_HOME has no ``auth.json`` → every live
     probe would be ``inconclusive`` (not logged in). When the real GROK_HOME (``$GROK_HOME`` first,
@@ -367,12 +382,6 @@ class GrokHookRecipe(HookRecipe):
         return {"GROK_HOME": str(canary / ".grok")}
 
     @staticmethod
-    def _real_grok_home() -> Path:
-        """The user's actual GROK_HOME ($GROK_HOME or ~/.grok) — read for auth.json ONLY."""
-        override = os.environ.get("GROK_HOME")
-        return Path(override) if override else Path(os.path.expanduser("~/.grok"))
-
-    @staticmethod
     def _grok_deny_hook_command(marker: Path) -> str:
         """A ``sh`` one-liner: create the marker proving the hook FIRED, print grok's deny-JSON,
         then exit 2 (explicit deny) — so blocking is proven even if either path regresses."""
@@ -402,15 +411,8 @@ class GrokHookRecipe(HookRecipe):
         # false inconclusive), besides letting foreign hooks interfere. Every cell off = hermetic:
         # the probe measures grok's OWN hook and nothing else.
         (home / "config.toml").write_text(_GROK_COMPAT_OFF_TOML, encoding="utf-8")
-        # Auth seam (fail-safe): copy auth.json alone when the real home has one, so a live probe
-        # can authenticate. Any failure degrades to the unauthenticated path (→ inconclusive).
-        auth = self._real_grok_home() / "auth.json"
-        try:
-            if auth.is_file():
-                shutil.copyfile(auth, home / "auth.json")
-                (home / "auth.json").chmod(0o600)
-        except OSError:
-            pass
+        # Auth seam: the shared fail-safe helper (see HookRecipe._copy_auth_into).
+        self._copy_auth_into(self._real_home("GROK_HOME", ".grok"), home)
 
     def build_invocation(
         self, canary: Path, prompt_text: str, model: str
@@ -421,6 +423,11 @@ class GrokHookRecipe(HookRecipe):
         # (stdin is dead headless), so write it into the canary and reference it; return stdin=None.
         # NO probe-only extra flag: the hook is GLOBAL (always trusted), so unlike codex there is
         # no folder-trust to bypass — recipe argv == executor argv exactly.
+        #
+        # Deliberately duplicates the engine's own prompt.md write (_probe_in materializes the
+        # same path/content just before calling this): the recipe stays self-contained — the file
+        # it points --prompt-file at is guaranteed to exist with the right content regardless of
+        # caller ordering (e.g. a direct build_invocation call in tests).
         prompt_file = canary / _PROBE_SUBDIR / "prompt.md"
         prompt_file.parent.mkdir(parents=True, exist_ok=True)
         prompt_file.write_text(prompt_text, encoding="utf-8")
