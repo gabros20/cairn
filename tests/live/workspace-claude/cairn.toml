@@ -1,0 +1,26 @@
+# Live smoke workspace for the CLAUDE executor (tests/live/workspace-claude).
+#
+# This is the FIRST time cairn's ClaudeExecutor runs against the real `claude` CLI
+# (unit tests only ever drive a fake binary). It is deliberately tiny: one agent step,
+# one cheap model (haiku), one small typed artifact — a token-minimal end-to-end proof
+# that compose → invoke → sentinel-parse → validate → trail works on the real vendor.
+#
+# NOT run by the offline `cairn test` suites of the main repo; it is its own workspace,
+# exercised live by the w-live agent and regression-locked via `cairn test record`.
+
+[workspace]
+name             = "workspace-claude"
+doctrine         = "prompts/DOCTRINE.md"
+runs_dir         = "runs"
+default_executor = "claude"
+
+[defaults]
+step_timeout  = "5m"                             # a haiku smoke step is fast; fail rather than hang
+trail_context = { events = 12, learnings = 5 }
+
+# The ONLY place vendor model names live. `cheap` → haiku keeps this smoke test's token
+# cost minimal; the smoke agents all pick tier=cheap.
+[executors.claude]
+enabled = true
+[executors.claude.tiers]
+cheap = { model = "haiku" }

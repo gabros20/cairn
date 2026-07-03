@@ -1,0 +1,21 @@
+# smoke — the live claude executor's happy path. One agent step, haiku, one typed artifact.
+# Run live:  cd tests/live/workspace-claude && uv run cairn run smoke --headless
+
+pipeline: smoke
+version: 1
+
+run_id: "smoke-{date}"
+
+artifacts:
+  report:
+    path: report.json
+    schema: schemas/report.json          # validated against a real JSON Schema (executor, ok required)
+    describe: "A tiny JSON proving the claude executor ran: keys executor (string) and ok (bool)."
+
+steps:
+  - id: write_report
+    agent: smoker
+    produces: [report]
+    args:
+      # The agent is told exactly what to write — this is a smoke test, not a reasoning test.
+      want: 'a JSON object with exactly the keys {"executor": "claude", "ok": true}'

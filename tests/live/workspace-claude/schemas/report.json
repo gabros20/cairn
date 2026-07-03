@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cairn:smoke/report",
+  "title": "smoke report",
+  "description": "The tiny typed artifact the smoke agent writes: proof the claude executor ran.",
+  "type": "object",
+  "required": ["executor", "ok"],
+  "properties": {
+    "executor": { "type": "string" },
+    "ok": { "type": "boolean" },
+    "note": { "type": "string" }
+  }
+}
