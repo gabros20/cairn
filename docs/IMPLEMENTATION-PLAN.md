@@ -1,14 +1,22 @@
 # cairn — Implementation Plan
 
-The concrete build order: PORT-DESIGN §7's milestones re-based onto cairn. Same verification
-discipline (every milestone independently checkable, smallest runnable slice first), same risks
-(PORT-DESIGN §8.1 carries over unchanged — notably the Codex headless-hook probe), new framing:
-the deliverable is the **framework + brease-factory as workspace #1**, not a one-off port.
+> **Historical build record — read as history, not as a roadmap.** This is the plan cairn was built
+> against, kept for provenance: what got built, in what order, and against which verifications.
+> Milestones **C0–C5**, the post-C5 hardening backlog, and the self-improve scaffold are **complete**
+> (802 tests green; the `v0.1.0` tag is cut). The one thing still ahead is the **brease-factory
+> workspace migration** — porting the origin pipeline in as workspace #1 (EXAMPLE-BREASE-REBUILD),
+> which the deferred C2–C5 live-parity items ride along with. The milestone *bodies* below are left
+> as-written (a record); the dated Status section beneath this banner is the current-state summary.
+> References to *PORT-DESIGN* point at an earlier design doc in the origin pipeline's repo, kept here
+> only as historical citation.
+
+The concrete build order below re-based an earlier design's milestones onto cairn, under one
+verification discipline (every milestone independently checkable, smallest runnable slice first).
 
 **Ordering principle:** the kernel is fully verifiable with the `shell` executor alone — synthetic
-pipelines, no LLM, no API keys, seconds in CI. So we prove the entire orchestration machine
-deterministically (C0–C1) *before* any agent CLI enters (C2+). Model-driven milestones then only
-ever debug one new thing at a time.
+pipelines, no LLM, no API keys, seconds in CI. So we proved the entire orchestration machine
+deterministically (C0–C1) *before* any agent CLI entered (C2+), so each model-driven milestone
+only ever debugged one new thing at a time.
 
 ---
 
