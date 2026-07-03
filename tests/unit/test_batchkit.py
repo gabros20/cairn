@@ -28,13 +28,17 @@ def _write_jsonl(path: Path, lines: list[str]) -> Path:
 
 
 def _ok_spawn(run_dir_for):
-    """A fake spawn that always succeeds, echoing a run-complete marker per its params."""
+    """A fake spawn that always succeeds, echoing a run-complete marker per its params.
+
+    Mirrors the real CLI: a SUCCESS prints its ``→ run_dir`` marker to stdout (cli.py), so
+    stderr is empty. Spawn returns ``(exit, stdout, stderr)``.
+    """
 
     def spawn(argv, cwd):
         # derive a stable pseudo run dir from the --param values in argv
         params = _params_of(argv)
         rd = run_dir_for(params)
-        return 0, f"cairn: run complete → {rd}\n"
+        return 0, f"cairn: run complete → {rd}\n", ""
 
     return spawn
 
@@ -121,10 +125,16 @@ def test_jobs_must_be_at_least_one(tmp_path):
 
 
 def _coded_spawn(codes_by_url):
+    """Fake spawn mirroring the real CLI's stream split: a SUCCESS marker goes to stdout, a
+    FAILURE (``run halted``) marker goes to stderr (cli.py). Returns ``(exit, stdout, stderr)``."""
+
     def spawn(argv, cwd):
         p = _params_of(argv)
         code = codes_by_url[p["url"]]
-        return code, f"cairn: run halted (exit {code}) → /runs/{p['url']}\n"
+        marker = f"cairn: run halted (exit {code}) → /runs/{p['url']}\n"
+        if code == 0:
+            return 0, f"cairn: run complete → /runs/{p['url']}\n", ""
+        return code, "", marker
 
     return spawn
 
@@ -182,7 +192,7 @@ def test_run_dir_none_when_child_prints_no_marker(tmp_path):
     pf = _write_jsonl(tmp_path / "s.jsonl", ['{"url": "a"}'])
     res = batchkit.run_batch(
         tmp_path, "hello", pf, jobs=1, out=io.StringIO(),
-        spawn=lambda argv, cwd: (4, "traceback: boom\n"),
+        spawn=lambda argv, cwd: (4, "", "traceback: boom\n"),
     )
     assert res.outcomes[0].run_dir is None
     assert res.outcomes[0].exit_code == 4
@@ -215,7 +225,7 @@ def test_spawn_exception_becomes_failed_outcome_not_batch_abort(tmp_path):
         p = _params_of(argv)
         if p["url"] == "b":
             raise FileNotFoundError("no such workspace dir")
-        return 0, f"cairn: run complete → /runs/{p['url']}\n"
+        return 0, f"cairn: run complete → /runs/{p['url']}\n", ""
 
     out = io.StringIO()
     res = batchkit.run_batch(tmp_path, "hello", pf, jobs=1, out=out, spawn=spawn)
@@ -234,6 +244,94 @@ def test_spawn_exception_becomes_failed_outcome_not_batch_abort(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# Failed-child stderr tail — the failure reason survives into RunOutcome.error.
+# --------------------------------------------------------------------------- #
+
+
+def test_failed_child_stderr_tail_lands_in_error(tmp_path):
+    # A child that starts but exits non-zero: its stderr (the actual failure reason) is
+    # retained as a legible tail in RunOutcome.error — the marker is on stderr for failures.
+    pf = _write_jsonl(tmp_path / "s.jsonl", ['{"url": "a"}'])
+
+    def spawn(argv, cwd):
+        stderr = (
+            "cairn: gate 'design' halted: fidelity below threshold\n"
+            "cairn: run halted (exit 6) → /runs/a\n"
+        )
+        return 6, "some normal progress on stdout\n", stderr
+
+    res = batchkit.run_batch(tmp_path, "hello", pf, jobs=1, out=io.StringIO(), spawn=spawn)
+    o = res.outcomes[0]
+    assert o.exit_code == 6
+    assert o.error is not None
+    assert "fidelity below threshold" in o.error
+    # marker is still parsed off the (stderr) marker line — failure markers go to stderr
+    assert o.run_dir == Path("/runs/a")
+
+
+def test_successful_child_keeps_error_none_even_with_stderr(tmp_path):
+    # A run that exits 0 keeps error=None regardless of any stderr chatter (warnings etc.).
+    pf = _write_jsonl(tmp_path / "s.jsonl", ['{"url": "a"}'])
+
+    def spawn(argv, cwd):
+        return 0, "cairn: run complete → /runs/a\n", "warning: deprecated flag\n"
+
+    res = batchkit.run_batch(tmp_path, "hello", pf, jobs=1, out=io.StringIO(), spawn=spawn)
+    assert res.outcomes[0].error is None
+    assert res.outcomes[0].ok
+
+
+def test_error_tail_is_bounded_for_a_runaway_child(tmp_path):
+    # A child that floods stderr must not balloon memory: RunOutcome.error keeps only a
+    # bounded tail (last N lines, capped in size) — the END of the stream (where the real
+    # failure is) survives; the head is dropped.
+    pf = _write_jsonl(tmp_path / "s.jsonl", ['{"url": "a"}'])
+    flood = "\n".join(f"noise line {i}" for i in range(5000)) + "\nFATAL: the real reason\n"
+
+    def spawn(argv, cwd):
+        return 4, "", flood
+
+    res = batchkit.run_batch(tmp_path, "hello", pf, jobs=1, out=io.StringIO(), spawn=spawn)
+    err = res.outcomes[0].error
+    assert err is not None
+    # bounded: far smaller than the multi-MB flood, and both bounds are honored
+    assert len(err) <= batchkit._ERROR_TAIL_MAX_BYTES
+    assert len(err.splitlines()) <= batchkit._ERROR_TAIL_MAX_LINES
+    # the tail (the real reason) is what we keep; the head noise is gone
+    assert "FATAL: the real reason" in err
+    assert "noise line 0" not in err
+
+
+def test_failed_child_with_empty_stderr_has_none_error(tmp_path):
+    # A silent failure (non-zero exit, no stderr) leaves error=None — the exit code alone
+    # is the signal; there is no tail to show.
+    pf = _write_jsonl(tmp_path / "s.jsonl", ['{"url": "a"}'])
+
+    def spawn(argv, cwd):
+        return 4, "cairn: run complete → /runs/a\n", ""
+
+    res = batchkit.run_batch(tmp_path, "hello", pf, jobs=1, out=io.StringIO(), spawn=spawn)
+    assert res.outcomes[0].exit_code == 4
+    assert res.outcomes[0].error is None
+
+
+def test_progress_line_stays_single_line_for_multiline_error(tmp_path):
+    # A failed child with a multi-line stderr tail must still stream ONE progress line
+    # (the per-completion contract) — the progress compacts the error to its first line.
+    pf = _write_jsonl(tmp_path / "s.jsonl", ['{"url": "a"}'])
+
+    def spawn(argv, cwd):
+        return 4, "", "first failure line\nsecond line\nthird line\n"
+
+    out = io.StringIO()
+    batchkit.run_batch(tmp_path, "hello", pf, jobs=1, out=out, spawn=spawn)
+    lines = [ln for ln in out.getvalue().splitlines() if ln.strip()]
+    assert len(lines) == 1
+    assert "first failure line" in lines[0]
+    assert "second line" not in lines[0]
+
+
+# --------------------------------------------------------------------------- #
 # Summary determinism — input order even when completion order is reversed.
 # --------------------------------------------------------------------------- #
 
@@ -249,7 +347,7 @@ def test_summary_is_input_ordered_despite_reordered_completion(tmp_path):
         time.sleep(0.08 if p["url"] == "0" else 0.01 * (int(p["url"]) + 1))
         with lock:
             completion_order.append(p["url"])
-        return 0, f"cairn: run complete → /runs/{p['url']}\n"
+        return 0, f"cairn: run complete → /runs/{p['url']}\n", ""
 
     res = batchkit.run_batch(tmp_path, "hello", pf, jobs=4, out=io.StringIO(), spawn=spawn)
 
@@ -291,7 +389,7 @@ def test_pool_bounds_concurrency(tmp_path):
         with lock:
             live -= 1
         p = _params_of(argv)
-        return 0, f"cairn: run complete → /runs/{p['url']}\n"
+        return 0, f"cairn: run complete → /runs/{p['url']}\n", ""
 
     batchkit.run_batch(tmp_path, "hello", pf, jobs=3, out=io.StringIO(), spawn=spawn)
     assert peak <= 3

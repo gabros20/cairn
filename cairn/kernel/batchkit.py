@@ -30,9 +30,19 @@ from cairn.kernel.types import ExitCode
 # Sensible fallback pool size; the CLI passes ``-j`` explicitly (docs/API.md shows ``-j 8``).
 DEFAULT_JOBS = 4
 
-# spawn(argv, cwd) -> (exit_code, combined_output). Injected in tests; default = subprocess.
-Spawn = Callable[[list[str], Path], "tuple[int, str]"]
+# spawn(argv, cwd) -> (exit_code, stdout, stderr). Injected in tests; default = subprocess.
+# stdout/stderr are kept SEPARATE (not merged): the ``→ run_dir`` marker lands on stdout for a
+# success but on stderr for a failure/awaiting-human (cli.py), so parse_run_dir sees both, while
+# the failure tail (RunOutcome.error) is drawn from stderr alone.
+Spawn = Callable[[list[str], Path], "tuple[int, str, str]"]
 Clock = Callable[[], float]
+
+# Bounds on the failed-child stderr tail retained in RunOutcome.error. A runaway child can flood
+# megabytes to stderr; subprocess buffers that transiently, but every RunOutcome lives for the
+# whole batch (one per line, all held at once), so we keep only a small legible TAIL — the end,
+# where the actual failure (gate reason / config / executor error) is — never the whole stream.
+_ERROR_TAIL_MAX_LINES = 20
+_ERROR_TAIL_MAX_BYTES = 2000  # chars; an approximate byte cap (kept simple to avoid mid-codepoint splits)
 
 
 # --------------------------------------------------------------------------- #
@@ -45,8 +55,11 @@ class RunOutcome:
     """One child run's result. ``index`` is the 0-based input line order (summary is sorted
     by it, never by completion order). ``run_dir`` is parsed from the child's terminal
     marker line; None if the child printed none (e.g. it crashed before bootstrapping).
-    ``error`` carries the exception text when the SPAWN itself raised (exit_code=EXECUTOR);
-    None for a child that ran to an exit code, even a failing one."""
+    ``error`` carries diagnostic text for a FAILED run and is None for a success. Two ways it
+    is populated: (1) the SPAWN itself raised (missing interpreter, bad cwd) → exit_code=EXECUTOR
+    and error = the exception text; (2) the child STARTED but exited non-zero → error = a bounded
+    tail of its stderr (the actual failure reason: gate/config/executor error). A child that
+    exited 0, or one that failed silently with no stderr, keeps error=None."""
 
     index: int
     params: dict
@@ -149,11 +162,31 @@ def build_run_argv(
     return argv
 
 
-def default_spawn(argv: list[str], cwd: Path) -> tuple[int, str]:
-    """Run one child to completion, capturing stdout+stderr combined. Never raises on a
-    non-zero child — the exit code IS the signal batch collects."""
+def default_spawn(argv: list[str], cwd: Path) -> tuple[int, str, str]:
+    """Run one child to completion, capturing stdout and stderr SEPARATELY. Never raises on a
+    non-zero child — the exit code IS the signal batch collects. The streams are kept apart so
+    the failure reason (stderr) can be surfaced without the marker parse depending on a clean
+    stdout: the ``→ run_dir`` marker is on stdout for a success but on stderr for a failure."""
     proc = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True)
-    return proc.returncode, (proc.stdout or "") + (proc.stderr or "")
+    return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
+
+
+def _error_tail(stderr: str) -> str | None:
+    """The bounded, legible tail of a failed child's stderr, or None if it wrote nothing.
+
+    Keeps the LAST ``_ERROR_TAIL_MAX_LINES`` lines then caps to ``_ERROR_TAIL_MAX_BYTES`` chars
+    (from the end) — the end is where the actual failure surfaces, and the cap keeps a runaway
+    child from ballooning the RunOutcome held for the whole batch."""
+    text = stderr.strip()
+    if not text:
+        return None
+    lines = text.splitlines()
+    if len(lines) > _ERROR_TAIL_MAX_LINES:
+        lines = lines[-_ERROR_TAIL_MAX_LINES:]
+    tail = "\n".join(lines)
+    if len(tail) > _ERROR_TAIL_MAX_BYTES:
+        tail = tail[-_ERROR_TAIL_MAX_BYTES:]
+    return tail
 
 
 def parse_run_dir(output: str) -> Path | None:
@@ -228,7 +261,7 @@ def run_batch(
         argv = build_run_argv(pipeline, params, gate_presets, extra_args)
         start = clock()
         try:
-            code, output = spawn(argv, workspace_dir)
+            code, stdout, stderr = spawn(argv, workspace_dir)
         except Exception as exc:  # noqa: BLE001 — crash containment IS the failure policy:
             # a spawn that raises (missing interpreter, bad cwd, OS error) becomes a failed
             # outcome, never a fleet abort — siblings keep running.
@@ -241,12 +274,16 @@ def run_batch(
                 error=f"{type(exc).__name__}: {exc}",
             )
         duration = clock() - start
+        # Marker can be on EITHER stream (stdout for success, stderr for failure/awaiting-human),
+        # so parse over both; the failure tail is drawn from stderr alone, only when the child failed.
+        combined = stdout + "\n" + stderr
         return RunOutcome(
             index=index,
             params=params,
-            run_dir=parse_run_dir(output),
+            run_dir=parse_run_dir(combined),
             exit_code=code,
             duration_s=duration,
+            error=_error_tail(stderr) if code != 0 else None,
         )
 
     results: dict[int, RunOutcome] = {}
@@ -267,6 +304,8 @@ def run_batch(
 
 def _progress(out: TextIO, done: int, total: int, o: RunOutcome) -> None:
     rd = o.run_dir.name if o.run_dir is not None else "?"
-    tail = f"  {o.error}" if o.error else ""
+    # ONE line per completion (pinned): compact a multi-line error tail to its first line here;
+    # the full tail is rendered in the CLI's end-of-batch summary block.
+    tail = f"  {o.error.splitlines()[0]}" if o.error else ""
     out.write(f"[{done}/{total}] {rd}  exit {o.exit_code}  {o.duration_s:.1f}s{tail}\n")
     out.flush()

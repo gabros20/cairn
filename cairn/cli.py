@@ -32,7 +32,7 @@ from cairn.kernel import newkit
 from cairn.kernel.artifacts import resolve_path, validate
 from cairn.kernel.batchkit import run_batch
 from cairn.kernel.compose import make_composer, render_artifact_path
-from cairn.kernel.config import Config, ExecutorConfig, load_config
+from cairn.kernel.config import Config, ExecutorConfig, installed_version, load_config, version_compat
 from cairn.kernel.errors import CairnError, ConfigError
 from cairn.kernel.gatekit import answer_gate, is_answered, read_choice
 from cairn.kernel.gckit import apply_gc, plan_gc
@@ -470,10 +470,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
             # same drift guard `cairn resume` enforces: a timer re-fire after a pipeline edit
             # must fail loud, not silently resume the old run against the new file.
             try:
-                recorded_hash = load_run(match.run_dir).get("pipeline_hash")
+                recorded = load_run(match.run_dir)
+                recorded_hash = recorded.get("pipeline_hash")
+                recorded_version = recorded.get("cairn_version")
             except (OSError, ValueError, ConfigError):
-                recorded_hash = None
+                recorded_hash = recorded_version = None
             fail = _pipeline_drift_guard(recorded_hash, phash, p.pipeline, match.run_dir, force=False)
+            if fail is not None:
+                return fail
+            # `cairn run` has no --force flag; a cross-major run-dir can only be resumed via
+            # `cairn resume … --force`, so the idempotent re-fire refuses it here too.
+            fail = _version_compat_guard(recorded_version, match.run_dir, force=False)
             if fail is not None:
                 return fail
             run_dir = match.run_dir
@@ -545,6 +552,49 @@ def _pipeline_drift_guard(recorded: str | None, current_hash: str, pipeline: str
     return None
 
 
+def _version_compat_guard(recorded: str | None, run_dir: Path, *, force: bool) -> int | None:
+    """The cross-version resume gate shared by ``cairn resume`` and ``run --idempotent``'s
+    resume path (docs/DISTRIBUTION.md §3, *Run-dir format*): compare the cairn version that
+    created this run against the installed one. Same major.minor resumes silently; a
+    cross-minor drift or an unrecorded/legacy version warns and proceeds; a cross-major
+    difference refuses without ``--force`` (run-dir semantics may not carry across a major).
+    Returns the exit code to fail with, or None to proceed. Mirrors `_pipeline_drift_guard`,
+    including the remedy naming the command that actually takes ``--force``."""
+    installed = installed_version()
+    verdict = version_compat(recorded, installed)
+    if verdict == "ok":
+        return None
+    if verdict == "warn":
+        if recorded:
+            print(
+                f"cairn: warning — resuming a run created by cairn {recorded} on cairn "
+                f"{installed} (version drift)",
+                file=sys.stderr,
+            )
+        else:
+            print(
+                f"cairn: warning — this run dir records no cairn version; resuming on cairn "
+                f"{installed}",
+                file=sys.stderr,
+            )
+        return None
+    # verdict == "refuse" — cross-major.
+    if not force:
+        print(
+            f"cairn: this run was created by cairn {recorded} but cairn {installed} is "
+            f"installed (major-version drift). Run `cairn resume {run_dir} --force` to "
+            f"resume against the installed version.",
+            file=sys.stderr,
+        )
+        return int(ExitCode.CONFIG)
+    print(
+        f"cairn: warning — resuming across cairn-version drift (--force): "
+        f"run {recorded} vs installed {installed}",
+        file=sys.stderr,
+    )
+    return None
+
+
 def _cmd_resume(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
     ws = _workspace(args)
@@ -564,6 +614,9 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         return int(ExitCode.CONFIG)
 
     fail = _pipeline_drift_guard(run_doc.get("pipeline_hash"), _pipeline_hash(ws, pipeline), pipeline, run_dir, force=args.force)
+    if fail is not None:
+        return fail
+    fail = _version_compat_guard(run_doc.get("cairn_version"), run_dir, force=args.force)
     if fail is not None:
         return fail
 
@@ -992,10 +1045,21 @@ def _cmd_batch(args: argparse.Namespace) -> int:
         return _print_config_error(exc)
 
     print(f"cairn: batch {result.pipeline} — {result.total} run(s), {len(result.failed)} failed")
+    # A few stderr-tail lines per failed run, indented under its line — enough to name the
+    # failure (gate/config/executor error) without flooding; the rest lives in the run dir.
+    _SUMMARY_ERROR_LINES = 6
     for o in result.failed:
         rd = o.run_dir.name if o.run_dir is not None else "?"
-        extra = f" — {o.error}" if o.error else ""
-        print(f"  ✗ [{o.index}] {rd}  exit {o.exit_code}{extra}", file=sys.stderr)
+        print(f"  ✗ [{o.index}] {rd}  exit {o.exit_code}", file=sys.stderr)
+        if not o.error:
+            continue
+        tail_lines = o.error.splitlines()
+        for line in tail_lines[:_SUMMARY_ERROR_LINES]:
+            print(f"      {line}", file=sys.stderr)
+        if len(tail_lines) > _SUMMARY_ERROR_LINES:
+            extra = len(tail_lines) - _SUMMARY_ERROR_LINES
+            where = f"; see {o.run_dir}" if o.run_dir is not None else ""
+            print(f"      … (+{extra} more line(s){where})", file=sys.stderr)
     return int(result.exit_code)
 
 

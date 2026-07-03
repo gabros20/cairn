@@ -279,6 +279,67 @@ def test_resume_after_pipeline_file_deleted_is_clean_config_error(hello_ws, monk
 
 
 # --------------------------------------------------------------------------- #
+# resume: cross-version gate (DISTRIBUTION §3, Run-dir format).
+# --------------------------------------------------------------------------- #
+
+
+def _set_run_version(rd: Path, version: str) -> None:
+    p = rd / "run.json"
+    doc = json.loads(p.read_text())
+    doc["cairn_version"] = version
+    p.write_text(json.dumps(doc, indent=2))
+
+
+def test_resume_refuses_cross_major_version_without_force(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=friendly"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    _set_run_version(rd, "9.0.0")
+    rc = main(["resume", str(rd)])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "9.0.0" in err and cairn.__version__ in err  # names both versions
+    assert f"resume {rd} --force" in err  # the remedy names the flag-bearing command
+
+
+def test_resume_cross_major_version_bypassed_by_force(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=friendly"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    (rd / "message.txt").unlink()  # force a genuine re-run, not a done-noop
+    _set_run_version(rd, "9.0.0")
+    rc = main(["resume", str(rd), "--force"])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.OK)
+    assert "--force" in err  # the override warning fired
+    assert (rd / "message.txt").exists()
+
+
+def test_resume_cross_minor_version_warns_and_proceeds(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=friendly"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    (rd / "message.txt").unlink()
+    _set_run_version(rd, "0.9.0")
+    rc = main(["resume", str(rd)])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.OK)  # a cross-minor drift never refuses
+    assert "0.9.0" in err and "version drift" in err
+    assert (rd / "message.txt").exists()
+
+
+def test_resume_same_version_is_silent(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=friendly"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    (rd / "message.txt").unlink()  # a real resume — the run wrote the installed version
+    rc = main(["resume", str(rd)])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.OK)
+    assert "version drift" not in err  # no version noise on a same-version resume
+
+
+# --------------------------------------------------------------------------- #
 # resume + gate verb.
 # --------------------------------------------------------------------------- #
 
@@ -726,8 +787,45 @@ def test_batch_aggregates_child_failure_exit(hello_ws, monkeypatch, capsys):
     pf.write_text('{"name": "Ada"}\n', encoding="utf-8")
     # A child `cairn run nope-pipeline` exits CONFIG(2); batch surfaces the worst child code.
     rc = main(["batch", "nope-pipeline", "--params-file", str(pf)])
+    err = capsys.readouterr()
     assert rc == int(ExitCode.CONFIG)
-    assert "1 failed" in capsys.readouterr().out
+    assert "1 failed" in err.out
+    # the failed run's stderr tail is surfaced, indented, under its summary line
+    assert "✗ [0]" in err.err
+    assert "nope-pipeline" in err.err  # the child's config-error reason bubbles up
+
+
+def test_batch_summary_renders_failed_stderr_tail(hello_ws, monkeypatch, capsys):
+    # The batch summary prints the failed child's stderr tail as an indented block; a long
+    # tail is truncated with a pointer at the run dir's logs.
+    from cairn.kernel.batchkit import BatchResult, RunOutcome
+
+    monkeypatch.chdir(hello_ws)
+    pf = hello_ws / "s.jsonl"
+    pf.write_text('{"name": "Ada"}\n', encoding="utf-8")
+
+    long_tail = "\n".join(f"reason line {i}" for i in range(12))
+    fake = BatchResult(
+        pipeline="hello",
+        outcomes=(
+            RunOutcome(
+                index=0,
+                params={"name": "Ada"},
+                run_dir=Path("/runs/ada"),
+                exit_code=6,
+                duration_s=0.1,
+                error=long_tail,
+            ),
+        ),
+        exit_code=6,
+    )
+    monkeypatch.setattr("cairn.cli.run_batch", lambda *a, **k: fake)
+    rc = main(["batch", "hello", "--params-file", str(pf)])
+    err = capsys.readouterr().err
+    assert rc == 6
+    assert "✗ [0] ada  exit 6" in err
+    assert "      reason line 0" in err  # indented tail block
+    assert "+6 more line(s)" in err and "/runs/ada" in err  # truncation + pointer
 
 
 # --------------------------------------------------------------------------- #
