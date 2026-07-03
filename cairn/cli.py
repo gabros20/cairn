@@ -31,7 +31,7 @@ from cairn.kernel.artifacts import resolve_path, validate
 from cairn.kernel.compose import make_composer, render_artifact_path
 from cairn.kernel.config import Config, ExecutorConfig, load_config
 from cairn.kernel.errors import CairnError, ConfigError
-from cairn.kernel.gatekit import answer_gate
+from cairn.kernel.gatekit import answer_gate, is_answered, read_choice
 from cairn.kernel.guards import build_shims
 from cairn.kernel.plan import (
     GateNode,
@@ -557,14 +557,66 @@ def _cmd_resume(args: argparse.Namespace) -> int:
 
 def _cmd_gate(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
+    ws = _workspace(args)
     spec = args.assignment
     if "=" not in spec:
         print(f"cairn: expected <name>=<choice>, got {spec!r}", file=sys.stderr)
         return int(ExitCode.CONFIG)
     name, _, choice = spec.partition("=")
+
+    # (a) it must be a real run dir.
+    try:
+        run_doc = load_run(run_dir)
+    except (OSError, ValueError, ConfigError):
+        print(f"cairn: {run_dir} is not a run dir (no readable run.json)", file=sys.stderr)
+        return int(ExitCode.CONFIG)
+
+    # Re-plan from the recorded pipeline+params (same path resume uses) so we validate against
+    # the run's actual gates — never blind-write a typo'd gate/choice.
+    pipeline = run_doc["pipeline"]
+    params = {k: _param_str(v) for k, v in (run_doc.get("params") or {}).items() if v is not None}
+    now = _parse_created_at(run_doc.get("created_at"))
+    try:
+        p = build_plan(ws, pipeline, params, now=now)
+    except ConfigError as exc:
+        return _print_config_error(exc)
+
+    gates = {g.name: g for g in _iter_gates(p.nodes)}
+    gate = gates.get(name)
+    if gate is None:
+        skipped = {s.node for s in p.skipped if s.kind == "gate"}
+        if name in skipped:
+            print(f"cairn: gate {name!r} is not active in this run (its condition is false)", file=sys.stderr)
+        else:
+            known = ", ".join(sorted(gates)) or "(none)"
+            print(f"cairn: no gate {name!r} in pipeline {pipeline!r} (gates: {known})", file=sys.stderr)
+        return int(ExitCode.CONFIG)
+
+    # (b) refuse to overwrite an already-recorded decision — explicit beats silent clobber.
+    if is_answered(run_dir, name):
+        print(f"cairn: gate {name!r} is already answered ({read_choice(run_dir, name)!r}); refusing to overwrite", file=sys.stderr)
+        return int(ExitCode.CONFIG)
+
+    # (c) the choice must be one of the gate's declared options.
+    options = [k for k, _ in gate.options]
+    if choice not in options:
+        print(f"cairn: {choice!r} is not an option for gate {name!r} (options: {', '.join(options)})", file=sys.stderr)
+        return int(ExitCode.CONFIG)
+
     answer_gate(run_dir, name, choice)
     print(f"cairn: gate {name!r} answered {choice!r} (by external) → {run_dir}")
     return int(ExitCode.OK)
+
+
+def _iter_gates(nodes):
+    """Yield every :class:`GateNode` in a plan, recursing into parallels and loops."""
+    for node in nodes:
+        if isinstance(node, GateNode):
+            yield node
+        elif isinstance(node, ParallelNode):
+            yield from _iter_gates(node.steps)
+        elif isinstance(node, LoopNode):
+            yield from _iter_gates(node.body)
 
 
 # --------------------------------------------------------------------------- #

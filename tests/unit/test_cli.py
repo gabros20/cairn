@@ -338,6 +338,44 @@ def test_gate_verb_bad_assignment(hello_ws, monkeypatch, capsys):
     assert "<name>=<choice>" in capsys.readouterr().err
 
 
+def test_gate_rejects_non_run_dir(tmp_path, capsys):
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    rc = main(["gate", str(empty), "tone=friendly"])
+    assert rc == int(ExitCode.CONFIG)
+    assert "not a run dir" in capsys.readouterr().err
+
+
+def test_gate_rejects_unknown_gate_name(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--to", "greet", "--headless"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    rc = main(["gate", str(rd), "nope=friendly"])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "no gate 'nope'" in err and "tone" in err  # names the real gate
+
+
+def test_gate_rejects_choice_not_an_option(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--to", "greet", "--headless"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    rc = main(["gate", str(rd), "tone=loud"])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "not an option" in err and "friendly" in err and "formal" in err
+
+
+def test_gate_refuses_to_overwrite_answered_gate(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless"]) == 0  # tone resolves to default 'friendly'
+    rd = _run_dir(hello_ws, "hello-world")
+    rc = main(["gate", str(rd), "tone=formal"])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "already answered" in err and "friendly" in err  # names the recorded choice
+
+
 # --------------------------------------------------------------------------- #
 # validate.
 # --------------------------------------------------------------------------- #
