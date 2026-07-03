@@ -216,7 +216,7 @@ def test_needs_optional_on_a_plan_dropped_producer_survives():
 # --------------------------------------------------------------------------- #
 
 
-def _write_ws(tmp_path: Path, pipeline_yaml: str, *, agents=None, extra=None) -> Path:
+def _write_ws(tmp_path: Path, pipeline_yaml: str, *, agents=None, extra=None, tools="") -> Path:
     ws = tmp_path / "ws"
     (ws / "pipelines").mkdir(parents=True)
     (ws / "schemas").mkdir()
@@ -228,7 +228,7 @@ def _write_ws(tmp_path: Path, pipeline_yaml: str, *, agents=None, extra=None) ->
         'reasoning = { model = "opus", effort = "high" }\n'
         'balanced = { model = "sonnet", effort = "medium" }\n'
         'cheap = { model = "haiku", effort = "low" }\n'
-        "[secrets]\nOK_TOKEN = {}\n",
+        "[secrets]\nOK_TOKEN = {}\n" + tools,
         encoding="utf-8",
     )
     (ws / "schemas" / "s.json").write_text('{"type":"object"}', encoding="utf-8")
@@ -567,3 +567,87 @@ def test_requires_pin_must_be_a_string(hello_ws):
     with pytest.raises(ConfigError) as exc:
         plan(hello_ws, "hello", {}, now=NOW)
     assert "requires" in str(exc.value)
+
+
+# --------------------------------------------------------------------------- #
+# Range-scoped tool preflight (docs/TOOLING-AND-GROWTH §2) — plan warns (never
+# errors, never runs a check) when an in-range step is scoped by a declared
+# tool's `needed_by`; a `needed_by` naming no step/pipeline is a dangling-scope
+# lint. Presence checks stay doctor's job; plan stays offline and fast.
+# --------------------------------------------------------------------------- #
+
+_TWO_STEPS = (
+    "  - { id: one, run: 'echo', produces: [a] }\n"
+    "  - { id: two, run: 'echo', needs: [a], produces: [b] }\n"
+)
+
+
+def _tool_msgs(p) -> list[str]:
+    return [w.message for w in p.warnings if "tool" in w.message]
+
+
+def test_in_range_tool_scope_warns_naming_step_and_tool(tmp_path):
+    tools = '[tools.crawl4ai]\ncheck = "true"\nneeded_by = ["two"]\n'
+    ws = _write_ws(tmp_path, _HEADER + _TWO_STEPS, tools=tools)
+    p = plan(ws, "p", {}, now=NOW)
+    msgs = _tool_msgs(p)
+    assert any(
+        "'two'" in m and "'crawl4ai'" in m and "unverified" in m and "cairn doctor" in m
+        for m in msgs
+    ), msgs
+    # a plain warning, never an error — the plan still emits its nodes
+    assert not [w for w in p.warnings if w.level == "error"]
+    assert _ids(p.nodes) == ["one", "two"]
+
+
+def test_out_of_range_tool_scope_does_not_warn(tmp_path):
+    # `two` is sliced off by --to one; its tool must not warn.
+    tools = '[tools.crawl4ai]\ncheck = "true"\nneeded_by = ["two"]\n'
+    ws = _write_ws(tmp_path, _HEADER + _TWO_STEPS, tools=tools)
+    p = plan(ws, "p", {}, now=NOW, to_node="one")
+    assert _ids(p.nodes) == ["one"]
+    assert _tool_msgs(p) == []
+
+
+def test_dangling_needed_by_is_a_lint_warning(tmp_path):
+    tools = '[tools.crawl4ai]\ncheck = "true"\nneeded_by = ["ghost"]\n'
+    ws = _write_ws(tmp_path, _HEADER + _TWO_STEPS, tools=tools)
+    p = plan(ws, "p", {}, now=NOW)
+    msgs = _tool_msgs(p)
+    assert any("'ghost'" in m and "dangling" in m for m in msgs), msgs
+
+
+def test_no_tools_declared_means_no_tool_warnings(tmp_path):
+    ws = _write_ws(tmp_path, _HEADER + _TWO_STEPS)
+    p = plan(ws, "p", {}, now=NOW)
+    assert _tool_msgs(p) == []
+
+
+def test_unscoped_tool_does_not_range_warn(tmp_path):
+    # crawl4ai with no needed_by is workspace-global — doctor's job, not a range warning.
+    tools = '[tools.crawl4ai]\ncheck = "true"\n'
+    ws = _write_ws(tmp_path, _HEADER + _TWO_STEPS, tools=tools)
+    p = plan(ws, "p", {}, now=NOW)
+    assert _tool_msgs(p) == []
+
+
+def test_pipeline_scoped_tool_warns_for_the_whole_plan(tmp_path):
+    # `needed_by = ["p"]` names the pipeline itself, not a step.
+    tools = '[tools.crawl4ai]\ncheck = "true"\nneeded_by = ["p"]\n'
+    ws = _write_ws(tmp_path, _HEADER + _TWO_STEPS, tools=tools)
+    p = plan(ws, "p", {}, now=NOW)
+    msgs = _tool_msgs(p)
+    assert any("pipeline 'p'" in m and "'crawl4ai'" in m and "unverified" in m for m in msgs), msgs
+
+
+def test_dropped_step_tool_scope_does_not_warn_and_is_not_dangling(tmp_path):
+    # `two` is dropped by its own when:; its tool scope must not warn (it won't run) and must
+    # not be flagged dangling (the step exists in the pipeline source).
+    steps = (
+        "  - { id: one, run: 'echo', produces: [a] }\n"
+        "  - { id: two, run: 'echo', needs: [a], produces: [b], when: \"params.x == 'never'\" }\n"
+    )
+    tools = '[tools.crawl4ai]\ncheck = "true"\nneeded_by = ["two"]\n'
+    ws = _write_ws(tmp_path, _HEADER + steps, tools=tools)
+    p = plan(ws, "p", {}, now=NOW)
+    assert _tool_msgs(p) == []

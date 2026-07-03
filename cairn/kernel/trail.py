@@ -23,9 +23,23 @@ TRAIL_NAME = "trail.jsonl"
 ENVELOPE_VERSION = 1
 
 
+def format_at(dt: datetime) -> str:
+    """Format ``dt`` as the canonical trail/manifest timestamp.
+
+    UTC, millisecond precision, Z-terminated — the one shape every ``at``/``created_at``
+    in the system is written in, so trail events and run.json agree byte-for-byte. A naive
+    ``dt`` is *read as* UTC (the codebase-wide tolerance: learnkit/gckit pin naive→UTC), so
+    an aware clock round-trips exactly and a legacy naive one no longer needs downstream
+    naive-pinning workarounds.
+    """
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 def _now_iso() -> str:
     """UTC, millisecond precision, Z-terminated — the envelope `at` format."""
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return format_at(datetime.now(timezone.utc))
 
 
 def _parse_at(at: str) -> datetime:

@@ -8,9 +8,29 @@ from __future__ import annotations
 
 import json
 
-from cairn.kernel.trail import TrailWriter, derive_status, follow, read_trail
+from datetime import datetime, timezone
+
+from cairn.kernel.trail import (
+    TrailWriter,
+    derive_status,
+    follow,
+    format_at,
+    read_trail,
+)
 
 RUN_ID = "acme-redesign-20260703"
+
+
+def test_format_at_is_z_terminated_utc_for_aware_and_naive():
+    # An aware UTC clock round-trips to the canonical Z-terminated, millisecond shape.
+    aware = datetime(2026, 7, 3, 10, 14, 2, 113000, tzinfo=timezone.utc)
+    assert format_at(aware) == "2026-07-03T10:14:02.113Z"
+    # A naive datetime is read AS UTC (the codebase-wide tolerance) — never crashes, no offset.
+    naive = datetime(2026, 7, 3, 10, 14, 2, 113000)
+    s = format_at(naive)
+    assert s == "2026-07-03T10:14:02.113Z"
+    # Whatever we write parses straight back with a real tzinfo (no naive-pinning needed).
+    assert datetime.fromisoformat(s).tzinfo is not None
 
 
 def test_emit_appends_one_envelope_line_per_event(tmp_path):

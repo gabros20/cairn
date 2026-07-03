@@ -1035,6 +1035,107 @@ def _emit(
 
 
 # --------------------------------------------------------------------------- #
+# Range-scoped tool preflight (docs/TOOLING-AND-GROWTH §2).
+#
+# A `[tools]` entry may carry `needed_by = [step-or-pipeline, …]`, scoping it to
+# the steps that care. At plan time — offline, so we NEVER run a tool's `check`;
+# that stays `cairn doctor`'s job — we warn (never error) when an in-range step
+# (or this pipeline) is named by a tool's scope: fail-fast beats a crash after a
+# long build. A `needed_by` naming no step/pipeline anywhere in the workspace is
+# a dangling-scope lint on the same warnings channel. Unscoped tools (no
+# `needed_by`) are workspace-global — doctor's concern, not a range warning.
+# --------------------------------------------------------------------------- #
+
+
+def _flatten_step_ids(nodes: tuple[Node, ...] | list[Node]) -> set[str]:
+    """Every StepNode id in ``nodes``, descending into parallel/loop children."""
+    out: set[str] = set()
+    for node in nodes:
+        if isinstance(node, StepNode):
+            out.add(node.id)
+        elif isinstance(node, ParallelNode):
+            out |= _flatten_step_ids(node.steps)
+        elif isinstance(node, LoopNode):
+            out |= _flatten_step_ids(node.body)
+    return out
+
+
+def _collect_raw_step_ids(raw_nodes: Any, into: set[str]) -> None:
+    """Every step ``id`` in a raw (unparsed) node list — incl. parallel/loop bodies and
+    conditionally-dropped steps — the full set a ``needed_by`` scope may legitimately name."""
+    if not isinstance(raw_nodes, list):
+        return
+    for rn in raw_nodes:
+        if not isinstance(rn, dict):
+            continue
+        if "parallel" in rn:
+            _collect_raw_step_ids(rn.get("steps", []) or [], into)
+        elif "loop" in rn:
+            _collect_raw_step_ids(rn.get("body", []) or [], into)
+        elif "gate" not in rn:
+            sid = rn.get("id")
+            if isinstance(sid, str) and sid:
+                into.add(sid)
+
+
+def _workspace_scope_names(workspace_dir: Path) -> set[str]:
+    """Every pipeline name + every step id across the workspace's pipelines — the universe a
+    tool's ``needed_by`` may name. Tolerant of unreadable/malformed files (the real planner
+    reports those precisely); used only to distinguish a valid cross-pipeline scope from a
+    dangling one, so a tool needed by a step in *another* pipeline is never mis-flagged."""
+    names: set[str] = set()
+    d = workspace_dir / "pipelines"
+    if not d.is_dir():
+        return names
+    for f in sorted(d.glob("*.yaml")):
+        names.add(f.stem)
+        try:
+            doc = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+        except (OSError, yaml.YAMLError):
+            continue
+        if isinstance(doc, dict):
+            _collect_raw_step_ids(doc.get("steps", []) or [], names)
+    return names
+
+
+def _lint_tools(
+    config: Config,
+    pipeline_name: str,
+    in_range_ids: set[str],
+    workspace_names: set[str],
+    warnings: list[Finding],
+) -> None:
+    """Append the range-scoped tool warnings for one plan (see the section note above)."""
+    for tool in config.tools.values():
+        scoped = set(tool.needed_by)
+        for target in tool.needed_by:
+            if target not in workspace_names:
+                warnings.append(
+                    Finding(
+                        "warning",
+                        f"tool {tool.name!r}: needed_by names {target!r}, which is not a step "
+                        f"or pipeline anywhere in this workspace (dangling scope)",
+                    )
+                )
+        for sid in sorted(in_range_ids & scoped):
+            warnings.append(
+                Finding(
+                    "warning",
+                    f"step {sid!r} needs tool {tool.name!r} — declared but unverified here; "
+                    f"run cairn doctor",
+                )
+            )
+        if pipeline_name in scoped:
+            warnings.append(
+                Finding(
+                    "warning",
+                    f"pipeline {pipeline_name!r} needs tool {tool.name!r} — declared but "
+                    f"unverified here; run cairn doctor",
+                )
+            )
+
+
+# --------------------------------------------------------------------------- #
 # The public entry points.
 # --------------------------------------------------------------------------- #
 
@@ -1129,6 +1230,16 @@ def plan(
     guards = _parse_guards(doc.get("guards", []), ctx)
 
     emitted, resolved_models = _emit(active, executor, step_executors, config, from_node, to_node, str(pfile))
+
+    # Range-scoped tool preflight — offline; only pay the workspace scan when tools exist.
+    if config.tools:
+        _lint_tools(
+            config,
+            pipeline_name,
+            _flatten_step_ids(emitted),
+            _workspace_scope_names(workspace_dir),
+            warnings,
+        )
 
     return Plan(
         pipeline=pipeline,
