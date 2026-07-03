@@ -659,7 +659,10 @@ class _Walk:
 
     def _build_env(self, step: StepNode) -> dict[str, str]:
         env: dict[str, str] = {}
-        for key in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR"):
+        # USER/LOGNAME are identity, not secrets: a macOS Keychain lookup (how `claude`/`codex`
+        # find their stored OAuth credential) needs USER, so stripping it makes every executor
+        # report "Not logged in". Kept in the deny-by-default baseline for that reason.
+        for key in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME"):
             if key in os.environ:
                 env[key] = os.environ[key]
         env["CAIRN_RUN_DIR"] = str(self.run_dir)

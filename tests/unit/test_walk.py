@@ -691,6 +691,27 @@ def test_env_is_scrubbed_and_secret_flows_from_dotenv(ws: Path, tmp_path: Path, 
     assert seen["SECRET"] == "s3cr3t"
 
 
+def test_identity_env_passes_through_for_keychain_auth(ws: Path, tmp_path: Path, monkeypatch) -> None:
+    # USER/LOGNAME must reach the child: on macOS a CLI's Keychain lookup (how `claude`
+    # finds its OAuth credential) needs USER — without it the child reports "Not logged in".
+    monkeypatch.setenv("USER", "tamas")
+    monkeypatch.setenv("LOGNAME", "tamas")
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    seen = {}
+
+    def on_invoke(inv, _n):
+        seen.update(inv.env)
+        (inv.cwd / "a.txt").write_text("ok")
+        return done_result()
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
+    assert seen["USER"] == "tamas"
+    assert seen["LOGNAME"] == "tamas"
+
+
 def test_dotenv_strips_quotes_and_tolerates_export(ws: Path, tmp_path: Path) -> None:
     (ws / ".env").write_text('export QUOTED="q u o t e d"\nBARE=plain\n', encoding="utf-8")
     arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
