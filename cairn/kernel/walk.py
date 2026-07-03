@@ -434,7 +434,10 @@ class _Walk:
                     data["metrics"] = block["metrics"]
                 # Executor-reported usage (json output-format, future) outranks a model's
                 # self-reported STEP-block usage; today result.usage is None → block wins.
-                usage = result.usage or block.get("usage")
+                # An executor-reported {} still wins the precedence (the block's self-report
+                # must not leak through it), but carries no numbers — the truthiness guard
+                # then omits it from the event, keeping step-done lean.
+                usage = result.usage if result.usage is not None else block.get("usage")
                 if usage:
                     data["usage"] = usage
                 self._emit("step-done", node=step.id, attempt=attempt, cycle=cycle, data=data)
@@ -889,6 +892,8 @@ class _Walk:
         def beat() -> None:
             while not stop.wait(interval):
                 log_bytes, last_line = _tail_log(log_path)
+                if stop.is_set():
+                    return  # step finished while we read the log — never emit a stale beat
                 self._emit(
                     "heartbeat",
                     node=node,

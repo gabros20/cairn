@@ -289,6 +289,29 @@ def test_executor_reported_usage_on_result_wins_over_step_block(ws: Path, tmp_pa
     assert done_ev["data"]["duration_s"] == 2.5
 
 
+def test_executor_reported_empty_usage_outranks_block_and_is_omitted(ws: Path, tmp_path: Path) -> None:
+    # Pinned composed behavior: an executor-reported {} still wins the precedence (the
+    # model's STEP-block self-report must not leak through it), and being number-less it
+    # is then omitted from step-done entirely — no usage key at all, not the block's dict.
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        (inv.cwd / "a.txt").write_text("hi")
+        return Result(
+            step={"status": "done", "summary": "ok", "usage": {"in_tokens": 1}},
+            exit_code=0,
+            duration_s=1.0,
+            usage={},
+        )
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
+
+    done_ev = next(e for e in read_trail(run_dir) if e["event"] == "step-done")
+    assert "usage" not in done_ev["data"]
+
+
 def test_created_at_and_node_at_are_z_terminated_utc(ws: Path, tmp_path: Path) -> None:
     # walk.py single-sources the trail's Z-terminated UTC formatter, so run.json's created_at
     # (and every node `at`) parse as tz-aware — no downstream naive-pinning workaround needed.
@@ -370,8 +393,11 @@ def test_heartbeat_emitted_during_a_slow_step(ws: Path, tmp_path: Path) -> None:
     assert hb["data"]["log_bytes"] > 0
     assert hb["data"]["last_line"] == "working line two"
     assert "elapsed_s" in hb["data"]
-    # step-done still lands last for the node — the daemon never outlives the step.
-    assert any(e["event"] == "step-done" and e["node"] == "s" for e in read_trail(run_dir))
+    # step-done still lands last for the node — the daemon never outlives the step, and
+    # no stale heartbeat sneaks in after it (the stop.is_set() re-check before emit).
+    events = list(read_trail(run_dir))
+    done_seq = next(e["seq"] for e in events if e["event"] == "step-done" and e["node"] == "s")
+    assert all(e["seq"] < done_seq for e in events if e["event"] == "heartbeat")
 
 
 def test_heartbeat_is_off_by_default_zero_cost(ws: Path, tmp_path: Path) -> None:
