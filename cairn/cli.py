@@ -86,7 +86,10 @@ SUBCOMMANDS: list[str] = [
 
 
 def _now() -> datetime:
-    return datetime.now()
+    # Aware UTC — the one clock source behind run.json `created_at`, node `at` (both stamped
+    # Z-terminated by trail.format_at), plan/{date} templating, doctor, and gatekit. A naive
+    # local clock here would be *labeled* UTC downstream — wrong by the local offset.
+    return datetime.now(timezone.utc)
 
 
 def _workspace(args: argparse.Namespace) -> Path:

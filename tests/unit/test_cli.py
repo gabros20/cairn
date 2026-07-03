@@ -1221,3 +1221,20 @@ def test_subprocess_runner_actually_shells_out():
     res = _SubprocessRunner().run([sys.executable, "-c", "import sys; print('hi'); sys.exit(7)"])
     assert res.returncode == 7
     assert res.stdout.strip() == "hi"
+
+
+# --------------------------------------------------------------------------- #
+# _now — the CLI's single clock source.
+# --------------------------------------------------------------------------- #
+
+
+def test_now_returns_aware_utc():
+    # _now() feeds run.json created_at / node `at` (stamped Z by trail.format_at), plan
+    # {date} templating, doctor, and gatekit. A naive local clock would be *labeled* UTC —
+    # a lie by the local offset — so the clock source itself must be aware UTC.
+    from datetime import timezone
+
+    from cairn.cli import _now
+
+    dt = _now()
+    assert dt.tzinfo is timezone.utc
