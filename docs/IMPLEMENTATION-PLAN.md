@@ -16,16 +16,26 @@ ever debug one new thing at a time.
 
 - **C0 + C1 — complete.** Planner, walker, gatekit, composer, artifacts, trail/runstate, guards,
   expression + template engines, config, the `shell`/`stub` executors, the `cairn test` suite layer,
-  the scaffold, and every C1-scope CLI verb are built and green (460 tests).
+  the scaffold, and every C1-scope CLI verb are built and green (623 tests).
   *Deviation from the strict ordering:* built as parallel module waves with per-module
   implement→review→fix rather than strictly C0-then-C1. The C1 "synthetic-suite" verification bar is
-  met by the 460-test suite + the offline `hello` end-to-end run + the testkit stub layer (a full
+  met by the suite + the offline `hello` end-to-end run + the testkit stub layer (a full
   pipeline replays offline through the `stub` executor).
 - **C2 — partial.** Envelope composer and the `claude`/`codex`/`grok` executors are code-complete and
-  unit-tested against fake binaries; the live `claude` parity run is still pending.
-- **C4 — pending:** the Codex headless-hook (blocking-pretool) probe.
-- **C5–C7 — not started:** Grok live setup, batch / CMS population / scheduling, package extraction
-  (cairn to its own repo per DISTRIBUTION.md).
+  unit-tested against fake binaries; the **`claude` executor is now live-verified** (the first live
+  `claude -p` runs, captured as offline stub regressions in `tests/live/workspace-claude`; this is
+  also what forced `--permission-mode bypassPermissions` and the `USER`/`LOGNAME` env baseline). The
+  `codex`/`grok` live parity runs are still pending.
+- **C6 verbs — shipped ahead of sequence.** `cairn batch` (process pool of `cairn run --headless`),
+  `cairn learnings` (cross-run `learn`-event aggregation), `cairn gc` (dry-run retention, `--apply`
+  to delete), and **first-class scheduling** (`schedules.yaml`, `cairn schedule install|list|run|
+  uninstall`, cron/launchd/systemd backends, content-key idempotency) are all built and tested —
+  LIVE, no longer stubs. The workspace **`requires`-pin** is enforced at plan time and cairn's
+  version is **0.1.0**.
+- **C4 — pending:** the Codex headless-hook (blocking-pretool) probe — now also the empirical
+  confirmation that Claude's PreToolUse hooks still fire+block under `bypassPermissions` (ARCHITECTURE §4).
+- **Still ahead:** Grok live setup (C5), the `brease=on` CMS-population branch, `v0.1.0` tag/packaging
+  (C7 — packaging this standalone repo, not a repo move), and the brease-factory workspace migration.
 
 ---
 
@@ -105,6 +115,9 @@ with per-step models recorded in `run.json`.
 
 ## C6 — Batch + CMS branch
 
+*Status: batch, learnings, gc, and scheduling below are **built and tested (LIVE)** — shipped ahead
+of sequence. Only the `brease=on` CMS-population branch remains future.*
+
 **Build:** `cairn batch` (process pool of `cairn run --headless`); the `brease=on` branch
 (brease-auth manual step, modeler, populate-approval gate with headless default **no**, populator,
 wrong-CMS guard **fail-closed**); **scheduling** (`--idempotent`, `schedules.yaml`,
@@ -114,16 +127,18 @@ sugar over batch + headless + locking, all of which land in this milestone).
 **Verify:** a 3-site batch per executor, gates preset, guards armed (per-process env — assert no
 fail-open); one CMS build populates the correct env and a wrong-target mutation is blocked.
 
-## C7 — Extraction + hardening
+## C7 — Packaging + hardening
 
-**Build:** extract `cairn/` to its own repo per the `DISTRIBUTION.md` spec (package anatomy §1,
-compatibility surfaces §3, workspace scaffold §4 incl. the operator skill), tag `v0.1.0`,
-`uv tool install git+…` path; workspace pins `requires`; CI = synthetic suite (C1) + `cairn plan`
-over every workspace pipeline + doctor smoke. Optionally stub a 4th executor to prove nothing
-leaked outside the plugin surfaces.
+*cairn is already its own standalone repo (DISTRIBUTION §2), so "extraction" here is **packaging**,
+not a repo move. The workspace `requires`-pin refusal at plan time has already landed (see Status).*
 
-**Verify:** brease-factory runs against the *installed* cairn (not the in-repo copy); version-pin
-mismatch is refused at plan time.
+**Build:** package this repo per the `DISTRIBUTION.md` spec (package anatomy §1, compatibility
+surfaces §3, workspace scaffold §4 incl. the operator skill), tag `v0.1.0`, `uv tool install git+…`
+path; CI = synthetic suite (C1) + `cairn plan` over every workspace pipeline + doctor smoke.
+Optionally stub a 4th executor to prove nothing leaked outside the plugin surfaces.
+
+**Verify:** brease-factory runs against the *installed* cairn (not the run-in-place copy); version-pin
+mismatch is refused at plan time (**done** — `cairn plan` via `config.check_requires`).
 
 ---
 
@@ -134,7 +149,7 @@ mismatch is refused at plan time.
 | C0 start | confirm cairn replaces the straight port (this plan supersedes PORT-DESIGN M0–M7) | yes |
 | C2 | workspace layout migration (skills to root, `.claude/` thins to wrapper+symlinks) | migrate |
 | C4 | Codex guard posture — set by the doctor probe, not by judgment | probe decides |
-| C7 | extraction timing — only when the Executor protocol has survived three real implementations | after C5 |
+| C7 | packaging/tag timing — only when the Executor protocol has survived three real implementations | after C5 |
 
 Risks: PORT-DESIGN §8.1 applies verbatim (Codex hooks/version churn, Grok user-config-only model
 routing, undocumented Grok schemas, cross-vendor tier quality). One risk is *retired* by this
