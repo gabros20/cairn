@@ -61,6 +61,33 @@ systemd user timers), is idempotent, and never touches entries outside its marke
 default to `~/Library/LaunchAgents` (launchd) and `~/.config/systemd/user` (systemd), overridable
 with `--launchd-dir` / `--systemd-dir`.
 
+The two moments — install-time sync and fire-time execution — never touch the same layer, which is
+what lets the host own the clock while cairn owns state:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Op as Operator
+    participant Y as schedules.yaml
+    participant CLI as cairn schedule
+    participant Host as host scheduler<br/>(cron/launchd/systemd)
+    participant Run as cairn run --headless …<br/>(--idempotent opt-in)
+    participant Trail as trail.jsonl
+
+    Note over Op,Host: install-time — sync (only on add/remove/retime)
+    Op->>CLI: cairn schedule install
+    CLI->>Y: read declared entries
+    CLI->>Host: write one line per entry:<br/>`cairn schedule run <name>`
+
+    Note over Host,Trail: fire-time — the timer runs, unattended
+    Host->>CLI: cairn schedule run <name>
+    CLI->>Y: resolve <name> → argv
+    CLI->>Run: exec the run: argv verbatim
+    Run->>Trail: append run/step/gate/learn events
+    Run-->>CLI: exit code (propagated unchanged)
+    CLI-->>Host: re-emit child stdout/stderr (cron MAILTO)
+```
+
 **One cron shape the calendar backends refuse.** A cron expression that restricts **both**
 day-of-month and day-of-week (e.g. `0 3 1 * 1` — "the 1st **or** a Monday") means a *union* in cron,
 but launchd's `StartCalendarInterval` and systemd's `OnCalendar` can only **AND** their components.
