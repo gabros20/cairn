@@ -163,6 +163,10 @@ def _doctor_probe_hooks(scope: list[str], workspace_dir: Path, out: Callable[[st
         result = hookprobe.probe(recipe, workspace_dir=workspace_dir)
         level, line = hookprobe.render(result, blocking_hooks)
         out(line)
+        # Side-channel findings (e.g. a canary dir that survived cleanup and may hold copied
+        # auth material) — warnings only, never part of the exit policy.
+        for w in result.warnings:
+            out(f"  ! hook probe {name}   {w}")
         if level == "error":
             errs += 1
     return errs

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 from pathlib import Path
 
@@ -244,6 +245,55 @@ def test_canary_dir_is_cleaned_up(fakebin, tmp_path, monkeypatch):
     assert not created[0].exists(), "the canary tempdir must be removed after the probe"
 
 
+def test_leftover_canary_cleaned_by_retry_without_warning(fakebin, tmp_path, monkeypatch):
+    """A detached vendor child that writes ONCE after the first rmtree (the observed live codex
+    plugins-clone straggler) is mopped up by the single bounded-wait retry — no warning."""
+    real_rmtree = shutil.rmtree
+    calls = {"n": 0}
+
+    def flaky(path, *a, **k):
+        real_rmtree(path, *a, **k)
+        if not Path(path).name.startswith("cairn-hookprobe-"):
+            return  # only meddle with the probe's canary root, not e.g. tempfile's own dirs
+        calls["n"] += 1
+        if calls["n"] == 1:  # simulate the child's late write, once
+            (Path(path) / "canary" / ".codex" / ".tmp" / "late").mkdir(parents=True)
+
+    monkeypatch.setattr(hookprobe.shutil, "rmtree", flaky)
+    slept: list[float] = []
+    monkeypatch.setattr(hookprobe.time, "sleep", lambda s: slept.append(s))
+
+    r = _run(ClaudeHookRecipe(), "fires_blocks", tmp_path)
+    assert r.outcome == "fires_blocks"
+    assert r.warnings == ()
+    assert calls["n"] == 2 and slept, "expected one bounded wait + one retry"
+
+
+def test_leftover_canary_survives_retry_and_warns(fakebin, tmp_path, monkeypatch):
+    """A straggler that persists through the retry must surface as a legible warning naming the
+    leftover path (it may contain copied auth material) — and never raise."""
+    real_rmtree = shutil.rmtree
+    roots: list[Path] = []
+
+    def stubborn(path, *a, **k):
+        real_rmtree(path, *a, **k)
+        if not Path(path).name.startswith("cairn-hookprobe-"):
+            return  # only meddle with the probe's canary root, not e.g. tempfile's own dirs
+        (Path(path) / "canary" / ".codex" / ".tmp" / "straggler").mkdir(parents=True)
+        if Path(path) not in roots:
+            roots.append(Path(path))
+
+    monkeypatch.setattr(hookprobe.shutil, "rmtree", stubborn)
+    monkeypatch.setattr(hookprobe.time, "sleep", lambda s: None)
+
+    r = _run(ClaudeHookRecipe(), "fires_blocks", tmp_path)
+    assert r.outcome == "fires_blocks"  # the verdict itself is unaffected
+    assert len(r.warnings) == 1
+    assert str(roots[0]) in r.warnings[0]
+    assert "auth" in r.warnings[0]  # names the risk: the leftover may hold copied auth material
+    real_rmtree(roots[0], ignore_errors=True)  # tidy the deliberately-planted leftover
+
+
 # --------------------------------------------------------------------------- #
 # The recipes emit valid, firing hook config.
 # --------------------------------------------------------------------------- #
@@ -438,6 +488,25 @@ def test_doctor_probe_falsification_fails_exit(tmp_path, monkeypatch):
     rc = run_doctor(ws, probe_hooks=True, out=lines.append)
     assert rc == int(ExitCode.CONFIG)
     assert any("✗ hook probe claude" in ln for ln in lines)
+
+
+def test_doctor_prints_probe_warnings(tmp_path, monkeypatch):
+    ws = _hello_ws(tmp_path)
+    leftover = "canary dir left behind at /tmp/cairn-hookprobe-x (it may contain copied auth material)"
+    monkeypatch.setattr(
+        hookprobe, "probe",
+        lambda recipe, **kw: ProbeResult(
+            "claude", "fires_blocks", "d", "v", "under bypassPermissions", "deny",
+            warnings=(leftover,),
+        ),
+    )
+    from cairn.kernel.doctor import run_doctor
+    from cairn.kernel.types import ExitCode
+
+    lines: list[str] = []
+    rc = run_doctor(ws, probe_hooks=True, out=lines.append)
+    assert rc == int(ExitCode.OK)  # a cleanup warning never fails the exit
+    assert any(ln.startswith("  !") and leftover in ln for ln in lines)
 
 
 def test_doctor_probe_inconclusive_only_warns(tmp_path, monkeypatch):

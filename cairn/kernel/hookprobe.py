@@ -41,7 +41,8 @@ import os
 import shlex
 import shutil
 import tempfile
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
@@ -95,7 +96,9 @@ _AUTH_SIGNS = (
 @dataclass(frozen=True)
 class ProbeResult:
     """One executor's probe outcome. ``detail`` is a human sentence; ``posture`` and
-    ``mechanism`` are copied from the recipe for the doctor line + the record."""
+    ``mechanism`` are copied from the recipe for the doctor line + the record. ``warnings``
+    carries side-channel findings (e.g. a canary dir that survived cleanup) that the doctor
+    prints as warning lines — they never change the outcome or the exit code."""
 
     executor: str
     outcome: Outcome
@@ -103,6 +106,7 @@ class ProbeResult:
     cli_version: str | None
     posture: str      # e.g. "under bypassPermissions"
     mechanism: str    # e.g. "PreToolUse deny-JSON"
+    warnings: tuple[str, ...] = ()
 
 
 # --------------------------------------------------------------------------- #
@@ -346,6 +350,12 @@ def _looks_like_auth_failure(output: str, code: int) -> bool:
     return code != 0 and any(sign in low for sign in _AUTH_SIGNS)
 
 
+# How long the cleanup waits before its single retry — long enough for a detached vendor
+# child (observed live: codex's plugins-clone writer) to finish its late write, short enough
+# not to stall doctor.
+_CLEANUP_RETRY_WAIT_S = 1.0
+
+
 def probe(
     recipe: HookRecipe,
     *,
@@ -357,7 +367,10 @@ def probe(
     """Run ``recipe`` once against a fresh canary and return its :class:`ProbeResult`.
 
     ``extra_env`` is a test seam (merged last, over the walker baseline); the production doctor
-    path passes nothing, preserving env fidelity. Never caches; always removes the canary."""
+    path passes nothing, preserving env fidelity. Never caches. Cleanup removes the canary,
+    retrying once after a bounded wait if a detached vendor child re-created files; a canary
+    that STILL survives is reported in ``result.warnings`` (it may contain copied auth
+    material) — never raised."""
     model = model or recipe.model
 
     if recipe.static_outcome is not None:
@@ -367,56 +380,93 @@ def probe(
 
     tmp = Path(tempfile.mkdtemp(prefix="cairn-hookprobe-"))
     try:
-        canary = tmp / "canary"
-        (canary / _PROBE_SUBDIR).mkdir(parents=True)
-        marker = canary / _MARKER_REL
-        sidecar = canary / _SIDECAR_REL
-
-        env = build_probe_env(canary, workspace_dir)
-        env.update(recipe.extra_env(canary))
-        if extra_env:
-            env.update(extra_env)
-
-        if not recipe.available(env):
-            return ProbeResult(
-                recipe.name, "inconclusive",
-                f"{recipe.name!r} not found on PATH — nothing to probe",
-                None, recipe.posture, recipe.mechanism,
-            )
-
-        version = recipe.version(env)
-        recipe.write_canary(canary, marker, sidecar)
-        prompt_text = recipe.build_prompt(sidecar)
-        (canary / _PROBE_SUBDIR / "prompt.md").write_text(prompt_text, encoding="utf-8")
-        argv, stdin_text = recipe.build_invocation(canary, prompt_text, model)
-
-        try:
-            code, output, _dur = run_process(
-                argv,
-                stdin_text=stdin_text,
-                env=env,
-                cwd=canary,
-                timeout_s=timeout_s,
-                log_path=canary / _PROBE_SUBDIR / "invoke.log",
-            )
-        except ExecTimeout:
-            return ProbeResult(
-                recipe.name, "inconclusive",
-                f"the canary invocation timed out after {timeout_s}s",
-                version, recipe.posture, recipe.mechanism,
-            )
-
-        if _looks_like_auth_failure(output, code):
-            return ProbeResult(
-                recipe.name, "inconclusive",
-                f"{recipe.name} reported an auth/login failure (run its login) — cannot probe",
-                version, recipe.posture, recipe.mechanism,
-            )
-
-        outcome, detail = _classify(marker.exists(), sidecar.exists())
-        return ProbeResult(recipe.name, outcome, detail, version, recipe.posture, recipe.mechanism)
+        result = _probe_in(
+            recipe, tmp, workspace_dir=workspace_dir, timeout_s=timeout_s,
+            model=model, extra_env=extra_env,
+        )
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        leftover = _cleanup_canary(tmp)
+    if leftover is not None:
+        result = replace(
+            result,
+            warnings=result.warnings + (
+                f"canary dir left behind at {leftover} — a detached {recipe.name} child "
+                f"re-created files after cleanup; remove it manually (it may contain copied "
+                f"auth material)",
+            ),
+        )
+    return result
+
+
+def _cleanup_canary(tmp: Path) -> Path | None:
+    """Remove the canary root; on leftovers, wait briefly and retry ONCE. Returns the path if
+    it still exists afterward (the caller turns that into a warning). Never raises."""
+    shutil.rmtree(tmp, ignore_errors=True)
+    if not tmp.exists():
+        return None
+    time.sleep(_CLEANUP_RETRY_WAIT_S)
+    shutil.rmtree(tmp, ignore_errors=True)
+    return tmp if tmp.exists() else None
+
+
+def _probe_in(
+    recipe: HookRecipe,
+    tmp: Path,
+    *,
+    workspace_dir: Path,
+    timeout_s: int,
+    model: str,
+    extra_env: dict[str, str] | None,
+) -> ProbeResult:
+    """The probe body, against a caller-owned tempdir (the caller cleans up)."""
+    canary = tmp / "canary"
+    (canary / _PROBE_SUBDIR).mkdir(parents=True)
+    marker = canary / _MARKER_REL
+    sidecar = canary / _SIDECAR_REL
+
+    env = build_probe_env(canary, workspace_dir)
+    env.update(recipe.extra_env(canary))
+    if extra_env:
+        env.update(extra_env)
+
+    if not recipe.available(env):
+        return ProbeResult(
+            recipe.name, "inconclusive",
+            f"{recipe.name!r} not found on PATH — nothing to probe",
+            None, recipe.posture, recipe.mechanism,
+        )
+
+    version = recipe.version(env)
+    recipe.write_canary(canary, marker, sidecar)
+    prompt_text = recipe.build_prompt(sidecar)
+    (canary / _PROBE_SUBDIR / "prompt.md").write_text(prompt_text, encoding="utf-8")
+    argv, stdin_text = recipe.build_invocation(canary, prompt_text, model)
+
+    try:
+        code, output, _dur = run_process(
+            argv,
+            stdin_text=stdin_text,
+            env=env,
+            cwd=canary,
+            timeout_s=timeout_s,
+            log_path=canary / _PROBE_SUBDIR / "invoke.log",
+        )
+    except ExecTimeout:
+        return ProbeResult(
+            recipe.name, "inconclusive",
+            f"the canary invocation timed out after {timeout_s}s",
+            version, recipe.posture, recipe.mechanism,
+        )
+
+    if _looks_like_auth_failure(output, code):
+        return ProbeResult(
+            recipe.name, "inconclusive",
+            f"{recipe.name} reported an auth/login failure (run its login) — cannot probe",
+            version, recipe.posture, recipe.mechanism,
+        )
+
+    outcome, detail = _classify(marker.exists(), sidecar.exists())
+    return ProbeResult(recipe.name, outcome, detail, version, recipe.posture, recipe.mechanism)
 
 
 # --------------------------------------------------------------------------- #
