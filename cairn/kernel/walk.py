@@ -81,6 +81,7 @@ from cairn.kernel.runstate import (
 )
 from cairn.kernel.schemas import get_schema
 from cairn.kernel.template import HELPERS, TemplateContext, TemplateError, render
+from cairn.kernel.trail import format_at
 from cairn.kernel.types import ExitCode, Invocation
 
 # The template placeholder + helper shapes, mirrored here so lenient command rendering can
@@ -153,7 +154,7 @@ def bootstrap_run(
                 "versions": {},
             },
             "models": models,
-            "created_at": now.isoformat(),
+            "created_at": format_at(now),
             "status": "running",
             "nodes": {},
         }
@@ -428,8 +429,11 @@ class _Walk:
                 }
                 if block.get("metrics"):
                     data["metrics"] = block["metrics"]
-                if block.get("usage"):
-                    data["usage"] = block["usage"]
+                # Executor-reported usage (json output-format, future) outranks a model's
+                # self-reported STEP-block usage; today result.usage is None → block wins.
+                usage = result.usage or block.get("usage")
+                if usage:
+                    data["usage"] = usage
                 self._emit("step-done", node=step.id, attempt=attempt, cycle=cycle, data=data)
                 self._set_status(step.id, "done", cycles=cycle)
                 return
@@ -844,7 +848,7 @@ class _Walk:
             return self._trail.emit(event, node=node, attempt=attempt, cycle=cycle, data=data)
 
     def _set_status(self, node_id: str, status: str, cycles: int | None = None) -> None:
-        at = self.now.isoformat()
+        at = format_at(self.now)
         with self._lock:
             update_run(
                 self.run_dir,
