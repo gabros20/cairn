@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cairn:fleet/summary",
+  "title": "fleet summary artifact",
+  "description": "The grok-pinned summarize step's artifact: the executor names copied out of BOTH upstream artifacts plus the workspace sentinel token (checked by validators/fleet_sentinel.py, not this schema).",
+  "type": "object",
+  "required": ["executor", "build_executor", "review_executor", "token", "ok"],
+  "properties": {
+    "executor": { "const": "grok" },
+    "build_executor": { "const": "codex" },
+    "review_executor": { "const": "claude" },
+    "token": { "type": "string" },
+    "ok": { "type": "boolean" },
+    "note": { "type": "string" }
+  }
+}

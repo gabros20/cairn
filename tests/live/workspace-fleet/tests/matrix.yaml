@@ -1,0 +1,14 @@
+# Offline pipeline regression (zero tokens). The row is planned, bootstrapped, and walked
+# through the StubExecutor — which impersonates ALL THREE pinned executors and replays the
+# recorded artifacts under tests/stubs/ — so the live mixed-fleet run is locked in as a
+# repeatable check. `cairn test` binds this.
+#
+# DELIBERATE DEVIATION from the single-executor siblings' two-pipeline shape: no smokefail
+# here. Exit-3 retry/halt coverage is owned by workspace-claude/-codex/-grok (each proves it
+# per vendor); this workspace exists solely to prove the three executors cooperate in ONE
+# pipeline with per-step `executor:` pinning — so the matrix is happy-path only.
+
+fleet:
+  # Happy path: stubs replay build.json / review.json / summary.json per step; each validates
+  # against its schema (+ the summary's sentinel validator) → exit 0 (the default expectation).
+  - {}

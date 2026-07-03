@@ -1,0 +1,14 @@
+description: "Fleet summary agent — reads the build + review artifacts and writes the final summary (runs on the grok leg of the fleet)."
+
+tier: cheap             # → grok-composer-2.5-fast on grok in cairn.toml (the default/cheapest model)
+effort: low             # exercises grok's native `--effort low` argv path
+
+skills: []
+
+tools:
+  allow: [read, write]  # reads both upstream artifacts, writes the summary
+  network: false
+
+env: []
+
+returns: schemas/step-return.json

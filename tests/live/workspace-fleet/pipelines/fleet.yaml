@@ -1,0 +1,62 @@
+# fleet — the mixed-fleet live proof (C5): three agent steps in ONE pipeline, each pinned to
+# a different executor via the step-level `executor:` key, with artifacts flowing between
+# vendors via `needs`. build (codex/gpt-5.5) → review (claude/haiku, reads build) →
+# summarize (grok/grok-composer-2.5-fast, reads both). run.json's `models` map records the
+# per-step routing.
+# Run live:  cd tests/live/workspace-fleet && uv run cairn run fleet --headless
+
+pipeline: fleet
+version: 1
+
+run_id: "fleet-{date}"
+
+artifacts:
+  build:
+    path: build.json
+    schema: schemas/build.json
+    describe: "The build leg's tiny JSON. Its `executor` key names the vendor that wrote it."
+  review:
+    path: review.json
+    schema: schemas/review.json
+    describe: "The review leg's JSON: `build_executor` must be copied from the build artifact."
+  summary:
+    path: summary.json
+    schema: schemas/summary.json
+    validator: validators/fleet_sentinel.py    # ALSO gated on the workspace's unique sentinel token
+    describe: "The final JSON: executor names copied from both upstream artifacts + the sentinel token."
+
+steps:
+  # Each step is told exactly what to write — this proves plumbing, not intelligence.
+
+  - id: build
+    agent: builder
+    executor: codex                            # per-step pin (overrides default_executor=claude)
+    produces: [build]
+    args:
+      want: 'write build.json containing exactly {"executor": "codex", "ok": true}'
+
+  - id: review
+    agent: reviewer
+    executor: claude                           # the C5 bar: review pinned to claude
+    needs: [build]
+    produces: [review]
+    args:
+      # build_executor's value is deliberately NOT stated here — the agent must read it out
+      # of build.json (the CONTRACT gives the absolute path), proving cross-executor dataflow.
+      want: >-
+        read the build artifact listed under Inputs, then write review.json containing exactly
+        {"executor": "claude", "build_executor": <the "executor" value you read from the build
+        artifact>, "ok": true}
+
+  - id: summarize
+    agent: summarizer
+    executor: grok                             # third vendor in the same run
+    needs: [build, review]
+    produces: [summary]
+    args:
+      want: >-
+        read BOTH input artifacts listed under Inputs, then write summary.json containing exactly
+        {"executor": "grok", "build_executor": <the "executor" value from the build artifact>,
+        "review_executor": <the "executor" value from the review artifact>, "token": <the token
+        arg below, verbatim>, "ok": true}
+      token: "cairn-fleet-sentinel-e5a2c7"

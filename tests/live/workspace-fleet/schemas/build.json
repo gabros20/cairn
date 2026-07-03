@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cairn:fleet/build",
+  "title": "fleet build artifact",
+  "description": "The tiny typed artifact the codex-pinned build step writes.",
+  "type": "object",
+  "required": ["executor", "ok"],
+  "properties": {
+    "executor": { "const": "codex" },
+    "ok": { "type": "boolean" },
+    "note": { "type": "string" }
+  }
+}

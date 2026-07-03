@@ -1,0 +1,14 @@
+description: "Fleet review agent — reads the build artifact and writes the review artifact (runs on the claude leg of the fleet)."
+
+tier: cheap             # → haiku on claude in cairn.toml; keeps live token cost minimal
+effort: low             # exercises the claude executor's `--effort` argv path
+
+skills: []
+
+tools:
+  allow: [read, write]  # reads the build artifact, writes the review artifact
+  network: false
+
+env: []
+
+returns: schemas/step-return.json

@@ -1,0 +1,14 @@
+description: "Fleet build agent — writes the tiny typed build artifact (runs on the codex leg of the fleet)."
+
+tier: cheap             # → gpt-5.5 on codex in cairn.toml (the only ChatGPT-plan model)
+effort: low             # cost control on the codex leg (`-c model_reasoning_effort=low`)
+
+skills: []
+
+tools:
+  allow: [read, write]  # the agent only needs to write its one artifact
+  network: false
+
+env: []
+
+returns: schemas/step-return.json

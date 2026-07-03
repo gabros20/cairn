@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cairn:fleet/review",
+  "title": "fleet review artifact",
+  "description": "The claude-pinned review step's artifact. `build_executor` must be copied out of the build artifact (the value never appears in the review prompt), so a schema pass proves the cross-executor dataflow, not just the write.",
+  "type": "object",
+  "required": ["executor", "build_executor", "ok"],
+  "properties": {
+    "executor": { "const": "claude" },
+    "build_executor": { "const": "codex" },
+    "ok": { "type": "boolean" },
+    "note": { "type": "string" }
+  }
+}

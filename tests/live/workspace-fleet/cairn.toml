@@ -1,0 +1,46 @@
+# Live MIXED-FLEET workspace (tests/live/workspace-fleet) — the C5 proof.
+#
+# The three single-executor workspaces (workspace-claude/-codex/-grok) each verified ONE
+# vendor CLI end-to-end. This workspace proves they cooperate in a SINGLE pipeline with
+# per-step executor pinning: build → codex, review → claude, summarize → grok, artifacts
+# flowing between them via `needs`, per-step models recorded in run.json.
+#
+# NOT run by the offline `cairn test` suites of the main repo; it is its own workspace,
+# exercised live once and regression-locked via `cairn test record`.
+
+[workspace]
+name             = "workspace-fleet"
+doctrine         = "prompts/DOCTRINE.md"
+runs_dir         = "runs"
+# Every fleet step carries an explicit `executor:` pin, so the default is only a fallback
+# for future unpinned steps; claude/haiku is the cheapest+fastest vendor on this machine.
+default_executor = "claude"
+
+[defaults]
+step_timeout  = "10m"                            # codex exec is the slow leg (~1min observed solo); generous headroom
+trail_context = { events = 12, learnings = 5 }
+
+# The ONLY place vendor model names live. Each tier copies the machine caveat its
+# single-executor workspace verified live:
+
+# Verified live: `cheap` → haiku keeps the claude leg's token cost minimal.
+[executors.claude]
+enabled = true
+[executors.claude.tiers]
+cheap = { model = "haiku" }
+
+# Verified live on codex-cli 0.142.5 with a ChatGPT account: gpt-5.5 is the ONLY accepted
+# model (every -mini/-codex variant is rejected with "not supported when using Codex with
+# a ChatGPT account"), so `cheap` pins gpt-5.5 and cost is kept down via effort=low.
+[executors.codex]
+enabled = true
+[executors.codex.tiers]
+cheap = { model = "gpt-5.5" }
+
+# Verified live on grok 0.2.82 (grok.com session login): `grok models` lists exactly two
+# models — grok-composer-2.5-fast (the default, fastest/cheapest) and grok-build. `cheap`
+# pins grok-composer-2.5-fast; cost is further kept down via grok's native --effort low.
+[executors.grok]
+enabled = true
+[executors.grok.tiers]
+cheap = { model = "grok-composer-2.5-fast" }
