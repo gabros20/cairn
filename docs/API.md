@@ -40,7 +40,7 @@ already carrying the `self-improve` learning-loop furniture:
 │   ├── matrix.yaml                #   param sets the stub runs exercise
 │   ├── fixtures/proposals/…       #   valid-*/invalid-* validator fixtures
 │   └── stubs/self-improve/…       #   canned artifacts for stub runs
-└── runs/                          # §8 — every execution, self-describing (gitignored, never shared)
+└── runs/                          # §8 — created on first run; every execution, self-describing (gitignored)
 ```
 
 Two directories are conventional, added when a workspace needs them (they are *not* in the day-0
@@ -425,13 +425,17 @@ validation outranks this block in both directions (ARCHITECTURE §7).
 
 ## 8. Run directory layout & schemas
 
-The skeleton (`run.json`, `trail.jsonl`, `gates/`, `logs/`) is identical in every cairn run on earth;
-only the artifact paths under it are author-controlled (each artifact's `path:`). A populated run:
+The skeleton (`run.json`, `trail.jsonl`, `gates/`, `logs/`, and the internal `.cairn.lock` / `.cairn/`)
+is identical in every cairn run on earth; only the artifact paths under it are author-controlled (each
+artifact's `path:`). A populated run:
 
 ```
 runs/acme-redesign-20260703/
 ├── run.json                       # the pinned manifest — schemas/run.schema.json (§8.1)
 ├── trail.jsonl                    # append-only event log — the authority (§8.2)
+├── .cairn.lock                    # advisory flock — serializes resume/parallel writers (SECURITY §5)
+├── .cairn/                        # kernel bookkeeping, not author-facing
+│   └── step-return.json           #   the STEP return schema, materialized for the executor to read
 ├── gates/
 │   └── scope.json                 # one decision file per answered gate ({choice, by, at})
 ├── logs/                          # one pair per step attempt — the exact record of what ran
@@ -443,8 +447,9 @@ runs/acme-redesign-20260703/
 └── captures/  blueprints/  qa/ …  # the artifacts themselves, at each artifact's declared path:
 ```
 
-Log stems are `<step>[.rN][.cK].{log,prompt.md}` — the retry suffix (`.rN`, N>1) precedes the loop-cycle
-suffix (`.cK`), both omitted when they're 1 / absent.
+Log stems are `<step>[.rN][.cK].{log,prompt.md}`: the retry suffix `.rN` appears only from the second
+attempt on (attempt 1 carries none), and the loop-cycle suffix `.cK` is present for **every** cycle of a
+loop body — cycle 1 is `.c1` — and absent only for steps outside a loop.
 
 ### 8.1 `run.json` (pinned — resolves today's live drift)
 ```json
