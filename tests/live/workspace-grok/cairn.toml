@@ -1,0 +1,28 @@
+# Live smoke workspace for the GROK executor (tests/live/workspace-grok).
+#
+# This is the FIRST time cairn's GrokExecutor runs against the real `grok` CLI
+# (unit tests only ever drive a fake binary). It is deliberately tiny: one agent step,
+# one model, one small typed artifact — a token-minimal end-to-end proof that
+# compose → invoke → sentinel-parse → validate → trail works on the real vendor.
+#
+# NOT run by the offline `cairn test` suites of the main repo; it is its own workspace,
+# exercised live and regression-locked via `cairn test record`.
+
+[workspace]
+name             = "workspace-grok"
+doctrine         = "prompts/DOCTRINE.md"
+runs_dir         = "runs"
+default_executor = "grok"
+
+[defaults]
+step_timeout  = "10m"                            # a solo live call ran ~20s; generous headroom
+trail_context = { events = 12, learnings = 5 }
+
+# The ONLY place vendor model names live. Verified live on grok 0.2.82 with a grok.com
+# session login: `grok models` lists exactly two models — grok-composer-2.5-fast (the
+# default, fastest/cheapest) and grok-build. `cheap` pins grok-composer-2.5-fast; cost is
+# further kept down via effort=low (grok's native headless --effort flag).
+[executors.grok]
+enabled = true
+[executors.grok.tiers]
+cheap = { model = "grok-composer-2.5-fast" }

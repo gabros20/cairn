@@ -1,0 +1,25 @@
+# smokefail — the live grok executor's FAILURE path. The agent writes a valid-looking report,
+# but its validator requires a secret `token` the prompt withholds, so the step can never pass:
+# one retry-with-feedback, then a GATE_FAILED halt (exit 3). Exercises the retry + halt semantics
+# on the real CLI. Run live:  uv run cairn run smokefail --headless
+#
+# Kept cheap: retry.attempts=1 → at most 2 grok invocations.
+
+pipeline: smokefail
+version: 1
+
+run_id: "smokefail-{date}"
+
+artifacts:
+  gated_report:
+    path: gated_report.json
+    validator: validators/requires_token.py   # unsatisfiable by the agent → deterministic halt
+    describe: "A JSON report gated by a secret token the agent is never told — always rejected."
+
+steps:
+  - id: write_gated
+    agent: smoker
+    produces: [gated_report]
+    retry: { attempts: 1, feedback: true }     # show one retry-with-feedback, then halt
+    args:
+      want: 'a JSON object with the keys {"executor": "grok", "ok": true}'

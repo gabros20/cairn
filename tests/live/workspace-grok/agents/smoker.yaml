@@ -1,0 +1,14 @@
+description: "Smoke agent — writes one tiny typed report so the live grok executor can be verified end-to-end."
+
+tier: cheap             # → grok-composer-2.5-fast in cairn.toml (the default/cheapest model)
+effort: low             # exercises the executor's native `--effort low` argv path on the real CLI
+
+skills: []
+
+tools:
+  allow: [read, write]  # the agent only needs to write its one report artifact
+  network: false
+
+env: []
+
+returns: schemas/step-return.json
