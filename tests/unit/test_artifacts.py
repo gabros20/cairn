@@ -247,6 +247,26 @@ def test_executable_validator_runs_via_shebang(tmp_path):
     assert result.ok is True
 
 
+def test_validator_receives_rendered_artifact_path_as_argv3(tmp_path):
+    # Contract: argv = [run_dir, artifact_name, artifact_path]. echo_argv3.py echoes argv[3].
+    (tmp_path / "captures").mkdir()
+    (tmp_path / "captures" / "site-map.json").write_text("{}")
+    decl = _decl(name="site-map", path="captures/site-map.json", validator="echo_argv3.py")
+    resolved = resolve_path(decl, "captures/site-map.json", tmp_path)
+    result = validate(resolved, decl, tmp_path, VALIDATORS)
+    assert result.reasons == ["argv3=captures/site-map.json"]
+
+
+def test_glob_validator_receives_the_pattern_as_argv3(tmp_path):
+    # Glob artifacts get the rendered *pattern* string, not a matched file.
+    (tmp_path / "blueprints").mkdir()
+    (tmp_path / "blueprints" / "a.json").write_text("{}")
+    decl = ArtifactDecl(name="bp", path="blueprints/**", validator=VALIDATORS / "echo_argv3.py")
+    resolved = resolve_path(decl, "blueprints/**", tmp_path)
+    result = validate(resolved, decl, tmp_path, VALIDATORS)
+    assert result.reasons == ["argv3=blueprints/**"]
+
+
 # --------------------------------------------------------------------------- #
 # Missing-artifact short-circuit
 # --------------------------------------------------------------------------- #

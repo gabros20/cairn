@@ -247,8 +247,11 @@ returns: schemas/step-return.json   # default; override for special agents
 
 ## 4. Validator & guard-check contract
 
-Any executable. Validators: `argv = [run_dir, artifact_name]`; exit 0 pass; exit 1 fail with one
-reason per stdout line (fed to trail, halt message, and retry envelopes). Guard checks:
+Any executable. Validators: `argv = [run_dir, artifact_name, artifact_path]`; exit 0 pass; exit 1
+fail with one reason per stdout line (fed to trail, halt message, and retry envelopes). `artifact_path`
+is the artifact's rendered, run-dir-relative path (a glob artifact receives its pattern, e.g.
+`blueprints/**`), so a generic validator can locate the file without knowing the logical name. Guard
+checks:
 `stdin = {"command": "...", "env": {...}, "run_dir": "..."}` JSON; exit 0 allow; exit 2 deny with
 stderr reason. Both must be side-effect-free.
 

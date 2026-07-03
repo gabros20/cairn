@@ -57,10 +57,14 @@ class ResolvedArtifact:
 
     Plain paths resolve to exactly one entry (whether or not it exists yet); glob
     patterns resolve to the sorted set of matches (empty when nothing matches).
+    ``rendered_path`` keeps the run-dir-relative path string the planner rendered (the
+    literal path for plain artifacts, the pattern for globs) — it is the third argv
+    element passed to external validators (API §4).
     """
 
     name: str
     paths: list[Path]
+    rendered_path: str
 
 
 @dataclass(frozen=True)
@@ -160,7 +164,7 @@ def resolve_path(decl: ArtifactDecl, rendered_path: str, run_dir: Path) -> Resol
         paths = sorted(run_dir.glob(rendered_path))
     else:
         paths = [run_dir / rendered_path]
-    return ResolvedArtifact(name=decl.name, paths=paths)
+    return ResolvedArtifact(name=decl.name, paths=paths, rendered_path=rendered_path)
 
 
 def exists(resolved: ResolvedArtifact) -> bool:
@@ -192,14 +196,15 @@ def validate(
     """
     run_dir = Path(run_dir)
     if not exists(resolved):
-        missing = decl.path if _is_glob(decl.path) else _rel(resolved.paths[0], run_dir)
-        return ValidationResult(ok=False, reasons=[f"artifact missing: {missing}"])
+        return ValidationResult(
+            ok=False, reasons=[f"artifact missing: {resolved.rendered_path}"]
+        )
 
     reasons: list[str] = []
     if decl.schema is not None:
         reasons.extend(_schema_reasons(resolved, decl.schema, run_dir))
     if decl.validator is not None:
-        reasons.extend(_validator_reasons(decl, run_dir, workspace_dir, timeout_s))
+        reasons.extend(_validator_reasons(resolved, decl, run_dir, workspace_dir, timeout_s))
     return ValidationResult(ok=not reasons, reasons=reasons)
 
 
@@ -232,15 +237,24 @@ def _schema_reasons(resolved: ResolvedArtifact, schema_file: Path, run_dir: Path
 
 
 def _validator_reasons(
-    decl: ArtifactDecl, run_dir: Path, workspace_dir: Path, timeout_s: int
+    resolved: ResolvedArtifact,
+    decl: ArtifactDecl,
+    run_dir: Path,
+    workspace_dir: Path,
+    timeout_s: int,
 ) -> list[str]:
-    """Run the external validator (API §4): exit 0 pass; exit 1 → stdout reasons; else fail."""
+    """Run the external validator (API §4): exit 0 pass; exit 1 → stdout reasons; else fail.
+
+    argv is ``[run_dir, artifact_name, artifact_path]`` — the third element is the
+    rendered run-dir-relative path (the pattern for glob artifacts).
+    """
     validator = decl.validator
     assert validator is not None
+    argv_tail = [str(run_dir), decl.name, resolved.rendered_path]
     if validator.suffix == ".py":
-        cmd = [sys.executable, str(validator), str(run_dir), decl.name]
+        cmd = [sys.executable, str(validator), *argv_tail]
     else:
-        cmd = [str(validator), str(run_dir), decl.name]
+        cmd = [str(validator), *argv_tail]
     try:
         proc = subprocess.run(
             cmd,

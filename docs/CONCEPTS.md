@@ -183,8 +183,8 @@ the weakest CLI's hook support becomes the whole system's safety ceiling (PORT-D
 
 ## 10. Validator
 
-**Is:** a pure check — any executable, contract `argv: run_dir, artifact_name` → exit 0 or exit 1
-with machine-readable reasons on stdout. Today's `validate-artifact.py` decomposes into these.
+**Is:** a pure check — any executable, contract `argv: run_dir, artifact_name, artifact_path` → exit
+0 or exit 1 with machine-readable reasons on stdout. Today's `validate-artifact.py` decomposes into these.
 
 **Why pure and external:** validators are the *only* arbiter of done-ness, so they must be runnable
 by the walker, by `cairn validate` ad-hoc, by a retry prompt (reasons are fed back verbatim), and in
