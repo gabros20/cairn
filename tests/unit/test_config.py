@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from cairn.kernel.config import Config, load_config
+from cairn.kernel.config import Config, load_config, version_compat
 from cairn.kernel.errors import ConfigError
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -254,8 +254,6 @@ def test_check_requires_no_pin_is_a_noop(tmp_path):
 # version_compat — the cross-version resume gate's classifier (DISTRIBUTION §3).
 # --------------------------------------------------------------------------- #
 
-from cairn.kernel.config import version_compat
-
 
 @pytest.mark.parametrize(
     ("recorded", "installed", "verdict"),
@@ -264,6 +262,9 @@ from cairn.kernel.config import version_compat
         ("0.1.0", "0.1.0", "ok"),
         ("0.1.0", "0.1.9", "ok"),
         ("0.1", "0.1.4", "ok"),
+        # pre/dev tags compare by release tuple only — same major.minor ⇒ silent
+        ("0.2.0rc1", "0.2.0", "ok"),
+        ("0.2.0.dev1", "0.2.5", "ok"),
         # cross-minor within the same major ⇒ warn, never refuse
         ("0.1.0", "0.2.0", "warn"),
         ("0.9.0", "0.1.0", "warn"),

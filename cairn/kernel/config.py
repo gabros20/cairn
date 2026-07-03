@@ -183,6 +183,8 @@ def version_compat(recorded: str | None, installed: str) -> str:
     rec_major, inst_major = (rec[0] if rec else 0), (inst[0] if inst else 0)
     rec_minor = rec[1] if len(rec) > 1 else 0
     inst_minor = inst[1] if len(inst) > 1 else 0
+    # NB: 0.x minors can break under SemVer, but DISTRIBUTION §3 deliberately maps
+    # cross-minor → warn (refuse is reserved for cross-major, even in the 0.x series).
     if rec_major != inst_major:
         return "refuse"
     if rec_minor != inst_minor:
