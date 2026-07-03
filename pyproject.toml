@@ -1,10 +1,46 @@
 [project]
-name = "cairn"
+# PyPI distribution name. The import package and console script stay `cairn`; the bare
+# `cairn` name on PyPI belongs to an unrelated tool, so we publish as `cairn-pipelines`
+# (see docs/RELEASING.md § name situation).
+name = "cairn-pipelines"
 # Single-sourced: hatch reads __version__ from cairn/__init__.py (see [tool.hatch.version]).
 dynamic = ["version"]
 description = "Artifact-native pipeline orchestrator that delegates steps to coding-agent CLIs"
+readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Tamás Gábor" }]
+keywords = [
+    "pipeline",
+    "orchestrator",
+    "workflow",
+    "automation",
+    "agent",
+    "coding-agent",
+    "cli",
+    "claude",
+    "codex",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Environment :: Console",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+]
 dependencies = ["pyyaml", "jsonschema"]
+
+[project.urls]
+# TODO(activation): replace OWNER before the first publish (docs/RELEASING.md § activation).
+Homepage = "https://github.com/OWNER/cairn"
+Repository = "https://github.com/OWNER/cairn"
+Documentation = "https://github.com/OWNER/cairn/tree/main/docs"
+Changelog = "https://github.com/OWNER/cairn/blob/main/CHANGELOG.md"
+Issues = "https://github.com/OWNER/cairn/issues"
 
 [project.scripts]
 cairn = "cairn.cli:main"
@@ -37,3 +73,31 @@ packages = ["cairn"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# python-semantic-release drives releases from the GitHub Actions workflow (.github/workflows/
+# release.yml). It runs from the action, not as a project dependency. Schema verified against
+# python-semantic-release 10.5.3 docs (configuration + uv integration guide).
+[tool.semantic_release]
+# The version is dynamic in [project] (single-sourced from cairn/__init__.py), so PSR stamps the
+# Python variable directly — no version_toml entry (that is only for a static [project].version).
+version_variables = ["cairn/__init__.py:__version__"]
+tag_format = "v{version}"
+# Runs inside the PSR action container: install uv, re-lock our own package at the bumped version,
+# stage the lockfile so it rides the release commit, then build sdist+wheel. $PACKAGE_NAME is
+# provided by PSR (the distribution name, cairn-pipelines).
+build_command = """
+python -m pip install uv
+uv lock --upgrade-package "$PACKAGE_NAME"
+git add uv.lock
+uv build
+"""
+
+[tool.semantic_release.changelog]
+# Update mode stacks each generated section above the seed rather than rewriting the whole file;
+# the marker below must exist verbatim in CHANGELOG.md for the insertion to land.
+mode = "update"
+insertion_flag = "<!-- version list -->"
+
+[tool.semantic_release.changelog.default_templates]
+changelog_file = "CHANGELOG.md"
+output_format = "md"

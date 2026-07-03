@@ -12,7 +12,7 @@ wheels = [
 ]
 
 [[package]]
-name = "cairn"
+name = "cairn-pipelines"
 source = { editable = "." }
 dependencies = [
     { name = "jsonschema" },
