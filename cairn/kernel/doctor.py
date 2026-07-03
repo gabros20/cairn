@@ -18,7 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Callable
 
-from cairn.kernel.config import Config, load_config
+from cairn.kernel.config import Config, load_config, requires_satisfied
 from cairn.kernel.errors import ConfigError
 from cairn.kernel.plan import plan as build_plan
 
@@ -149,20 +149,18 @@ def _doctor_requires(spec: str, out: Callable[[str], None]) -> int:
     """One line stating whether the installed cairn satisfies the workspace ``requires`` pin.
     Reuses :func:`config.requires_satisfied` (never reimplements the PEP-440 subset). Returns
     1 (a doctor error) when unsatisfied or the spec is malformed, else 0."""
-    from cairn.kernel.config import requires_satisfied
-
     version = _version()
     try:
         ok = requires_satisfied(spec, version)
     except ValueError as exc:
-        out(f'{_BAD} requires "{spec}"    malformed spec: {exc}')
+        out(f'{_BAD} requires "{spec}"  malformed spec: {exc}')
         return 1
     if ok:
         out(f'{_OK} requires "{spec}"  satisfied by {version}')
         return 0
     out(
         f'{_BAD} requires "{spec}"  NOT satisfied by {version} '
-        f"→ install a matching cairn (e.g. `uv tool install 'cairn{spec}'`)"
+        f"→ install a cairn matching the pin, or edit `requires` in cairn.toml"
     )
     return 1
 

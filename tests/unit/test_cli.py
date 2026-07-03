@@ -644,7 +644,8 @@ def test_doctor_reports_requires_not_satisfied_and_fails(hello_ws, monkeypatch, 
     out = capsys.readouterr().out
     assert rc == int(ExitCode.CONFIG)  # an unsatisfied pin is a doctor error
     assert 'requires ">=9.0"' in out and "NOT satisfied by" in out
-    assert "uv tool install" in out  # the fix hint
+    # the fix hint offers both remedies, channel-neutrally
+    assert "install a cairn matching the pin" in out and "edit `requires` in cairn.toml" in out
 
 
 def test_doctor_no_requires_pin_prints_no_requires_line(hello_ws, monkeypatch, capsys):
