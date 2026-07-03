@@ -1,0 +1,86 @@
+# cairn release — python-semantic-release cuts the version, changelog, tag, and GitHub Release
+# from Conventional Commits; a second job publishes the built dist to PyPI via Trusted Publishing.
+# Manual-first: dispatch it when you want to release. See docs/RELEASING.md for the flow and the
+# one-time activation checklist. Action refs verified against python-semantic-release 10.5.3.
+name: release
+
+on:
+  workflow_dispatch:
+  # Uncomment to release on every push to main once the workflow is trusted in practice.
+  # Nothing releases unless commits since the last tag warrant a version bump, so this is safe
+  # to enable — it just removes the manual dispatch step.
+  # push:
+  #   branches: [main]
+
+# One release at a time per branch; queue rather than cancel so an in-flight tag/commit is never
+# interrupted half-written.
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: semantic release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the version commit + tag and create the GitHub Release
+    outputs:
+      released: ${{ steps.release.outputs.released }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Checkout repository (full history + tags)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0 # PSR needs the whole history + tags to evaluate the next version
+
+      - name: Force release branch to the workflow SHA
+        # Guard against a push landing on the branch while this workflow ran.
+        run: git reset --hard ${{ github.sha }}
+
+      - name: Semantic version release
+        id: release
+        uses: python-semantic-release/python-semantic-release@v10.5.3
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          git_committer_name: github-actions
+          git_committer_email: actions@users.noreply.github.com
+
+      - name: Upload distributions to the GitHub Release
+        uses: python-semantic-release/publish-action@v10.5.3
+        if: steps.release.outputs.released == 'true'
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          tag: ${{ steps.release.outputs.tag }}
+
+      - name: Hand the built dist to the publish job
+        uses: actions/upload-artifact@v4
+        if: steps.release.outputs.released == 'true'
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: publish to PyPI
+    needs: release
+    # Only when PSR actually cut a new version this run.
+    if: needs.release.outputs.released == 'true'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/cairn-pipelines/
+    permissions:
+      id-token: write # OIDC for PyPI Trusted Publishing — no API token, no secrets
+    steps:
+      - name: Download the built dist
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI (Trusted Publishing)
+        uses: pypa/gh-action-pypi-publish@v1.14.0
+        with:
+          packages-dir: dist/
