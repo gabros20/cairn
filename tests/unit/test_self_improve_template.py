@@ -342,9 +342,13 @@ def _git_workspace(ws: Path) -> None:
         assert res.returncode == 0, res.stderr
 
 
-def _run_open_pr(ws: Path, tmp_path: Path, monkeypatch, proposals: list[dict]) -> tuple[subprocess.CompletedProcess, Path, Path]:
+def _run_open_pr(
+    ws: Path, tmp_path: Path, monkeypatch, proposals: list[dict], *, shims_only: tuple[str, ...] = ()
+) -> tuple[subprocess.CompletedProcess, Path, Path]:
     """Invoke the script directly, the way the open-pr step does — shimmed PATH, a
-    CONTROLLED TMPDIR (so temp leftovers are observable), no network."""
+    CONTROLLED TMPDIR (so temp leftovers are observable), no network. With
+    ``shims_only``, PATH is REPLACED by the shim dir minus the named binaries — so a
+    'missing tool' scenario can never fall through to the real machine's binary."""
     _with_shims(monkeypatch, tmp_path)
     run_dir = tmp_path / "runs" / "self-improve-20260703"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -353,6 +357,10 @@ def _run_open_pr(ws: Path, tmp_path: Path, monkeypatch, proposals: list[dict]) -
     tmpdir.mkdir(exist_ok=True)
     env = dict(os.environ)
     env.update({"CAIRN_WORKSPACE": str(ws), "CAIRN_RUN_DIR": str(run_dir), "TMPDIR": str(tmpdir)})
+    if shims_only:
+        for name in shims_only:
+            (tmp_path / "shim-bin" / name).unlink()
+        env["PATH"] = str(tmp_path / "shim-bin")
     res = subprocess.run(
         [sys.executable, str(ws / SCRIPT), str(run_dir / "proposals.json"), str(run_dir / "pr.json")],
         capture_output=True, text=True, env=env,
@@ -411,6 +419,82 @@ def test_open_pr_skips_hostile_targets_but_still_applies_the_good_ones(ws: Path,
     assert list(tmpdir.iterdir()) == [], "mkdtemp parent dir was not cleaned up"
 
 
+def test_open_pr_skips_proposals_missing_required_fields(ws: Path, tmp_path: Path, monkeypatch) -> None:
+    # The gate-time veto path again: a human may delete keys, not just whole
+    # proposals — a missing field is a skip-with-reason, never a traceback.
+    if shutil.which("git") is None:  # pragma: no cover
+        pytest.skip("git required")
+    _git_workspace(ws)
+    no_action = {"id": "no-action", "promotion": "prompt", "target": "prompts/DOCTRINE.md",
+                 "text": "x", "rationale": "r"}
+    no_rationale = {"id": "no-rationale", "promotion": "prompt", "target": "prompts/DOCTRINE.md",
+                    "action": "append", "text": "x"}
+    good = {"id": "good", "promotion": "prompt", "target": "prompts/DOCTRINE.md",
+            "action": "append", "text": "\n## A fine rule\n", "rationale": "recurred"}
+
+    res, run_dir, _tmpdir = _run_open_pr(ws, tmp_path, monkeypatch, [no_action, no_rationale, good])
+
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "Traceback" not in res.stderr
+    record = json.loads((run_dir / "pr.json").read_text(encoding="utf-8"))
+    assert record["applied"] == ["prompts/DOCTRINE.md"]
+    assert {s["id"] for s in record["skipped"]} == {"no-action", "no-rationale"}
+    assert all("missing required field" in s["reason"] for s in record["skipped"])
+
+
+def test_open_pr_all_missing_fields_fails_clean_without_traceback(ws: Path, tmp_path: Path, monkeypatch) -> None:
+    if shutil.which("git") is None:  # pragma: no cover
+        pytest.skip("git required")
+    _git_workspace(ws)
+    broken = {"id": "no-text", "promotion": "prompt", "target": "prompts/DOCTRINE.md",
+              "action": "append", "rationale": "r"}
+
+    res, _run_dir, tmpdir = _run_open_pr(ws, tmp_path, monkeypatch, [broken])
+
+    assert res.returncode == 1
+    assert "Traceback" not in res.stderr
+    branches = subprocess.run(
+        [shutil.which("git"), "-C", str(ws), "branch", "--list", "self-improve/*"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert branches == "", f"stale branch left behind: {branches}"
+    assert list(tmpdir.iterdir()) == []
+
+
+def test_open_pr_missing_gh_is_legible_and_keeps_the_committed_branch(ws: Path, tmp_path: Path, monkeypatch) -> None:
+    # `gh` vanishing between the [tools] preflight and the PR call must not traceback:
+    # the failure names the missing binary AND the surviving branch (the commit is
+    # valuable — a retry pushes it; only the all-fail path deletes the branch).
+    if shutil.which("git") is None:  # pragma: no cover
+        pytest.skip("git required")
+    _git_workspace(ws)
+    good = {"id": "good", "promotion": "prompt", "target": "prompts/DOCTRINE.md",
+            "action": "append", "text": "\n## A fine rule\n", "rationale": "recurred"}
+
+    res, _run_dir, tmpdir = _run_open_pr(ws, tmp_path, monkeypatch, [good], shims_only=("gh",))
+
+    assert res.returncode == 1
+    assert "Traceback" not in res.stderr
+    assert "not found on PATH" in res.stderr
+    branches = subprocess.run(
+        [shutil.which("git"), "-C", str(ws), "branch", "--list", "self-improve/*"],
+        capture_output=True, text=True,
+    ).stdout.strip().lstrip("* ").strip()
+    assert branches.startswith("self-improve/"), "the committed branch must survive a push/PR failure"
+    assert branches in res.stderr, "the failure message must name the surviving branch"
+    assert list(tmpdir.iterdir()) == [], "the temp worktree dir must still be cleaned up"
+
+
+def test_ladder_table_names_every_promotion_enum_token(ws: Path) -> None:
+    # The curator's ladder table must carry the schema's `promotion` token per row —
+    # neither the agent nor a customizer should have to guess the mapping.
+    schema = json.loads((ws / "schemas/self-improve-proposals.json").read_text(encoding="utf-8"))
+    tokens = schema["properties"]["proposals"]["items"]["properties"]["promotion"]["enum"]
+    text = (ws / "skills/self-improve-curator/SKILL.md").read_text(encoding="utf-8")
+    for token in tokens:
+        assert f"`{token}`" in text, f"SKILL.md ladder table is missing the `{token}` enum token"
+
+
 # --------------------------------------------------------------------------- #
 # 5. Retrofit — `cairn new pipeline self-improve` into an existing workspace.
 # --------------------------------------------------------------------------- #
@@ -453,3 +537,30 @@ def test_new_pipeline_self_improve_never_clobbers(ws: Path) -> None:
     skill.write_text("customized doctrine\n", encoding="utf-8")
     newkit.new_stub("pipeline", "self-improve", ws)
     assert skill.read_text(encoding="utf-8") == "customized doctrine\n"
+
+
+def test_retrofit_appends_the_matrix_row_to_an_existing_hello_only_matrix(ws: Path) -> None:
+    # tests/matrix.yaml is a SHARED aggregation file: an older workspace already has
+    # one (hello row only), so plain no-clobber would silently drop the self-improve
+    # row — and with it the standing headless-refusal proof. The retrofit must
+    # APPEND the row without touching existing rows.
+    for rel in _FURNITURE:
+        (ws / rel).unlink()
+    (ws / "tests/matrix.yaml").write_text(
+        "# my matrix\nhello:\n  - { name: Ada }\n", encoding="utf-8"
+    )
+    newkit.new_stub("pipeline", "self-improve", ws)
+    text = (ws / "tests/matrix.yaml").read_text(encoding="utf-8")
+    doc = yaml.safe_load(text)
+    assert doc["hello"] == [{"name": "Ada"}], "existing rows must survive untouched"
+    assert doc["self-improve"] == [{}], "the self-improve row must be appended"
+    assert text.startswith("# my matrix\n"), "the append must not rewrite the file"
+
+
+def test_retrofit_leaves_a_matrix_that_already_covers_self_improve(ws: Path) -> None:
+    for rel in _FURNITURE:
+        (ws / rel).unlink()
+    custom = "self-improve:\n  - { since: '2026-01-01' }\nhello:\n  - {}\n"
+    (ws / "tests/matrix.yaml").write_text(custom, encoding="utf-8")
+    newkit.new_stub("pipeline", "self-improve", ws)
+    assert (ws / "tests/matrix.yaml").read_text(encoding="utf-8") == custom

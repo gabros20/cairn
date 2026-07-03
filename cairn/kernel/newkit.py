@@ -3,13 +3,16 @@
 ``new workspace`` instantiates the packaged ``templates/workspace/`` tree (the one hard
 requirement: ``cairn run hello`` works immediately, offline, zero auth) with
 ``{{WORKSPACE_NAME}}`` substituted. ``new pipeline|agent|skill|validator`` drop a minimal,
-plan-valid single-file stub into the right workspace directory. Pure stdlib.
+plan-valid single-file stub into the right workspace directory. Stdlib + pyyaml (the
+matrix-append check on the packaged self-improve retrofit).
 """
 
 from __future__ import annotations
 
 import shutil
 from pathlib import Path
+
+import yaml
 
 _WORKSPACE_MARKER = "{{WORKSPACE_NAME}}"
 
@@ -68,8 +71,12 @@ def new_workspace(name: str, dest_dir: Path | None = None) -> Path:
 # curator agent, curation-doctrine skill, proposals schema + validator, open-pr
 # script, and test fixtures/stubs/matrix. The pipeline file itself refuses to
 # overwrite; companion files that already exist are left untouched (never clobber a
-# customization). cairn.toml is never edited — the pipeline's header comment names
-# the two blocks ([executors.*] tiers, [tools.gh]) an older workspace wires by hand.
+# customization) — EXCEPT tests/matrix.yaml, which is a shared aggregation file: when
+# it exists without a top-level `self-improve:` key, the packaged row is APPENDED
+# (append-only; existing rows are never touched), so the standing headless-refusal
+# proof isn't silently dropped. cairn.toml is never edited — the pipeline's header
+# comment names the two blocks ([executors.*] tiers, [tools.gh]) an older workspace
+# wires by hand.
 # --------------------------------------------------------------------------- #
 
 _PACKAGED_PIPELINE_FILES: dict[str, tuple[str, ...]] = {
@@ -89,6 +96,36 @@ _PACKAGED_PIPELINE_FILES: dict[str, tuple[str, ...]] = {
 }
 
 
+_MATRIX_REL = "tests/matrix.yaml"
+
+# Appended verbatim to an existing matrix that lacks the row (see the note above).
+_MATRIX_SELF_IMPROVE_ROW = """\
+
+self-improve:
+  # Headless, no presets: the approve gate resolves to its DEFAULT — "no" — so
+  # open-pr is SKIPPED: the standing proof an unattended run can never self-promote.
+  - {}
+"""
+
+
+def _append_matrix_row(dest: Path) -> None:
+    """Append the packaged ``self-improve:`` row to an existing matrix that lacks it.
+
+    Append-only by design: existing rows are never rewritten. A matrix that already
+    carries a top-level ``self-improve`` key (or that doesn't parse as a mapping —
+    the workspace's own `cairn test` will say so far more precisely) is left alone.
+    """
+    text = dest.read_text(encoding="utf-8")
+    try:
+        doc = yaml.safe_load(text)
+    except yaml.YAMLError:
+        return
+    if not isinstance(doc, dict) or "self-improve" in doc:
+        return
+    joiner = "" if text.endswith("\n") else "\n"
+    dest.write_text(text + joiner + _MATRIX_SELF_IMPROVE_ROW, encoding="utf-8")
+
+
 def _copy_packaged_pipeline(name: str, workspace_dir: Path) -> Path:
     src = templates_dir()
     pipeline_rel = f"pipelines/{name}.yaml"
@@ -98,6 +135,8 @@ def _copy_packaged_pipeline(name: str, workspace_dir: Path) -> Path:
     for rel in _PACKAGED_PIPELINE_FILES[name]:
         dest = workspace_dir / rel
         if dest.exists() and rel != pipeline_rel:
+            if rel == _MATRIX_REL:
+                _append_matrix_row(dest)  # shared file: append the row, touch nothing else
             continue  # keep the workspace's customized copy
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src / rel, dest)  # copy2 keeps the exec bit on validators/scripts

@@ -28,16 +28,17 @@ never invent a proposal to have something to show.
 ## The ladder: where a promotion lands
 
 Match the learning to the maturation ladder (this workspace's README) and name the ONE
-workspace file the edit amends:
+workspace file the edit amends. The middle column is the exact `promotion` token the
+proposals schema accepts:
 
-| The learning looks like | Promote to | Typical target |
+| The learning looks like | `promotion` token | Typical target |
 |---|---|---|
-| a prompt fragment agents keep re-deriving | skill | `skills/<name>/SKILL.md` |
-| a check a human does by eye every run | validator | `validators/<name>.py` (new file) |
-| "be careful not to X" | doctrine rule / guard | `prompts/DOCTRINE.md` |
-| a value edited between runs | param default | `pipelines/<name>.yaml` |
-| an agent step that always runs one command | `run:` step | `pipelines/<name>.yaml` |
-| a routing / tier lesson | agent config | `agents/<name>.yaml` |
+| a prompt fragment agents keep re-deriving | `skill` | `skills/<name>/SKILL.md` |
+| a check a human does by eye every run | `validator` | `validators/<name>.py` (new file) |
+| "be careful not to X" | `prompt` (doctrine rule) or `guard` | `prompts/DOCTRINE.md` |
+| a value edited between runs | `param` (a param default) | `pipelines/<name>.yaml` |
+| an agent step that always runs one command | `pipeline` (demote to a `run:` step) | `pipelines/<name>.yaml` |
+| a routing / tier lesson | `agent` | `agents/<name>.yaml` |
 
 ## The proposal: mechanical and reviewable
 
