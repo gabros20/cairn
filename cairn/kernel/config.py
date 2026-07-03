@@ -145,6 +145,35 @@ def _require_table(value: Any, where: str, file: Path) -> dict[str, Any]:
     return value
 
 
+def _require_int(value: Any, where: str, file: Path) -> int:
+    # bool is a subclass of int — reject it so `events = true` doesn't silently become 1.
+    if isinstance(value, bool) or not isinstance(value, int):
+        _fail(f"{where} must be an integer, got {value!r}", file)
+    return value
+
+
+def _require_number(value: Any, where: str, file: Path) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        _fail(f"{where} must be a number, got {value!r}", file)
+    return value
+
+
+def _require_bool(value: Any, where: str, file: Path) -> bool:
+    if not isinstance(value, bool):
+        _fail(f"{where} must be true or false, got {value!r}", file)
+    return value
+
+
+def _warn_unknown(
+    table: dict[str, Any], known: set[str], where: str, warnings: list[Finding]
+) -> None:
+    for key in table:
+        if key not in known:
+            warnings.append(
+                Finding("warning", f"unknown key {key!r} in [{where}] — ignored")
+            )
+
+
 def _parse_duration_field(raw: dict[str, Any], key: str, where: str, file: Path) -> int:
     value = raw[key]
     if not isinstance(value, str):
@@ -155,8 +184,11 @@ def _parse_duration_field(raw: dict[str, Any], key: str, where: str, file: Path)
         _fail(f"{where}.{key}: {exc}", file)
 
 
-def _parse_workspace(raw: Any, file: Path) -> Workspace:
+def _parse_workspace(raw: Any, file: Path, warnings: list[Finding]) -> Workspace:
     table = _require_table(raw, "workspace", file)
+    _warn_unknown(
+        table, {"name", "doctrine", "runs_dir", "default_executor"}, "workspace", warnings
+    )
     name = table.get("name")
     if not isinstance(name, str) or not name:
         _fail("[workspace] requires a non-empty string 'name'", file)
@@ -168,8 +200,11 @@ def _parse_workspace(raw: Any, file: Path) -> Workspace:
     )
 
 
-def _parse_defaults(raw: Any, file: Path) -> Defaults:
+def _parse_defaults(raw: Any, file: Path, warnings: list[Finding]) -> Defaults:
     table = _require_table(raw, "defaults", file)
+    _warn_unknown(
+        table, {"step_timeout", "trail_context", "heartbeat", "budget"}, "defaults", warnings
+    )
 
     step_timeout_s = (
         _parse_duration_field(table, "step_timeout", "defaults", file)
@@ -183,15 +218,28 @@ def _parse_defaults(raw: Any, file: Path) -> Defaults:
     )
 
     tc_raw = _require_table(table.get("trail_context", {}), "defaults.trail_context", file)
+    _warn_unknown(tc_raw, {"events", "learnings"}, "defaults.trail_context", warnings)
     trail_context = TrailContext(
-        events=tc_raw.get("events", 12),
-        learnings=tc_raw.get("learnings", 5),
+        events=_require_int(tc_raw["events"], "defaults.trail_context.events", file)
+        if "events" in tc_raw
+        else 12,
+        learnings=_require_int(tc_raw["learnings"], "defaults.trail_context.learnings", file)
+        if "learnings" in tc_raw
+        else 5,
     )
 
     budget = None
     if "budget" in table:
         b_raw = _require_table(table["budget"], "defaults.budget", file)
-        budget = Budget(run_usd=b_raw.get("run_usd"), step_usd=b_raw.get("step_usd"))
+        _warn_unknown(b_raw, {"run_usd", "step_usd"}, "defaults.budget", warnings)
+        budget = Budget(
+            run_usd=_require_number(b_raw["run_usd"], "defaults.budget.run_usd", file)
+            if "run_usd" in b_raw
+            else None,
+            step_usd=_require_number(b_raw["step_usd"], "defaults.budget.step_usd", file)
+            if "step_usd" in b_raw
+            else None,
+        )
 
     return Defaults(
         step_timeout_s=step_timeout_s,
@@ -201,7 +249,9 @@ def _parse_defaults(raw: Any, file: Path) -> Defaults:
     )
 
 
-def _parse_tier(name: str, exec_name: str, raw: Any, file: Path) -> TierSpec:
+def _parse_tier(
+    name: str, exec_name: str, raw: Any, file: Path, warnings: list[Finding]
+) -> TierSpec:
     if name not in TIERS:
         _fail(
             f"executors.{exec_name}.tiers: unknown tier {name!r} "
@@ -209,6 +259,7 @@ def _parse_tier(name: str, exec_name: str, raw: Any, file: Path) -> TierSpec:
             file,
         )
     table = _require_table(raw, f"executors.{exec_name}.tiers.{name}", file)
+    _warn_unknown(table, {"model", "effort"}, f"executors.{exec_name}.tiers.{name}", warnings)
     model = table.get("model")
     if not isinstance(model, str) or not model:
         _fail(f"executors.{exec_name}.tiers.{name} requires a string 'model'", file)
@@ -222,14 +273,25 @@ def _parse_tier(name: str, exec_name: str, raw: Any, file: Path) -> TierSpec:
     return TierSpec(model=model, effort=effort)
 
 
-def _parse_executor(name: str, raw: Any, file: Path) -> ExecutorConfig:
+def _parse_executor(
+    name: str, raw: Any, file: Path, warnings: list[Finding]
+) -> ExecutorConfig:
     table = _require_table(raw, f"executors.{name}", file)
+    # `flags` is an open table (arbitrary argv the executor appends) — not key-checked.
+    _warn_unknown(
+        table, {"enabled", "pin_version", "setup", "tiers", "flags"}, f"executors.{name}", warnings
+    )
+    enabled = (
+        _require_bool(table["enabled"], f"executors.{name}.enabled", file)
+        if "enabled" in table
+        else True
+    )
     tiers_raw = _require_table(table.get("tiers", {}), f"executors.{name}.tiers", file)
-    tiers = {t: _parse_tier(t, name, spec, file) for t, spec in tiers_raw.items()}
+    tiers = {t: _parse_tier(t, name, spec, file, warnings) for t, spec in tiers_raw.items()}
     flags = _require_table(table.get("flags", {}), f"executors.{name}.flags", file)
     return ExecutorConfig(
         name=name,
-        enabled=table.get("enabled", True),
+        enabled=enabled,
         pin_version=table.get("pin_version"),
         setup=table.get("setup"),
         tiers=tiers,
@@ -263,12 +325,18 @@ def load_config(workspace_dir: Path) -> Config:
     """
     file = Path(workspace_dir) / "cairn.toml"
     if not file.is_file():
-        raise ConfigError(f"no cairn.toml found in {workspace_dir}", file=str(file))
+        message = f"no cairn.toml found in {workspace_dir}"
+        raise ConfigError(
+            message, findings=[Finding("error", message)], file=str(file)
+        )
 
     try:
         raw = tomllib.loads(file.read_text(encoding="utf-8"))
     except tomllib.TOMLDecodeError as exc:
-        raise ConfigError(f"cairn.toml is not valid TOML: {exc}", file=str(file)) from exc
+        message = f"cairn.toml is not valid TOML: {exc}"
+        raise ConfigError(
+            message, findings=[Finding("error", message)], file=str(file)
+        ) from exc
 
     warnings = [
         Finding("warning", f"unknown top-level key [{key}] in cairn.toml — ignored")
@@ -277,7 +345,7 @@ def load_config(workspace_dir: Path) -> Config:
     ]
 
     executors = {
-        name: _parse_executor(name, spec, file)
+        name: _parse_executor(name, spec, file, warnings)
         for name, spec in _require_table(raw.get("executors", {}), "executors", file).items()
     }
     tools = {
@@ -294,8 +362,8 @@ def load_config(workspace_dir: Path) -> Config:
     }
 
     return Config(
-        workspace=_parse_workspace(raw.get("workspace", {}), file),
-        defaults=_parse_defaults(raw.get("defaults", {}), file),
+        workspace=_parse_workspace(raw.get("workspace", {}), file, warnings),
+        defaults=_parse_defaults(raw.get("defaults", {}), file, warnings),
         executors=executors,
         tools=tools,
         secrets=secrets,
