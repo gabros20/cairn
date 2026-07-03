@@ -24,6 +24,17 @@ exfiltrate a secret the step happened to hold. Exit 0 → allowed; exit 2 → de
 is the reason); ANY other outcome (other exit code, timeout, spawn failure, crash) is resolved by
 ``on_error``: fail-open with a warning, or fail-closed naming the error. No shell is ever invoked.
 
+Two boundary facts:
+
+* The shim layer intercepts a *binary name* resolved via PATH; invoking a guarded binary by
+  ABSOLUTE PATH sidesteps the shim. That is by design — the shim is one of three defence layers,
+  and the executor's ``hook`` and the ``post`` validator still cover an absolute-path invocation
+  (ARCHITECTURE §4). A guard must never rely on the shim alone.
+* Guard *runner* infrastructure failure (the ``--shim-check`` interpreter itself failing to
+  start, distinct from a check script erroring) fails CLOSED: the shim propagates the non-zero
+  code and the real binary is not run. A deny can never silently flip to allow; the trade is
+  availability, taken deliberately.
+
 Stdlib only.
 """
 
@@ -38,7 +49,10 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from cairn.kernel.errors import ConfigError
 from cairn.kernel.plan import GuardDecl
+
+_SHIM_MARKER = "# cairn guard shim for"
 
 
 @dataclass(frozen=True)
@@ -77,6 +91,35 @@ def _safe_env(env: dict[str, str]) -> dict[str, str]:
     return {k: v for k, v in env.items() if k.startswith("CAIRN_")}
 
 
+# The minimal system keys a check process needs to run (so a .py check's interpreter can
+# start and use a temp dir) — pulled from the runner's own environment, never the step's.
+# Everything else in os.environ (secrets, tokens) is withheld from the check process.
+_SYSTEM_ENV_KEYS = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "TEMP",
+    "TMP",
+    "SYSTEMROOT",
+)
+
+
+def _check_process_env(env: dict[str, str]) -> dict[str, str]:
+    """The environment the check SUBPROCESS runs with: the ``CAIRN_*`` subset of the step's
+    ``env`` plus a minimal system allowlist for the interpreter — and nothing else. This is the
+    real containment boundary: filtering only the stdin payload would still leak every secret in
+    the ambient process env through inheritance."""
+    proc_env = _safe_env(env)
+    for key in _SYSTEM_ENV_KEYS:
+        val = os.environ.get(key)
+        if val is not None:
+            proc_env.setdefault(key, val)
+    return proc_env
+
+
 def _last_line(text: str, default: str) -> str:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     return lines[-1] if lines else default
@@ -109,6 +152,7 @@ def run_check(
             text=True,
             timeout=timeout_s,
             cwd=cwd,
+            env=_check_process_env(env),
         )
     except subprocess.TimeoutExpired:
         return _resolve_error(guard, f"timed out after {timeout_s}s")
@@ -167,14 +211,27 @@ for a in "$@"; do
   cmd="$cmd $a"
 done
 CAIRN_SHIM_COMMAND="$cmd"; export CAIRN_SHIM_COMMAND
-'{python}' -m cairn.kernel.guards --shim-check {names} || exit $?
-# allowed → locate and exec the real binary (PATH minus the shim dir)
+# re-entrancy marker: if a shim for this binary is already on the stack we must not run the
+# guard chain again (a symlinked/aliased shim dir on PATH could otherwise recurse into us).
+case ":$CAIRN_SHIM_ACTIVE:" in
+  *":$bin:"*) ;;  # already inside a shim for $bin → skip straight to the real binary
+  *)
+    CAIRN_SHIM_ACTIVE="$CAIRN_SHIM_ACTIVE:$bin"; export CAIRN_SHIM_ACTIVE
+    '{python}' -m cairn.kernel.guards --shim-check {names} || exit $?
+    ;;
+esac
+# allowed → locate and exec the real binary (PATH minus the shim dir). We exclude by exact
+# string first, then by PHYSICAL path (symlinks + trailing slashes resolved) so a second,
+# differently-spelled reference to the shim dir on PATH cannot re-select this shim.
 real=''
+SHIM_PHYS=$(cd "$SHIM_DIR" 2>/dev/null && pwd -P)
 oldifs="$IFS"
 IFS=':'
 for d in $PATH; do
   [ -z "$d" ] && continue
   [ "$d" = "$SHIM_DIR" ] && continue
+  dphys=$(cd "$d" 2>/dev/null && pwd -P)
+  [ -n "$dphys" ] && [ "$dphys" = "$SHIM_PHYS" ] && continue
   if [ -x "$d/$bin" ]; then real="$d/$bin"; break; fi
 done
 IFS="$oldifs"
@@ -221,8 +278,25 @@ def build_shims(
     for g in guards:
         binary = _binary_name(g.match_command)
         if not binary:
-            continue  # nothing concrete to shim (e.g. an empty match_command)
+            # A shim needs a concrete binary to wrap; a leading-glob (or empty) match_command
+            # has no prefix to derive one from, so it cannot be enforced at the shim layer.
+            raise ConfigError(
+                f"guard {g.name!r}: match_command {g.match_command!r} has no concrete binary "
+                "prefix to build a shim for (remove the 'shim' layer or anchor the pattern)"
+            )
         by_binary.setdefault(binary, []).append(g)
+
+    # Sweep stale cairn shims left from a previous build into a reused dir: a shim for a binary
+    # no longer guarded would find no matching guard and silently wave the command through.
+    for entry in shim_dir.iterdir():
+        if entry.name == "manifest.json" or entry.name in by_binary or not entry.is_file():
+            continue
+        try:
+            head = entry.read_text(encoding="utf-8", errors="ignore")[:200]
+        except OSError:
+            continue
+        if _SHIM_MARKER in head:  # only sweep files we generated; leave foreign files alone
+            entry.unlink()
 
     manifest = {
         "workspace_dir": str(workspace_dir),

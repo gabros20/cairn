@@ -158,6 +158,24 @@ def test_run_check_forwards_only_cairn_env_no_secrets(tmp_path: Path) -> None:
     assert result.reason is None
 
 
+def test_run_check_check_process_env_excludes_secrets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A secret sits in the PARENT process env. The check subprocess must NOT inherit it:
+    # the engine spawns the check with a filtered env, not the ambient os.environ.
+    monkeypatch.setenv("SECRET_CANARY", "hunter2")
+    monkeypatch.setenv("BREASE_TOKEN", "leak-me")
+    result = run_check(
+        guard("deny_if_secret_in_process_env.py"),
+        command="brease status",
+        env={"CAIRN_RUN_ID": "abc"},
+        run_dir=tmp_path,
+        workspace_dir=tmp_path,
+    )
+    assert result.allowed is True, result.reason
+    assert result.reason is None
+
+
 # --------------------------------------------------------------------------- #
 # matches — tool exact, command glob (with '*' crossing spaces)
 # --------------------------------------------------------------------------- #
@@ -251,6 +269,50 @@ def test_build_shims_is_idempotent(tmp_path: Path) -> None:
     body2 = (shim_dir / "brease").read_text()
     assert first == second
     assert body1 == body2
+
+
+def test_build_shims_clears_stale_shims(tmp_path: Path) -> None:
+    shim_dir = tmp_path / "shims"
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    build_shims(
+        [guard("allow_all.py", name="a", command="brease*")],
+        shim_dir=shim_dir,
+        workspace_dir=ws,
+    )
+    assert (shim_dir / "brease").exists()
+    # Rebuild with a guard on a DIFFERENT binary: the old brease shim must be removed, or a
+    # brease command finds no matching guard → silent fail-open passthrough.
+    build_shims(
+        [guard("allow_all.py", name="b", command="vercel*")],
+        shim_dir=shim_dir,
+        workspace_dir=ws,
+    )
+    assert not (shim_dir / "brease").exists()
+    assert (shim_dir / "vercel").exists()
+    manifest = json.loads((shim_dir / "manifest.json").read_text())
+    assert set(manifest["guards"]) == {"b"}
+
+
+def test_build_shims_leaves_foreign_files_alone(tmp_path: Path) -> None:
+    shim_dir = tmp_path / "shims"
+    shim_dir.mkdir()
+    (shim_dir / "not-a-shim.txt").write_text("hand-placed", encoding="utf-8")
+    build_shims(
+        [guard("allow_all.py", name="a", command="brease*")],
+        shim_dir=shim_dir,
+        workspace_dir=tmp_path,
+    )
+    # only cairn-generated shims are swept; unrelated files survive.
+    assert (shim_dir / "not-a-shim.txt").read_text() == "hand-placed"
+
+
+def test_build_shims_empty_binary_prefix_is_a_config_error(tmp_path: Path) -> None:
+    from cairn.kernel.errors import ConfigError
+
+    g = guard("allow_all.py", name="bad", command="*brease")  # leading glob → no prefix
+    with pytest.raises(ConfigError):
+        build_shims([g], shim_dir=tmp_path / "shims", workspace_dir=tmp_path)
 
 
 # --------------------------------------------------------------------------- #
@@ -348,3 +410,29 @@ def test_shim_chain_first_allows_second_denies(
     )
     assert result.returncode == 2, result.stderr
     assert not record.exists()
+
+
+def test_shim_no_recursion_when_shim_dir_appears_twice_on_path(
+    tmp_path: Path, fake_brease: tuple[Path, Path]
+) -> None:
+    bin_dir, record = fake_brease
+    shim_dir = tmp_path / "shims"
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    build_shims(
+        [guard("allow_all.py", name="ok", command="brease*")],
+        shim_dir=shim_dir,
+        workspace_dir=ws,
+    )
+    env = dict(os.environ)
+    # shim dir spelled two ways (plain + trailing slash): a naive string exclusion would let
+    # the second spelling re-select the shim itself → infinite recursion.
+    env["PATH"] = f"{shim_dir}:{shim_dir}/:{bin_dir}"
+    env["CAIRN_RUN_DIR"] = str(tmp_path)
+    env["CAIRN_SHIM_DIR"] = str(shim_dir)
+    # A short timeout turns any recursion into a hard failure instead of a hang.
+    result = subprocess.run(
+        ["brease", "status"], env=env, capture_output=True, text=True, timeout=15
+    )
+    assert result.returncode == 7, result.stderr  # resolved to the real binary, no recursion
+    assert record.read_text().strip() == "status"
