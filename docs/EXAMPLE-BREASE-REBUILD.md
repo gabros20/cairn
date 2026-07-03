@@ -1,9 +1,17 @@
 # cairn — brease-rebuild, expressed completely
 
-The proof that the abstraction covers the real system: the entire six-phase pipeline (+ all
-conditional steps, both gates, the review loop, the CMS branch, deploy) as one cairn workspace.
-Everything here maps 1:1 to behavior the current Claude-Code implementation already has; the
-mapping table at the end makes that explicit.
+> **What this is.** A worked example, not a shipped cairn workspace. *brease-rebuild* is a real,
+> six-phase website-rebuild pipeline that runs today as an **internal Claude-Code system**
+> (brease-factory) — the origin pipeline cairn was distilled from. This page expresses that whole
+> pipeline as **one cairn workspace** to prove the abstraction covers a real system end to end;
+> actually porting it is the planned **first workspace migration** (future work — IMPLEMENTATION-PLAN).
+> Two things it references are **separate from cairn itself**: the *Brease CMS* (third-party content
+> tooling the `brease=on` branch drives — not a cairn feature) and the vendor coding-agent CLIs the
+> `agent:` steps call.
+
+The mapping is 1:1: every mechanism the origin pipeline has today (all conditional steps, both gates,
+the review loop, the CMS branch, deploy) has a home in the workspace below, and the fidelity table at
+the end makes that explicit.
 
 ## `pipelines/brease-rebuild.yaml`
 
