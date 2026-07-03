@@ -39,7 +39,7 @@ from typing import Any, Callable
 import yaml
 
 from cairn.kernel.artifacts import ArtifactDecl, parse_artifacts
-from cairn.kernel.config import Config, load_config
+from cairn.kernel.config import Config, check_requires, load_config
 from cairn.kernel.errors import ConfigError
 from cairn.kernel.expr import EvalError, Expr, ExprError
 from cairn.kernel.expr import parse as parse_expr
@@ -1080,6 +1080,9 @@ def plan(
 
     config = load_config(workspace_dir)  # ConfigError on a bad cairn.toml
     warnings.extend(config.warnings)
+    # The workspace version pin (DISTRIBUTION §3): refuse to plan when the installed
+    # cairn falls outside the workspace's `requires` range.
+    check_requires(config.requires, file=workspace_dir / "cairn.toml")
 
     artifact_decls = parse_artifacts(doc.get("artifacts", {}) or {}, workspace_dir)
 

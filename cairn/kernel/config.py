@@ -56,6 +56,139 @@ def parse_duration(text: str) -> int:
 
 
 # --------------------------------------------------------------------------- #
+# The workspace `requires` version pin (docs/DISTRIBUTION.md §3).
+#
+# A workspace may pin the cairn it needs — `requires = ">=0.1,<0.2"` at the top
+# level of cairn.toml — and the planner refuses when the installed cairn falls
+# outside the range. Stdlib-only PEP 440 subset: comma-separated clauses with
+# the operators ==, !=, >=, <=, >, <, ~= plus the `==X.Y.*` prefix wildcard;
+# versions are `N(.N)*` with optional (a|b|rc)N pre-release, `.postN`, `.devN`
+# (a dev/pre-release orders BEFORE its release, per PEP 440). A bare clause
+# with no operator means exact equality (releases compare zero-padded, so
+# "0.1" == "0.1.0").
+# --------------------------------------------------------------------------- #
+
+_PRE_RANK = {"a": 0, "b": 1, "rc": 2}
+_VERSION_RE = re.compile(
+    r"v?(\d+(?:\.\d+)*)(?:(a|b|rc)(\d+))?(?:\.post(\d+))?(?:\.dev(\d+))?"
+)
+_CLAUSE_OPS = ("~=", "==", "!=", ">=", "<=", ">", "<")
+
+_Version = tuple[tuple[int, ...], tuple[int, int] | None, int | None, int | None]
+
+
+def _parse_version(text: str) -> _Version:
+    """``"0.1.0.dev0"`` → ``(release, pre, post, dev)``; ValueError on anything else."""
+    m = _VERSION_RE.fullmatch(text.strip())
+    if m is None:
+        raise ValueError(f"invalid version {text!r}")
+    release = tuple(int(part) for part in m.group(1).split("."))
+    pre = (_PRE_RANK[m.group(2)], int(m.group(3))) if m.group(2) else None
+    post = int(m.group(4)) if m.group(4) is not None else None
+    dev = int(m.group(5)) if m.group(5) is not None else None
+    return release, pre, post, dev
+
+
+def _version_key(v: _Version, width: int) -> tuple:
+    """A totally-ordered sort key; ``width`` zero-pads the release for comparison."""
+    release, pre, post, dev = v
+    rel = release + (0,) * (width - len(release))
+    if pre is None and post is None and dev is not None:
+        pre_key = (-1, 0, 0)  # a pure .devN sorts before every pre-release
+    elif pre is None:
+        pre_key = (1, 0, 0)  # a final release sorts after its pre-releases
+    else:
+        pre_key = (0, *pre)
+    post_key = (0, 0) if post is None else (1, post)
+    dev_key = (1, 0) if dev is None else (0, dev)
+    return (rel, pre_key, post_key, dev_key)
+
+
+def _clause_ok(op: str, installed: _Version, wanted: _Version, wildcard: bool) -> bool:
+    if wildcard:  # ==X.Y.* / !=X.Y.* — prefix match on the release tuple
+        prefix = wanted[0]
+        padded = installed[0] + (0,) * max(0, len(prefix) - len(installed[0]))
+        matches = padded[: len(prefix)] == prefix
+        return matches if op == "==" else not matches
+    if op == "~=":  # ~=X.Y.Z ⇒ >=X.Y.Z and ==X.Y.*
+        if len(wanted[0]) < 2:
+            raise ValueError("~= needs at least two release components (e.g. ~=0.1)")
+        return _clause_ok(">=", installed, wanted, False) and _clause_ok(
+            "==", installed, (wanted[0][:-1], None, None, None), True
+        )
+    width = max(len(installed[0]), len(wanted[0]))
+    a, b = _version_key(installed, width), _version_key(wanted, width)
+    return {
+        "==": a == b,
+        "!=": a != b,
+        ">=": a >= b,
+        "<=": a <= b,
+        ">": a > b,
+        "<": a < b,
+    }[op]
+
+
+def requires_satisfied(spec: str, installed: str) -> bool:
+    """Does ``installed`` satisfy every clause of ``spec`` (e.g. ``">=0.1,<0.2"``)?
+
+    Raises ValueError with the offending clause on a malformed spec.
+    """
+    inst = _parse_version(installed)
+    clauses = [c.strip() for c in spec.split(",")]
+    if not any(clauses):
+        raise ValueError("empty requires spec")
+    for clause in clauses:
+        if not clause:
+            raise ValueError(f"empty clause in requires spec {spec!r}")
+        op = next((o for o in _CLAUSE_OPS if clause.startswith(o)), None)
+        version_text = clause[len(op) :].strip() if op else clause
+        op = op or "=="
+        wildcard = version_text.endswith(".*")
+        if wildcard:
+            if op not in ("==", "!="):
+                raise ValueError(f"'.*' is only valid with == or != (clause {clause!r})")
+            version_text = version_text[:-2]
+        if not _clause_ok(op, inst, _parse_version(version_text), wildcard):
+            return False
+    return True
+
+
+def installed_version() -> str:
+    """The installed cairn version — single source of truth is ``cairn.__version__``
+    (pyproject reads the same string via hatch's dynamic version)."""
+    import cairn
+
+    return cairn.__version__
+
+
+def check_requires(
+    requires: str | None, *, file: str | Path, installed: str | None = None
+) -> None:
+    """Enforce the workspace ``requires`` pin; no-op when the workspace doesn't pin.
+
+    Raises ConfigError naming both the required range and the installed version when
+    the pin is unsatisfied (or the spec itself is malformed).
+    """
+    if requires is None:
+        return
+    version = installed if installed is not None else installed_version()
+    try:
+        ok = requires_satisfied(requires, version)
+    except ValueError as exc:
+        message = f"cairn.toml requires: {exc}"
+        raise ConfigError(
+            message, findings=[Finding("error", message)], file=str(file)
+        ) from exc
+    if not ok:
+        message = (
+            f"this workspace requires cairn {requires!r} but cairn {version} is "
+            f"installed — install a matching version (e.g. `uv tool install "
+            f"'cairn{requires}'`) or update the requires pin in cairn.toml"
+        )
+        raise ConfigError(message, findings=[Finding("error", message)], file=str(file))
+
+
+# --------------------------------------------------------------------------- #
 # Typed config dataclasses (all frozen — config is immutable during a run).
 # --------------------------------------------------------------------------- #
 
@@ -361,6 +494,13 @@ def load_config(workspace_dir: Path) -> Config:
         for name, spec in _require_table(raw.get("sinks", {}), "sinks", file).items()
     }
 
+    requires = raw.get("requires")
+    if requires is not None and not isinstance(requires, str):
+        _fail(
+            f"requires must be a version-spec string like '>=0.1,<0.2', got {requires!r}",
+            file,
+        )
+
     return Config(
         workspace=_parse_workspace(raw.get("workspace", {}), file, warnings),
         defaults=_parse_defaults(raw.get("defaults", {}), file, warnings),
@@ -368,6 +508,6 @@ def load_config(workspace_dir: Path) -> Config:
         tools=tools,
         secrets=secrets,
         sinks=sinks,
-        requires=raw.get("requires"),
+        requires=requires,
         warnings=warnings,
     )

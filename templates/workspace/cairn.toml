@@ -1,6 +1,11 @@
 # cairn workspace config. One file; every relative path resolves against this
 # directory. Full reference: docs/API.md §1 in the cairn repo.
 
+# Pin the cairn version this workspace requires (docs/DISTRIBUTION.md §3) — checked
+# at plan time; a mismatched install refuses with exit 2. Top-level key: keep it
+# above the first [table] when you uncomment it.
+# requires = ">=0.1,<0.2"
+
 [workspace]
 name             = "{{WORKSPACE_NAME}}"   # the only value `cairn new workspace` substitutes
 doctrine         = "prompts/DOCTRINE.md"  # workspace doctrine, inlined into every agent envelope

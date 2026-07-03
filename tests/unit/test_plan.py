@@ -520,3 +520,50 @@ def test_unused_artifact_and_missing_skill_are_warnings(tmp_path):
     assert "ghost-skill" in messages  # skill dir missing
     # warnings never block: the plan still emits
     assert _ids(p.nodes) == ["one"]
+
+
+# --------------------------------------------------------------------------- #
+# The workspace `requires` version pin (docs/DISTRIBUTION.md §3) — enforced at
+# plan time: a cairn.toml `requires` range the installed cairn does not satisfy
+# refuses with a ConfigError naming both versions.
+# --------------------------------------------------------------------------- #
+
+
+def _pin_requires(ws: Path, spec: str) -> None:
+    """Prepend a top-level `requires` pin to the workspace cairn.toml."""
+    toml = ws / "cairn.toml"
+    toml.write_text(f'requires = "{spec}"\n' + toml.read_text(encoding="utf-8"), encoding="utf-8")
+
+
+def test_requires_pin_unsatisfied_refuses_at_plan_time(hello_ws):
+    import cairn
+
+    _pin_requires(hello_ws, ">=99.0")
+    with pytest.raises(ConfigError) as exc:
+        plan(hello_ws, "hello", {}, now=NOW)
+    msg = str(exc.value)
+    assert "requires" in msg
+    assert ">=99.0" in msg  # the required range …
+    assert cairn.__version__ in msg  # … and the installed version, both named
+
+
+def test_requires_pin_satisfied_plans_green(hello_ws):
+    # the DISTRIBUTION §3 canonical pin, satisfied by the installed 0.1.x cairn
+    _pin_requires(hello_ws, ">=0.1,<0.2")
+    p = plan(hello_ws, "hello", {}, now=NOW)
+    assert _ids(p.nodes) == ["greet", "tone", "compose"]
+
+
+def test_requires_pin_malformed_spec_is_a_config_error(hello_ws):
+    _pin_requires(hello_ws, ">=banana")
+    with pytest.raises(ConfigError) as exc:
+        plan(hello_ws, "hello", {}, now=NOW)
+    assert "requires" in str(exc.value)
+
+
+def test_requires_pin_must_be_a_string(hello_ws):
+    toml = hello_ws / "cairn.toml"
+    toml.write_text("requires = 1\n" + toml.read_text(encoding="utf-8"), encoding="utf-8")
+    with pytest.raises(ConfigError) as exc:
+        plan(hello_ws, "hello", {}, now=NOW)
+    assert "requires" in str(exc.value)

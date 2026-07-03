@@ -190,3 +190,61 @@ def test_unknown_key_in_executor_warns(tmp_path):
     )
     cfg = load_config(tmp_path)
     assert any(f.level == "warning" and "enbaled" in f.message for f in cfg.warnings)
+
+
+# --------------------------------------------------------------------------- #
+# The `requires` version pin — the matching rule (docs/DISTRIBUTION.md §3).
+# PEP 440 subset, stdlib-only: comma-AND clauses; ==/!=/>=/<=/>/</~= plus the
+# ==X.Y.* prefix wildcard; releases compare zero-padded; dev/pre sort before
+# their release; a bare clause means exact equality.
+# --------------------------------------------------------------------------- #
+
+from cairn.kernel.config import check_requires, requires_satisfied
+
+
+@pytest.mark.parametrize(
+    ("spec", "installed", "ok"),
+    [
+        # the canonical DISTRIBUTION §3 pin
+        (">=0.1,<0.2", "0.1.0", True),
+        (">=0.1,<0.2", "0.1.9", True),
+        (">=0.1,<0.2", "0.2.0", False),
+        (">=0.1,<0.2", "0.0.9", False),
+        # zero-padded release comparison
+        (">=0.1", "0.1", True),
+        ("==0.1", "0.1.0", True),
+        # bare clause = exact equality
+        ("0.1.0", "0.1.0", True),
+        ("0.1.0", "0.1.1", False),
+        # prefix wildcard + compatible-release
+        ("==0.1.*", "0.1.7", True),
+        ("==0.1.*", "0.2.0", False),
+        ("~=0.1.0", "0.1.4", True),
+        ("~=0.1.0", "0.2.0", False),
+        # dev/pre-releases order BEFORE their release (PEP 440)
+        (">=0.1", "0.1.0.dev0", False),
+        (">=0.1", "0.1.0rc1", False),
+        ("<0.2", "0.2.0.dev0", True),
+        ("!=0.1.0", "0.1.0", False),
+        ("!=0.1.0", "0.1.1", True),
+    ],
+)
+def test_requires_satisfied_matching_rule(spec, installed, ok):
+    assert requires_satisfied(spec, installed) is ok
+
+
+@pytest.mark.parametrize("spec", ["", " , ", ">=banana", "~=1", ">=0.1.*"])
+def test_requires_satisfied_rejects_malformed_specs(spec):
+    with pytest.raises(ValueError):
+        requires_satisfied(spec, "0.1.0")
+
+
+def test_check_requires_names_both_versions(tmp_path):
+    with pytest.raises(ConfigError) as exc:
+        check_requires(">=9.0", file=tmp_path / "cairn.toml", installed="0.1.0")
+    msg = str(exc.value)
+    assert ">=9.0" in msg and "0.1.0" in msg
+
+
+def test_check_requires_no_pin_is_a_noop(tmp_path):
+    check_requires(None, file=tmp_path / "cairn.toml", installed="0.1.0")
