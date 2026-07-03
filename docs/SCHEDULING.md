@@ -77,12 +77,12 @@ sequenceDiagram
     Note over Op,Host: install-time — sync (only on add/remove/retime)
     Op->>CLI: cairn schedule install
     CLI->>Y: read declared entries
-    CLI->>Host: write one line per entry:<br/>`cairn schedule run <name>`
+    CLI->>Host: write one line per entry:<br/>cairn schedule run NAME
 
     Note over Host,Trail: fire-time — the timer runs, unattended
-    Host->>CLI: cairn schedule run <name>
-    CLI->>Y: resolve <name> → argv
-    CLI->>Run: exec the run: argv verbatim
+    Host->>CLI: cairn schedule run NAME
+    CLI->>Y: resolve NAME to its run argv
+    CLI->>Run: exec the run argv verbatim
     Run->>Trail: append run/step/gate/learn events
     Run-->>CLI: exit code (propagated unchanged)
     CLI-->>Host: re-emit child stdout/stderr (cron MAILTO)
