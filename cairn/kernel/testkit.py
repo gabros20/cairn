@@ -418,8 +418,15 @@ def run_envelope_suite(workspace_dir: Path, *, update: bool = False) -> SuiteRes
                 continue
             envelope = composer(step, p, _GOLDEN_RUN_DIR, cycle=1 if in_loop else None, retry_reasons=[])
             golden = env_root / f"{name}.{step.id}.golden.md"
-            _tally_envelope(result, name, step.id, golden, envelope, update)
+            _tally_envelope(result, name, step.id, golden, _portable(envelope, workspace_dir), update)
     return result
+
+
+def _portable(envelope: str, workspace_dir: Path) -> str:
+    """Normalize machine-specific absolute paths to stable tokens so a committed golden
+    diffs clean on any checkout (runtime envelopes stay absolute — this is a test-layer
+    normalization only, applied identically on write and on compare)."""
+    return envelope.replace(str(workspace_dir), "<WORKSPACE>").replace(str(_GOLDEN_RUN_DIR), "<RUN_DIR>")
 
 
 def _tally_envelope(result: SuiteResult, pipeline: str, step_id: str, golden: Path, envelope: str, update: bool) -> None:

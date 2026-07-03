@@ -269,6 +269,25 @@ def test_envelope_suite_update_then_clean_then_drift(tmp_path: Path) -> None:
     assert "envelope drift" in third.failures[0]
 
 
+def test_envelope_goldens_are_portable_across_workspace_paths(tmp_path: Path) -> None:
+    # A golden written for a workspace at path A must diff clean against an envelope composed
+    # for the same workspace checked out at a different path B (CI on another machine).
+    ws_a = build_ws(tmp_path / "a")
+    ws_b = build_ws(tmp_path / "b")
+
+    assert run_envelope_suite(ws_a, update=True).passed == 1
+    # Simulate the committed goldens being checked out under ws_b.
+    shutil.copytree(ws_a / "tests/envelopes", ws_b / "tests/envelopes")
+
+    result = run_envelope_suite(ws_b)
+    assert result.failed == 0, result.failures
+    assert result.passed == 1
+
+    golden = (ws_b / "tests/envelopes/agentic.think.golden.md").read_text()
+    assert "<WORKSPACE>" in golden
+    assert str(ws_a) not in golden and str(ws_b) not in golden
+
+
 def test_envelope_suite_no_agent_steps_is_a_pass(tmp_path: Path) -> None:
     ws = build_ws(tmp_path)
     (ws / "pipelines/agentic.yaml").unlink()  # remove the only agent-step pipeline

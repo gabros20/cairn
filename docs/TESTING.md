@@ -52,10 +52,10 @@ tests/
 ```yaml
 # tests/matrix.yaml — which param combinations the stub runs exercise
 brease-rebuild:
-  - { mode: rebuild,   brease: off }
-  - { mode: redesign,  brease: off }               # exercises escalation + the art-review loop
-  - { mode: reimagine, brease: off }               # exercises strategy + full conditional chain
-  - { mode: redesign,  brease: on, _gates: { populate-approval: no } }
+  - { mode: rebuild,   brease: "off" }
+  - { mode: redesign,  brease: "off" }             # exercises escalation + the art-review loop
+  - { mode: reimagine, brease: "off" }             # exercises strategy + full conditional chain
+  - { mode: redesign,  brease: "on", _gates: { populate-approval: "no" } }   # quote YAML-boolean enums (API.md §2.1)
 ```
 
 ## 4. `cairn test` — four suites, one command
