@@ -22,6 +22,23 @@ One event stream per run: `runs/<id>/trail.jsonl`. Envelope:
   "event": "step-done", "node": "capture", "attempt": 1, "cycle": null, "data": { … } }
 ```
 
+One event's path from the walker to every reader — note that **redaction runs on the values before
+serialization**, so a secret is scrubbed identically in the authoritative file and in every tee, and
+that the file write is synchronous while the webhook tee can never block the run:
+
+```mermaid
+flowchart LR
+  WALK["walk.py<br/>single writer"] -->|emit event| RED["redact<br/>values · pre-serialize"]
+  RED --> SER["json.dumps<br/>+ monotonic seq"]
+  SER -->|flushed + fsynced append| JSONL[("trail.jsonl<br/>sink #0 · the authority")]
+  SER -.->|tee · same redacted event| Q["webhook sink<br/>daemon queue · bounded"]
+  Q -->|POST NDJSON| WH(("ops endpoint"))
+  Q -.->|queue full → drop + one warning| DROP["dropped<br/>never blocks the run"]
+
+  JSONL --> TRAIL["cairn trail --follow --json"]
+  JSONL --> PS["cairn ps"]
+```
+
 **Guarantees** (what makes it a protocol, not a log file):
 - **Single writer** — only the walker appends; executors/steps never touch it.
 - **Atomic line appends, flushed per event** — a reader never sees a torn line as final.
@@ -50,7 +67,11 @@ One event stream per run: `runs/<id>/trail.jsonl`. Envelope:
 *Status: the run/plan/step/gate/loop/`learn` events above are emitted by the walker today, and
 `heartbeat` now emits too — opt-in via `[defaults] heartbeat` (off by default), carrying the full
 node/attempt/cycle envelope, with ordering guaranteed (no beat lands after its step's terminal
-event). `guard-deny` lands with the guard engine (C3). `usage` is plumbed end-to-end
+event). `guard-deny` is the one taxonomy event **not emitted yet**: a deny happens *inside* the
+executor subprocess (a native hook or a PATH shim exiting 2), which the walker doesn't observe as a
+trail event — it will emit once the per-executor guard wiring (`install_guards`, ARCHITECTURE §4)
+lands; the `post` validator backstop that enforces today surfaces instead as a `step-fail` with
+validator reasons. `usage` is plumbed end-to-end
 (`Result.usage`; an executor-reported figure outranks the model's STEP-block self-report) — all
 three executors run plain-text output today, so they pass `None` and the numbers arrive with a
 json output-format later; the stable schema is the deliverable.*
@@ -115,7 +136,7 @@ $ cairn ps [--workspace .] [--json]
 RUN                          STATUS    NODE        LAST EVENT      AGE
 acme-redesign-20260703       running   build       heartbeat 12s   41m
 globex-reimagine-20260703    gate      scope       gate-pending    2m   ← waiting on a human
-initech-rebuild-20260702     halted    populate    guard-deny      3h
+initech-rebuild-20260702     halted    populate    step-fail       3h
 ```
 
 Implementation: scan `runs/*/run.json` + each trail's last line — no registry, no index file, no
