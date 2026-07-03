@@ -32,10 +32,25 @@ def test_argv_shape_and_prompt_on_stdin(tmp_path, monkeypatch):
     assert argv[0].split("/")[-1] == "codex"
     assert argv[1:] == [
         "exec", "-C", str(inv.cwd), "-m", "gpt-5.5",
-        "--sandbox", "workspace-write", "-a", "never",
+        "--sandbox", "workspace-write", "--skip-git-repo-check",
         "-c", "model_reasoning_effort=high",
     ]
     assert stdin == "the codex prompt"  # prompt is delivered on stdin, not argv
+
+
+def test_no_approval_flag(tmp_path, monkeypatch):
+    # codex-cli 0.142.5 removed `-a/--ask-for-approval` from `codex exec` (approval is
+    # hardwired to `never` in exec mode); passing `-a never` is an argv error. Live-verified.
+    _, _, argv, _, _ = _invoke(tmp_path, monkeypatch, effort=None)
+    assert "-a" not in argv and "--ask-for-approval" not in argv
+
+
+def test_skip_git_repo_check_present(tmp_path, monkeypatch):
+    # Without it, `codex exec` refuses to run in a cwd that is neither a git repo nor a
+    # trusted directory ("Not inside a trusted directory and --skip-git-repo-check was not
+    # specified.") — cairn run dirs are arbitrary. Live-verified on 0.142.5.
+    _, _, argv, _, _ = _invoke(tmp_path, monkeypatch, effort=None)
+    assert "--skip-git-repo-check" in argv
 
 
 def test_effort_override_omitted_when_none(tmp_path, monkeypatch):
