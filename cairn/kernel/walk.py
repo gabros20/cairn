@@ -41,11 +41,13 @@ import os
 import re
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 import cairn
 from cairn.executors.base import ExecTimeout
@@ -394,7 +396,8 @@ class _Walk:
                 return_schema=self._schema_path,
             )
             try:
-                result = executor.invoke(inv)
+                with self._heartbeat(step.id, attempt, cycle, log_path):
+                    result = executor.invoke(inv)
             except ExecTimeout as exc:
                 self._emit("timeout", node=step.id, attempt=attempt, cycle=cycle, data={"error": str(exc)})
                 raise _Halt(ExitCode.TIMEOUT, step.id, f"timeout: {exc}") from exc
@@ -859,6 +862,53 @@ class _Walk:
         with self._lock:
             update_run(self.run_dir, lambda doc: doc.__setitem__("status", status))
 
+    # -- heartbeat (liveness — OBSERVABILITY §1) ---------------------------- #
+
+    @contextmanager
+    def _heartbeat(
+        self, node: str, attempt: int, cycle: int | None, log_path: Path
+    ) -> Iterator[None]:
+        """Emit a periodic ``heartbeat`` while a blocking step runs.
+
+        Opt-in via ``[defaults] heartbeat`` (config's ``heartbeat_s``); off by default, so
+        it is **zero-cost** when unset — no timer thread is even started. When on, a daemon
+        timer emits ``heartbeat`` every interval with the step-log byte size + last line +
+        elapsed, so ``cairn ps``/``--follow`` can tell a working step from a hung one. The
+        first beat waits a full interval, so a step that finishes faster emits none. The
+        thread is daemon and joined on exit — it can never outlive the step — and every beat
+        goes through the same single-writer trail lock as any other event.
+        """
+        interval = self.config.defaults.heartbeat_s
+        if not interval or interval <= 0:
+            yield
+            return
+
+        stop = threading.Event()
+        started = time.monotonic()
+
+        def beat() -> None:
+            while not stop.wait(interval):
+                log_bytes, last_line = _tail_log(log_path)
+                self._emit(
+                    "heartbeat",
+                    node=node,
+                    attempt=attempt,
+                    cycle=cycle,
+                    data={
+                        "elapsed_s": round(time.monotonic() - started, 1),
+                        "log_bytes": log_bytes,
+                        "last_line": last_line,
+                    },
+                )
+
+        thread = threading.Thread(target=beat, name=f"cairn-heartbeat-{node}", daemon=True)
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()  # Event.wait returns at once → the daemon exits without a full interval.
+            thread.join(timeout=5)
+
     def _write_step_return_schema(self) -> None:
 
         self._schema_path.parent.mkdir(parents=True, exist_ok=True)
@@ -885,3 +935,30 @@ class _Walk:
     @staticmethod
     def _node_id(node: Any) -> str:
         return node.id if isinstance(node, StepNode) else node.name
+
+
+def _tail_log(path: Path, tail_bytes: int = 4096) -> tuple[int, str]:
+    """(byte size, last non-empty line) of a step log — bounded-cost, never raises.
+
+    Only the final ``tail_bytes`` are read, so a heartbeat over a multi-hour step's log stays
+    cheap. A missing/partway-written/unreadable log degrades to ``(0, "")`` — a heartbeat is
+    a liveness ping, never a hard dependency.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return 0, ""
+    last = ""
+    try:
+        with path.open("rb") as fh:
+            if size > tail_bytes:
+                fh.seek(size - tail_bytes)
+                fh.readline()  # drop the partial first line after the seek
+            chunk = fh.read()
+    except OSError:
+        return size, ""
+    for raw in chunk.splitlines():
+        line = raw.decode("utf-8", "replace").strip()
+        if line:
+            last = line
+    return size, last

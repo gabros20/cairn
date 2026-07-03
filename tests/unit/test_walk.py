@@ -13,6 +13,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import threading
+import time
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 
@@ -260,6 +263,130 @@ def test_agent_success_emits_learnings_and_usage(ws: Path, tmp_path: Path) -> No
     assert done_ev["data"]["usage"] == {"in_tokens": 10, "out_tokens": 4}
     assert done_ev["data"]["metrics"] == {"pages": 3}
     assert node_status(load_run(run_dir), "s") == "done"
+
+
+def test_executor_reported_usage_on_result_wins_over_step_block(ws: Path, tmp_path: Path) -> None:
+    # The future json-output path: the executor reports usage on Result (authoritative),
+    # outranking a model's self-reported STEP-block usage. Today Result.usage is always None,
+    # so this only fires once an executor populates it — the plumbing, tested honestly.
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        (inv.cwd / "a.txt").write_text("hi")
+        return Result(
+            step={"status": "done", "summary": "ok", "usage": {"in_tokens": 1}},
+            exit_code=0,
+            duration_s=2.5,
+            usage={"in_tokens": 999, "out_tokens": 7},
+        )
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
+
+    done_ev = next(e for e in read_trail(run_dir) if e["event"] == "step-done")
+    assert done_ev["data"]["usage"] == {"in_tokens": 999, "out_tokens": 7}
+    assert done_ev["data"]["duration_s"] == 2.5
+
+
+def test_created_at_and_node_at_are_z_terminated_utc(ws: Path, tmp_path: Path) -> None:
+    # walk.py single-sources the trail's Z-terminated UTC formatter, so run.json's created_at
+    # (and every node `at`) parse as tz-aware — no downstream naive-pinning workaround needed.
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        (inv.cwd / "a.txt").write_text("hi")
+        return done_result()
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    created_at = json.loads((run_dir / "run.json").read_text())["created_at"]
+    assert created_at.endswith("Z")
+    assert datetime.fromisoformat(created_at).tzinfo is not None  # aware, no naive-pinning
+
+    assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
+    node_at = load_run(run_dir)["nodes"]["s"]["at"]
+    assert node_at.endswith("Z") and datetime.fromisoformat(node_at).tzinfo is not None
+
+
+def test_legacy_naive_created_at_still_loads(ws: Path, tmp_path: Path) -> None:
+    # Old run dirs carry a naive `created_at` (no Z/offset). Reading tolerance must survive:
+    # load_run parses it, and datetime.fromisoformat handles the naive string without crashing.
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    doc = json.loads((run_dir / "run.json").read_text())
+    doc["created_at"] = "2026-07-03T11:04:00"  # legacy naive stamp
+    (run_dir / "run.json").write_text(json.dumps(doc))
+
+    reloaded = load_run(run_dir)
+    assert reloaded["created_at"] == "2026-07-03T11:04:00"
+    assert datetime.fromisoformat(reloaded["created_at"]).year == 2026
+
+
+def test_heartbeat_emitted_during_a_slow_step(ws: Path, tmp_path: Path) -> None:
+    # A slow step blocks inside invoke() until the walker has emitted at least one heartbeat;
+    # a watcher thread releases it once one appears (patched tiny interval — no real sleep).
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    release = threading.Event()
+
+    def on_invoke(inv, _n):
+        inv.log_path.parent.mkdir(parents=True, exist_ok=True)
+        inv.log_path.write_text("working line one\nworking line two\n", encoding="utf-8")
+        assert release.wait(timeout=5), "walker emitted no heartbeat while the step was blocked"
+        (inv.cwd / "a.txt").write_text("done")
+        return done_result()
+
+    def watch() -> None:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if any(e["event"] == "heartbeat" for e in read_trail(run_dir)):
+                release.set()
+                return
+            time.sleep(0.005)
+
+    watcher = threading.Thread(target=watch, daemon=True)
+    watcher.start()
+
+    cfg = load_config(ws)
+    cfg = replace(cfg, defaults=replace(cfg.defaults, heartbeat_s=0.01))
+    code = walk(
+        plan, run_dir, workspace_dir=ws, config=cfg,
+        executors={"fake": FakeExecutor(on_invoke)},
+        composer=lambda **kw: "PROMPT", interactive=False, gate_presets={}, now=NOW,
+    )
+    watcher.join(timeout=1)
+
+    assert code == ExitCode.OK
+    hbs = [e for e in read_trail(run_dir) if e["event"] == "heartbeat"]
+    assert hbs, "expected at least one heartbeat event"
+    hb = hbs[0]
+    assert hb["node"] == "s"
+    assert hb["attempt"] == 1
+    assert hb["data"]["log_bytes"] > 0
+    assert hb["data"]["last_line"] == "working line two"
+    assert "elapsed_s" in hb["data"]
+    # step-done still lands last for the node — the daemon never outlives the step.
+    assert any(e["event"] == "step-done" and e["node"] == "s" for e in read_trail(run_dir))
+
+
+def test_heartbeat_is_off_by_default_zero_cost(ws: Path, tmp_path: Path) -> None:
+    # Unconfigured heartbeat (heartbeat_s is None) emits nothing — no timer thread, no beats.
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        (inv.cwd / "a.txt").write_text("hi")
+        return done_result()
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert load_config(ws).defaults.heartbeat_s is None
+    assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
+    assert not [e for e in read_trail(run_dir) if e["event"] == "heartbeat"]
 
 
 # --------------------------------------------------------------------------- #
