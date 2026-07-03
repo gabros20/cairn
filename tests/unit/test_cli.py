@@ -353,6 +353,34 @@ def test_test_binds_pipeline_suite_green(hello_ws, monkeypatch, capsys):
     assert "pipelines: 1 passed, 0 failed" in out
 
 
+def test_test_surfaces_suite_notes(hello_ws, monkeypatch, capsys):
+    # A day-0 workspace with no fixtures still surfaces the "(no fixtures)" coverage signal —
+    # not just bare passed/failed counts.
+    monkeypatch.chdir(hello_ws)
+    rc = main(["test"])
+    out = capsys.readouterr().out
+    assert rc == int(ExitCode.OK)
+    assert out.count("(no fixtures)") == 4  # one per suite
+
+
+def test_test_envelopes_update_is_reachable(hello_ws, monkeypatch, capsys):
+    # `--update` must be wired so goldens can be seeded on day 0.
+    monkeypatch.chdir(hello_ws)
+    rc = main(["test", "envelopes", "--update"])
+    assert rc == int(ExitCode.OK)
+
+
+def test_test_exits_nonzero_and_shows_failures(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    fx = hello_ws / "tests" / "fixtures" / "greeting"
+    fx.mkdir(parents=True)
+    (fx / "valid-broken.json").write_text("not json at all", encoding="utf-8")  # a valid-* must pass
+    rc = main(["test", "validators"])
+    out = capsys.readouterr().out
+    assert rc == 1
+    assert "FAIL:" in out
+
+
 def test_test_record_harvests_run(hello_ws, monkeypatch, capsys):
     monkeypatch.chdir(hello_ws)
     main(["run", "hello", "--headless"])
