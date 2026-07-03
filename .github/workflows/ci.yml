@@ -1,0 +1,89 @@
+# cairn CI — the release gate (docs/DISTRIBUTION.md §3): the synthetic suite, `cairn plan`
+# over every shipped workspace pipeline, a doctor smoke, and the wheel → install → scaffold
+# → `cairn run hello --headless` path on Linux + macOS.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    name: unit suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      - run: uv run pytest tests/unit -q
+
+  plan:
+    name: plan every pipeline
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      # Headless plan only — no execution, no live models. `cairn plan` reads the cwd as
+      # the workspace, so scaffold the template first (which also exercises `cairn new`).
+      - name: plan the scaffold workspace (templates/workspace)
+        run: |
+          CAIRN="$PWD/.venv/bin/cairn"
+          "$CAIRN" new workspace ci-scaffold --dir "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/ci-scaffold"
+          for f in pipelines/*.yaml; do
+            "$CAIRN" plan "$(basename "$f" .yaml)"
+          done
+      - name: plan the live smoke workspace (tests/live/workspace-claude)
+        run: |
+          CAIRN="$PWD/.venv/bin/cairn"
+          cd tests/live/workspace-claude
+          for f in pipelines/*.yaml; do
+            "$CAIRN" plan "$(basename "$f" .yaml)"
+          done
+
+  doctor:
+    name: doctor smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv sync
+      # Doctor may report findings (exit 2 — e.g. the claude CLI is absent on a CI runner);
+      # it must never crash. Accept 0/2, fail on anything else (a traceback exits 1).
+      - name: cairn doctor tolerates a bare machine
+        run: |
+          CAIRN="$PWD/.venv/bin/cairn"
+          "$CAIRN" new workspace ci-doctor --dir "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/ci-doctor"
+          set +e
+          "$CAIRN" doctor
+          rc=$?
+          set -e
+          echo "doctor exit: $rc"
+          test "$rc" -eq 0 -o "$rc" -eq 2
+
+  package:
+    name: wheel install smoke (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - run: uv build
+      - run: uv tool install dist/*.whl
+      # The installed-tool day-0 path: scaffold works (proves templates/workspace shipped
+      # inside the wheel as cairn/_templates) and `cairn run hello` completes offline.
+      - name: cairn new + run hello --headless from the installed wheel
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          cairn --version
+          cairn --help
+          cairn new workspace pkg-smoke --dir "$RUNNER_TEMP"
+          cd "$RUNNER_TEMP/pkg-smoke"
+          cairn run hello --headless
+          test -f runs/*/greeting.json
