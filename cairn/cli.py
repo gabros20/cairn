@@ -18,7 +18,6 @@ import dataclasses
 import hashlib
 import json
 import shutil
-import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
@@ -48,7 +47,6 @@ from cairn.kernel.plan import (
 )
 from cairn.kernel.runstate import load_run, update_run
 from cairn.kernel.schedkit import (
-    RunResult,
     diff_schedules,
     find_idempotent_run,
     install as install_schedules,
@@ -1180,23 +1178,11 @@ def _print_gc_result(result, plan) -> None:
 # --------------------------------------------------------------------------- #
 
 
-class _SubprocessRunner:
-    """The schedkit ``Runner`` adapter — the CLI's one bridge to the real host scheduler.
-
-    schedkit keeps every side effect (crontab / launchctl / systemctl / a child ``cairn``)
-    behind this injected boundary; this is its only production implementation. Combined
-    stdout/stderr are captured so ``schedule run`` can propagate the child's exit verbatim.
-    """
-
-    def run(self, argv: list[str], *, input: str | None = None, cwd: Path | None = None) -> RunResult:
-        proc = subprocess.run(
-            [str(a) for a in argv],
-            input=input,
-            cwd=str(cwd) if cwd is not None else None,
-            capture_output=True,
-            text=True,
-        )
-        return RunResult(returncode=proc.returncode, stdout=proc.stdout or "", stderr=proc.stderr or "")
+# The schedkit ``Runner`` adapter — the CLI's one bridge to the real host scheduler — is now
+# the shared production runner from ``cairn.kernel.proc`` (the single subprocess-capture seam,
+# unified with batchkit's spawn). Aliased under the CLI's historical name so ``schedule``'s
+# injection point and the tests that monkeypatch ``cli._SubprocessRunner`` stay stable.
+from cairn.kernel.proc import SubprocessRunner as _SubprocessRunner
 
 
 def _resolve_cairn_bin() -> str:
