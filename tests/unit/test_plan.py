@@ -651,3 +651,36 @@ def test_dropped_step_tool_scope_does_not_warn_and_is_not_dangling(tmp_path):
     ws = _write_ws(tmp_path, _HEADER + steps, tools=tools)
     p = plan(ws, "p", {}, now=NOW)
     assert _tool_msgs(p) == []
+
+
+def test_all_local_scopes_never_scan_sibling_pipelines(tmp_path, monkeypatch):
+    # Every needed_by target resolves against the CURRENT pipeline (its name + its own step
+    # ids, already in hand) — the workspace-wide fallback scan must not run at all, so sibling
+    # pipeline files are never re-read on the common in-pipeline-scoping path.
+    import cairn.kernel.plan as plan_mod
+
+    def _boom(workspace_dir):
+        raise AssertionError("workspace scan ran despite all-local scopes")
+
+    monkeypatch.setattr(plan_mod, "_workspace_scope_names", _boom)
+    tools = '[tools.crawl4ai]\ncheck = "true"\nneeded_by = ["two", "p"]\n'
+    ws = _write_ws(tmp_path, _HEADER + _TWO_STEPS, tools=tools)
+    # belt and braces: an unreadable sibling would also blow up any accidental scan
+    (ws / "pipelines" / "broken.yaml").write_text("steps: [:::not yaml", encoding="utf-8")
+    p = plan(ws, "p", {}, now=NOW)  # no raise → the fallback stayed lazy
+    msgs = _tool_msgs(p)
+    assert not any("dangling" in m for m in msgs)
+    assert any("'two'" in m and "unverified" in m for m in msgs)
+
+
+def test_dangling_check_tolerates_a_malformed_sibling_pipeline(tmp_path):
+    # A residual (non-local) target forces the workspace fallback scan; a malformed sibling
+    # pipelines/broken.yaml must be skipped, not crash the plan — the dangling warning still
+    # lands and the plan still emits.
+    tools = '[tools.crawl4ai]\ncheck = "true"\nneeded_by = ["ghost"]\n'
+    ws = _write_ws(tmp_path, _HEADER + _TWO_STEPS, tools=tools)
+    (ws / "pipelines" / "broken.yaml").write_text("steps: [:::not yaml", encoding="utf-8")
+    p = plan(ws, "p", {}, now=NOW)
+    msgs = _tool_msgs(p)
+    assert any("'ghost'" in m and "dangling" in m for m in msgs), msgs
+    assert _ids(p.nodes) == ["one", "two"]
