@@ -166,9 +166,11 @@ promote      edits to skills/validators/guards/params           (the ladder, exe
              — on a branch, as a PR — never committed directly
 ```
 
-*Status: the `runtime` and `recall` rows are built — agents emit `learn` events and envelope block
-4 injects prior learnings. The `aggregate` verb (`cairn learnings`) is a stub today (exit 2); it
-and the `self-improve.yaml` curate→promote pipeline land C6, see IMPLEMENTATION-PLAN.*
+*Status: the `runtime`, `recall`, and `aggregate` rows are built — agents emit `learn` events,
+envelope block 4 injects prior learnings, and the `aggregate` verb (`cairn learnings [--since]
+[--tag]`) scans every run's trail under the runs root and renders the ranked, deduped view (LIVE).
+The `curate`/`promote` rows — the `self-improve.yaml` promote pipeline that folds learnings into
+skills/validators/guards on a branch — remain future, see IMPLEMENTATION-PLAN.*
 
 Two closure speeds, both already designed: **runtime closure** (block 4 — a learning recorded in
 run N is in run N+1's envelope with zero human action) and **design-time closure** (curation →

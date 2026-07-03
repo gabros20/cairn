@@ -203,7 +203,7 @@ guards:
 |---|---|---|
 | Where run dirs live | `cairn.toml → [workspace] runs_dir` (absolute or workspace-relative) | one setting per workspace; batch children land under it too |
 | One run's exact dir | `cairn run --run-dir PATH` | per-invocation escape hatch (CI temp dirs, tests) |
-| Run dir name | the pipeline's `run_id:` template | collision ⇒ auto `-v2` suffix; `--idempotent` resumes instead |
+| Run dir name | the pipeline's `run_id:` template | collision ⇒ auto `-v2` suffix; `--idempotent` matches an equivalent run by a `(pipeline, params, {date})` content key (via `schedkit.find_idempotent_run`) and resumes/no-ops it instead of minting a variant |
 | Artifact paths inside the run | each artifact's `path:` (template-capable) | the *only* author-controlled layout inside a run |
 | The run skeleton (`run.json`, `trail.jsonl`, `gates/`, `logs/`) | **not configurable, on purpose** | the legibility invariant: every cairn run dir on earth reads the same (ARCHITECTURE §11) |
 
@@ -327,7 +327,11 @@ Built-in `invoke` shapes (as actually built; flags re-verified at doctor time �
 
 ```
 claude:  claude -p "<envelope text>" --model {model} [--effort {effort}] --output-format text
-             (prompt passed as the -p argument; nothing on stdin)
+             --permission-mode bypassPermissions
+             (prompt passed as the -p argument; nothing on stdin. bypassPermissions is required:
+              headless `claude -p` under the default mode refuses every tool use and exits 0
+              without producing the artifact — cairn's blocking PreToolUse guards are the
+              enforcement layer instead of an interactive prompt)
 codex:   codex exec -C {cwd} -m {model} --sandbox workspace-write -a never
              [-c model_reasoning_effort={effort}]  < envelope
              (prompt on stdin; --output-schema is NOT wired yet — the STEP sentinel is the contract)
@@ -408,7 +412,10 @@ Full taxonomy (run/plan/step/gate/loop/guard/heartbeat/learn) in OBSERVABILITY.m
 cairn plan <pipeline> [--param k=v]... [--executor X] [--json]
 cairn run  <pipeline> [--param k=v]... [--executor X] [--step-executor STEP=X]...
            [--gate NAME=CHOICE]... [--headless] [--to NODE] [--from NODE] [--run-dir PATH]
-           [--idempotent]                       # existing run_id ⇒ resume-or-no-op (SCHEDULING.md §3)
+           [--idempotent]                       # match an equivalent run by the (pipeline, params,
+                                                # {date}) content key: complete → no-op (exit 0);
+                                                # incomplete → resume it (same drift guard as resume);
+                                                # none → fresh run (SCHEDULING.md §3)
 cairn resume <run-dir> [--force]        # accept pipeline-hash drift explicitly
 cairn gate <run-dir> <name>=<choice>    # answer a pending gate externally (writes gates/<name>.json,
                                         # by:"external") — the operator-pattern hook for coding agents:
@@ -426,12 +433,14 @@ cairn trail <run-dir> [--watch] [--follow --json [--since SEQ]]
 cairn ps [--workspace .] [--json]       # cross-run fleet view (running/gate-waiting/halted) —
                                         # derived from run.json + trail recency; no daemon, no registry
 cairn doctor [--executor X] [--probe-hooks]
-cairn batch <pipeline> --params-file sites.jsonl [-j 8] [--gate NAME=CHOICE]...  # stub — exit 2 until C6+
-cairn learnings [--since DATE] [--tag TAG]      # stub — exit 2 until C6+; aggregate learn events across all runs
+cairn batch <pipeline> --params-file sites.jsonl [-j 8] [--gate NAME=CHOICE]...
+                                        # process pool of `cairn run --headless` children, one per JSONL line
+cairn learnings [--since DATE] [--tag TAG]      # aggregate learn events across all runs, ranked
                                                 # (the learning loop: TOOLING-AND-GROWTH §7)
-cairn gc [--keep-days N] [--keep-last M] [--artifacts-only]   # stub — exit 2 until C6+; retention — never automatic
-cairn schedule install|list|run <name>|uninstall [--backend cron|launchd|systemd]  # stub — exit 2 until C6+
-                                                # sync schedules.yaml → host scheduler; the installed
+cairn gc [--keep-days N] [--keep-last M] [--artifacts-only] [--include-needs-human] [--apply]
+                                        # retention — never automatic; dry-run unless --apply
+cairn schedule install|list|run <name>|uninstall [--backend cron|launchd|systemd]
+           [--launchd-dir P] [--systemd-dir P]  # sync schedules.yaml → host scheduler; the installed
                                                 # entry always calls `cairn schedule run <name>` (SCHEDULING.md)
 cairn new workspace|pipeline|agent|skill|validator <name>
 ```

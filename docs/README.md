@@ -227,12 +227,15 @@ resident daemon (the filesystem is the state).
 
 ## Status
 
-**C0–C1 built and green (460 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
+**C0–C1 built and green (595 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
 artifacts, trail/runstate, guards, expression + template engines, config, doctor, scaffold); all
-five executors (`shell`/`stub` live; `claude`/`codex`/`grok` code-complete and unit-tested against
-fake binaries, **not yet live-verified**); the workspace test layer (`cairn test` + `record`); and
-the full C1-scope CLI (`batch`/`learnings`/`gc`/`schedule` still stubbed → exit 2). The day-0
-pipeline runs end-to-end offline (`cairn run hello --headless`). Still ahead, per
-[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md) (C0–C7): live-model parity (C2/C3), the Codex
-headless-hook probe (C4), Grok live setup (C5), batch / CMS population / scheduling (C6), and
-package extraction to its own repo (C7).
+five executors (`shell`/`stub` live; the **`claude` executor now live-verified** — the first live
+`claude -p` runs recorded as offline stub regressions in `tests/live/workspace-claude`;
+`codex`/`grok` code-complete and unit-tested against fake binaries, **not yet live-verified**); the
+workspace test layer (`cairn test` + `record`); and the full CLI — the `batch`/`learnings`/`gc`/
+`schedule` verbs are now **LIVE** (no longer stubbed), with first-class **scheduling shipped**
+(`schedules.yaml`, cron/launchd/systemd installers, content-key idempotency). **v0.1.0 packaging is
+landing this wave.** The day-0 pipeline runs end-to-end offline (`cairn run hello --headless`).
+Still ahead, per [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md): the Codex headless-hook probe
+(C4), Grok live setup (C5), the CMS-population branch, and the brease-factory workspace migration
+(deferred — cairn's eventual first workspace).

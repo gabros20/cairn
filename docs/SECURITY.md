@@ -32,9 +32,9 @@ ever reading the value into a message.
 
 ### 1.2 Pass-through — deny by default
 
-A step's process env is a **scrubbed baseline** (`PATH`, `HOME`, `LANG`/`LC_ALL`, `TMPDIR`, the
-`CAIRN_RUN_DIR`/`CAIRN_STEP`/`CAIRN_WORKSPACE` run vars, and `CLAUDE_PROJECT_DIR`) **plus only what
-its agent declares**:
+A step's process env is a **scrubbed baseline** (`PATH`, `HOME`, `LANG`/`LC_ALL`, `TMPDIR`, `USER`,
+`LOGNAME`, the `CAIRN_RUN_DIR`/`CAIRN_STEP`/`CAIRN_WORKSPACE` run vars, and `CLAUDE_PROJECT_DIR`)
+**plus only what its agent declares**:
 
 ```yaml
 # agents/populator.yaml
@@ -43,6 +43,11 @@ env: [BREASE_TOKEN]          # explicit, reviewable, diffable — absent list = 
 
 The capture agent has no `env:` — a prompt-injected `printenv` inside P0 finds nothing worth
 stealing. This single default removes the largest secret-exfiltration surface for free.
+
+`USER`/`LOGNAME` are in the baseline deliberately: they are **identity, not secrets**, and the CLI
+executors need them. A headless `claude`/`codex` finds its stored OAuth credential via the macOS
+Keychain, whose lookup keys off `USER`; strip it and every executor reports "Not logged in" (found
+live — the first `claude -p` runs failed exactly this way until the baseline carried `USER`).
 
 ### 1.3 Redaction — kernel-side, literal, everywhere it writes
 
@@ -143,10 +148,13 @@ separate machinery.
   flock) — two concurrent `cairn resume`s on the same run cannot interleave; the loser exits 4
   with "run is held by PID …". Batch's parallelism is across run dirs, so it never contends.
 - **Retention:** capture-heavy runs are multi-GB. `cairn gc [--keep-days N] [--keep-last M]
-  [--artifacts-only]` deletes or slims old runs (`--artifacts-only` keeps `run.json` + trail +
-  envelopes — the audit skeleton — while dropping bulk payloads). Never automatic; runs are the
-  audit record and deleting them is an operator's decision.
-  *Status: designed; the `gc` verb is a stub today (exit 2) — lands C6, see IMPLEMENTATION-PLAN.*
+  [--artifacts-only] [--include-needs-human] [--apply]` deletes or slims old runs
+  (`--artifacts-only` keeps `run.json` + trail + `.cairn.lock` — the audit skeleton — while dropping
+  bulk payloads). It is a **dry-run by default** — printing the plan of what would be deleted/slimmed
+  — and only touches disk with `--apply`. A live run (`status == "running"`, a held flock, or a
+  trail-derived `running`/`gate` status) is never selected; a `gate`/needs-human run is protected
+  unless `--include-needs-human` is passed. Never automatic; runs are the audit record and deleting
+  them is an operator's decision. *Status: LIVE — built and tested.*
 
 ## 6. Non-features, named
 

@@ -137,10 +137,20 @@ Guards declare `enforce:` layers; the engine wires what each executor supports a
 `hook`/`shim` engine and the empirical hook-firing probe land with the live executors — guard engine
 C3, the doctor hook probe C4 (see IMPLEMENTATION-PLAN).*
 
+**The C4 probe carries a specific, now-unavoidable burden.** The `claude` executor runs headless with
+`--permission-mode bypassPermissions` (it must — see API §7 / SECURITY §1.2: the default mode refuses
+every tool use and the guards are the enforcement layer instead of an interactive prompt). That makes
+`Capabilities.blocking_hooks = True` an **asserted design claim, not yet an empirically confirmed
+fact**: the whole containment story depends on PreToolUse hooks *still firing AND still blocking*
+(exit 2) even under `bypassPermissions`. The C4 doctor hook-probe must confirm exactly that —
+`bypassPermissions` bypasses the interactive permission prompt but does **not** disable hooks — on
+each machine. Until the probe runs, treat `blocking_hooks=True` as the design's assumption.
+
 `cairn doctor` empirically probes hook firing per executor (spawn a canary invocation that attempts
-a guarded command) and records the result — PORT-DESIGN's "highest risk" becomes a diagnosed,
-per-machine fact instead of an assumption. The check script contract is one file, one convention
-(exit 0/2), reused across all three layers.
+a guarded command under the executor's real headless flags, `bypassPermissions` included) and records
+the result — PORT-DESIGN's "highest risk" becomes a diagnosed, per-machine fact instead of an
+assumption. The check script contract is one file, one convention (exit 0/2), reused across all three
+layers.
 
 ## 5. Isolation & environment
 
