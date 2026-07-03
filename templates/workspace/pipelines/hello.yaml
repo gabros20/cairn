@@ -17,7 +17,7 @@ artifacts:
     schema: schemas/greeting.json
   message:
     path: message.txt
-    validator: validators/nonempty.py       # called [run_dir, "message.txt"]; checks it exists + non-empty
+    validator: validators/nonempty.py       # exists + non-empty check (validator argv: run_dir, name, path)
 
 steps:
   # 1. run: — deterministic, no model, no auth. Writes the greeting artifact.
