@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -230,6 +231,55 @@ def test_resume_honors_recorded_executor_overrides(tmp_path, monkeypatch):
     # recorded stub override was honored.
     assert main(["resume", str(rd)]) == int(ExitCode.OK)
     assert (rd / "art2.json").is_file()
+
+
+def _phantom_ws(tmp_path: Path) -> Path:
+    """A workspace whose cairn.toml defines an executor `phantom` with NO registered plugin —
+    it plans fine (it has a config table) but can't be built."""
+    ws = newkit.new_workspace("ph", tmp_path)
+    (ws / "cairn.toml").write_text(
+        (ws / "cairn.toml").read_text()
+        + "\n[executors.phantom]\nenabled = true\n[executors.phantom.tiers]\nbalanced = { model = \"ghost\" }\n",
+        encoding="utf-8",
+    )
+    (ws / "agents" / "a1.yaml").write_text('description: "a1"\ntier: balanced\n', encoding="utf-8")
+    (ws / "pipelines" / "ph.yaml").write_text(
+        "pipeline: ph\nversion: 1\nrun_id: \"ph-{date}\"\n"
+        "artifacts:\n  a1: { path: a1.json, validator: validators/nonempty.py }\n"
+        "steps:\n  - id: s1\n    agent: a1\n    produces: [a1]\n",
+        encoding="utf-8",
+    )
+    return ws
+
+
+def test_run_missing_executor_plugin_is_typed_error(tmp_path, monkeypatch, capsys):
+    ws = _phantom_ws(tmp_path)
+    monkeypatch.chdir(ws)
+    rc = main(["run", "ph", "--step-executor", "s1=phantom", "--headless"])
+    assert rc == int(ExitCode.EXECUTOR)
+    assert "no such executor plugin" in capsys.readouterr().err
+
+
+def test_resume_missing_executor_plugin_is_typed_error(tmp_path, monkeypatch, capsys):
+    ws = _phantom_ws(tmp_path)
+    monkeypatch.chdir(ws)
+    main(["run", "ph", "--step-executor", "s1=phantom", "--headless"])  # records the override, halts 4
+    rd = _run_dir(ws, "ph")
+    capsys.readouterr()
+    rc = main(["resume", str(rd)])  # reconstructs phantom from run.json → same typed error
+    assert rc == int(ExitCode.EXECUTOR)
+    assert "no such executor plugin" in capsys.readouterr().err
+
+
+def test_resume_after_pipeline_file_deleted_is_clean_config_error(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    (hello_ws / "pipelines" / "hello.yaml").unlink()
+    rc = main(["resume", str(rd)])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "no longer exists" in err and "hello.yaml" in err
 
 
 # --------------------------------------------------------------------------- #
@@ -573,3 +623,38 @@ def test_guard_shim_allows_nonmatching_command(tmp_path):
     rd = _run_dir(ws, "allowed")
     log = (rd / "logs" / "safe-cmd.log").read_text()
     assert "faketool ran: safe now" in log  # the real binary executed through the shim
+
+
+# --------------------------------------------------------------------------- #
+# Wheel packaging: `cairn new workspace` must work from an installed copy (the wheel
+# force-includes templates/workspace → cairn/_templates/workspace). True install smoke.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.skipif(shutil.which("uv") is None, reason="uv required to build + install the wheel")
+def test_wheel_ships_templates_and_new_workspace_works_installed(tmp_path):
+    dist = tmp_path / "dist"
+    build = subprocess.run(
+        ["uv", "build", "--wheel", "-o", str(dist)], cwd=str(REPO), capture_output=True, text=True
+    )
+    assert build.returncode == 0, build.stderr
+    wheels = list(dist.glob("*.whl"))
+    assert wheels, "no wheel built"
+
+    venv = tmp_path / "venv"
+    assert subprocess.run(["uv", "venv", str(venv)], capture_output=True, text=True).returncode == 0
+    py = venv / "bin" / "python"
+    install = subprocess.run(
+        ["uv", "pip", "install", "--python", str(py), str(wheels[0])], capture_output=True, text=True
+    )
+    assert install.returncode == 0, install.stderr
+
+    cairn_bin = venv / "bin" / "cairn"
+    work = tmp_path / "work"
+    work.mkdir()
+    made = subprocess.run([str(cairn_bin), "new", "workspace", "x"], cwd=str(work), capture_output=True, text=True)
+    assert made.returncode == 0, made.stderr
+    assert (work / "x" / "pipelines" / "hello.yaml").is_file()  # templates shipped in the wheel
+    planned = subprocess.run([str(cairn_bin), "plan", "hello"], cwd=str(work / "x"), capture_output=True, text=True)
+    assert planned.returncode == 0, planned.stderr
+    assert "hello" in planned.stdout

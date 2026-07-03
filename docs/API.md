@@ -410,7 +410,7 @@ cairn gate <run-dir> <name>=<choice>    # answer a pending gate externally (writ
                                         # run exits 6 at an unanswered gate → operator asks the human in
                                         # its own UI → cairn gate … → cairn resume
 cairn validate <run-dir> [artifact]
-cairn test [validators|guards|pipelines|envelopes] [--pipeline P] [--update]
+cairn test [validators|guards|pipelines|envelopes] [--update]
                                         # L1 offline suite: fixtures + stub runs + envelope snapshots
                                         # (full spec: TESTING.md)
 cairn test record <run-dir> [--slim]    # harvest a real run into tests/stubs + tests/fixtures

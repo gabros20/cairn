@@ -131,10 +131,24 @@ def build_executor(name: str, cls: type, ec: ExecutorConfig | None) -> Any:
 
 
 def build_executors(resolved_models: dict, config: Config) -> dict[str, Any]:
-    """Build every executor a plan needs: each in ``resolved_models`` + always ``shell``."""
+    """Build every executor a plan needs: each in ``resolved_models`` + always ``shell``.
+
+    An executor named in ``cairn.toml`` (so it planned fine) but with no registered
+    ``cairn.executors`` plugin raises a typed :class:`CairnError` — mapped to ExitCode.EXECUTOR
+    by the callers — rather than a raw ``KeyError`` traceback."""
     names = {exec_name for exec_name, _m, _e in resolved_models.values()}
     names.add("shell")
-    return {name: build_executor(name, load_executor_class(name), config.executors.get(name)) for name in names}
+    out: dict[str, Any] = {}
+    for name in names:
+        try:
+            cls = load_executor_class(name)
+        except KeyError as exc:
+            raise CairnError(
+                f"executor {name!r} has no registered plugin (no such executor plugin) — "
+                f"check the cairn.executors entry points"
+            ) from exc
+        out[name] = build_executor(name, cls, config.executors.get(name))
+    return out
 
 
 def _print_config_error(exc: ConfigError) -> int:
@@ -499,6 +513,11 @@ def _cmd_resume(args: argparse.Namespace) -> int:
 
     pipeline = run_doc["pipeline"]
     params = {k: _param_str(v) for k, v in (run_doc.get("params") or {}).items() if v is not None}
+
+    pfile = ws / "pipelines" / f"{pipeline}.yaml"
+    if not pfile.is_file():
+        print(f"cairn: cannot resume — pipeline file {pfile} no longer exists", file=sys.stderr)
+        return int(ExitCode.CONFIG)
 
     current_hash = _pipeline_hash(ws, pipeline)
     recorded = run_doc.get("pipeline_hash")

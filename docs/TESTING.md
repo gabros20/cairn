@@ -61,7 +61,7 @@ brease-rebuild:
 ## 4. `cairn test` — four suites, one command
 
 ```
-cairn test [validators|guards|pipelines|envelopes] [--pipeline P] [--update]
+cairn test [validators|guards|pipelines|envelopes] [--update]
 ```
 
 **4.1 validators** — for every artifact with fixtures: each `valid-*` must pass; each `invalid-*`

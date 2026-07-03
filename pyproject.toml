@@ -25,5 +25,11 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["cairn"]
 
+# The scaffold tree lives at templates/workspace in the source repo (tests depend on it there);
+# force-include it INTO the wheel under cairn/_templates so `cairn new workspace` works from an
+# installed (`uv tool install`) copy. newkit.templates_dir() resolves this path first.
+[tool.hatch.build.targets.wheel.force-include]
+"templates/workspace" = "cairn/_templates/workspace"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

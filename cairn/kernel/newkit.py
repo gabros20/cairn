@@ -17,22 +17,24 @@ _WORKSPACE_MARKER = "{{WORKSPACE_NAME}}"
 def templates_dir() -> Path:
     """Locate the packaged ``templates/workspace`` tree.
 
-    Prefer the installed package's sibling (``importlib.resources``); fall back to the repo
-    checkout layout (``<repo>/templates/workspace``, where this file is ``cairn/kernel/``).
+    Installed wheels force-include the tree at ``cairn/_templates/workspace`` (pyproject), so
+    prefer that; fall back to the repo checkout layout (``<repo>/templates/workspace``, where
+    this file is ``cairn/kernel/``) for dev. The source tree keeps ``templates/workspace`` at
+    the repo root — ``test_scaffold_template.py`` depends on that location.
     """
-    # Repo checkout: cairn/kernel/newkit.py → parents[2] is the repo root.
-    checkout = Path(__file__).resolve().parents[2] / "templates" / "workspace"
-    if checkout.is_dir():
-        return checkout
-    try:  # installed: templates packaged alongside the cairn package
+    try:  # installed: templates force-included inside the package
         from importlib.resources import files
 
-        packaged = Path(str(files("cairn"))).parent / "templates" / "workspace"
+        packaged = Path(str(files("cairn"))) / "_templates" / "workspace"
         if packaged.is_dir():
             return packaged
     except (ModuleNotFoundError, TypeError):  # pragma: no cover - defensive
         pass
-    raise FileNotFoundError("cannot locate templates/workspace (not in checkout or package)")
+    # Repo checkout: cairn/kernel/newkit.py → parents[2] is the repo root.
+    checkout = Path(__file__).resolve().parents[2] / "templates" / "workspace"
+    if checkout.is_dir():
+        return checkout
+    raise FileNotFoundError("cannot locate templates/workspace (not in package or checkout)")
 
 
 def new_workspace(name: str, dest_dir: Path | None = None) -> Path:
