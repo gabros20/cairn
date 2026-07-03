@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cairn:step-return",
+  "title": "STEP return block",
+  "description": "The sentinel-framed final message an agent emits (docs/API.md §7).",
+  "type": "object",
+  "required": ["status", "summary", "artifacts"],
+  "properties": {
+    "status": { "enum": ["done", "skipped", "blocked"] },
+    "summary": { "type": "string", "maxLength": 2000 },
+    "artifacts": { "type": "array", "items": { "type": "string" } },
+    "metrics": { "type": "object" },
+    "learnings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["note"],
+        "properties": {
+          "note": { "type": "string" },
+          "tag": { "type": "string" }
+        }
+      }
+    },
+    "blockers": { "type": "array", "items": { "type": "string" } }
+  }
+}

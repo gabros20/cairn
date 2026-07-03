@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cairn:run",
+  "title": "run.json",
+  "description": "The pinned per-run manifest (docs/API.md §8.1).",
+  "type": "object",
+  "required": [
+    "run_id",
+    "pipeline",
+    "pipeline_hash",
+    "cairn_version",
+    "params",
+    "dims",
+    "executors",
+    "models",
+    "created_at",
+    "status",
+    "nodes"
+  ],
+  "properties": {
+    "run_id": { "type": "string" },
+    "pipeline": { "type": "string" },
+    "pipeline_hash": { "type": "string" },
+    "cairn_version": { "type": "string" },
+    "params": { "type": "object" },
+    "dims": { "type": "object" },
+    "executors": {
+      "type": "object",
+      "required": ["default"],
+      "properties": {
+        "default": { "type": "string" },
+        "overrides": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "versions": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        }
+      }
+    },
+    "models": {
+      "type": "object",
+      "additionalProperties": { "type": "string" }
+    },
+    "created_at": { "type": "string" },
+    "status": { "enum": ["running", "done", "halted"] },
+    "nodes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "status": { "enum": ["running", "done", "skipped", "halted"] },
+          "at": { "type": "string" },
+          "cycles": { "type": "integer", "minimum": 0 }
+        }
+      }
+    }
+  }
+}
