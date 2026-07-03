@@ -37,6 +37,32 @@ dependency floor and the plugin boundary held.)
 Dependency rule: **downward only.** Executors never read pipelines; the kernel never contains a CLI
 name; the workspace is immutable during a run; all mutation lands in exactly one run dir.
 
+The same picture as a control flow — how a `cairn run` moves through the kernel modules, and where
+the guard engine sits relative to the executor it wraps:
+
+```mermaid
+graph LR
+  CLI["cli.py<br/>plan · run · resume · …"] --> PLAN["plan.py<br/>load → verify → Plan"]
+  PLAN --> WALK["walk.py<br/>the trail walker"]
+
+  WALK --> COMPOSE["compose.py<br/>envelope (AX)"]
+  WALK --> GATE["gatekit.py<br/>gate resolution"]
+  WALK --> GUARD["guards.py<br/>hook · shim · post"]
+
+  COMPOSE --> EX["executors/*<br/>claude · codex · grok · shell · stub"]
+  GUARD -.wraps.-> EX
+  EX --> ART["artifacts.py<br/>schema + validator"]
+  ART -->|done predicate| WALK
+
+  WALK --> TRAIL["trail.py<br/>trail.jsonl · the authority"]
+  TRAIL --> SINKS["sinks.py<br/>jsonl (#0) · webhook tee"]
+```
+
+`plan.py` produces a static `Plan`; `walk.py` executes it, composing an envelope per step
+(`compose.py`), resolving gates (`gatekit.py`), installing guards (`guards.py`), invoking a fresh
+process (`executors/*`), and gating on artifact validity (`artifacts.py`) before appending to the
+trail (`trail.py`) and teeing to any sinks (`sinks.py`).
+
 ## 2. Planning — `cairn plan`
 
 Planning is a pure function: `(workspace, pipeline, params) → Plan | ConfigError`. Steps:
@@ -73,6 +99,24 @@ The walker consumes the Plan against a run dir. Per node kind:
 8. record                  trail: done{step, artifacts, metrics} · run.json phase status
    on fail                 → retry? (attempts left: re-compose WITH validator reasons; goto 3)
                            → else halt (§3.5)
+```
+
+The same lifecycle as a state machine — note that *validate* is the only gate to *done*, and that
+`cairn resume` re-enters a halted step at *compose*, never trusting a hand-edited artifact (§3.5):
+
+```mermaid
+stateDiagram-v2
+  [*] --> Pending
+  Pending --> Done: already valid (done-skip)
+  Pending --> Compose: not done · needs present
+  Compose --> Execute: envelope rendered · guards installed
+  Execute --> Validate: process returns · STEP parsed
+  Validate --> Done: every produces passes
+  Validate --> Retry: fail · attempts left
+  Retry --> Compose: re-compose with validator reasons
+  Validate --> Halt: fail · no attempts
+  Halt --> Compose: cairn resume
+  Done --> [*]
 ```
 
 ### 3.2 `gate`
@@ -133,9 +177,13 @@ Guards declare `enforce:` layers; the engine wires what each executor supports a
 | `shim` (PATH wrapper) | ✓ | ✓ | ✓ | ✓ |
 | `post` (validator backstop) | ✓ | ✓ | ✓ | ✓ |
 
-*Status: the `post` (validator backstop) layer is what the built kernel wires today; the `hook`/`shim`
-engine lands with the live executors (guard engine C3), and the empirical hook-firing probe has
-shipped (`cairn doctor --probe-hooks`, C4 — see IMPLEMENTATION-PLAN).*
+*Status: `post` (the validator backstop) is the layer that **enforces** on a live run today — it is
+the walker's hard artifact gate, always on. The `hook`/`shim` machinery is **built** (`guards.py`:
+the check chain, `build_shims`, the `--shim-check` entry) and unit-tested at L1 (`cairn test guards`),
+and the empirical hook-firing probe has **shipped** (`cairn doctor --probe-hooks`, C4 — see
+IMPLEMENTATION-PLAN); what is **not yet wired** is the per-executor `install_guards` hook that installs
+those native hooks + PATH shims for a run (the CLI executors' `install_guards` is still a stub), so
+until it lands `post` carries enforcement alone.*
 
 **The C4 probe settles a specific burden.** The `claude` executor runs headless with
 `--permission-mode bypassPermissions` (it must — see API §7 / SECURITY §1.2: the default mode refuses
@@ -153,7 +201,7 @@ field, carries codex's per-machine truth.)
 `cairn doctor --probe-hooks` empirically probes hook firing per executor — it spawns a throwaway canary
 project carrying a native deny-hook, invokes the vendor CLI headlessly under the executor's real argv
 posture and the walker's exact env baseline, and classifies the outcome (fires+blocks / fires-not-blocks
-/ no-fire / inconclusive) — so PORT-DESIGN's "highest risk" becomes a diagnosed, per-machine fact instead
+/ no-fire / inconclusive) — so the port design's highest risk becomes a diagnosed, per-machine fact instead
 of an assumption. On the dev machine all three vendor executors probe **hook-primary**: `claude`,
 `codex` (codex-cli 0.142.5 *does* ship native PreToolUse blocking hooks), and `grok` (grok 0.2.82:
 PreToolUse fires+blocks under `bypassPermissions`). One posture caveat is grok-specific: a grok hook
