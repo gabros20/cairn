@@ -164,10 +164,27 @@ class PlanSkip:
 
 
 @dataclass(frozen=True)
+class ToolRequirement:
+    """A ``[tools.X]`` entry whose ``needed_by`` scope names an in-range step (or this pipeline).
+
+    Computed at plan time — offline, so ``check`` is NOT run here; it is carried whole so
+    ``cairn run`` can probe it before minting anything (docs/TOOLING-AND-GROWTH.md §2). ``targets``
+    is the sorted in-range step ids the scope names, plus the pipeline name when pipeline-scoped —
+    the "needed by" list a refusal prints. Unscoped tools never appear here (doctor's concern)."""
+
+    tool: str
+    check: str
+    install: str | None
+    targets: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class Plan:
     """The emitted, executable plan. ``nodes`` is the ``--from``/``--to`` slice; dataflow and
     references are verified over the whole pipeline before slicing. ``resolved_models`` maps a
-    step id → ``(executor, model, effort)`` for every agent step *in range*."""
+    step id → ``(executor, model, effort)`` for every agent step *in range*. ``tool_requirements``
+    is the range-scoped subset of ``[tools]`` (see :class:`ToolRequirement`) — the hard-stop set
+    ``cairn run`` verifies before it mints or walks anything."""
 
     pipeline: str
     version: int
@@ -181,6 +198,7 @@ class Plan:
     executor_default: str | None
     resolved_models: dict[str, tuple[str, str, str | None]]
     skipped: tuple[PlanSkip, ...] = ()
+    tool_requirements: tuple[ToolRequirement, ...] = ()
 
 
 # --------------------------------------------------------------------------- #
@@ -1150,6 +1168,25 @@ def _lint_tools(
             )
 
 
+def _tool_requirements(
+    config: Config, pipeline_name: str, in_range_ids: set[str]
+) -> tuple[ToolRequirement, ...]:
+    """The range-scoped tool subset for the run-time hard-stop — the same in-range matching
+    :func:`_lint_tools` warns on, captured structurally so ``cairn run`` can probe each ``check``
+    before minting anything. A tool is included iff its ``needed_by`` names an in-range step or
+    this pipeline; unscoped tools (empty ``needed_by``) and tools scoped only to out-of-range /
+    dropped steps are excluded — the exclusion is what makes "out-of-range ⇒ never checked" hold."""
+    reqs: list[ToolRequirement] = []
+    for tool in config.tools.values():
+        scoped = set(tool.needed_by)
+        targets = sorted(in_range_ids & scoped)
+        if pipeline_name in scoped:
+            targets.append(pipeline_name)
+        if targets:
+            reqs.append(ToolRequirement(tool.name, tool.check, tool.install, tuple(targets)))
+    return tuple(reqs)
+
+
 # --------------------------------------------------------------------------- #
 # The public entry points.
 # --------------------------------------------------------------------------- #
@@ -1247,18 +1284,22 @@ def plan(
     emitted, resolved_models = _emit(active, executor, step_executors, config, from_node, to_node, str(pfile))
 
     # Range-scoped tool preflight — offline; the workspace-wide scan is a lazy fallback
-    # that only runs for a needed_by target the current pipeline can't account for.
+    # that only runs for a needed_by target the current pipeline can't account for. The same
+    # in-range match feeds both the plan-time warnings and the run-time hard-stop set.
+    tool_requirements: tuple[ToolRequirement, ...] = ()
     if config.tools:
+        in_range_ids = _flatten_step_ids(emitted)
         local_names = {pipeline_name}
         _collect_raw_step_ids(raw_steps, local_names)
         _lint_tools(
             config,
             pipeline_name,
-            _flatten_step_ids(emitted),
+            in_range_ids,
             local_names,
             lambda: _workspace_scope_names(workspace_dir),
             warnings,
         )
+        tool_requirements = _tool_requirements(config, pipeline_name, in_range_ids)
 
     return Plan(
         pipeline=pipeline,
@@ -1273,6 +1314,7 @@ def plan(
         executor_default=config.workspace.default_executor,
         resolved_models=resolved_models,
         skipped=tuple(skips),
+        tool_requirements=tool_requirements,
     )
 
 

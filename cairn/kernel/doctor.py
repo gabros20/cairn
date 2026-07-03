@@ -21,6 +21,7 @@ from typing import Callable
 from cairn.kernel.config import Config, load_config, requires_satisfied
 from cairn.kernel.errors import ConfigError
 from cairn.kernel.plan import plan as build_plan
+from cairn.kernel.toolcheck import run_tool_check
 
 _OK = "✔"
 _BAD = "✗"
@@ -239,17 +240,10 @@ def _doctor_tool(name: str, tool, out: Callable[[str], None]) -> None:
 
 
 def _run_check(check: str) -> bool:
-    try:
-        proc = subprocess.run(
-            ["/bin/sh", "-c", check],
-            capture_output=True,
-            text=True,
-            timeout=30,
-            env=os.environ.copy(),
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return False
-    return proc.returncode == 0
+    # Thin alias over the shared runner so doctor and `cairn run`'s hard-stop probe tools with
+    # byte-identical semantics (docs/TOOLING-AND-GROWTH.md §2). Kept as a named function so the
+    # doctor call sites (and their tests) read unchanged.
+    return run_tool_check(check)
 
 
 def _guard_runner_imports() -> bool:

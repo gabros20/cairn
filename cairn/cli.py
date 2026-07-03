@@ -47,6 +47,7 @@ from cairn.kernel.plan import (
 )
 from cairn.kernel.proc import SubprocessRunner as _SubprocessRunner
 from cairn.kernel.runstate import load_run, update_run
+from cairn.kernel.toolcheck import run_tool_check
 from cairn.kernel.schedkit import (
     diff_schedules,
     find_idempotent_run,
@@ -419,6 +420,29 @@ def _print_walk_result(code: ExitCode, run_dir: Path) -> None:
         print(f"cairn: run halted (exit {int(code)}) → {run_dir}", file=sys.stderr)
 
 
+def _preflight_tools(p: Plan) -> int | None:
+    """The `cairn run` hard-stop (docs/TOOLING-AND-GROWTH.md §2): run each in-range scoped tool's
+    ``check`` BEFORE anything is minted or walked. Called from every entrance that is about to
+    execute (fresh run, both resume entrances of `cairn run`, and `cairn resume`) once the no-op /
+    idempotent-complete cases have been ruled out — so a done run is never blocked by a tool that
+    has since vanished. A failing check refuses with a legible message naming the tool, the
+    step(s)/pipeline needing it, the failed check, and the fix (install hint + `cairn doctor`),
+    and returns ``ExitCode.CONFIG`` (nothing created on disk). All checks pass → returns None with
+    zero output. ``p.tool_requirements`` already excludes unscoped and out-of-range tools, so this
+    runs no subprocess a plan-time scope didn't already justify."""
+    failures = [req for req in p.tool_requirements if not run_tool_check(req.check)]
+    if not failures:
+        return None
+    lines = [f"cairn: refusing to run {p.pipeline!r} — required tool(s) unverified on this machine:"]
+    for req in failures:
+        lines.append(f"  ✗ {req.tool}  `{req.check}` failed (needed by: {', '.join(req.targets)})")
+        if req.install:
+            lines.append(f"      fix: {req.install}")
+    lines.append("  → run `cairn doctor` to verify tooling, then re-run.")
+    print("\n".join(lines), file=sys.stderr)
+    return int(ExitCode.CONFIG)
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     ws = _workspace(args)
     now = _now()
@@ -450,10 +474,15 @@ def _cmd_run(args: argparse.Namespace) -> int:
             fast = _idempotent_shortcut(run_dir)
             if fast is not None:
                 return fast
-        elif not existing:
+        # Committed to execute (fresh mint or resume): verify in-range tools BEFORE minting —
+        # a failing check refuses with nothing created on disk (docs/TOOLING-AND-GROWTH §2).
+        fail = _preflight_tools(p)
+        if fail is not None:
+            return fail
+        if not existing:
             run_dir = bootstrap_run(ws, p, now=now, run_dir=run_dir, pipeline_hash=phash)
             created = True
-        if existing:
+        else:
             # An existing --run-dir resumes (with or without --idempotent) — through the same
             # guards as every other resume entrance (drift → version). `cairn run` has no
             # --force; the refusals name `cairn resume <run-dir> --force` as the escape hatch.
@@ -473,6 +502,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if match is not None and match.complete:
             print(f"cairn: already done → {match.run_dir}")
             return int(ExitCode.OK)
+        # Committed to execute: verify in-range tools BEFORE minting (nothing on disk on failure).
+        fail = _preflight_tools(p)
+        if fail is not None:
+            return fail
         if match is not None:
             # Incomplete equivalent run → resume it, never mint a variant — but through the
             # same guards `cairn resume` enforces: a timer re-fire after a pipeline edit or
@@ -647,6 +680,12 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         config = load_config(ws)
     except ConfigError as exc:
         return _print_config_error(exc)
+
+    # Resume re-checks in-range tools: a tool can vanish between sessions and the steps ahead
+    # still need it (docs/TOOLING-AND-GROWTH §2). Cheap, and nothing is walked on a failure.
+    fail = _preflight_tools(p)
+    if fail is not None:
+        return fail
 
     interactive = sys.stdin.isatty()
     try:

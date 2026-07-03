@@ -684,3 +684,49 @@ def test_dangling_check_tolerates_a_malformed_sibling_pipeline(tmp_path):
     msgs = _tool_msgs(p)
     assert any("'ghost'" in m and "dangling" in m for m in msgs), msgs
     assert _ids(p.nodes) == ["one", "two"]
+
+
+# --------------------------------------------------------------------------- #
+# plan.tool_requirements — the additive, range-scoped subset `cairn run` hard-stops
+# on (docs/TOOLING-AND-GROWTH §2). Same in-range match as the warnings; carried
+# structurally (whole check/install) so run-time can probe without re-deriving.
+# --------------------------------------------------------------------------- #
+
+
+def _reqs(p) -> dict:
+    return {r.tool: r for r in p.tool_requirements}
+
+
+def test_tool_requirements_carries_in_range_scoped_tool(tmp_path):
+    tools = '[tools.crawl4ai]\ncheck = "true"\ninstall = "uv sync"\nneeded_by = ["two"]\n'
+    ws = _write_ws(tmp_path, _HEADER + _TWO_STEPS, tools=tools)
+    reqs = _reqs(plan(ws, "p", {}, now=NOW))
+    assert "crawl4ai" in reqs
+    r = reqs["crawl4ai"]
+    assert r.check == "true" and r.install == "uv sync" and r.targets == ("two",)
+
+
+def test_tool_requirements_excludes_unscoped_tool(tmp_path):
+    # unscoped (no needed_by) is doctor's global concern — never a run-time hard-stop.
+    tools = '[tools.crawl4ai]\ncheck = "true"\n'
+    ws = _write_ws(tmp_path, _HEADER + _TWO_STEPS, tools=tools)
+    assert plan(ws, "p", {}, now=NOW).tool_requirements == ()
+
+
+def test_tool_requirements_excludes_out_of_range_tool(tmp_path):
+    # `two` sliced off by --to one → its scoped tool is not a run-time requirement (never probed).
+    tools = '[tools.crawl4ai]\ncheck = "true"\nneeded_by = ["two"]\n'
+    ws = _write_ws(tmp_path, _HEADER + _TWO_STEPS, tools=tools)
+    assert plan(ws, "p", {}, now=NOW, to_node="one").tool_requirements == ()
+
+
+def test_tool_requirements_includes_pipeline_scope(tmp_path):
+    tools = '[tools.crawl4ai]\ncheck = "true"\nneeded_by = ["p"]\n'
+    ws = _write_ws(tmp_path, _HEADER + _TWO_STEPS, tools=tools)
+    reqs = _reqs(plan(ws, "p", {}, now=NOW))
+    assert reqs["crawl4ai"].targets == ("p",)
+
+
+def test_tool_requirements_absent_when_no_tools_declared(tmp_path):
+    ws = _write_ws(tmp_path, _HEADER + _TWO_STEPS)
+    assert plan(ws, "p", {}, now=NOW).tool_requirements == ()

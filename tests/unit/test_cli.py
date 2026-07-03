@@ -181,13 +181,108 @@ def test_run_idempotent_twice_same_dir(hello_ws, monkeypatch, capsys):
 def test_run_stub_executor_offline(monkeypatch, tmp_path, capsys):
     # A full agent pipeline "runs" offline via the stub — but brease-rebuild's agents have no
     # recorded stubs here, so the first agent step fails loudly (never a false green).
+    # `--to capture` keeps the range short of the `deploy` step so the vercel tool hard-stop
+    # (docs/TOOLING-AND-GROWTH §2) doesn't fire on this offline machine — that hard-stop has its
+    # own test below; here we're exercising the stub/artifact-gate path.
     monkeypatch.chdir(BREASE_WS)
     rc = main([
-        "run", "brease-rebuild", "--executor", "stub", "--headless",
+        "run", "brease-rebuild", "--executor", "stub", "--headless", "--to", "capture",
         "--param", "url=https://acme.com", "--run-dir", str(tmp_path / "r"),
     ])
     # discover has no stub dir → artifact gate fails → halt (gate-failed), not a crash.
     assert rc == int(ExitCode.GATE_FAILED)
+
+
+# --------------------------------------------------------------------------- #
+# run/resume tool hard-stop (docs/TOOLING-AND-GROWTH §2) — a `[tools]` entry whose
+# needed_by scopes an in-range step is verified BEFORE anything is minted or walked;
+# a failing check refuses (CONFIG) naming tool/step/check/fix, nothing on disk.
+# --------------------------------------------------------------------------- #
+
+
+def _add_tool(ws: Path, body: str) -> None:
+    toml = ws / "cairn.toml"
+    toml.write_text(toml.read_text() + body, encoding="utf-8")
+
+
+def _no_runs(ws: Path) -> bool:
+    runs = ws / "runs"
+    return (not runs.exists()) or not any(runs.iterdir())
+
+
+def test_run_hardstops_on_failing_scoped_tool_and_mints_nothing(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    _add_tool(hello_ws, '\n[tools.needsit]\ncheck = "false"\ninstall = "brew install needsit"\nneeded_by = ["greet"]\n')
+    rc = main(["run", "hello", "--headless", "--gate", "tone=friendly"])
+    assert rc == int(ExitCode.CONFIG)
+    err = capsys.readouterr().err
+    # names the tool, the step that needs it, the failed check, and the fix (install + doctor)
+    assert "needsit" in err and "greet" in err and "false" in err
+    assert "brew install needsit" in err and "cairn doctor" in err
+    assert _no_runs(hello_ws)  # nothing created on disk
+
+
+def test_run_passing_scoped_tool_check_proceeds_silently(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    _add_tool(hello_ws, '\n[tools.needsit]\ncheck = "true"\nneeded_by = ["greet"]\n')
+    rc = main(["run", "hello", "--headless", "--gate", "tone=friendly"])
+    assert rc == int(ExitCode.OK)
+    captured = capsys.readouterr()
+    assert "needsit" not in (captured.out + captured.err)  # zero output change on all-pass
+    rd = _run_dir(hello_ws, "hello-world")
+    assert (rd / "message.txt").read_text().startswith("Friendly hello, world")
+
+
+def test_run_unscoped_failing_tool_never_blocks(hello_ws, monkeypatch):
+    # An unscoped [tools] entry (no needed_by) is doctor's concern — a failing check must NOT
+    # hard-stop a run, matching the split the plan-time warning shipped with.
+    monkeypatch.chdir(hello_ws)
+    _add_tool(hello_ws, '\n[tools.needsit]\ncheck = "false"\n')
+    rc = main(["run", "hello", "--headless", "--gate", "tone=friendly"])
+    assert rc == int(ExitCode.OK)
+
+
+def test_run_out_of_range_tool_check_never_executes(hello_ws, monkeypatch, tmp_path):
+    # `compose` is sliced off by `--to greet`; its scoped tool must not even RUN its check.
+    # The check has a side effect (touch a sentinel) AND exits non-zero — proof it never ran is
+    # both: the run succeeds (no hard-stop) and the sentinel was never created.
+    monkeypatch.chdir(hello_ws)
+    sentinel = tmp_path / "check-ran.flag"
+    _add_tool(hello_ws, f'\n[tools.composetool]\ncheck = "touch {sentinel} ; false"\nneeded_by = ["compose"]\n')
+    rc = main(["run", "hello", "--headless", "--to", "greet"])
+    assert rc == int(ExitCode.OK)
+    assert not sentinel.exists()
+
+
+def test_run_full_brease_rebuild_hardstops_on_unverified_vercel(monkeypatch, tmp_path, capsys):
+    # The real fixture: brease-ws declares [tools.vercel] needed_by=["deploy"]. A full-range run
+    # verifies vercel up front and refuses (deploy is 15 steps away — fail-fast beats a P6 crash).
+    monkeypatch.chdir(BREASE_WS)
+    rd = tmp_path / "r"
+    rc = main([
+        "run", "brease-rebuild", "--executor", "stub", "--headless",
+        "--param", "url=https://acme.com", "--run-dir", str(rd),
+    ])
+    assert rc == int(ExitCode.CONFIG)
+    err = capsys.readouterr().err
+    assert "vercel" in err and "deploy" in err and "cairn doctor" in err
+    assert not (rd / "run.json").exists()  # nothing minted in the target run dir
+
+
+def test_resume_rechecks_scoped_tool_that_vanished(hello_ws, monkeypatch, capsys):
+    # A tool can vanish between sessions and the in-range steps still need it: `cairn resume`
+    # re-runs the range-scoped tool checks and refuses if one now fails (my resume ruling: yes,
+    # re-check; kept cheap by verifying only in-range tools).
+    monkeypatch.chdir(hello_ws)
+    # 1) an initial run (headless resolves the gate to its default) mints a real run dir.
+    rc = main(["run", "hello", "--headless", "--run-dir", str(hello_ws / "r")])
+    assert rc == int(ExitCode.OK)
+    capsys.readouterr()
+    # 2) a tool needed by an in-range step goes bad on this machine; resume must refuse (CONFIG).
+    _add_tool(hello_ws, '\n[tools.needsit]\ncheck = "false"\nneeded_by = ["greet"]\n')
+    rc = main(["resume", str(hello_ws / "r")])
+    assert rc == int(ExitCode.CONFIG)
+    assert "needsit" in capsys.readouterr().err
 
 
 def _twofleet_ws(tmp_path: Path) -> Path:
