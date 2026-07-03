@@ -30,7 +30,7 @@ def test_load_one_schedule(tmp_path):
         """
         weekly:
           cron: "0 3 * * 1"
-          run: [run, brease-rebrand, --param, url=https://a.test]
+          run: [run, brease-rebrand, --param, url=https://a.test, --headless]
         """,
     )
     scheds = load_schedules(ws)
@@ -39,7 +39,7 @@ def test_load_one_schedule(tmp_path):
     assert isinstance(s, Schedule)
     assert s.name == "weekly"
     assert s.cron == "0 3 * * 1"
-    assert s.run == ("run", "brease-rebrand", "--param", "url=https://a.test")
+    assert s.run == ("run", "brease-rebrand", "--param", "url=https://a.test", "--headless")
 
 
 def test_missing_file_is_config_error(tmp_path):
@@ -85,7 +85,7 @@ def test_unknown_pipeline_fails_at_parse_time(tmp_path):
         """
         weekly:
           cron: "0 3 * * 1"
-          run: [run, no-such-pipeline]
+          run: [run, no-such-pipeline, --headless]
         """,
     )
     with pytest.raises(ConfigError, match="unknown pipeline 'no-such-pipeline'"):
@@ -140,9 +140,62 @@ def test_gc_and_resume_verbs_need_no_pipeline(tmp_path):
           run: [gc, --keep-days, "30"]
         catchup:
           cron: "0 5 * * *"
-          run: [resume, acme-redesign-20260703]
+          run: [resume, acme-redesign-20260703, --headless]
         """,
     )
     scheds = load_schedules(ws)
     assert set(scheds) == {"cleanup", "catchup"}
     assert scheds["cleanup"].run[0] == "gc"
+
+
+def test_run_without_headless_is_rejected(tmp_path):
+    # SCHEDULING.md §4: scheduled run/batch/resume are headless runs — required, not optional.
+    ws = _workspace(
+        tmp_path,
+        """
+        weekly:
+          cron: "0 3 * * 1"
+          run: [run, brease-rebrand, --param, url=https://a.test]
+        """,
+    )
+    with pytest.raises(ConfigError, match="--headless"):
+        load_schedules(ws)
+
+
+def test_batch_without_headless_is_rejected(tmp_path):
+    ws = _workspace(
+        tmp_path,
+        """
+        fleet:
+          cron: "0 3 * * 1"
+          run: [batch, brease-rebrand, --params-file, sites.jsonl]
+        """,
+    )
+    with pytest.raises(ConfigError, match="--headless"):
+        load_schedules(ws)
+
+
+def test_resume_without_headless_is_rejected(tmp_path):
+    ws = _workspace(
+        tmp_path,
+        """
+        catchup:
+          cron: "0 5 * * *"
+          run: [resume, acme-redesign-20260703]
+        """,
+    )
+    with pytest.raises(ConfigError, match="--headless"):
+        load_schedules(ws)
+
+
+def test_gc_is_exempt_from_headless(tmp_path):
+    # gc is inherently non-interactive; requiring --headless would be nonsense.
+    ws = _workspace(
+        tmp_path,
+        """
+        cleanup:
+          cron: "0 4 * * 0"
+          run: [gc, --keep-days, "30"]
+        """,
+    )
+    assert load_schedules(ws)["cleanup"].run == ("gc", "--keep-days", "30")

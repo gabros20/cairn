@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from cairn.kernel.errors import ConfigError
 from cairn.kernel.schedkit import (
     Schedule,
     merge_cron,
@@ -111,3 +112,23 @@ def test_render_systemd_oncalendar_wildcards_and_lists():
     assert "OnCalendar=*-*-* 02:30:00" in timer  # no DOW prefix when dow is wildcard
     _, timer2 = render_systemd(_sched(cron="0 9,17 * * *"), workspace_dir=WS)
     assert "OnCalendar=*-*-* 09,17:00:00" in timer2
+
+
+# --- DOM+DOW both restricted: cron means OR, launchd/systemd can't → fail loud ----
+
+
+def test_launchd_rejects_both_dom_and_dow_restricted():
+    # `0 0 1 * 1` in cron fires on the 1st OR on Mondays; launchd's array is AND. Refuse.
+    with pytest.raises(ConfigError, match="day-of-month and day-of-week"):
+        render_launchd(_sched(cron="0 0 1 * 1"), workspace_dir=WS)
+
+
+def test_systemd_rejects_both_dom_and_dow_restricted():
+    with pytest.raises(ConfigError, match="day-of-month and day-of-week"):
+        render_systemd(_sched(cron="0 0 1 * 1"), workspace_dir=WS)
+
+
+def test_cron_still_accepts_both_dom_and_dow_restricted():
+    # the cron backend passes the expression through verbatim — OR semantics preserved
+    block = render_cron({"both": _sched(cron="0 0 1 * 1", name="both")}, workspace_dir=WS)
+    assert "0 0 1 * 1 " in block

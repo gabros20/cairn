@@ -127,6 +127,39 @@ def test_list_installed_cron_reads_back_managed_block():
     assert installed["weekly"].schedule == "0 3 * * 1"
 
 
+def _install_list_diff(schedules):
+    """install → read back the piped crontab → list → diff against the same declaration."""
+    runner = FakeRunner()
+    install(schedules, "cron", workspace_dir=WS, runner=runner)
+    written = next(c for c in runner.calls if c["argv"] == ["crontab", "-"])["input"]
+    reader = FakeRunner({("crontab", "-l"): RunResult(0, written)})
+    installed = list_installed("cron", runner=reader)
+    return installed, diff_schedules(schedules, installed)
+
+
+def test_macro_schedule_reads_back_unchanged_not_garbled():
+    # @daily has 1 token, not 5 — positional slicing would garble it and report `changed` forever.
+    schedules = {"nightly": _sched(cron="@daily", name="nightly")}
+    installed, diff = _install_list_diff(schedules)
+    assert installed["nightly"].schedule == "@daily"
+    assert diff.unchanged == ("nightly",)
+    assert diff.changed == ()
+
+
+def test_stepped_list_schedule_reads_back_unchanged():
+    schedules = {"quarterly": _sched(cron="*/15 * * * *", name="quarterly")}
+    installed, diff = _install_list_diff(schedules)
+    assert installed["quarterly"].schedule == "*/15 * * * *"
+    assert diff.unchanged == ("quarterly",)
+
+
+def test_schedule_name_with_spaces_reads_back_intact():
+    schedules = {"my sched": _sched(cron="0 3 * * 1", name="my sched")}
+    installed, diff = _install_list_diff(schedules)
+    assert installed["my sched"].schedule == "0 3 * * 1"
+    assert diff.unchanged == ("my sched",)
+
+
 def test_diff_reports_added_removed_changed_unchanged():
     declared = {
         "weekly": _sched(cron="0 3 * * 1"),
@@ -166,3 +199,12 @@ def test_run_schedule_propagates_nonzero_exit():
 def test_run_schedule_unknown_name_is_config_error():
     with pytest.raises(ConfigError, match="no schedule named 'ghost'"):
         run_schedule({"weekly": _sched()}, "ghost", workspace_dir=WS, runner=FakeRunner())
+
+
+def test_run_schedule_passes_argv_verbatim_never_injects_flags():
+    # a gc schedule has no --headless (it's exempt); run_schedule must not add one
+    gc = Schedule(name="cleanup", cron="0 4 * * 0", run=("gc", "--keep-days", "30"))
+    runner = FakeRunner({("cairn", "gc"): RunResult(0, "")})
+    run_schedule({"cleanup": gc}, "cleanup", workspace_dir=WS, runner=runner)
+    assert runner.calls[-1]["argv"] == ["cairn", "gc", "--keep-days", "30"]
+    assert "--headless" not in runner.calls[-1]["argv"]

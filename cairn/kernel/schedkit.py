@@ -6,12 +6,19 @@ schedulable. This module is the engine behind the ``cairn schedule`` verb:
 
 - :func:`load_schedules` — parse + validate ``schedules.yaml`` into typed
   :class:`Schedule` objects, with precise :class:`ConfigError`\\ s (unknown keys, bad
-  cron expressions, unknown pipelines fail loudly at parse time where checkable).
+  cron expressions, unknown pipelines fail loudly at parse time where checkable). A
+  scheduled ``run``/``batch``/``resume`` MUST carry ``--headless`` — a schedule can never
+  block on a human (SCHEDULING.md §4); ``gc`` is exempt (inherently non-interactive).
 - :func:`idempotency_key` / :func:`find_idempotent_run` — the pure predicate that makes
   a scheduled ``cairn run --idempotent`` a no-op (or a resume) when an equivalent
   successful run already exists. This is the heart of "scheduling without a scheduler".
+  Identity is bucketed by calendar day (mirroring the ``{date}`` a run_id embeds), so a
+  firing that straddles midnight — or a systemd ``Persistent=true`` catch-up that lands the
+  next day — is treated as a NEW run, not a duplicate of the prior day's.
 - :func:`render_cron` / :func:`render_launchd` / :func:`render_systemd` — RENDER-ONLY
-  functions returning the exact host-scheduler text, fully unit-testable offline.
+  functions returning the exact host-scheduler text, fully unit-testable offline. cron gets
+  the expression verbatim; launchd/systemd REJECT a schedule that restricts both day-of-month
+  and day-of-week (cron's OR semantics, which their AND-only calendars cannot express).
 - :func:`install` / :func:`uninstall` / :func:`list_installed` / :func:`run_schedule` —
   the effectful verbs. Every side effect (crontab / launchctl / systemctl / filesystem)
   is dependency-injected via a :class:`Runner` and explicit target dirs, so tests never
@@ -46,6 +53,9 @@ SCHEDULES_YAML = "schedules.yaml"
 _ALLOWED_VERBS = frozenset({"run", "batch", "resume", "gc"})
 # Verbs whose FIRST positional token is a pipeline name we can check against pipelines/.
 _PIPELINE_VERBS = frozenset({"run", "batch"})
+# Verbs that spawn an agent run and so MUST be headless when scheduled (SCHEDULING.md §4:
+# "scheduled runs are headless runs ... simply required here"). gc is inherently non-interactive.
+_HEADLESS_VERBS = frozenset({"run", "batch", "resume"})
 _SCHEDULE_KEYS = frozenset({"cron", "run"})
 
 
@@ -126,6 +136,12 @@ def _parse_schedule(name: str, entry: Any, workspace_dir: Path, file: Path) -> S
         _fail(
             f"schedule {name!r}: run verb {verb!r} not allowed "
             f"(allowed: {', '.join(sorted(_ALLOWED_VERBS))})",
+            file,
+        )
+    if verb in _HEADLESS_VERBS and "--headless" not in run:
+        _fail(
+            f"schedule {name!r}: a scheduled {verb!r} must be headless — add --headless "
+            "to its 'run' argv (SCHEDULING.md §4: a schedule can never block on a human)",
             file,
         )
     if verb in _PIPELINE_VERBS:
@@ -387,6 +403,26 @@ def _host_command(schedule: Schedule, workspace_dir: Path, cairn_bin: str) -> st
     )
 
 
+def _parse_managed_cron_line(line: str) -> tuple[str, str] | None:
+    """Recover ``(name, cron_expr)`` from one managed crontab line, or None if it isn't ours.
+
+    Rather than assume a fixed 5-field cron (which garbles ``@daily`` and other macros), split on
+    the known command anchor ``" cd "`` — a cron expression never contains it — so the cron expr
+    is everything before the command, whatever its token count. The schedule name is recovered by
+    shlex-splitting the command tail, so names with spaces survive the round-trip intact.
+    """
+    cron_expr, sep, command = line.partition(" cd ")
+    if not sep:
+        return None
+    try:
+        tokens = shlex.split("cd " + command)
+    except ValueError:
+        return None
+    if len(tokens) < 3 or tokens[-3:-1] != ["schedule", "run"]:
+        return None
+    return tokens[-1], cron_expr.strip()
+
+
 def render_cron(
     schedules: Mapping[str, Schedule], *, workspace_dir: Path, cairn_bin: str = "cairn"
 ) -> str:
@@ -420,6 +456,22 @@ def launchd_label(name: str, prefix: str = "io.cairn.") -> str:
     return f"{prefix}{name}"
 
 
+def _reject_dom_and_dow(spec: CronSpec, name: str, backend: str) -> None:
+    """Refuse a schedule that restricts BOTH day-of-month and day-of-week.
+
+    In cron such a schedule means "the 1st OR a Monday" (a union). launchd's interval array
+    and systemd's OnCalendar both AND their components, so a faithful translation is impossible
+    — rather than silently install a schedule that fires on the wrong days, fail loud.
+    """
+    if not spec.dom.wildcard and not spec.dow.wildcard:
+        raise ConfigError(
+            f"schedule {name!r}: cron restricts both day-of-month and day-of-week "
+            f"(an OR that the {backend} backend cannot express, only AND). Use the cron "
+            "backend, or split it into two schedules (one per day rule).",
+            findings=[Finding("error", f"{name}: dom+dow OR not expressible in {backend}")],
+        )
+
+
 def _calendar_intervals(spec: CronSpec) -> list[dict[str, int]]:
     """Expand a CronSpec into launchd StartCalendarInterval dicts (cartesian over set fields)."""
     axes: list[tuple[str, tuple[int, ...]]] = []
@@ -445,7 +497,9 @@ def render_launchd(
     A single-interval schedule renders StartCalendarInterval as one dict; a schedule that
     expands to several fire-times renders it as an array (launchd's native repeat mechanism).
     """
-    intervals = _calendar_intervals(parse_cron(schedule.cron))
+    spec = parse_cron(schedule.cron)
+    _reject_dom_and_dow(spec, schedule.name, "launchd")
+    intervals = _calendar_intervals(spec)
     plist: dict[str, Any] = {
         "Label": launchd_label(schedule.name, label_prefix),
         "ProgramArguments": [cairn_bin, "schedule", "run", schedule.name],
@@ -486,6 +540,8 @@ def render_systemd(
     The timer is ``Persistent=true`` so a missed firing (machine asleep) runs at next boot —
     the same catch-up-via-resume posture ``--idempotent`` gives (SCHEDULING.md §3).
     """
+    spec = parse_cron(schedule.cron)
+    _reject_dom_and_dow(spec, schedule.name, "systemd")
     command = f"{cairn_bin} schedule run {schedule.name}"
     service = (
         "[Unit]\n"
@@ -499,7 +555,7 @@ def render_systemd(
         "[Unit]\n"
         f"Description=cairn schedule timer: {schedule.name}\n\n"
         "[Timer]\n"
-        f"OnCalendar={_on_calendar(parse_cron(schedule.cron))}\n"
+        f"OnCalendar={_on_calendar(spec)}\n"
         "Persistent=true\n\n"
         "[Install]\n"
         "WantedBy=timers.target\n"
@@ -661,10 +717,10 @@ def list_installed(
             for line in region.group(0).splitlines():
                 if line.startswith("#") or not line.strip():
                     continue
-                fields = line.split()
-                cron_expr = " ".join(fields[:5])
-                name = fields[-1]  # ... schedule run <name>
-                entries[name] = InstalledEntry(name=name, schedule=cron_expr)
+                parsed = _parse_managed_cron_line(line)
+                if parsed is not None:
+                    name, cron_expr = parsed
+                    entries[name] = InstalledEntry(name=name, schedule=cron_expr)
     elif backend == "launchd":
         target = _require_dir(launchd_dir, backend, "launchd_dir")
         for path in sorted(target.glob(f"{label_prefix}*.plist")):
