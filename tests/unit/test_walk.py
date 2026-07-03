@@ -339,6 +339,39 @@ def test_skippable_skip_satisfies_the_node(ws: Path, tmp_path: Path) -> None:
     assert node_status(load_run(run_dir), "s") == "skipped"
 
 
+def test_recorded_skip_sticks_across_resume(ws: Path, tmp_path: Path) -> None:
+    # Ruling 2a: a recorded self-skip is a completed decision — never re-fired on resume.
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"], skippable=True)], arts, resolved_models=models_for("s"))
+
+    ex = FakeExecutor(lambda inv, n: Result(step={"status": "skipped", "summary": "nothing", "artifacts": []}, exit_code=0, duration_s=1.0))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.OK
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.OK  # resume
+    assert len(ex.invocations) == 1  # NOT re-invoked
+
+
+def test_recorded_block_reruns_across_resume_even_with_valid_artifact(ws: Path, tmp_path: Path) -> None:
+    # Ruling 2b: a halted (blocked) node re-runs regardless of a valid stub on disk.
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, n):
+        (inv.cwd / "a.txt").write_text("valid stub")  # writes a VALID artifact each time
+        if n == 1:
+            return Result(step={"status": "blocked", "summary": "no", "artifacts": [], "blockers": ["x"]}, exit_code=0, duration_s=1.0)
+        return done_result()
+
+    ex = FakeExecutor(on_invoke)
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.GATE_FAILED
+    assert node_status(load_run(run_dir), "s") == "halted"
+
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.OK  # resume re-runs despite valid artifact
+    assert len(ex.invocations) == 2
+    assert node_status(load_run(run_dir), "s") == "done"
+
+
 # --------------------------------------------------------------------------- #
 # 6. Timeout & executor failure.
 # --------------------------------------------------------------------------- #
@@ -439,6 +472,35 @@ def test_manual_headless_halts_needs_human(ws: Path, tmp_path: Path) -> None:
     plan = make_plan([manual_step("m", "do a thing")], {})
     run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
     assert _walk(ws, plan, run_dir, {}) == ExitCode.NEEDS_HUMAN
+
+
+@pytest.mark.parametrize("exc", [EOFError, KeyboardInterrupt])
+def test_gate_tty_interrupt_halts_needs_human(ws: Path, tmp_path: Path, monkeypatch, exc) -> None:
+    gate = GateNode(name="tone", reads=(), ask="?", options=(("a", "A"),), default="a", when_runtime=None)
+    plan = make_plan([gate], {})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    def interrupt(*_a):
+        raise exc()
+
+    monkeypatch.setattr("builtins.input", interrupt)
+    assert _walk(ws, plan, run_dir, {}, interactive=True) == ExitCode.NEEDS_HUMAN
+    assert load_run(run_dir)["status"] == "halted"
+    assert any(e["event"] == "run-halt" for e in read_trail(run_dir))
+
+
+@pytest.mark.parametrize("exc", [EOFError, KeyboardInterrupt])
+def test_manual_tty_interrupt_halts_needs_human(ws: Path, tmp_path: Path, monkeypatch, exc) -> None:
+    plan = make_plan([manual_step("m", "do it")], {})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    def interrupt(*_a):
+        raise exc()
+
+    monkeypatch.setattr("builtins.input", interrupt)
+    assert _walk(ws, plan, run_dir, {}, interactive=True) == ExitCode.NEEDS_HUMAN
+    assert load_run(run_dir)["status"] == "halted"
+    assert any(e["event"] == "run-halt" for e in read_trail(run_dir))
 
 
 def test_manual_step_resumes_once_its_produce_exists(ws: Path, tmp_path: Path) -> None:
@@ -622,6 +684,26 @@ def test_env_is_scrubbed_and_secret_flows_from_dotenv(ws: Path, tmp_path: Path, 
     assert seen["SECRET"] == "s3cr3t"
 
 
+def test_dotenv_strips_quotes_and_tolerates_export(ws: Path, tmp_path: Path) -> None:
+    (ws / ".env").write_text('export QUOTED="q u o t e d"\nBARE=plain\n', encoding="utf-8")
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan(
+        [agent_step("s", produces=["a"], env=["QUOTED", "BARE"])], arts, resolved_models=models_for("s")
+    )
+
+    seen = {}
+
+    def on_invoke(inv, _n):
+        seen.update(inv.env)
+        (inv.cwd / "a.txt").write_text("ok")
+        return done_result()
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
+    assert seen["QUOTED"] == "q u o t e d"  # surrounding quotes stripped
+    assert seen["BARE"] == "plain"          # export prefix tolerated
+
+
 def test_missing_secret_halts_config(ws: Path, tmp_path: Path) -> None:
     arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
     plan = make_plan([agent_step("s", produces=["a"], env=["ABSENT_SECRET"])], arts, resolved_models=models_for("s"))
@@ -650,6 +732,16 @@ def test_run_command_unresolved_cairn_ref_halts_config(ws: Path, tmp_path: Path)
     plan = make_plan([run_step("write", cmd, produces=["out"])], {"out": art})
     run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
     assert _walk(ws, plan, run_dir, {"shell": ShellExecutor()}) == ExitCode.CONFIG
+
+
+def test_run_command_nonzero_exit_fails_even_when_produces_validate(ws: Path, tmp_path: Path) -> None:
+    art = ArtifactDecl("out", "out.txt", validator=_nonempty(ws))
+    cmd = "python3 -c \"open('{artifact:out}','w').write('ok')\" ; exit 3"
+    plan = make_plan([run_step("write", cmd, produces=["out"])], {"out": art})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    assert _walk(ws, plan, run_dir, {"shell": ShellExecutor()}) == ExitCode.GATE_FAILED
+    assert (run_dir / "out.txt").read_text() == "ok"  # the produce IS valid — exit code still fails it
 
 
 # --------------------------------------------------------------------------- #

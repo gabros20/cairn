@@ -7,6 +7,13 @@ exist and validate, a gate is answered iff ``gates/<name>.json`` exists, a loop'
 run dir** — every done node skips, the first not-done node re-executes; no counters are
 stored anywhere but the artifacts and the trail.
 
+**Resume done-ness precedence: recorded decision > artifact predicate > re-run.** A node's
+recorded ``run.json`` status can outrank what is on disk: a ``skipped`` node stays skipped
+(a self-skip is a completed decision — re-firing it would burn an invocation every resume),
+a ``halted`` node re-runs unconditionally (a blocked step that wrote a valid stub must not
+silently pass), and every other status falls through to the artifact predicate (so a
+crash-mid-step with valid outputs still skips). See :meth:`_Walk._is_done`.
+
 The five node kinds (ARCHITECTURE §3.1-3.6):
 
 - **step** — done-skip → needs-check → compose/render → invoke → validate ``produces``
@@ -67,6 +74,7 @@ from cairn.kernel.runstate import (
     RunExistsError,
     create_run,
     load_run,
+    node_status,
     run_lock,
     set_node_status,
     update_run,
@@ -268,7 +276,12 @@ class _Walk:
                     self._dispatch(node, None)
             except _Halt as halt:
                 if halt.node is not None:
-                    self._set_status(halt.node, "halted")
+                    # A needs-human halt (manual/gate awaiting an operator) is not a node
+                    # failure — leave it "running" so a resume, once the operator fulfils
+                    # the produce/answers the gate, satisfies it via the artifact predicate
+                    # instead of force-re-running it (which "halted" would mandate, §3.5).
+                    node_stat = "running" if halt.exit_code == ExitCode.NEEDS_HUMAN else "halted"
+                    self._set_status(halt.node, node_stat)
                 self._emit(
                     "run-halt",
                     node=halt.node,
@@ -445,7 +458,14 @@ class _Walk:
 
         print(rendered)
         print("Produces:", ", ".join(step.produces) or "(none)")
-        input("Press Enter when done... ")
+        try:
+            input("Press Enter when done... ")
+        except (EOFError, KeyboardInterrupt) as exc:
+            # A closed/interrupted TTY is not an unhandled crash: it is the operator
+            # declining to answer → the same typed needs-human halt as headless.
+            self._emit("gate-pending", node=step.id, cycle=cycle,
+                       data={"manual": rendered, "produces": list(step.produces)})
+            raise _Halt(ExitCode.NEEDS_HUMAN, step.id, "manual step interrupted (no operator)") from exc
         ok, reasons = self._validate_produces(step, cycle)
         if not ok:
             self._emit("step-fail", node=step.id, cycle=cycle, data={"validator_reasons": reasons})
@@ -566,12 +586,29 @@ class _Walk:
     # -- artifact predicates ------------------------------------------------ #
 
     def _is_done(self, step: StepNode, cycle: int | None) -> bool:
-        """Resume/skip predicate: every declared ``produces`` exists AND validates."""
+        """Resume/skip predicate — recorded decision outranks the artifact predicate.
+
+        Precedence (ARCHITECTURE §3.5): a recorded ``skipped`` is a *completed decision*
+        (a self-skip must not re-fire and burn an invocation every resume) → done; a
+        recorded ``halted`` (blocked or failed) is NOT done regardless of what is on disk
+        (a blocked step that wrote a valid stub must not silently pass) → re-run; every
+        other status (``done``/``running``/absent — the crash-mid-step case) falls through
+        to the artifact predicate: every declared ``produces`` exists AND validates.
+        """
+        status = self._node_status(step.id)
+        if status == "skipped":
+            return True
+        if status == "halted":
+            return False
+
         declared = [n for n in step.produces if n in self.plan.artifacts]
         if not declared:
             return False  # nothing provable → always (re-)run
         ok, _ = self._validate_produces(step, cycle)
         return ok
+
+    def _node_status(self, node_id: str) -> str | None:
+        return node_status(load_run(self.run_dir), node_id)
 
     def _validate_produces(self, step: StepNode, cycle: int | None) -> tuple[bool, list[str]]:
         resolved = []
@@ -651,8 +688,13 @@ class _Walk:
             line = line.strip()
             if not line or line.startswith("#") or "=" not in line:
                 continue
+            if line.startswith("export ") or line.startswith("export\t"):
+                line = line[len("export"):].lstrip()
             key, _, val = line.partition("=")
-            out[key.strip()] = val.strip()
+            val = val.strip()
+            if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+                val = val[1:-1]  # strip matching surrounding quotes
+            out[key.strip()] = val
         return out
 
     # -- lenient command rendering (API §2.8) ------------------------------- #

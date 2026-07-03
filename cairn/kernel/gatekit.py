@@ -130,7 +130,12 @@ def _ask_tty(gate: GateNode, options: list[str], prompt, out) -> str:
     if gate.reads:
         print(f"(reads: {', '.join(gate.reads)})", file=stream)
     while True:
-        answer = ask(f"choice [{'/'.join(options)}]: ").strip()
+        try:
+            answer = ask(f"choice [{'/'.join(options)}]: ").strip()
+        except (EOFError, KeyboardInterrupt) as exc:
+            # A closed/interrupted TTY is the operator declining to answer, not a crash:
+            # surface it as the typed needs-human signal the walker turns into exit 6.
+            raise GateNeedsHuman(gate.name) from exc
         if answer in options:
             return answer
         print(f"{answer!r} is not one of {options}", file=stream)

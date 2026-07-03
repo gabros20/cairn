@@ -129,6 +129,23 @@ def test_headless_without_default_emits_pending_then_raises(tmp_path: Path) -> N
     assert not is_answered(tmp_path, "tone")  # nothing written
 
 
+@pytest.mark.parametrize("exc", [EOFError, KeyboardInterrupt])
+def test_interactive_tty_interrupt_becomes_needs_human(tmp_path: Path, exc) -> None:
+    rec = _Recorder()
+
+    def interrupt(_prompt):
+        raise exc()
+
+    with pytest.raises(GateNeedsHuman):
+        resolve_gate(
+            _gate(), tmp_path, interactive=True, presets={}, emit=rec, now=NOW,
+            prompt=interrupt, out=open("/dev/null", "w"),
+        )
+
+    assert [e for e, _ in rec.events] == ["gate-pending"]  # emitted before the interrupt
+    assert not is_answered(tmp_path, "tone")               # nothing recorded
+
+
 def test_answer_gate_writes_by_external(tmp_path: Path) -> None:
     answer_gate(tmp_path, "tone", "formal")
 
