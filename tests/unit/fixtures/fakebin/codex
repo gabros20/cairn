@@ -1,0 +1,29 @@
+#!/usr/bin/env python3
+"""Fake `codex` CLI for executor tests. See fakebin/claude for the env-var contract."""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+_NAME = "codex"
+_DEFAULT_VERSION = "codex 0.138.0 (fake)"
+
+if "--version" in sys.argv:
+    print(os.environ.get("CAIRN_TEST_VERSION", _DEFAULT_VERSION))
+    sys.exit(0)
+
+scratch = Path(os.environ["CAIRN_TEST_SCRATCH"])
+scratch.mkdir(parents=True, exist_ok=True)
+(scratch / "argv.json").write_text(json.dumps(sys.argv), encoding="utf-8")
+(scratch / "env.json").write_text(json.dumps(dict(os.environ)), encoding="utf-8")
+(scratch / "cwd.txt").write_text(os.getcwd(), encoding="utf-8")
+(scratch / "stdin.txt").write_text(sys.stdin.read(), encoding="utf-8")
+
+sleep_s = os.environ.get("CAIRN_TEST_SLEEP")
+if sleep_s:
+    time.sleep(float(sleep_s))
+
+print(f"chatty {_NAME} preamble the sentinel must survive")
+print('<<<STEP {"status": "done", "summary": "fake ok", "artifacts": []} STEP>>>')
+sys.exit(int(os.environ.get("CAIRN_TEST_EXIT", "0")))
