@@ -13,7 +13,7 @@ as the only state.
 
 ## Status
 
-**C0–C1 built and green (681 tests).** Implemented: the kernel (planner, walker, gatekit,
+**C0–C1 built and green (780 tests).** Implemented: the kernel (planner, walker, gatekit,
 composer, artifacts, trail/runstate, guards, expression + template engines, config); all five
 executors — `shell` and `stub` live, and the **`claude`, `codex`, and `grok` executors all
 live-verified** (the first live `claude -p` / `codex exec` / `grok --prompt-file` runs, captured
@@ -24,11 +24,16 @@ codex → claude → grok with per-step models recorded in `run.json`
 the workspace test layer (`cairn test` — validators/guards/pipelines/envelopes + `record`); the
 full CLI — the `batch`/`learnings`/`gc`/`schedule` verbs are now **LIVE** (no longer stubs), and
 first-class **scheduling has shipped** (`schedules.yaml`, cron/launchd/systemd installers,
-content-key idempotency); and the `cairn new` scaffold. **v0.1.0 packaging is landing this wave.**
+content-key idempotency); and the `cairn new` scaffold. **v0.1.0 is tagged.** The hardening
+backlog has since shipped too: opt-in `heartbeat` trail events, the webhook trail sink (tee, never
+authority), kernel-side secret redaction, cross-version resume gates, range-scoped tool
+enforcement at plan/run, batch failures that name their reason, and one aware-UTC clock behind
+every persisted timestamp.
 Every module went implement → review → fix. The day-0 pipeline runs end-to-end offline:
 `uv run cairn run hello --headless`.
 
-**Not done yet:** the CMS-population branch and the brease-factory workspace migration (deferred;
+**Not done yet:** the CMS-population branch, the learnings curate/promote pipeline
+(`self-improve.yaml`), and the brease-factory workspace migration (deferred;
 it remains cairn's eventual first workspace — the C4/C5 pipeline-parity runs against a real
 workspace are deferred with it). The doctor hook probe (`cairn doctor --probe-hooks`) now covers
 all three vendor CLIs — on the dev machine Claude's, Codex's, and Grok's PreToolUse hooks all fire

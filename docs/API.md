@@ -211,8 +211,8 @@ guards:
 `run:`/`manual:` command strings):
 
 ```
-VALUE placeholders     {params.<name>}  {dims.<key>}  {pipeline}  {date}=YYYYMMDD
-                       {datetime}=YYYYMMDD-HHMM  {cycle} (loop bodies only)
+VALUE placeholders     {params.<name>}  {dims.<key>}  {pipeline}  {date}=YYYYMMDD (UTC)
+                       {datetime}=YYYYMMDD-HHMM (UTC)  {cycle} (loop bodies only)
 REFERENCE placeholders {artifact:<name>} → the artifact's ABSOLUTE path
                        {gate:<name>}     → the recorded choice value
                        {run_dir}         → the run dir's absolute path
@@ -311,6 +311,10 @@ class Result:
     step: dict | None               # parsed STEP block (None if unparsable)
     exit_code: int
     duration_s: float
+    usage: dict | None = None       # executor-reported tokens/cost; outranks the model's
+                                    # STEP-block self-report. All three executors run plain-text
+                                    # output today and pass None — a json output-format is the
+                                    # future source; the stable schema is the value now
 
 class Executor(Protocol):
     name: str
@@ -451,7 +455,9 @@ cairn doctor [--executor X] [--probe-hooks]
                                         # blocking_hooks=True that the probe falsifies → error; None + a
                                         # concrete outcome → informational; inconclusive → warning, never error
 cairn batch <pipeline> --params-file sites.jsonl [-j 8] [--gate NAME=CHOICE]...
-                                        # process pool of `cairn run --headless` children, one per JSONL line
+                                        # process pool of `cairn run --headless` children, one per JSONL line;
+                                        # a failed child's summary names its reason — a bounded stderr tail
+                                        # (last lines, capped) + a pointer to the child's run dir
 cairn learnings [--since DATE] [--tag TAG]      # aggregate learn events across all runs, ranked
                                                 # (the learning loop: TOOLING-AND-GROWTH §7)
 cairn gc [--keep-days N] [--keep-last M] [--artifacts-only] [--include-needs-human] [--apply]

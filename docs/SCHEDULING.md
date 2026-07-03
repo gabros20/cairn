@@ -89,11 +89,12 @@ Consequences, all free:
 - overlap is safe — the run lock (`SECURITY.md` §5) makes the second invocation exit cleanly with
   "run is held".
 
-**The idempotency boundary is the calendar day.** The `{date}` bucket is `now` formatted `%Y%m%d`,
-so dedup holds *within* a calendar day and the next day's firing gets a new key (a new run). One
-consequence to know: a `Persistent=true`/catch-up firing (systemd, or a missed cron) that lands
-*after* midnight computes tomorrow's key — so it is treated as a new run, not a duplicate of the
-prior day's. `dims` are omitted from the key deliberately (they are derived from `params`).
+**The idempotency boundary is the calendar day — in UTC.** The `{date}` bucket is `now`
+(aware-UTC, cairn's one clock) formatted `%Y%m%d`, so dedup holds *within* a UTC calendar day and
+the next day's firing gets a new key (a new run). One consequence to know: a
+`Persistent=true`/catch-up firing (systemd, or a missed cron) that lands *after* UTC midnight
+computes tomorrow's key — so it is treated as a new run, not a duplicate of the prior day's.
+`dims` are omitted from the key deliberately (they are derived from `params`).
 
 ## 4. Unattended safety — already designed, now load-bearing
 

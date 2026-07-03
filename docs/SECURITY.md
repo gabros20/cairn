@@ -63,9 +63,12 @@ a validator's job where it matters (e.g. the deploy validator asserts no token-s
 `deploy.json`). Redaction is damage limitation, not permission — the pass-through rule above is
 the actual control.
 
-*Status: the declaration + deny-by-default pass-through (§1.1–1.2) are built and tested in C1; the
-literal scrubber activates in C2–C3, when live executors first produce output/logs to scrub — see
-IMPLEMENTATION-PLAN.*
+*Status: built. The declaration + deny-by-default pass-through (§1.1–1.2) landed in C1, and the
+literal scrubber is now live: declared `[secrets]` values are scrubbed from step logs (line by
+line), captured output, and every trail event — applied structurally *before* serialization, so a
+secret containing quotes, backslashes, or JSON syntax cannot escape the scrub. Envelopes never
+contain resolved secret values (verified). Known limit: a secret split across two log lines evades
+the literal match; single-line tokens are unaffected.*
 
 ## 2. Untrusted content — the prompt-injection posture
 
@@ -129,8 +132,9 @@ property (no mid-build fetching).
 ## 4. Budgets — governance for headless fleets
 
 *Status: designed. `ExitCode.BUDGET` (7) is reserved in the kernel today, but no budget is enforced
-yet — `usage`-tracked budgets and the exit-7 halt activate in C2–C3, once executors report
-tokens/cost — see IMPLEMENTATION-PLAN.*
+yet — the `usage` plumbing exists end-to-end (`Result.usage`, trail `step-done.usage`), but all
+three executors run plain-text output and pass `None`; budgets and the exit-7 halt activate once a
+json output-format supplies real tokens/cost — see IMPLEMENTATION-PLAN.*
 
 A 16-site batch with a looping art-review must have a ceiling. Budgets are declared, tracked from
 the trail's `usage` data, and enforced by the walker:

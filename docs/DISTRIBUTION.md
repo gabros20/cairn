@@ -65,13 +65,16 @@ Workspace side: `cairn.toml → requires = ">=0.1,<0.2"`, enforced at plan time 
 installed vs required range). `run.json` records the exact tool version, executor versions, and
 pipeline content-hash — so any old run is diagnosable regardless of what's installed today.
 
-*Status: two surfaces are enforced today. Run-dir **pipeline-hash** drift — `cairn resume` (and
-`run --idempotent`'s resume path) refuses a changed pipeline without `--force`. And the workspace
-**`requires`-pin** — `cairn plan` (via `config.check_requires`) now **refuses to plan** when the
+*Status: three gates are enforced today. Run-dir **pipeline-hash** drift — `cairn resume` (and
+`run --idempotent`'s resume path) refuses a changed pipeline without `--force`. The workspace
+**`requires`-pin** — `cairn plan` (via `config.check_requires`) **refuses to plan** when the
 installed cairn falls outside `cairn.toml: requires = …`, naming both the required range and the
-installed version. cairn's own version is **0.1.0** (single-sourced from `cairn/__init__.py`); the
-`v0.1.0` git tag is being cut this wave. The remaining schema-version and executor-protocol gates
-stay parsed-but-not-yet-enforced (IMPLEMENTATION-PLAN).*
+installed version. And the **run-dir format version gate** — every resume entrance (including
+`run`'s resume paths) compares `run.json.cairn_version` to the installed version exactly per the
+table: same-minor silent, cross-minor warn, cross-major refuse without `--force`; an unreadable
+`run.json` fails loud (`CONFIG`), never silently proceeds. cairn's own version is **0.1.0**
+(single-sourced from `cairn/__init__.py`); the `v0.1.0` git tag is cut. The schema-version and
+executor-protocol gates stay parsed-but-not-yet-enforced (IMPLEMENTATION-PLAN).*
 
 Release discipline: a git tag is releasable iff the synthetic suite is green and `cairn plan`
 passes over the example + brease workspaces. CHANGELOG entry per tag; migration notes on any
@@ -121,15 +124,17 @@ classifies fires+blocks / fires-not-blocks / no-fire / inconclusive (on the dev 
 codex, and grok all report fires+blocks → hook-primary). Rules: doctor
 checks the *default* executor + any named via `--executor`, and only a lint error or a broken
 in-scope executor fails its exit — `[tools]`/`[secrets]`/guard-runner problems are **warnings**
-(a missing vercel prints its `needed_by` scope but blocks nothing). Per-run auth (e.g. `brease
-login` into a run dir) is not doctor's job — it's a `manual:` step in the pipeline (TOOLING §2).
+(a missing vercel prints its `needed_by` scope but blocks nothing — though `cairn run`/`resume`
+now hard-stop before minting when a *scoped* tool's check fails, TOOLING §2). Per-run auth (e.g.
+`brease login` into a run dir) is not doctor's job — it's a `manual:` step in the pipeline
+(TOOLING §2).
 
 *Status: the per-executor line currently reports `healthy`/its first finding; the richer
 `(version, auth ok, hooks: blocking)` detail is still cosmetic follow-up now that all three vendor
 executors are live (C2–C5 done), and the `--probe-hooks` hook line has shipped (C4/C5). The
-`requires` pin itself is now enforced — at **plan** time (`cairn plan` refuses an out-of-range
-install, §3); surfacing it as a dedicated `satisfies requires …` line in `doctor` is the remaining
-cosmetic piece.*
+`requires` pin is enforced at **plan** time (`cairn plan` refuses an out-of-range install, §3),
+and doctor now prints its own `requires` satisfied/not-satisfied line whenever the workspace pins
+one.*
 
 ## 6. The operator skill — coding agents driving cairn
 

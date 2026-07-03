@@ -16,7 +16,7 @@ ever debug one new thing at a time.
 
 - **C0 + C1 — complete.** Planner, walker, gatekit, composer, artifacts, trail/runstate, guards,
   expression + template engines, config, the `shell`/`stub` executors, the `cairn test` suite layer,
-  the scaffold, and every C1-scope CLI verb are built and green (681 tests).
+  the scaffold, and every C1-scope CLI verb are built and green (780 tests).
   *Deviation from the strict ordering:* built as parallel module waves with per-module
   implement→review→fix rather than strictly C0-then-C1. The C1 "synthetic-suite" verification bar is
   met by the suite + the offline `hello` end-to-end run + the testkit stub layer (a full
@@ -65,8 +65,19 @@ ever debug one new thing at a time.
   `run.json` and cross-vendor dataflow asserted by schema; recorded offline replay + all four live
   workspaces planned and replayed in CI. The C5 parity items that need brease-factory (three-mode
   parity with C4) are **deferred with the workspace migration**, like C4's.
-- **Still ahead:** the `brease=on` CMS-population branch, `v0.1.0` tag/packaging
-  (C7 — packaging this standalone repo, not a repo move; its "after C5" gate is now satisfiable),
+- **Backlog wave — shipped.** The post-C5 hardening backlog is built, two-stage-reviewed, and
+  green: opt-in `heartbeat` trail events (`[defaults] heartbeat`; off by default; no beat after a
+  step's terminal event — OBSERVABILITY §1); `usage` plumbed end-to-end (`Result.usage`; executors
+  pass `None` today, the schema is the deliverable); the webhook trail sink (`[sinks.webhook]` tee
+  — jsonl stays the byte-identical synchronous authority — OBSERVABILITY §2); kernel-side secret
+  redaction live per SECURITY §1.3; batch failures naming their reason (bounded stderr tail in
+  `RunOutcome.error` + the batch summary); cross-version resume gates per DISTRIBUTION §3 + a
+  doctor `requires` line; range-scoped tool enforcement at plan (warn) and run/resume (hard-stop
+  before minting) per TOOLING §2; and one aware-UTC clock behind every persisted timestamp
+  (`{date}` buckets by UTC day). The `v0.1.0` tag is cut. Internal seam unification
+  (batchkit/schedkit over one `proc.SubprocessRunner`) rode along. Learnings curate/promote was
+  deliberately NOT built — it stays the future `self-improve.yaml` PR pipeline (TOOLING §7).
+- **Still ahead:** the `brease=on` CMS-population branch, the learnings curate/promote pipeline,
   and the brease-factory workspace migration (plus the C2–C5 parity runs deferred with it).
 
 ---
@@ -89,10 +100,10 @@ run-dir bootstrap (`run.json` pinned schema), halt/resume, timeouts, per-step lo
 `stub` executors**, `cairn run/resume/validate/trail/doctor` (doctor: workspace lint only for now)
 **+ `cairn test`** (validators/guards/pipelines suites — TESTING.md; the envelope suite lands with
 `compose.py` in C2) **+ the Trail Protocol v1** (versioned envelope, seq offsets, `--follow --json
---since`, `gate-pending`/`heartbeat` events, `cairn ps` — OBSERVABILITY.md; webhook sink and OTel
-exporter are post-C7 plugins) **+ the SECURITY.md kernel pieces** (run locking, `[secrets]`
-declaration/doctor check, scrubbed-baseline env with per-agent pass-through; redaction and budgets
-activate in C2/C3 when real executors produce output and usage).
+--since`, `gate-pending`/`heartbeat` events, `cairn ps` — OBSERVABILITY.md; the webhook sink has
+since shipped, the OTel exporter stays a post-C7 plugin) **+ the SECURITY.md kernel pieces** (run
+locking, `[secrets]` declaration/doctor check, scrubbed-baseline env with per-agent pass-through;
+redaction has since shipped — see Status; budgets stay future until executors report usage).
 
 **Verify — the synthetic suite (becomes permanent CI):** a fixture workspace whose steps are all
 `run:` scripts exercising every semantic: all five node kinds; done-skip on resume; `kill -9`
@@ -184,6 +195,7 @@ Optionally stub a 4th executor to prove nothing leaked outside the plugin surfac
 
 **Verify:** brease-factory runs against the *installed* cairn (not the run-in-place copy); version-pin
 mismatch is refused at plan time (**done** — `cairn plan` via `config.check_requires`).
+*Status: the `v0.1.0` tag is cut; the installed-run verify waits on the brease-factory migration.*
 
 ---
 
@@ -194,7 +206,7 @@ mismatch is refused at plan time (**done** — `cairn plan` via `config.check_re
 | C0 start | confirm cairn replaces the straight port (this plan supersedes PORT-DESIGN M0–M7) | yes |
 | C2 | workspace layout migration (skills to root, `.claude/` thins to wrapper+symlinks) | migrate |
 | C4 | Codex guard posture — set by the doctor probe, not by judgment | **resolved: hook-primary** (probe, dev machine) |
-| C7 | packaging/tag timing — only when the Executor protocol has survived three real implementations | after C5 *(now satisfiable — C5 done, three vendor executors live)* |
+| C7 | packaging/tag timing — only when the Executor protocol has survived three real implementations | after C5 *(satisfied — C5 done, three vendor executors live; `v0.1.0` tagged)* |
 
 Risks: PORT-DESIGN §8.1 applies verbatim (Codex hooks/version churn, Grok user-config-only model
 routing, undocumented Grok schemas, cross-vendor tier quality). Two are *retired*: orchestrator-logic

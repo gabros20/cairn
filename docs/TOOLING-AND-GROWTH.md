@@ -49,10 +49,13 @@ Semantics:
 - `cairn doctor` runs every `check`; a failure prints the `install` hint and its `needed_by`
   scope. Tool checks are **advisory** — a failing tool is a warning, never a hard exit on its own
   (doctor's exit is driven only by a workspace-lint error or a broken in-scope executor).
-- *Designed, not yet built:* range-scoped tool enforcement — `cairn plan` warning when a step's
-  `needed_by` tools are unverified and `cairn run` hard-stopping before it (fail-fast beats a P6
-  crash after a 90-minute build). Today `needed_by` annotates doctor's output but does not gate a
-  run — lands with the guard/tools milestone, see IMPLEMENTATION-PLAN.
+- *Built:* range-scoped tool enforcement — `cairn plan` warns when an in-range step's `needed_by`
+  tools are unverified (a lazy workspace scan; zero subprocesses at plan time), and `cairn run`/
+  `resume` hard-stop **before minting the run** when a scoped tool's check fails: one aggregated
+  refusal naming every failing tool, exit `CONFIG`, nothing on disk (fail-fast beats a P6 crash
+  after a 90-minute build). Unscoped tools stay doctor's advisory job; there is deliberately no
+  skip flag. One deliberate ruling: resume re-checks tools even for status-done nodes, because the
+  walk's artifact self-heal can re-execute them.
 - **Machine setup vs run setup:** `[tools]` is per-machine (doctor's job). Per-run auth — like
   `brease login` scoped into a run dir — stays a `manual:` step in the pipeline, where it is
   checkable and resumable (see `brease-auth` in the example pipeline).
