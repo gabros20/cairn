@@ -27,6 +27,24 @@ So: the artifacts get validators, and **the validators get fixtures**.
 
 ## 2. The validation pyramid — five layers, priced
 
+Wide base, narrow apex: the cheap layers run constantly, the dear ones rarely. Each bar's width is
+its cadence — how often you pay it.
+
+```
+        ▲  tokens & cost rise · cadence falls
+        │
+   L4   │ ██████                        full live run + golden-run diff — whole pipeline incl. model behavior · per release
+   L3   │ ██████████                    live slice: cairn run --from X --to Y — one changed step vs a real model · per feature
+   L2   │ ██████████████                cairn doctor — the machine: auth · versions · hook probe · [tools] · per machine
+   L1   │ ██████████████████            cairn test — offline suite: validators · guards · envelopes · stub runs · every commit
+   L0   │ ██████████████████████████    cairn plan — config: dataflow · refs · exprs · schemas exist · every edit
+        │
+        ▼  0 tokens, milliseconds · constant
+```
+
+L0–L2 spend zero tokens and gate every commit; L3–L4 spend real tokens and are human-triggered per
+feature or release. The same five, priced:
+
 | | Layer | Verifies | Cost | Cadence |
 |---|---|---|---|---|
 | L0 | `cairn plan` | config: dataflow, references, expressions, schemas exist | 0 tokens, ms | every edit |
