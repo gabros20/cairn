@@ -257,6 +257,9 @@ def test_run_out_of_range_tool_check_never_executes(hello_ws, monkeypatch, tmp_p
 def test_run_full_brease_rebuild_hardstops_on_unverified_vercel(monkeypatch, tmp_path, capsys):
     # The real fixture: brease-ws declares [tools.vercel] needed_by=["deploy"]. A full-range run
     # verifies vercel up front and refuses (deploy is 15 steps away — fail-fast beats a P6 crash).
+    # Hermetic: stub the check-runner to "failed" so the test never executes the fixture's real
+    # `vercel whoami` (which would pass on an authed machine, or hit the network logged-out).
+    monkeypatch.setattr("cairn.cli.run_tool_check", lambda check: False)
     monkeypatch.chdir(BREASE_WS)
     rd = tmp_path / "r"
     rc = main([
@@ -267,6 +270,23 @@ def test_run_full_brease_rebuild_hardstops_on_unverified_vercel(monkeypatch, tmp
     err = capsys.readouterr().err
     assert "vercel" in err and "deploy" in err and "cairn doctor" in err
     assert not (rd / "run.json").exists()  # nothing minted in the target run dir
+
+
+def test_run_dir_resume_entrance_guards_before_tool_preflight(hello_ws, monkeypatch, capsys):
+    # Entrance order is normalized across every resume path: guards (drift → version) fire
+    # BEFORE the tool hard-stop — a drifted pipeline refuses on drift, and no tool check runs.
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--run-dir", str(hello_ws / "r")]) == int(ExitCode.OK)
+    capsys.readouterr()
+    pfile = hello_ws / "pipelines" / "hello.yaml"
+    pfile.write_text(pfile.read_text() + "\n# drift\n", encoding="utf-8")
+    sentinel = hello_ws / "check-ran.flag"
+    _add_tool(hello_ws, f'\n[tools.needsit]\ncheck = "touch {sentinel} ; false"\nneeded_by = ["greet"]\n')
+    rc = main(["run", "hello", "--headless", "--run-dir", str(hello_ws / "r")])
+    assert rc == int(ExitCode.CONFIG)
+    err = capsys.readouterr().err
+    assert "drift" in err and "needsit" not in err  # the drift guard refused first
+    assert not sentinel.exists()  # ...and the tool check never ran
 
 
 def test_resume_rechecks_scoped_tool_that_vanished(hello_ws, monkeypatch, capsys):

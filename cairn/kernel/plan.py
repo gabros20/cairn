@@ -1124,19 +1124,21 @@ def _workspace_scope_names(workspace_dir: Path) -> set[str]:
 def _lint_tools(
     config: Config,
     pipeline_name: str,
-    in_range_ids: set[str],
+    requirements: tuple[ToolRequirement, ...],
     local_names: set[str],
     workspace_names: Callable[[], set[str]],
     warnings: list[Finding],
 ) -> None:
-    """Append the range-scoped tool warnings for one plan (see the section note above).
+    """Append the tool warnings for one plan (see the section note above): the dangling-scope
+    lint (from the raw ``[tools]`` declarations) plus the range-scoped "unverified here"
+    warnings — the latter derived FROM ``requirements`` (the exact set ``cairn run`` hard-stops
+    on), so warning-set == hard-stop-set holds by construction, not by parallel logic.
 
     ``local_names`` is the current pipeline's own universe (its name + all raw step ids,
     already parsed); ``workspace_names`` is the lazy workspace-wide fallback, invoked at
     most once and only when a target fails to match locally."""
     fallback: set[str] | None = None
     for tool in config.tools.values():
-        scoped = set(tool.needed_by)
         for target in tool.needed_by:
             if target in local_names:
                 continue
@@ -1150,20 +1152,14 @@ def _lint_tools(
                         f"or pipeline anywhere in this workspace (dangling scope)",
                     )
                 )
-        for sid in sorted(in_range_ids & scoped):
+    for req in requirements:
+        for target in req.targets:
+            what = "pipeline" if target == pipeline_name else "step"
             warnings.append(
                 Finding(
                     "warning",
-                    f"step {sid!r} needs tool {tool.name!r} — declared but unverified here; "
+                    f"{what} {target!r} needs tool {req.tool!r} — declared but unverified here; "
                     f"run cairn doctor",
-                )
-            )
-        if pipeline_name in scoped:
-            warnings.append(
-                Finding(
-                    "warning",
-                    f"pipeline {pipeline_name!r} needs tool {tool.name!r} — declared but "
-                    f"unverified here; run cairn doctor",
                 )
             )
 
@@ -1171,16 +1167,19 @@ def _lint_tools(
 def _tool_requirements(
     config: Config, pipeline_name: str, in_range_ids: set[str]
 ) -> tuple[ToolRequirement, ...]:
-    """The range-scoped tool subset for the run-time hard-stop — the same in-range matching
-    :func:`_lint_tools` warns on, captured structurally so ``cairn run`` can probe each ``check``
-    before minting anything. A tool is included iff its ``needed_by`` names an in-range step or
-    this pipeline; unscoped tools (empty ``needed_by``) and tools scoped only to out-of-range /
-    dropped steps are excluded — the exclusion is what makes "out-of-range ⇒ never checked" hold."""
+    """The range-scoped tool subset for the run-time hard-stop, captured structurally so
+    ``cairn run`` can probe each ``check`` before minting anything — and the single source
+    :func:`_lint_tools` derives its "unverified here" warnings from. A tool is included iff its
+    ``needed_by`` names an in-range step or this pipeline; unscoped tools (empty ``needed_by``)
+    and tools scoped only to out-of-range / dropped steps are excluded — the exclusion is what
+    makes "out-of-range ⇒ never checked" hold. ``targets`` is the sorted in-range step ids, plus
+    the pipeline name when pipeline-scoped (deduped for the degenerate step-named-as-pipeline
+    case)."""
     reqs: list[ToolRequirement] = []
     for tool in config.tools.values():
         scoped = set(tool.needed_by)
         targets = sorted(in_range_ids & scoped)
-        if pipeline_name in scoped:
+        if pipeline_name in scoped and pipeline_name not in targets:
             targets.append(pipeline_name)
         if targets:
             reqs.append(ToolRequirement(tool.name, tool.check, tool.install, tuple(targets)))
@@ -1284,22 +1283,22 @@ def plan(
     emitted, resolved_models = _emit(active, executor, step_executors, config, from_node, to_node, str(pfile))
 
     # Range-scoped tool preflight — offline; the workspace-wide scan is a lazy fallback
-    # that only runs for a needed_by target the current pipeline can't account for. The same
-    # in-range match feeds both the plan-time warnings and the run-time hard-stop set.
+    # that only runs for a needed_by target the current pipeline can't account for. The
+    # requirement set is computed once and feeds BOTH the plan-time warnings and the
+    # run-time hard-stop, so the two can never drift.
     tool_requirements: tuple[ToolRequirement, ...] = ()
     if config.tools:
-        in_range_ids = _flatten_step_ids(emitted)
+        tool_requirements = _tool_requirements(config, pipeline_name, _flatten_step_ids(emitted))
         local_names = {pipeline_name}
         _collect_raw_step_ids(raw_steps, local_names)
         _lint_tools(
             config,
             pipeline_name,
-            in_range_ids,
+            tool_requirements,
             local_names,
             lambda: _workspace_scope_names(workspace_dir),
             warnings,
         )
-        tool_requirements = _tool_requirements(config, pipeline_name, in_range_ids)
 
     return Plan(
         pipeline=pipeline,

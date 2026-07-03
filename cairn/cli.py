@@ -422,14 +422,21 @@ def _print_walk_result(code: ExitCode, run_dir: Path) -> None:
 
 def _preflight_tools(p: Plan) -> int | None:
     """The `cairn run` hard-stop (docs/TOOLING-AND-GROWTH.md §2): run each in-range scoped tool's
-    ``check`` BEFORE anything is minted or walked. Called from every entrance that is about to
-    execute (fresh run, both resume entrances of `cairn run`, and `cairn resume`) once the no-op /
-    idempotent-complete cases have been ruled out — so a done run is never blocked by a tool that
-    has since vanished. A failing check refuses with a legible message naming the tool, the
-    step(s)/pipeline needing it, the failed check, and the fix (install hint + `cairn doctor`),
-    and returns ``ExitCode.CONFIG`` (nothing created on disk). All checks pass → returns None with
-    zero output. ``p.tool_requirements`` already excludes unscoped and out-of-range tools, so this
-    runs no subprocess a plan-time scope didn't already justify."""
+    ``check`` BEFORE anything is minted or walked. Wired into every entrance about to execute —
+    a fresh mint (before ``bootstrap_run``, so a failure creates nothing on disk), both resume
+    entrances of `cairn run`, and `cairn resume` — always AFTER the resume guards (drift →
+    version → tools, the same order on every path). Only the `--idempotent` entrances
+    short-circuit an already-complete run before any check; the non-idempotent resume entrances
+    re-check even when run.json says "done" — deliberate, not an oversight: the walk's
+    skip-if-valid semantics re-execute a "done" step whose artifact has since been deleted or
+    invalidated (see ``walk._is_done``), and that repair re-execution still needs its tools, so
+    a status-done fast-path here would be wrong, not just redundant.
+
+    A failing check refuses with a legible message naming the tool, the step(s)/pipeline needing
+    it, the failed check, and the fix (install hint + `cairn doctor`), and returns
+    ``ExitCode.CONFIG``. All checks pass → returns None with zero output. ``p.tool_requirements``
+    already excludes unscoped and out-of-range tools, so this runs no subprocess a plan-time
+    scope didn't already justify."""
     failures = [req for req in p.tool_requirements if not run_tool_check(req.check)]
     if not failures:
         return None
@@ -474,19 +481,23 @@ def _cmd_run(args: argparse.Namespace) -> int:
             fast = _idempotent_shortcut(run_dir)
             if fast is not None:
                 return fast
-        # Committed to execute (fresh mint or resume): verify in-range tools BEFORE minting —
-        # a failing check refuses with nothing created on disk (docs/TOOLING-AND-GROWTH §2).
-        fail = _preflight_tools(p)
-        if fail is not None:
-            return fail
         if not existing:
+            # Fresh mint: verify in-range tools BEFORE minting — a failing check refuses with
+            # nothing created on disk (docs/TOOLING-AND-GROWTH §2).
+            fail = _preflight_tools(p)
+            if fail is not None:
+                return fail
             run_dir = bootstrap_run(ws, p, now=now, run_dir=run_dir, pipeline_hash=phash)
             created = True
         else:
             # An existing --run-dir resumes (with or without --idempotent) — through the same
-            # guards as every other resume entrance (drift → version). `cairn run` has no
-            # --force; the refusals name `cairn resume <run-dir> --force` as the escape hatch.
+            # sequence as every other resume entrance: guards (drift → version), then the tool
+            # hard-stop. `cairn run` has no --force; the refusals name
+            # `cairn resume <run-dir> --force` as the escape hatch.
             fail = _resume_guards(run_dir, phash, p.pipeline, force=False)
+            if fail is not None:
+                return fail
+            fail = _preflight_tools(p)
             if fail is not None:
                 return fail
     else:
@@ -502,20 +513,24 @@ def _cmd_run(args: argparse.Namespace) -> int:
         if match is not None and match.complete:
             print(f"cairn: already done → {match.run_dir}")
             return int(ExitCode.OK)
-        # Committed to execute: verify in-range tools BEFORE minting (nothing on disk on failure).
-        fail = _preflight_tools(p)
-        if fail is not None:
-            return fail
         if match is not None:
             # Incomplete equivalent run → resume it, never mint a variant — but through the
-            # same guards `cairn resume` enforces: a timer re-fire after a pipeline edit or
-            # a cross-major cairn upgrade must fail loud, not silently resume. `cairn run`
-            # has no --force flag; only `cairn resume … --force` can override.
+            # same sequence `cairn resume` enforces: guards (a timer re-fire after a pipeline
+            # edit or a cross-major cairn upgrade must fail loud, not silently resume), then
+            # the tool hard-stop. `cairn run` has no --force flag; only
+            # `cairn resume … --force` can override.
             fail = _resume_guards(match.run_dir, phash, p.pipeline, force=False)
+            if fail is not None:
+                return fail
+            fail = _preflight_tools(p)
             if fail is not None:
                 return fail
             run_dir = match.run_dir
         else:
+            # Fresh mint: verify in-range tools BEFORE minting (nothing on disk on failure).
+            fail = _preflight_tools(p)
+            if fail is not None:
+                return fail
             run_dir = bootstrap_run(ws, p, now=now, runs_root=runs_root, pipeline_hash=phash)
             created = True
 
