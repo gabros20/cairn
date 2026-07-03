@@ -25,11 +25,12 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 
 def run(*argv: str, cwd: Path | None = None) -> str:
@@ -40,8 +41,37 @@ def run(*argv: str, cwd: Path | None = None) -> str:
     return res.stdout.strip()
 
 
+# Mirrors validators/self-improve-proposals.py `_check_target` — ON PURPOSE, as defense
+# in depth: the validator guards the normal flow, but the documented per-proposal veto
+# (a human editing proposals.json while the approve gate is open) happens AFTER
+# validation, so this script must independently refuse a target that could write
+# outside the worktree. Keep the two in sync if you customize either.
+_FORBIDDEN_ROOTS = ("runs", ".git")
+
+
+def unsafe_target(root: Path, target: str) -> str | None:
+    """A refusal reason when ``target`` may not be edited, else None."""
+    if not isinstance(target, str) or not target:
+        return "unsafe target: must be a non-empty string"
+    p = PurePosixPath(target)
+    if p.is_absolute() or (len(target) > 1 and target[1] == ":"):
+        return f"unsafe target {target!r}: must be workspace-relative, not absolute"
+    if ".." in p.parts:
+        return f"unsafe target {target!r}: escapes the workspace (contains '..')"
+    if p.parts[0] in _FORBIDDEN_ROOTS or target == ".env":
+        return f"unsafe target {target!r}: protected path"
+    # Final backstop: the RESOLVED path (symlinks and all) must stay under the worktree.
+    resolved = (root / target).resolve()
+    if not resolved.is_relative_to(root.resolve()):
+        return f"unsafe target {target!r}: resolves outside the worktree"
+    return None
+
+
 def apply_edit(root: Path, prop: dict) -> str | None:
     """Apply one proposal inside the worktree; return a skip reason or None on success."""
+    reason = unsafe_target(root, prop.get("target", ""))
+    if reason is not None:
+        return reason
     target = root / prop["target"]
     action = prop["action"]
     if action == "create":
@@ -100,6 +130,7 @@ def main() -> int:
 
     applied: list[str] = []
     skipped: list[dict] = []
+    delete_branch = False
     try:
         for prop in proposals:
             reason = apply_edit(worktree / ws_rel, prop)
@@ -112,6 +143,7 @@ def main() -> int:
         if not applied:
             print("self-improve: every proposal failed to apply — refusing to open an empty PR.",
                   file=sys.stderr)
+            delete_branch = True  # the branch carries nothing; drop it in the cleanup below
             return 1
 
         # Commit BY PATHSPEC — only the approved proposals' targets, nothing else.
@@ -142,9 +174,14 @@ def main() -> int:
         finally:
             os.unlink(body_file)
     finally:
-        # Drop the temporary worktree; the branch (and the PR) survive.
+        # Drop the temporary worktree and its mkdtemp parent; on success the branch
+        # (and the PR) survive, while an all-fail run leaves no branch ref behind.
         subprocess.run(["git", "-C", str(repo_root), "worktree", "remove", "--force", str(worktree)],
                        capture_output=True, text=True)
+        shutil.rmtree(worktree.parent, ignore_errors=True)
+        if delete_branch:
+            subprocess.run(["git", "-C", str(repo_root), "branch", "-D", branch],
+                           capture_output=True, text=True)
 
     record_path.write_text(
         json.dumps({"status": "pr-opened", "branch": branch, "pr_url": pr_url,

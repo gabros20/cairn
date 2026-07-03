@@ -323,7 +323,96 @@ def test_matrix_row_walks_self_improve_through_cairn_test(ws: Path, tmp_path: Pa
 
 
 # --------------------------------------------------------------------------- #
-# 4. Retrofit — `cairn new pipeline self-improve` into an existing workspace.
+# 4. The open-pr script's own target guard — defense in depth.
+#
+# The validator guarantees safe targets on the NORMAL path, but the documented
+# per-proposal veto (a human editing proposals.json at the gate) happens AFTER
+# validation — so the script must independently refuse a target that escapes the
+# worktree; a refused target is just a failed-to-apply proposal, never a write.
+# --------------------------------------------------------------------------- #
+
+
+def _git_workspace(ws: Path) -> None:
+    real_git = shutil.which("git")
+    for args in (
+        ("init",), ("config", "user.email", "t@example.com"), ("config", "user.name", "T"),
+        ("add", "-A"), ("commit", "-m", "scaffold"),
+    ):
+        res = subprocess.run([real_git, "-C", str(ws), *args], capture_output=True, text=True)
+        assert res.returncode == 0, res.stderr
+
+
+def _run_open_pr(ws: Path, tmp_path: Path, monkeypatch, proposals: list[dict]) -> tuple[subprocess.CompletedProcess, Path, Path]:
+    """Invoke the script directly, the way the open-pr step does — shimmed PATH, a
+    CONTROLLED TMPDIR (so temp leftovers are observable), no network."""
+    _with_shims(monkeypatch, tmp_path)
+    run_dir = tmp_path / "runs" / "self-improve-20260703"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "proposals.json").write_text(json.dumps({"proposals": proposals}), encoding="utf-8")
+    tmpdir = tmp_path / "controlled-tmp"
+    tmpdir.mkdir(exist_ok=True)
+    env = dict(os.environ)
+    env.update({"CAIRN_WORKSPACE": str(ws), "CAIRN_RUN_DIR": str(run_dir), "TMPDIR": str(tmpdir)})
+    res = subprocess.run(
+        [sys.executable, str(ws / SCRIPT), str(run_dir / "proposals.json"), str(run_dir / "pr.json")],
+        capture_output=True, text=True, env=env,
+    )
+    return res, run_dir, tmpdir
+
+
+def _malicious(tmp_path: Path) -> list[dict]:
+    return [
+        {"id": "abs", "promotion": "prompt", "target": str(tmp_path / "evil-absolute.md"),
+         "action": "create", "text": "outside", "rationale": "injected at the gate"},
+        {"id": "dotdot", "promotion": "prompt", "target": "../evil-relative.md",
+         "action": "create", "text": "outside", "rationale": "injected at the gate"},
+    ]
+
+
+def test_open_pr_refuses_targets_injected_after_validation(ws: Path, tmp_path: Path, monkeypatch) -> None:
+    if shutil.which("git") is None:  # pragma: no cover
+        pytest.skip("git required")
+    _git_workspace(ws)
+
+    res, _run_dir, tmpdir = _run_open_pr(ws, tmp_path, monkeypatch, _malicious(tmp_path))
+
+    # Every proposal was hostile → nothing applied → the script refuses (exit 1)…
+    assert res.returncode == 1, res.stdout + res.stderr
+    # …and, crucially, not a byte landed outside the worktree.
+    assert not (tmp_path / "evil-absolute.md").exists()
+    assert not (tmp_path / "evil-relative.md").exists()
+    assert not (ws.parent / "evil-relative.md").exists()
+    # All-fail cleanup: the now-pointless branch ref and the temp dir are both gone.
+    branches = subprocess.run(
+        [shutil.which("git"), "-C", str(ws), "branch", "--list", "self-improve/*"],
+        capture_output=True, text=True,
+    ).stdout.strip()
+    assert branches == "", f"stale branch left behind: {branches}"
+    assert list(tmpdir.iterdir()) == [], "mkdtemp parent dir was not cleaned up"
+
+
+def test_open_pr_skips_hostile_targets_but_still_applies_the_good_ones(ws: Path, tmp_path: Path, monkeypatch) -> None:
+    if shutil.which("git") is None:  # pragma: no cover
+        pytest.skip("git required")
+    _git_workspace(ws)
+    good = {"id": "good", "promotion": "prompt", "target": "prompts/DOCTRINE.md",
+            "action": "append", "text": "\n## A fine rule\n", "rationale": "recurred"}
+
+    res, run_dir, tmpdir = _run_open_pr(ws, tmp_path, monkeypatch, [*_malicious(tmp_path), good])
+
+    # The run is otherwise unchanged: the good edit ships, the hostile ones are
+    # reported as failed-to-apply — never written.
+    assert res.returncode == 0, res.stdout + res.stderr
+    record = json.loads((run_dir / "pr.json").read_text(encoding="utf-8"))
+    assert record["applied"] == ["prompts/DOCTRINE.md"]
+    assert {s["id"] for s in record["skipped"]} == {"abs", "dotdot"}
+    assert not (tmp_path / "evil-absolute.md").exists()
+    assert not (tmp_path / "evil-relative.md").exists()
+    assert list(tmpdir.iterdir()) == [], "mkdtemp parent dir was not cleaned up"
+
+
+# --------------------------------------------------------------------------- #
+# 5. Retrofit — `cairn new pipeline self-improve` into an existing workspace.
 # --------------------------------------------------------------------------- #
 
 _FURNITURE = (
