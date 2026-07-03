@@ -36,6 +36,15 @@ def test_tiers_and_efforts_pinned():
     assert EFFORTS == ("low", "medium", "high", "xhigh")
 
 
+def test_result_usage_defaults_to_none():
+    # The stable plumbing: usage is optional and absent by default (plain-text executors),
+    # so every existing Result(...) call site keeps None without change.
+    r = Result(step={"status": "done"}, exit_code=0, duration_s=1.0)
+    assert r.usage is None
+    r2 = Result(step=None, exit_code=0, duration_s=1.0, usage={"in_tokens": 5})
+    assert r2.usage == {"in_tokens": 5}
+
+
 def test_finding_defaults_fix_to_none():
     f = Finding(level="error", message="boom")
     assert f.fix is None

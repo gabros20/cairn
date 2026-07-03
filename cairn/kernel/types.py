@@ -72,6 +72,11 @@ class Result:
     step: dict | None
     exit_code: int
     duration_s: float
+    # Executor-reported token/cost usage, when available. All three executors run with
+    # plain-text output today, so this is None — the future source is a per-CLI json
+    # output-format (e.g. `--output-format json`), which the walker will prefer over any
+    # model-self-reported STEP-block `usage`. The stable schema is the value now, not numbers.
+    usage: dict | None = None
 
 
 @runtime_checkable
