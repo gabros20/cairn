@@ -229,7 +229,11 @@ class CodexHookRecipe(HookRecipe):
     until auth is provisioned into the canary — deferred to the orchestrator (see C4 brief)."""
 
     name = "codex"
-    model = "gpt-5.1-codex-mini"  # cheapest codex tier; only used if live-run
+    # Live-verified on codex-cli 0.142.5 with a ChatGPT account: gpt-5.5 is the ONLY accepted
+    # model — every -mini/-codex variant is rejected ("not supported when using Codex with a
+    # ChatGPT account"); see tests/live/workspace-codex/cairn.toml. Don't cargo-cult this onto
+    # API-key machines expecting a cheaper tier; there, cost is steered by effort, not model.
+    model = "gpt-5.5"
     posture = "headless (codex exec)"
     mechanism = "PreToolUse deny-JSON (hookSpecificOutput.permissionDecision=deny)"
 
@@ -253,17 +257,20 @@ class CodexHookRecipe(HookRecipe):
     def build_invocation(
         self, canary: Path, prompt_text: str, model: str
     ) -> tuple[list[str], str | None]:
-        # Mirrors CodexExecutor._build_command, plus the two flags a headless canary needs:
-        # --dangerously-bypass-hook-trust (run our freshly-written hook without persisted trust)
-        # and --skip-git-repo-check (the canary is not a git repo). Prompt on stdin.
+        # LOCKSTEP with cairn/executors/codex.py::CodexExecutor._build_command (effort=None
+        # branch) — pinned by test_codex_invocation_mirrors_real_executor_argv; change that
+        # executor and this recipe together. Live-verified on codex-cli 0.142.5:
+        # `-a/--ask-for-approval` no longer exists on `codex exec` (argv error), and
+        # `--skip-git-repo-check` is required (the canary tempdir is not a git repo). The one
+        # probe-only addition is --dangerously-bypass-hook-trust, so the freshly-written canary
+        # hook runs without persisted hook trust. Prompt on stdin.
         argv = [
             "codex", "exec",
             "-C", str(canary),
             "-m", model,
             "--sandbox", "workspace-write",
-            "-a", "never",
-            "--dangerously-bypass-hook-trust",
             "--skip-git-repo-check",
+            "--dangerously-bypass-hook-trust",
         ]
         return argv, prompt_text
 

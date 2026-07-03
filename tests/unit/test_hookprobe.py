@@ -277,6 +277,36 @@ def test_codex_recipe_emits_hooks_json_under_codex_home(tmp_path):
     assert CodexHookRecipe().extra_env(canary)["CODEX_HOME"] == str(canary / ".codex")
 
 
+def test_codex_invocation_mirrors_real_executor_argv(tmp_path):
+    """The recipe argv must be the REAL CodexExecutor argv + the probe-only trust-bypass flag.
+
+    Pinned by construction (not a copied list) so drift in either direction — the executor
+    changing shape (as it did when codex-cli 0.142.5 dropped ``-a/--ask-for-approval``) or the
+    recipe growing stale — fails this test loudly."""
+    from cairn.executors.codex import CodexExecutor
+    from cairn.kernel.config import ExecutorConfig
+    from cairn.kernel.types import Invocation
+
+    inv = Invocation(
+        prompt_file=tmp_path / "p.md", model="gpt-5.5", effort=None, cwd=tmp_path,
+        env={}, timeout_s=60, log_path=tmp_path / "l.log", return_schema=tmp_path / "s.json",
+    )
+    exec_argv, exec_stdin = CodexExecutor(ExecutorConfig(name="codex"))._build_command(inv, "PROMPT")
+    recipe_argv, recipe_stdin = CodexHookRecipe().build_invocation(tmp_path, "PROMPT", "gpt-5.5")
+
+    assert recipe_argv == exec_argv + ["--dangerously-bypass-hook-trust"]
+    assert recipe_stdin == exec_stdin == "PROMPT"
+    # The two live-verified 0.142.5 facts, asserted explicitly so a regression names itself:
+    assert "-a" not in recipe_argv  # `-a/--ask-for-approval` no longer exists on `codex exec`
+    assert "--skip-git-repo-check" in recipe_argv  # the canary tempdir is not a git repo
+
+
+def test_codex_recipe_default_model_is_gpt_5_5():
+    # Live-verified: this ChatGPT account rejects every -mini/-codex model variant with a 400;
+    # only gpt-5.5 is accepted (documented in tests/live/workspace-codex/cairn.toml).
+    assert CodexHookRecipe().model == "gpt-5.5"
+
+
 def test_claude_invocation_carries_bypass_permissions(tmp_path):
     argv, stdin_text = ClaudeHookRecipe().build_invocation(tmp_path, "PROMPT", "haiku")
     assert argv[0] == "claude" and stdin_text is None
