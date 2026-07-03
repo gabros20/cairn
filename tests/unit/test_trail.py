@@ -15,6 +15,7 @@ from cairn.kernel.trail import (
     derive_status,
     follow,
     format_at,
+    make_redactor,
     read_trail,
 )
 
@@ -130,6 +131,109 @@ def test_redactor_is_applied_to_the_serialized_line(tmp_path):
     raw = (tmp_path / "trail.jsonl").read_text()
     assert "sk-secret-123" not in raw
     assert "∎REDACTED:BREASE_TOKEN∎" in raw
+
+
+def test_jsonl_is_byte_identical_with_and_without_tee_sinks(tmp_path, monkeypatch):
+    # The authority file must not change one byte when a tee sink is attached. Freeze the
+    # clock so the only thing that could differ (the `at` timestamp) is held constant.
+    import cairn.kernel.trail as trailmod
+
+    monkeypatch.setattr(trailmod, "_now_iso", lambda: "2026-07-03T10:14:02.113Z")
+    plain = tmp_path / "plain"
+    teed = tmp_path / "teed"
+
+    w1 = TrailWriter(plain, RUN_ID)
+    w1.emit("run-start", data={"url": "https://acme.test"})
+    w1.emit("step-done", node="capture", data={"artifacts": ["a.json"]})
+    w1.close()
+
+    seen: list[dict] = []
+
+    class RecordingSink:
+        def emit(self, event: dict) -> None:
+            seen.append(event)
+
+        def close(self) -> None:
+            pass
+
+    w2 = TrailWriter(teed, RUN_ID, tee_sinks=[RecordingSink()])
+    w2.emit("run-start", data={"url": "https://acme.test"})
+    w2.emit("step-done", node="capture", data={"artifacts": ["a.json"]})
+    w2.close()
+
+    assert (teed / "trail.jsonl").read_bytes() == (plain / "trail.jsonl").read_bytes()
+    # The tee saw the same two events, parsed as dicts.
+    assert [e["event"] for e in seen] == ["run-start", "step-done"]
+
+
+def test_tee_sink_receives_the_redacted_event(tmp_path):
+    seen: list[dict] = []
+
+    class RecordingSink:
+        def emit(self, event: dict) -> None:
+            seen.append(event)
+
+        def close(self) -> None:
+            pass
+
+    redactor = make_redactor({"TOKEN": "sk-secret-123"})
+    w = TrailWriter(tmp_path, RUN_ID, redactor=redactor, tee_sinks=[RecordingSink()])
+    w.emit("guard-deny", data={"command": "auth sk-secret-123"})
+    w.close()
+
+    # What the webhook would send must be the redacted form — never the raw secret.
+    assert "sk-secret-123" not in json.dumps(seen[0])
+    assert "∎REDACTED:TOKEN∎" in seen[0]["data"]["command"]
+
+
+def test_a_raising_tee_sink_never_breaks_emit(tmp_path):
+    class BoomSink:
+        def emit(self, event: dict) -> None:
+            raise RuntimeError("sink is on fire")
+
+        def close(self) -> None:
+            pass
+
+    w = TrailWriter(tmp_path, RUN_ID, tee_sinks=[BoomSink()])
+    # emit must return normally and the authority file must still be written.
+    w.emit("run-start")
+    w.close()
+    assert [e["event"] for e in read_trail(tmp_path)] == ["run-start"]
+
+
+def test_close_closes_tee_sinks(tmp_path):
+    closed: list[bool] = []
+
+    class ClosingSink:
+        def emit(self, event: dict) -> None:
+            pass
+
+        def close(self) -> None:
+            closed.append(True)
+
+    w = TrailWriter(tmp_path, RUN_ID, tee_sinks=[ClosingSink()])
+    w.emit("run-start")
+    w.close()
+    assert closed == [True]
+
+
+def test_make_redactor_replaces_by_value_with_the_named_marker():
+    redact = make_redactor({"BREASE_TOKEN": "sk-abc", "VERCEL_TOKEN": "vc-xyz"})
+    assert redact is not None
+    out = redact("using sk-abc and vc-xyz here")
+    assert out == "using ∎REDACTED:BREASE_TOKEN∎ and ∎REDACTED:VERCEL_TOKEN∎ here"
+
+
+def test_make_redactor_is_none_when_no_secrets_resolved():
+    assert make_redactor({}) is None
+    # An empty value is skipped (a bare "" would otherwise match everywhere).
+    assert make_redactor({"UNSET": ""}) is None
+
+
+def test_make_redactor_prefers_the_longest_value_on_overlap():
+    # A secret that is a substring of another must not leave the longer one half-scrubbed.
+    redact = make_redactor({"SHORT": "abc", "LONG": "abcdef"})
+    assert redact("abcdef") == "∎REDACTED:LONG∎"
 
 
 def _emit_then(tmp_path, event, **kw):

@@ -12,15 +12,54 @@ there are no threads or daemons here.
 from __future__ import annotations
 
 import json
-import os
+import logging
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+from cairn.kernel.sinks import JsonlSink, Sink
+
 TRAIL_NAME = "trail.jsonl"
 ENVELOPE_VERSION = 1
+
+_log = logging.getLogger("cairn.trail")
+
+# The literal-match redaction marker (SECURITY.md §1.3). ``NAME`` is the declared secret's
+# name, so a scrubbed line still says *which* secret sat there without ever showing its value.
+REDACTION_MARKER = "∎REDACTED:{name}∎"
+
+
+def make_redactor(secrets: Mapping[str, str]) -> Callable[[str], str] | None:
+    """Build a literal-match scrubber over the *resolved* secret values (SECURITY.md §1.3).
+
+    ``secrets`` maps declared name → resolved value; only truthy values are scrubbed (an empty
+    value is skipped — a bare ``""`` would otherwise match everywhere). Returns ``None`` when
+    nothing is scrubbable, so the caller pays *nothing* when no secret resolved. The returned
+    callable replaces each value with ``∎REDACTED:NAME∎``; longest values first so one secret
+    that is a substring of another never leaves the longer one half-scrubbed. A value that
+    never appears costs one ``in`` scan — O(line length × num secrets) overall.
+    """
+    pairs = sorted(
+        (
+            (value, REDACTION_MARKER.format(name=name))
+            for name, value in secrets.items()
+            if value
+        ),
+        key=lambda p: len(p[0]),
+        reverse=True,
+    )
+    if not pairs:
+        return None
+
+    def redact(text: str) -> str:
+        for value, marker in pairs:
+            if value in text:
+                text = text.replace(value, marker)
+        return text
+
+    return redact
 
 
 def format_at(dt: datetime) -> str:
@@ -64,7 +103,12 @@ class TrailWriter:
     """Single-writer appender for one run's trail.
 
     `seq` resumes from the last line on re-open, so a crashed-then-resumed walker keeps
-    the offset strictly monotonic. Each emit is one flushed+fsynced append.
+    the offset strictly monotonic. Each emit is one flushed+fsynced append to sink #0, the
+    authoritative :class:`~cairn.kernel.sinks.JsonlSink` (`trail.jsonl`), and — for any
+    configured `tee_sinks` — a best-effort push of the same (redacted) event. Tee sinks are
+    **never authority**: one that raises is logged and ignored, so a dead webhook can neither
+    fail nor slow the run (OBSERVABILITY §2). Redaction (SECURITY §1.3) is applied here, once,
+    to the serialized line — so both the file and every tee see the scrubbed form.
     """
 
     def __init__(
@@ -73,14 +117,16 @@ class TrailWriter:
         run_id: str,
         *,
         redactor: Callable[[str], str] | None = None,
+        tee_sinks: list[Sink] | None = None,
     ) -> None:
         self.run_dir = Path(run_dir)
         self.run_id = run_id
         self._redactor = redactor
+        self._tee_sinks = tee_sinks or []
         self._path = self.run_dir / TRAIL_NAME
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self._seq = _last_seq(self._path)
-        self._fh = self._path.open("a", encoding="utf-8")
+        self._jsonl = JsonlSink(self._path)  # sink #0 — the authority
 
     def emit(
         self,
@@ -106,14 +152,32 @@ class TrailWriter:
         serialized = json.dumps(envelope, ensure_ascii=False)
         if self._redactor is not None:
             serialized = self._redactor(serialized)
-        self._fh.write(serialized + "\n")
-        self._fh.flush()
-        os.fsync(self._fh.fileno())
+        # Authority first: an IO failure here is fatal (the run's record of truth).
+        self._jsonl.write_line(serialized)
+        # Then tee the *redacted* event (parsed back so the file and the tee agree exactly).
+        if self._tee_sinks:
+            try:
+                teed = json.loads(serialized)
+            except json.JSONDecodeError:
+                teed = None  # never fall back to the unredacted envelope — skip this tee
+            if teed is not None:
+                for sink in self._tee_sinks:
+                    try:
+                        sink.emit(teed)
+                    except Exception:  # noqa: BLE001 — a tee must never fail the run
+                        _log.warning(
+                            "cairn: trail sink %r raised on emit — ignored.",
+                            getattr(sink, "_name", type(sink).__name__),
+                        )
         return envelope
 
     def close(self) -> None:
-        if not self._fh.closed:
-            self._fh.close()
+        self._jsonl.close()
+        for sink in self._tee_sinks:
+            try:
+                sink.close()
+            except Exception:  # noqa: BLE001 — closing a tee must never fail the run
+                _log.warning("cairn: trail sink close raised — ignored.")
 
     def __enter__(self) -> TrailWriter:
         return self
