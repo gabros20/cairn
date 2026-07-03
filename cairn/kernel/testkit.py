@@ -537,14 +537,19 @@ def record_run(workspace_dir: Path, run_dir: Path, *, slim: bool = False) -> lis
 
 
 def _copy_into(resolved, run_dir: Path, dest_dir: Path, slim: bool) -> list[Path]:
-    """Copy every file of a resolved artifact into ``dest_dir`` at its run-dir-relative path."""
+    """Copy every file of a resolved artifact into ``dest_dir`` at its run-dir-relative path.
+
+    ``slim`` truncates only bulky *binary* payloads (>64 KiB, non-``.json``) to a marker line —
+    a schema/validator-bound ``.json`` is copied whole, since a slim marker would seed a stub
+    the artifact's schema/validator can never re-validate (a permanently-red pipeline row).
+    """
     out: list[Path] = []
     for src in resolved.paths:
         if not src.is_file():
             continue
         dest = dest_dir / src.relative_to(run_dir)
         dest.parent.mkdir(parents=True, exist_ok=True)
-        if slim and src.stat().st_size > 64 * 1024:
+        if slim and src.suffix.lower() != ".json" and src.stat().st_size > 64 * 1024:
             dest.write_text(f"cairn-stub-slim: {src.stat().st_size} bytes truncated\n", encoding="utf-8")
         else:
             dest.write_bytes(src.read_bytes())

@@ -221,6 +221,60 @@ def test_overlay_overwrites_existing_file(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# 8. Overlay never clobbers the run's control files (defense-in-depth).
+# --------------------------------------------------------------------------- #
+
+
+def test_overlay_skips_run_control_files(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    run_dir = make_run_dir(tmp_path, "hello")
+    (run_dir / ".cairn").mkdir()
+    (run_dir / ".cairn/step-return.json").write_text("REAL-SCHEMA")
+    (run_dir / "trail.jsonl").write_text("REAL-TRAIL")
+    (run_dir / "gates").mkdir()
+    (run_dir / "gates/tone.json").write_text("REAL-GATE")
+    (run_dir / "logs/greet.log").write_text("REAL-LOG")
+
+    # A malicious stub tree tries to overwrite every control file — plus a legit artifact.
+    write_stub(ws / "tests/stubs", "hello", "greet", {
+        "run.json": '{"pipeline": "evil"}',
+        ".cairn/step-return.json": "POISON",
+        "trail.jsonl": "POISON",
+        "gates/tone.json": "POISON",
+        "logs/greet.log": "POISON",
+        "note.json": "{}",
+    })
+
+    result = StubExecutor().invoke(make_inv(run_dir, ws, "greet"))
+
+    assert json.loads((run_dir / "run.json").read_text())["pipeline"] == "hello"
+    assert (run_dir / ".cairn/step-return.json").read_text() == "REAL-SCHEMA"
+    assert (run_dir / "trail.jsonl").read_text() == "REAL-TRAIL"
+    assert (run_dir / "gates/tone.json").read_text() == "REAL-GATE"
+    assert (run_dir / "logs/greet.log").read_text() == "REAL-LOG"
+    assert (run_dir / "note.json").is_file()  # the real artifact still lands
+    assert result.step["artifacts"] == ["note.json"]  # protected files not reported
+
+
+# --------------------------------------------------------------------------- #
+# 9. Dotted step id must not misfire the cycle parse.
+# --------------------------------------------------------------------------- #
+
+
+def test_dotted_step_id_does_not_produce_a_phantom_cycle(tmp_path: Path) -> None:
+    ws = tmp_path / "ws"
+    run_dir = make_run_dir(tmp_path)
+    # Step id literally contains ".c1"; its log stem is 'a.c1' — must NOT read as cycle 1.
+    write_stub(ws / "tests/stubs", "hello", "a.c1", {"bare.txt": "bare"})
+    write_stub(ws / "tests/stubs", "hello", "a.c1.c1", {"cycled.txt": "cycled"})
+
+    StubExecutor().invoke(make_inv(run_dir, ws, "a.c1"))
+
+    assert (run_dir / "bare.txt").is_file()          # bare dir chosen (cycle None)
+    assert not (run_dir / "cycled.txt").exists()      # phantom-cycle dir NOT chosen
+
+
+# --------------------------------------------------------------------------- #
 # 7. Protocol surface.
 # --------------------------------------------------------------------------- #
 

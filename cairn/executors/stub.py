@@ -32,12 +32,17 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from pathlib import Path
 
 from cairn.executors.base import Capabilities, Finding, Invocation, Result
 
 _SIDECAR = "_step.json"
+# Run control files/dirs a stub tree must never overwrite — defense-in-depth: `record` never
+# emits them, but a hand-authored stub could smuggle a poisoned run.json / trail / gate.
+_PROTECTED = frozenset({"run.json", ".cairn", "logs", "trail.jsonl", "gates", ".cairn.lock"})
+_SUFFIX_SEG = re.compile(r"[rc]\d+")
 
 
 class StubExecutor:
@@ -64,7 +69,7 @@ class StubExecutor:
     def invoke(self, inv: Invocation) -> Result:
         step = inv.env.get("CAIRN_STEP", "")
         pipeline = self._pipeline(inv)
-        cycle = self._cycle_from_log(inv.log_path)
+        cycle = self._cycle_from_log(inv.log_path, step)
         root = self._resolve_stubs_root(inv)
 
         stub_dir = self._locate(root, pipeline, step, cycle) if root is not None else None
@@ -95,16 +100,26 @@ class StubExecutor:
             return None
 
     @staticmethod
-    def _cycle_from_log(log_path: Path) -> int | None:
+    def _cycle_from_log(log_path: Path, step: str) -> int | None:
         """Parse the ``.cK`` loop-cycle suffix from ``logs/<id>[.rN][.cK].log``.
 
-        The step id is the stem's first dot segment; only the trailing ``.rN``/``.cK``
-        suffixes carry meaning, so a ``c<digits>`` segment *after* the first names the cycle.
+        A dotted step id (``a.c1``) could look like it carries a cycle suffix, so the parse is
+        anchored to the known ``step`` id: the stem must be ``<step>`` (→ no cycle) or
+        ``<step>.<suffix>`` where every ``.`` segment of ``<suffix>`` is an ``rN``/``cN`` token;
+        anything else yields ``None`` rather than a phantom cycle.
         """
-        parts = Path(log_path).stem.split(".")[1:]
-        for part in parts:
-            if part.startswith("c") and part[1:].isdigit():
-                return int(part[1:])
+        stem = Path(log_path).stem
+        if not step or stem == step:
+            return None
+        prefix = f"{step}."
+        if not stem.startswith(prefix):
+            return None
+        segments = stem[len(prefix):].split(".")
+        if not all(_SUFFIX_SEG.fullmatch(seg) for seg in segments):
+            return None
+        for seg in segments:
+            if seg.startswith("c"):
+                return int(seg[1:])
         return None
 
     def _resolve_stubs_root(self, inv: Invocation) -> Path | None:
@@ -140,6 +155,8 @@ class StubExecutor:
         copied: list[str] = []
         for src in sorted(stub_dir.rglob("*")):
             rel = src.relative_to(stub_dir)
+            if rel.parts[0] in _PROTECTED:
+                continue  # never let a stub tree clobber the run's control files/dirs
             if src.is_dir():
                 (run_dir / rel).mkdir(parents=True, exist_ok=True)
                 continue

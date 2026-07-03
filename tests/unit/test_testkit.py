@@ -332,7 +332,7 @@ def test_record_run_harvests_stubs_and_fixtures_then_pipeline_suite_passes(tmp_p
     assert val.failed == 0, val.failures
 
 
-def test_record_run_slim_truncates_large_files(tmp_path: Path) -> None:
+def test_record_run_slim_spares_schema_bound_json_but_truncates_binaries(tmp_path: Path) -> None:
     ws = build_ws(tmp_path)
     plan = build_plan(ws, "hello", {}, now=NOW, headless=True)
     run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
@@ -342,14 +342,19 @@ def test_record_run_slim_truncates_large_files(tmp_path: Path) -> None:
         composer=make_composer(workspace_dir=ws, config=load_config(ws), now=NOW),
         interactive=False, gate_presets={"tone": "friendly"}, now=NOW,
     )
-    # Bloat the message artifact past the 64 KiB slim threshold.
-    (run_dir / "message.txt").write_text("x" * (70 * 1024), encoding="utf-8")
+    # A >64 KiB schema-bound .json (greeting) and a >64 KiB non-json payload (message.txt).
+    big_greeting = {"name": "world", "pad": "x" * (70 * 1024)}
+    (run_dir / "greeting.json").write_text(json.dumps(big_greeting), encoding="utf-8")
+    (run_dir / "message.txt").write_text("y" * (70 * 1024), encoding="utf-8")
 
     record_run(ws, run_dir, slim=True)
 
-    recorded = (ws / "tests/stubs/hello/compose/message.txt").read_text()
-    assert recorded.startswith("cairn-stub-slim:")
-    assert "truncated" in recorded
+    # The .json is copied whole (a slim marker would break its schema on replay)...
+    recorded_json = (ws / "tests/stubs/hello/greet/greeting.json").read_text()
+    assert json.loads(recorded_json) == big_greeting
+    # ...while the bulky non-json payload is truncated to a marker line.
+    recorded_txt = (ws / "tests/stubs/hello/compose/message.txt").read_text()
+    assert recorded_txt.startswith("cairn-stub-slim:") and "truncated" in recorded_txt
 
 
 # --------------------------------------------------------------------------- #
