@@ -51,9 +51,23 @@ def _validate(doc: dict) -> None:
 
 
 def _atomic_write(path: Path, doc: dict) -> None:
+    """Durably replace `path` with `doc`: write tmp, fsync it, rename, fsync the dir.
+
+    run.json is a state authority (like the trail). Atomic alone isn't enough — without
+    fsyncing the tmp file before the rename, a power loss can land an empty or truncated
+    manifest. The directory fsync makes the rename itself durable.
+    """
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(doc, indent=2, ensure_ascii=False), encoding="utf-8")
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(doc, indent=2, ensure_ascii=False))
+        fh.flush()
+        os.fsync(fh.fileno())
     os.replace(tmp, path)
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 def create_run(runs_root: Path, run_id: str, payload: dict) -> Path:

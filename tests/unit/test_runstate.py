@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import multiprocessing as mp
-import time
+import os
 
 import pytest
 
@@ -116,6 +116,29 @@ def test_node_status_helpers_round_trip(tmp_path):
     assert doc["nodes"]["capture"]["cycles"] == 2
     # An unknown node has no status.
     assert node_status(doc, "nope") is None
+
+
+def test_atomic_write_fsyncs_the_tmp_file_before_replacing(tmp_path, monkeypatch):
+    # run.json is a state authority; like the trail it must be durable, not just atomic,
+    # so a power loss between write and rename can't leave an empty/truncated manifest.
+    order: list[str] = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def spy_fsync(fd):
+        order.append("fsync")
+        return real_fsync(fd)
+
+    def spy_replace(src, dst):
+        order.append("replace")
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "fsync", spy_fsync)
+    monkeypatch.setattr(os, "replace", spy_replace)
+
+    create_run(tmp_path, "acme-redesign-20260703", _payload())
+
+    assert "fsync" in order, "tmp file must be fsynced before the rename"
+    assert order.index("fsync") < order.index("replace")
 
 
 def test_run_lock_is_exclusive_and_reports_the_holder_pid(tmp_path):
