@@ -366,8 +366,13 @@ class Composer:
     def _abs(run_dir: Path, rel: str) -> str:
         return str(run_dir / rel)
 
-    def _abs_ws(self, path: Path) -> str:
-        return str(path if path.is_absolute() else self.workspace_dir / path)
+    @staticmethod
+    def _abs_ws(path: Path) -> str:
+        # decl.schema/validator are resolved absolute at parse time (artifacts._resolve_ref
+        # joins them onto the workspace dir). Assert that invariant rather than paper over a
+        # relative path with a join that never fires in practice.
+        assert path.is_absolute(), f"expected an absolute workspace path, got {path!r}"
+        return str(path)
 
     def _gate_choice(self, run_dir: Path, name: str) -> Any:
         path = run_dir / "gates" / f"{name}.json"
