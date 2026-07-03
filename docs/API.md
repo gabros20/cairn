@@ -70,7 +70,7 @@ params:                          # the CLI surface: --param k=v
   url:   { type: string, required: true }
   mode:  { type: enum, values: [rebuild, redesign, reimagine], default: rebuild }
   pages: { type: string, default: gate }          # <n> | all | gate
-  brease:{ type: enum, values: [on, off], default: off }
+  brease:{ type: enum, values: ["on", "off"], default: "off" }   # quote — see the note below
 
 dims:                            # derived config: preset table over one param
   from: mode
@@ -81,6 +81,12 @@ dims:                            # derived config: preset table over one param
 
 run_id: "{slug(params.url)}-{params.mode}-{date}"   # + auto -v2 suffix on collision
 ```
+
+> **Quote YAML-boolean enum values.** Bare `on`/`off`/`yes`/`no`/`true`/`false` are
+> parsed as *booleans* by YAML 1.1, but cairn resolves params to and compares them as
+> **strings** — so an unquoted `default: off` becomes `False` and the pipeline's own
+> `params.brease == 'off'` never matches (the branch silently mis-fires). Always quote
+> such enum values, defaults, and gate-option keys: `values: ["on", "off"], default: "off"`.
 
 ### 2.2 Artifacts
 
@@ -219,6 +225,16 @@ Resolution rules: a missing value is a **plan-time error**, never a silent empty
 expressions — misspellings must not quietly produce `acme--20260703`); helpers are the fixed set
 above (no user-defined functions — that's what `run:` steps are for); `{artifact:…}` in
 `artifact.path:` is illegal (paths can't depend on other paths).
+
+**Strict vs lenient contexts.** `run_id`, `artifact.path:`, and `args:` values are rendered
+**strictly**: any `{…}` that isn't a recognized cairn placeholder is a plan-time error, so a
+typo can never slip through. But `run:`/`manual:` command strings embed foreign syntax — a `jq`
+filter, an `awk` program, a Python dict literal — that legitimately contains braces, so they are
+rendered **leniently**: only the recognized cairn placeholders
+(`{params.x}`/`{dims.x}`/`{artifact:x}`/`{gate:x}`/`{run_dir}`/`{cycle}`/`{pipeline}`/helpers) are
+substituted and everything else passes through verbatim. Typos *inside* a recognized placeholder
+(`{artifact:typ0}`, `{params.mdoe}`) are still caught in both modes — leniency only spares braces
+that were never cairn's to begin with.
 
 **Outputs *outside* the run dir are deliberately not config.** The isolation doctrine (a run
 writes only inside its run dir) is load-bearing for resume, audit, and concurrency — so exporting

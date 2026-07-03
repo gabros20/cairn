@@ -15,8 +15,8 @@ params:
   url:    { type: string, required: true }
   mode:   { type: enum, values: [rebuild, redesign, reimagine], default: rebuild }
   pages:  { type: string, default: gate }        # <n> | all | gate
-  brease: { type: enum, values: [on, off], default: off }
-  deploy: { type: enum, values: [on, off], default: on }
+  brease: { type: enum, values: ["on", "off"], default: "off" }   # quote! bare on/off are YAML booleans
+  deploy: { type: enum, values: ["on", "off"], default: "on" }
   asset_budget: { type: int, default: 5 }
   variant: { type: string, default: "" }
 
@@ -144,8 +144,8 @@ steps:
     when: params.brease == 'on'
     reads: [brease-config, brease-context]
     ask: "P3 will MUTATE the Brease CMS shown above. Proceed?"
-    options: { yes: "populate the CMS", no: "halt here" }
-    default: no                                   # headless NEVER auto-mutates a CMS
+    options: { "yes": "populate the CMS", "no": "halt here" }   # quote! bare yes/no are YAML booleans
+    default: "no"                                 # headless NEVER auto-mutates a CMS
 
   - id: populate
     when: params.brease == 'on' && gates.populate-approval.choice == 'yes'
@@ -178,7 +178,7 @@ steps:
         executor: claude                          # judgment stays on the strongest reviewer
       - id: revise
         agent: frontend-builder
-        args: { revision: on, cycle: "{cycle}" }
+        args: { revision: "on", cycle: "{cycle}" }
         needs: [art-review, design-md]
         produces: [frontend]
         unless: artifacts.art-review.verdict == 'approve'
