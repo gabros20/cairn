@@ -56,6 +56,13 @@ jobs:
           for f in pipelines/*.yaml; do
             "$CAIRN" plan "$(basename "$f" .yaml)"
           done
+      - name: plan the mixed-fleet live workspace (tests/live/workspace-fleet)
+        run: |
+          CAIRN="$PWD/.venv/bin/cairn"
+          cd tests/live/workspace-fleet
+          for f in pipelines/*.yaml; do
+            "$CAIRN" plan "$(basename "$f" .yaml)"
+          done
       # The recorded offline replays (zero tokens, seconds): each live workspace's
       # `cairn test` walks its tests/matrix.yaml through the StubExecutor — no vendor
       # CLI, no network — so the live-verified runs stay locked in as regressions.
@@ -73,6 +80,11 @@ jobs:
         run: |
           CAIRN="$PWD/.venv/bin/cairn"
           cd tests/live/workspace-grok
+          "$CAIRN" test
+      - name: offline replay the mixed-fleet live workspace (tests/live/workspace-fleet)
+        run: |
+          CAIRN="$PWD/.venv/bin/cairn"
+          cd tests/live/workspace-fleet
           "$CAIRN" test
 
   doctor:
