@@ -64,9 +64,10 @@ from cairn.kernel.walk import bootstrap_run, walk
 # identically every run) and — separately — for the envelope suite's byte-stable goldens.
 _NOW = datetime(2026, 1, 1)
 _ENVELOPE_NOW = datetime(2026, 1, 1)
-# A fixed synthetic run dir for envelope composition: never created, so the trail is empty;
-# using a constant keeps the run-dir portion of a golden portable across machines.
-_GOLDEN_RUN_DIR = Path("/cairn/run")
+# Envelope goldens are composed against a fresh empty temp run dir (guaranteed-empty trail),
+# whose path is normalized to this token — so composition depends ONLY on the workspace, never
+# on any shared on-disk path a concurrent process might have populated.
+_RUN_DIR_TOKEN = "<RUN_DIR>"
 
 _SUITE_NAMES = ("validators", "guards", "pipelines", "envelopes")
 
@@ -407,26 +408,30 @@ def run_envelope_suite(workspace_dir: Path, *, update: bool = False) -> SuiteRes
 
     config = load_config(workspace_dir)
     composer = make_composer(workspace_dir=workspace_dir, config=config, now=_ENVELOPE_NOW)
-    for name in _pipeline_names(workspace_dir):
-        try:
-            p = build_plan(workspace_dir, name, {}, now=_ENVELOPE_NOW, headless=True)
-        except CairnError as exc:
-            result.notes.append(f"pipeline {name!r} did not plan (skipped): {exc}")
-            continue
-        for step, in_loop in _iter_steps(p.nodes):
-            if step.kind != "agent":
+    # A fresh empty run dir per invocation: no shared on-disk state, so the composed TRAIL block
+    # is always "(fresh run)" regardless of what any other process/test has on disk.
+    with tempfile.TemporaryDirectory() as td:
+        run_dir = Path(td)
+        for name in _pipeline_names(workspace_dir):
+            try:
+                p = build_plan(workspace_dir, name, {}, now=_ENVELOPE_NOW, headless=True)
+            except CairnError as exc:
+                result.notes.append(f"pipeline {name!r} did not plan (skipped): {exc}")
                 continue
-            envelope = composer(step, p, _GOLDEN_RUN_DIR, cycle=1 if in_loop else None, retry_reasons=[])
-            golden = env_root / f"{name}.{step.id}.golden.md"
-            _tally_envelope(result, name, step.id, golden, _portable(envelope, workspace_dir), update)
+            for step, in_loop in _iter_steps(p.nodes):
+                if step.kind != "agent":
+                    continue
+                envelope = composer(step, p, run_dir, cycle=1 if in_loop else None, retry_reasons=[])
+                golden = env_root / f"{name}.{step.id}.golden.md"
+                _tally_envelope(result, name, step.id, golden, _portable(envelope, workspace_dir, run_dir), update)
     return result
 
 
-def _portable(envelope: str, workspace_dir: Path) -> str:
+def _portable(envelope: str, workspace_dir: Path, run_dir: Path) -> str:
     """Normalize machine-specific absolute paths to stable tokens so a committed golden
     diffs clean on any checkout (runtime envelopes stay absolute — this is a test-layer
     normalization only, applied identically on write and on compare)."""
-    return envelope.replace(str(workspace_dir), "<WORKSPACE>").replace(str(_GOLDEN_RUN_DIR), "<RUN_DIR>")
+    return envelope.replace(str(workspace_dir), "<WORKSPACE>").replace(str(run_dir), _RUN_DIR_TOKEN)
 
 
 def _tally_envelope(result: SuiteResult, pipeline: str, step_id: str, golden: Path, envelope: str, update: bool) -> None:

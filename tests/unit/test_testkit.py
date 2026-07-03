@@ -288,6 +288,22 @@ def test_envelope_goldens_are_portable_across_workspace_paths(tmp_path: Path) ->
     assert str(ws_a) not in golden and str(ws_b) not in golden
 
 
+def test_envelope_goldens_are_deterministic_and_carry_no_absolute_paths(tmp_path: Path) -> None:
+    # Composition must depend only on the workspace — never on a shared on-disk run dir. Two
+    # update passes are byte-identical, and no machine-specific absolute path leaks into a golden.
+    ws = build_ws(tmp_path)
+    run_envelope_suite(ws, update=True)
+    golden_path = ws / "tests/envelopes/agentic.think.golden.md"
+    first = golden_path.read_text()
+
+    run_envelope_suite(ws, update=True)  # idempotent
+    assert golden_path.read_text() == first
+
+    assert "<RUN_DIR>" in first and "<WORKSPACE>" in first
+    for leak in ("/private/", "/var/folders/", "/tmp/", "/cairn/run", str(ws)):
+        assert leak not in first, f"absolute path leaked into golden: {leak}"
+
+
 def test_envelope_suite_no_agent_steps_is_a_pass(tmp_path: Path) -> None:
     ws = build_ws(tmp_path)
     (ws / "pipelines/agentic.yaml").unlink()  # remove the only agent-step pipeline
