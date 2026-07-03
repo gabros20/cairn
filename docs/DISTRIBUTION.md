@@ -9,47 +9,61 @@ coding agent operates cairn. Philosophy lives in the README; this is the mechani
 ## 1. Package anatomy
 
 ```
-designatives/cairn                     # the tool's own repo
+cairn                                  # the tool's own repo
 ├── pyproject.toml
-│     name = "cairn"                   # PyPI fallback if squatted: "cairn-pipelines"
+│     name            = "cairn-pipelines"     # PyPI DISTRIBUTION name (§ name situation below)
+│     dynamic         = ["version"]           # hatch reads __version__ from cairn/__init__.py
 │     requires-python = ">=3.11"
-│     dependencies = ["pyyaml", "jsonschema"]        # the FULL list — additions need a design reason
-│     [project.scripts]  cairn = "cairn.cli:main"
+│     license         = "MIT"                 # LICENSE + license-files
+│     dependencies    = ["pyyaml", "jsonschema"]   # the FULL list — additions need a design reason
+│     [project.scripts]  cairn = "cairn.cli:main"  # the console script stays `cairn`
 │     [project.entry-points."cairn.executors"]
 │       shell  = "cairn.executors.shell:ShellExecutor"
 │       stub   = "cairn.executors.stub:StubExecutor"     # the offline test executor (TESTING §5)
 │       claude = "cairn.executors.claude:ClaudeExecutor"
 │       codex  = "cairn.executors.codex:CodexExecutor"
 │       grok   = "cairn.executors.grok:GrokExecutor"
-├── cairn/                             # kernel (ARCHITECTURE §1) + executors + py.typed
+├── cairn/                             # kernel (ARCHITECTURE §1) + executors + __init__.py:__version__
 ├── templates/workspace/               # what `cairn new workspace` instantiates (§4);
 │                                      #   force-included into the wheel as cairn/_templates/workspace
-└── tests/                             # the C1 synthetic suite — the release gate
+├── .github/workflows/{ci.yml,release.yml}  # the release gate (§3) + the release automation (§3.1)
+└── tests/                             # the synthetic suite — the release gate's core
 ```
 
-Build backend is **hatchling**; the wheel ships `packages = ["cairn"]` and force-includes
-`templates/workspace` → `cairn/_templates/workspace` so `cairn new workspace` works from an
-installed copy (`newkit.templates_dir()` resolves that path first). This is the standalone repo
-today (`~/Documents/Work/Projects/cairn`, run in place with `uv run cairn …`); C7 packaging just
-adds the tag + wheel, no tree moves.
+**One tool, three names, one collision.** The import package and the console script are both
+`cairn`; the **PyPI distribution** is `cairn-pipelines`, because the bare `cairn` name on PyPI is
+already taken by an unrelated tool. So you `uv tool install cairn-pipelines` but the command you run
+is still `cairn` — and you must never install both `cairn` and `cairn-pipelines` into one
+environment, since they collide on the `cairn` import package and script. The full rationale and the
+pending-publisher setup live in [RELEASING.md](RELEASING.md) *(§ The name situation)*.
+
+Build backend is **hatchling**. The version is **single-sourced** from `cairn/__init__.py:__version__`
+— `pyproject` declares `dynamic = ["version"]` and `[tool.hatch.version]` reads that variable, so
+there is exactly one place the version lives (and PSR stamps it, §3.1). The wheel ships
+`packages = ["cairn"]` and **force-includes** `templates/workspace` → `cairn/_templates/workspace`
+so `cairn new workspace` works from an installed copy (`newkit.templates_dir()` resolves that path
+first). cairn is its own standalone repo, run in place with `uv run cairn …` during development;
+packaging adds the tag + wheel, no tree moves.
 
 ## 2. Install channels
 
-A note on lineage, so the phases below read correctly: cairn was **designed inside brease-factory**
-(the pipeline it was distilled from, and its eventual first workspace — README §Lineage), but it has
-been **built as its own standalone repo from day one** (`~/Documents/Work/Projects/cairn`). It has
-never lived *inside* brease-factory as a subtree. So "extraction" (C7) does **not** mean moving a tree
-out of another repo — it means **packaging and tagging** this repo: cutting `v0.1.0`, building the
-wheel, and installing it as a tool instead of running it in place.
+A note on lineage, so the channels below read correctly: cairn was **distilled from an internal
+Claude-Code pipeline** (the origin system it generalizes, and its eventual first workspace — README
+§Lineage), but it has been **built as its own standalone repo from day one**. It has never lived
+*inside* that pipeline as a subtree, so packaging is not a tree move out of another repo — it is
+**building and tagging** this repo: cutting a `vX.Y.Z` tag, building the wheel, and installing it as
+a tool instead of running it in place.
 
-| Phase | Channel | Command |
+| Channel | When | Command |
 |---|---|---|
-| Development (pre-tag) | in-repo | `uv run cairn …` (this repo, in place) |
-| Internal (C7 packaging) | git tag | `uv tool install git+https://github.com/designatives/cairn@v0.1.0` |
-| Public (if open-sourced) | PyPI | `uv tool install cairn` · zero-install `uvx cairn …` |
+| in-repo | development | `uv run cairn …` (this repo, in place) |
+| git tag | pre-publish / private | `uv tool install git+https://github.com/OWNER/cairn@v0.1.0` |
+| PyPI | published | `uv tool install cairn-pipelines` · zero-install `uvx --from cairn-pipelines cairn …` |
 
-Upgrades: `uv tool upgrade cairn` (or install a newer tag). Downgrade = install the older tag —
-safe because workspaces pin (§3) and runs record versions.
+The `v0.1.0` tag is cut; the PyPI channel activates once the one-time publisher setup in
+[RELEASING.md](RELEASING.md) *(§ Activation checklist)* is done. Upgrades: `uv tool upgrade
+cairn-pipelines` (or install a newer tag). Downgrade = install the older tag — safe because
+workspaces pin (§3) and runs record versions.
 
 ## 3. Versioning & compatibility — three surfaces, one policy
 
@@ -76,9 +90,38 @@ table: same-minor silent, cross-minor warn, cross-major refuse without `--force`
 (single-sourced from `cairn/__init__.py`); the `v0.1.0` git tag is cut. The schema-version and
 executor-protocol gates stay parsed-but-not-yet-enforced (IMPLEMENTATION-PLAN).*
 
-Release discipline: a git tag is releasable iff the synthetic suite is green and `cairn plan`
-passes over the example + brease workspaces. CHANGELOG entry per tag; migration notes on any
-schema-surface change. Nothing more ceremonial than that.
+## 3.1 How a release is cut — conventional commits, no manual bump
+
+Releases are **automated** by [python-semantic-release](https://python-semantic-release.readthedocs.io/)
+(PSR), configured in `pyproject.toml` `[tool.semantic_release]` and driven by
+`.github/workflows/release.yml`. Nobody edits a version number or writes a changelog entry by hand:
+
+- **The version comes from the commits.** PSR reads every [Conventional
+  Commit](https://www.conventionalcommits.org/) since the last `v*` tag — `fix:` → patch, `feat:`
+  → minor, a `BREAKING CHANGE:` footer (or `feat!:`) → major — and picks the next version. If
+  nothing since the last tag warrants a bump, **no release is cut**.
+- **What a dispatch does.** The workflow is `workflow_dispatch` (manual-first). Its `release` job
+  stamps the new version into `cairn/__init__.py`, prepends a `CHANGELOG.md` section above the
+  `<!-- version list -->` marker, re-locks `uv.lock`, builds the sdist + wheel, commits, tags
+  `vX.Y.Z`, and creates the GitHub Release; a second `publish` job — only when a version was
+  actually cut — uploads the dist to PyPI via **Trusted Publishing** (OIDC, no API token).
+- **The step-by-step and the one-time activation** (create the repo, fill `[project.urls]`,
+  register the PyPI pending publisher, create the `pypi` GitHub environment) live in
+  [RELEASING.md](RELEASING.md) — this section is the *shape*, that doc is the *how-to*.
+
+Migration notes still ride along on any schema-surface change; nothing more ceremonial than that.
+
+## 3.2 The release gate — `.github/workflows/ci.yml`
+
+CI is the gate a release rides on. On every push to `main` and every pull request, `ci.yml` runs
+four jobs: the **unit suite** (`uv run pytest tests/unit`), a **plan** job that scaffolds a fresh
+workspace with `cairn new` and runs `cairn plan` over every shipped pipeline (plus the live
+smoke workspaces, then replays each offline through the `stub` executor), a **doctor smoke** that
+asserts `cairn doctor` on a bare machine reports findings without ever crashing (accepts exit 0 or
+2), and a **wheel install smoke** on Linux **and** macOS that builds the wheel, `uv tool install`s
+it, and runs `cairn new` + `cairn run hello --headless` from the installed copy — proving the
+`templates/workspace` force-include (§1) actually shipped inside the wheel and the day-0 path works
+end to end.
 
 ## 4. The workspace scaffold — `cairn new workspace <name>`
 
@@ -143,7 +186,7 @@ now hard-stop before minting when a *scoped* tool's check fails, TOOLING §2). P
 
 *Status: the per-executor line currently reports `healthy`/its first finding; the richer
 `(version, auth ok, hooks: blocking)` detail is still cosmetic follow-up now that all three vendor
-executors are live (C2–C5 done), and the `--probe-hooks` hook line has shipped (C4/C5). The
+executors (claude, codex, grok) are live, and the `--probe-hooks` hook line has shipped. The
 `requires` pin is enforced at **plan** time (`cairn plan` refuses an out-of-range install, §3),
 and doctor now prints its own `requires` satisfied/not-satisfied line whenever the workspace pins
 one.*
@@ -175,9 +218,12 @@ machinery is the canonical framework-bloat trapdoor; revisit only when ≥3 real
 and copying demonstrably hurts. (The executor entry-point surface already covers the one thing
 that must be shared as code.)
 
-## 8. Open questions deferred, deliberately
+## 8. Settled, and still open
 
-- **License / open-sourcing** — decide at C7; nothing before it depends on the answer.
-- **PyPI name** — check `cairn` at publish time; fallback `cairn-pipelines` reserved in §1.
+Settled since this doc was first drafted: the **license** is MIT (`LICENSE` + `license` in
+`pyproject`), and the **PyPI name** is `cairn-pipelines` (the bare `cairn` was taken — §1, RELEASING).
+
+Still deliberately open:
+
 - **MCP server plugin** (trail resource + run/gate/resume tools) — only if the operator skill
   proves insufficient in practice; it hasn't been given the chance to yet.
