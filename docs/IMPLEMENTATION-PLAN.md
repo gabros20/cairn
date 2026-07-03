@@ -12,6 +12,22 @@ ever debug one new thing at a time.
 
 ---
 
+## Status 2026-07-03
+
+- **C0 + C1 — complete.** Planner, walker, gatekit, composer, artifacts, trail/runstate, guards,
+  expression + template engines, config, the `shell`/`stub` executors, the `cairn test` suite layer,
+  the scaffold, and every C1-scope CLI verb are built and green (~453 tests).
+  *Deviation from the strict ordering:* built as parallel module waves with per-module
+  implement→review→fix rather than strictly C0-then-C1. The C1 "synthetic-suite" verification bar is
+  met by the 453-test suite + the offline `hello` end-to-end run + the testkit stub layer (a full
+  pipeline replays offline through the `stub` executor).
+- **C2 — partial.** Envelope composer and the `claude`/`codex`/`grok` executors are code-complete and
+  unit-tested against fake binaries; the live `claude` parity run is still pending.
+- **C4 — pending:** the Codex headless-hook (blocking-pretool) probe.
+- **C5–C7 — not started:** Grok live setup, batch / CMS population / scheduling, site extraction.
+
+---
+
 ## C0 — Kernel skeleton + planner (no execution)
 
 **Build:** `cairn/` package in this repo (`pyproject.toml`; runs as `uv run cairn`). `plan.py`

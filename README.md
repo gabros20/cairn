@@ -13,10 +13,19 @@ as the only state.
 
 ## Status
 
-**Design phase — nothing implemented yet.** The complete design package lives in [`docs/`](docs/):
-start with [`docs/README.md`](docs/README.md) (vision, philosophy, positioning), then
-[`docs/CONCEPTS.md`](docs/CONCEPTS.md) and [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-The build order is [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md) (C0–C7).
+**C0–C1 built and green (~453 tests).** Implemented: the kernel (planner, walker, gatekit,
+composer, artifacts, trail/runstate, guards, expression + template engines, config); all five
+executors — `shell` and `stub` live, `claude`/`codex`/`grok` code-complete and unit-tested against
+fake binaries but **not yet live-verified**; the workspace test layer (`cairn test` — validators/
+guards/pipelines/envelopes + `record`); the full CLI (every C1-scope verb; `batch`/`learnings`/`gc`/
+`schedule` stubbed); and the `cairn new` scaffold. Every module went implement → review → fix.
+The day-0 pipeline runs end-to-end offline: `uv run cairn run hello --headless`.
+
+**Not done yet:** live-model parity runs (C2/C3 verify), the Codex headless-hook probe (C4), Grok
+live setup (C5), batch / CMS population / scheduling (C6), site extraction (C7). Design package in
+[`docs/`](docs/): start with [`docs/README.md`](docs/README.md), then
+[`docs/CONCEPTS.md`](docs/CONCEPTS.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and the
+build order in [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md) (C0–C7).
 
 | Doc | What |
 |---|---|
