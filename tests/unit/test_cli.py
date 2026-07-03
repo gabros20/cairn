@@ -121,6 +121,18 @@ def test_plan_json_shape(hello_ws, monkeypatch, capsys):
     assert kinds == ["run", "gate", "run"]
 
 
+def test_plan_json_carries_range_scoped_tool_warning(monkeypatch, capsys):
+    # brease-ws declares [tools.vercel] needed_by=["deploy"]; an in-range deploy step makes
+    # plan warn (offline — no check is run), and --json carries it structurally.
+    monkeypatch.chdir(BREASE_WS)
+    rc = main(["plan", "brease-rebuild", "--param", "url=https://acme.test", "--param", "mode=rebuild", "--json"])
+    assert rc == int(ExitCode.OK)
+    doc = json.loads(capsys.readouterr().out)
+    assert any(
+        "deploy" in w and "vercel" in w and "unverified" in w for w in doc["warnings"]
+    ), doc["warnings"]
+
+
 def test_plan_bad_param_exits_config_with_finding(monkeypatch, capsys):
     monkeypatch.chdir(BREASE_WS)
     rc = main(["plan", "brease-rebuild", "--param", "url=x", "--param", "mode=bogus"])
@@ -555,6 +567,40 @@ def test_doctor_missing_tool_prints_hint(hello_ws, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == int(ExitCode.OK)  # a scoped tool failure warns, never fails the exit
     assert "brew install badtool" in out
+
+
+def test_doctor_reports_requires_satisfied(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    monkeypatch.setenv("PATH", f"{FAKEBIN}{os.pathsep}{os.environ['PATH']}")
+    toml = hello_ws / "cairn.toml"
+    # A top-level bare key must precede any table header in TOML — prepend it.
+    toml.write_text('requires = ">=0.1,<0.2"\n' + toml.read_text(), encoding="utf-8")
+    rc = main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == int(ExitCode.OK)
+    assert 'requires ">=0.1,<0.2"' in out
+    assert f"satisfied by {cairn.__version__}" in out
+
+
+def test_doctor_reports_requires_not_satisfied_and_fails(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    monkeypatch.setenv("PATH", f"{FAKEBIN}{os.pathsep}{os.environ['PATH']}")
+    toml = hello_ws / "cairn.toml"
+    toml.write_text('requires = ">=9.0"\n' + toml.read_text(), encoding="utf-8")
+    rc = main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == int(ExitCode.CONFIG)  # an unsatisfied pin is a doctor error
+    assert 'requires ">=9.0"' in out and "NOT satisfied by" in out
+    assert "uv tool install" in out  # the fix hint
+
+
+def test_doctor_no_requires_pin_prints_no_requires_line(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    monkeypatch.setenv("PATH", f"{FAKEBIN}{os.pathsep}{os.environ['PATH']}")
+    rc = main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == int(ExitCode.OK)
+    assert 'requires "' not in out  # no pin declared ⇒ no requires line
 
 
 # --------------------------------------------------------------------------- #
