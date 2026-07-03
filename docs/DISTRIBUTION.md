@@ -161,7 +161,7 @@ kernel copy.
 ## 5. Machine onboarding
 
 ```console
-$ uv tool install git+https://github.com/designatives/cairn@v0.1.0
+$ uv tool install git+https://github.com/OWNER/cairn@v0.1.0
 $ cd my-workspace && cairn doctor
   ✔ cairn 0.1.0
   ✔ workspace lint  3 pipelines plan green

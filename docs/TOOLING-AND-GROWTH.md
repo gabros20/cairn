@@ -83,8 +83,12 @@ The design: executors render fragments to their native permission surface (Claud
 `permissions.allow`, Codex Rules, Grok `[permission]`) — authored once. Destructive verbs of an
 allowed tool get a `guards:` entry on top (the F18 pattern): allowlist says *may run*, guard says
 *checked before running*. *Status: the planner parses the fragments today (agents reference them via
-`tools.bash`), and the **guards** engine — the enforced code layer — is live across all three vendor
-CLIs (hook + shim + post, SECURITY §2.2). What is **not** yet wired is rendering the allowlist
+`tools.bash`), and the **guards** engine enforces at runtime across all three vendor CLIs through
+its **shim + post** layers — a fresh per-run PATH-shim dir wraps every executor (`_wrap_guards` →
+`build_shims` → `GuardedExecutor`) and validators re-check after each step. Its **hook** layer is
+built but the per-executor `install_guards` is still a documented no-op stub: the CLIs' native
+blocking-hooks capability is confirmed by `doctor --probe-hooks`, not yet wired as runtime
+enforcement (SECURITY §2.2). What is **not** yet wired is rendering the allowlist
 fragments to each executor's native permission format: the CLI executors currently run headless
 under `bypassPermissions` (a live constraint — Claude/Grok refuse every tool use otherwise; see
 IMPLEMENTATION-PLAN C2/C5), and `render_workspace` emits only `CLAUDE.md`/`AGENTS.md`. So the
