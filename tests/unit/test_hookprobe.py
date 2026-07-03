@@ -22,6 +22,7 @@ from cairn.kernel import hookprobe
 from cairn.kernel.hookprobe import (
     ClaudeHookRecipe,
     CodexHookRecipe,
+    GrokHookRecipe,
     ProbeResult,
     build_probe_env,
     probe,
@@ -85,18 +86,54 @@ sys.exit(0)
 '''
 
 
+# A faithful fake `grok`. Reads $GROK_HOME/hooks/*.json (the GLOBAL hook the recipe installed),
+# runs the PreToolUse command (writing the marker), and blocks on deny-JSON OR exit 2 — grok's
+# two documented block signals. --version prints a canned string.
+_FAKE_GROK = r'''#!/usr/bin/env python3
+import glob, json, os, subprocess, sys, time
+if "--version" in sys.argv:
+    print("grok 0.2.82 (fake)"); sys.exit(0)
+mode = os.environ.get("PROBE_FAKE_MODE", "fires_blocks")
+cwd = os.getcwd()
+sidecar = os.path.join(cwd, ".cairn-probe", "sidecar")
+if mode == "auth_fail":
+    print("Not logged in. Please run grok login"); sys.exit(1)
+if mode == "slow":
+    time.sleep(5); sys.exit(0)
+if mode == "idle":
+    sys.exit(0)  # the agent used no tool: no marker, no sidecar
+if mode == "no_fire":
+    open(sidecar, "w").close(); sys.exit(0)  # hook never runs; tool runs unguarded
+home = os.environ["GROK_HOME"]
+hookfile = glob.glob(os.path.join(home, "hooks", "*.json"))[0]
+hooks = json.load(open(hookfile))
+cmd = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+p = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True)
+blocked = (
+    '"decision": "deny"' in p.stdout or '"decision":"deny"' in p.stdout or p.returncode == 2
+)
+if mode == "fires_no_block":
+    blocked = False
+if not blocked:
+    open(sidecar, "w").close()
+sys.exit(0)
+'''
+
+
 @pytest.fixture
 def fakebin(tmp_path: Path, monkeypatch) -> Path:
-    """A bindir with fake claude/codex on PATH."""
+    """A bindir with fake claude/codex/grok on PATH."""
     bindir = tmp_path / "bin"
     bindir.mkdir()
-    for name, body in (("claude", _FAKE_CLAUDE), ("codex", _FAKE_CODEX)):
+    for name, body in (("claude", _FAKE_CLAUDE), ("codex", _FAKE_CODEX), ("grok", _FAKE_GROK)):
         f = bindir / name
         f.write_text(body, encoding="utf-8")
         f.chmod(f.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
-    # Hermetic: point the codex auth-seam at an empty dir so unit tests never read ~/.codex.
+    # Hermetic: point the codex/grok auth-seams at empty dirs so unit tests never read the
+    # user's real ~/.codex / ~/.grok.
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-such-codex-home"))
+    monkeypatch.setenv("GROK_HOME", str(tmp_path / "no-such-grok-home"))
     return bindir
 
 
@@ -165,6 +202,55 @@ def test_codex_fires_blocks(fakebin, tmp_path):
 
 def test_codex_no_fire(fakebin, tmp_path):
     assert _run(CodexHookRecipe(), "no_fire", tmp_path).outcome == "no_fire"
+
+
+# --------------------------------------------------------------------------- #
+# grok recipe against its fake (relocated GROK_HOME, global hook). All four
+# classifications flow through the engine unchanged for grok.
+# --------------------------------------------------------------------------- #
+
+
+def test_grok_registered_in_recipes():
+    assert isinstance(hookprobe.RECIPES["grok"], GrokHookRecipe)
+
+
+def test_grok_fires_blocks(fakebin, tmp_path):
+    r = _run(GrokHookRecipe(), "fires_blocks", tmp_path)
+    assert r.outcome == "fires_blocks"
+    assert r.executor == "grok"
+    assert r.cli_version and "0.2.82" in r.cli_version
+
+
+def test_grok_fires_no_block(fakebin, tmp_path):
+    assert _run(GrokHookRecipe(), "fires_no_block", tmp_path).outcome == "fires_no_block"
+
+
+def test_grok_no_fire(fakebin, tmp_path):
+    assert _run(GrokHookRecipe(), "no_fire", tmp_path).outcome == "no_fire"
+
+
+def test_grok_idle_is_inconclusive(fakebin, tmp_path):
+    assert _run(GrokHookRecipe(), "idle", tmp_path).outcome == "inconclusive"
+
+
+def test_grok_auth_failure_is_inconclusive(fakebin, tmp_path):
+    r = _run(GrokHookRecipe(), "auth_fail", tmp_path)
+    assert r.outcome == "inconclusive"
+    assert "auth" in r.detail.lower()
+
+
+def test_grok_exit_policy_true_falsified_is_error():
+    # GrokExecutor.capabilities.blocking_hooks is True, so a live no_fire/fires_no_block verdict
+    # is a FALSIFICATION → doctor error (falsified design claim). This must not be softened.
+    for outcome in ("no_fire", "fires_no_block"):
+        lvl, _ = render(
+            ProbeResult("grok", outcome, "d", "v", "under bypassPermissions", "m"), True
+        )
+        assert lvl == "error"
+    lvl_ok, _ = render(
+        ProbeResult("grok", "fires_blocks", "d", "v", "under bypassPermissions", "m"), True
+    )
+    assert lvl_ok == "ok"
 
 
 # --------------------------------------------------------------------------- #
@@ -479,6 +565,172 @@ def test_claude_invocation_carries_bypass_permissions(tmp_path):
     assert argv[0] == "claude" and stdin_text is None
     assert "--permission-mode" in argv and "bypassPermissions" in argv
     assert "haiku" in argv
+
+
+# --------------------------------------------------------------------------- #
+# grok recipe: emits a firing GLOBAL deny hook under a relocated GROK_HOME, and its
+# invocation mirrors the real executor by construction.
+# --------------------------------------------------------------------------- #
+
+
+def _grok_canary(tmp_path: Path) -> tuple[Path, Path, Path]:
+    canary = tmp_path / "canary"
+    (canary / ".cairn-probe").mkdir(parents=True)
+    return canary, canary / ".cairn-probe" / "marker", canary / ".cairn-probe" / "sidecar"
+
+
+def test_grok_recipe_emits_firing_global_deny_hook(tmp_path, monkeypatch):
+    monkeypatch.setenv("GROK_HOME", str(tmp_path / "no-such-grok-home"))  # hermetic auth seam
+    canary, marker, sidecar = _grok_canary(tmp_path)
+    GrokHookRecipe().write_canary(canary, marker, sidecar)
+
+    # The hook is GLOBAL: it lives under $GROK_HOME/hooks/ (always trusted), not <project>/.grok.
+    home = canary / ".grok"
+    hookfile = home / "hooks" / "cairn-probe.json"
+    hook = json.loads(hookfile.read_text())
+    entry = hook["hooks"]["PreToolUse"][0]
+    # NO matcher → matches every tool. grok's composer-agent shell tool is 'Shell', not 'Bash', so
+    # a "Bash" matcher would silently miss it (live-verified) → a false no_fire.
+    assert "matcher" not in entry
+    cmd = entry["hooks"][0]["command"]
+    # ALL claude/cursor compat cells disabled so the user's ~/.claude MCP servers / rules / hooks
+    # can't load into the canary (they stall headless shutdown + interfere).
+    cfg = (home / "config.toml").read_text()
+    assert "[compat.claude]" in cfg and "[compat.cursor]" in cfg
+    assert "mcps = false" in cfg and "hooks = false" in cfg
+    # GROK_HOME is relocated into the canary.
+    assert GrokHookRecipe().extra_env(canary)["GROK_HOME"] == str(home)
+    # Running the hook command must create the marker, print grok's deny-JSON, AND exit 2.
+    import subprocess
+
+    p = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True)
+    assert marker.exists()
+    assert '"decision": "deny"' in p.stdout or '"decision":"deny"' in p.stdout
+    assert p.returncode == 2
+
+
+def test_grok_invocation_mirrors_real_executor_argv(tmp_path):
+    """The recipe argv must equal the REAL GrokExecutor argv EXACTLY — no probe-only extra flag,
+    because the hook is global (always trusted) so there is no folder-trust to bypass.
+
+    Pinned by construction (not a copied list): drift in either direction — the executor changing
+    shape or the recipe growing stale — fails this test loudly."""
+    from cairn.executors.grok import GrokExecutor
+    from cairn.kernel.config import ExecutorConfig
+    from cairn.kernel.types import Invocation
+
+    canary, _marker, _sidecar = _grok_canary(tmp_path)
+    # The recipe writes the prompt to <canary>/.cairn-probe/prompt.md and points --prompt-file
+    # there; the executor references inv.prompt_file — so pin the mirror with that exact path.
+    prompt_file = canary / ".cairn-probe" / "prompt.md"
+    inv = Invocation(
+        prompt_file=prompt_file, model="grok-composer-2.5-fast", effort="low", cwd=canary,
+        env={}, timeout_s=60, log_path=tmp_path / "l.log", return_schema=tmp_path / "s.json",
+    )
+    exec_argv, exec_stdin = GrokExecutor(ExecutorConfig(name="grok"))._build_command(inv, "PROMPT")
+    recipe_argv, recipe_stdin = GrokHookRecipe().build_invocation(
+        canary, "PROMPT", "grok-composer-2.5-fast"
+    )
+
+    assert recipe_argv == exec_argv  # exact mirror — grok needs no trust-bypass extra
+    assert recipe_stdin == exec_stdin is None  # prompt via --prompt-file; stdin is dead headless
+    # The recipe actually materialized the prompt file it references (self-contained).
+    assert prompt_file.read_text() == "PROMPT"
+    # The two live-verified 0.2.82 facts, asserted so a regression names itself:
+    assert "--prompt-file" in recipe_argv  # stdin is not read headlessly
+    assert "text" not in recipe_argv and "plain" in recipe_argv  # --output-format plain, not text
+
+
+def test_grok_recipe_default_model_is_composer_2_5_fast():
+    # On this install only grok-composer-2.5-fast and grok-build exist (models_cache.json).
+    assert GrokHookRecipe().model == "grok-composer-2.5-fast"
+    assert GrokHookRecipe().effort == "low"
+
+
+# --- grok auth seam: copy auth.json (ONLY) into the canary GROK_HOME when present. --------- #
+
+
+def _write_real_grok_home(home: Path, *, with_auth: bool) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    if with_auth:
+        (home / "auth.json").write_text('{"token": "real-grok-auth"}', encoding="utf-8")
+    # Real-home config that must NEVER leak into the canary (isolation is the point).
+    (home / "config.toml").write_text('[models]\ndefault = "user-model"\n', encoding="utf-8")
+    (home / "hooks").mkdir(exist_ok=True)
+    (home / "hooks" / "user.json").write_text('{"hooks": {"Stop": [{"hooks": []}]}}', encoding="utf-8")
+
+
+def test_grok_auth_present_is_copied_alone(tmp_path, monkeypatch):
+    real_home = tmp_path / "realhome" / ".grok"
+    _write_real_grok_home(real_home, with_auth=True)
+    monkeypatch.setenv("GROK_HOME", str(real_home))
+
+    canary, marker, sidecar = _grok_canary(tmp_path)
+    GrokHookRecipe().write_canary(canary, marker, sidecar)
+
+    canary_home = canary / ".grok"
+    # Auth material copied — a live probe can authenticate…
+    assert (canary_home / "auth.json").read_text() == '{"token": "real-grok-auth"}'
+    # …but ONLY auth: the canary keeps its own probe hook + compat-disabling config, not the
+    # user's Stop hook or default model.
+    assert (canary_home / "hooks" / "cairn-probe.json").exists()
+    assert not (canary_home / "hooks" / "user.json").exists()
+    assert "user-model" not in (canary_home / "config.toml").read_text()
+
+
+def test_grok_auth_absent_leaves_canary_unauthenticated(tmp_path, monkeypatch):
+    real_home = tmp_path / "realhome" / ".grok"
+    _write_real_grok_home(real_home, with_auth=False)
+    monkeypatch.setenv("GROK_HOME", str(real_home))
+
+    canary, marker, sidecar = _grok_canary(tmp_path)
+    GrokHookRecipe().write_canary(canary, marker, sidecar)
+    assert not (canary / ".grok" / "auth.json").exists()  # → inconclusive live, as codex
+
+
+def test_grok_auth_defaults_to_home_dot_grok(tmp_path, monkeypatch):
+    monkeypatch.delenv("GROK_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "fakehome"))
+    _write_real_grok_home(tmp_path / "fakehome" / ".grok", with_auth=True)
+
+    canary, marker, sidecar = _grok_canary(tmp_path)
+    GrokHookRecipe().write_canary(canary, marker, sidecar)
+    assert (canary / ".grok" / "auth.json").exists()
+
+
+def test_grok_auth_copy_oserror_degrades_to_unauthenticated(tmp_path, monkeypatch):
+    real_home = tmp_path / "realhome" / ".grok"
+    _write_real_grok_home(real_home, with_auth=True)
+    monkeypatch.setenv("GROK_HOME", str(real_home))
+    monkeypatch.setattr(
+        hookprobe.shutil, "copyfile",
+        lambda src, dst: (_ for _ in ()).throw(OSError("disk says no")),
+    )
+
+    canary, marker, sidecar = _grok_canary(tmp_path)
+    GrokHookRecipe().write_canary(canary, marker, sidecar)  # must not raise
+    assert not (canary / ".grok" / "auth.json").exists()
+    assert (canary / ".grok" / "hooks" / "cairn-probe.json").exists()  # rest of canary intact
+
+
+def test_grok_copied_auth_dies_with_the_canary(fakebin, tmp_path, monkeypatch):
+    real_home = tmp_path / "realhome" / ".grok"
+    _write_real_grok_home(real_home, with_auth=True)
+    monkeypatch.setenv("GROK_HOME", str(real_home))
+
+    created: list[Path] = []
+    real_mkdtemp = hookprobe.tempfile.mkdtemp
+
+    def spy(*a, **k):
+        d = real_mkdtemp(*a, **k)
+        created.append(Path(d))
+        return d
+
+    monkeypatch.setattr(hookprobe.tempfile, "mkdtemp", spy)
+    r = _run(GrokHookRecipe(), "fires_blocks", tmp_path)
+    assert r.outcome == "fires_blocks"
+    assert created and not created[0].exists(), "canary (incl. copied auth.json) must be rmtree'd"
+    assert (real_home / "auth.json").read_text() == '{"token": "real-grok-auth"}'  # real home untouched
 
 
 # --------------------------------------------------------------------------- #

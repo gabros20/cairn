@@ -74,6 +74,23 @@ _DENY_JSON = json.dumps(
     }
 )
 
+# grok's PreToolUse deny shape is DIFFERENT from claude/codex: a top-level
+# ``{"decision": "deny", "reason": ...}`` on stdout, honored REGARDLESS of exit code (grok
+# 0.2.82, ~/.grok/docs/user-guide/10-hooks.md → "Output (Blocking Hooks)"). Belt-and-braces: the
+# grok hook prints this AND exits 2 (an explicit deny), so blocking is proven even if one path
+# regresses.
+_GROK_DENY_JSON = json.dumps({"decision": "deny", "reason": "cairn hook probe: blocked by design"})
+
+# The canary GROK_HOME's config.toml: turn OFF every claude/cursor compat cell (grok 0.2.82,
+# 05-configuration.md → Harness Compatibility). Without this, grok scans the user's ``~/.claude`` /
+# ``~/.cursor`` (they follow $HOME, outside the relocated GROK_HOME) and pulls in their MCP servers,
+# permission rules, and hooks — live-observed to stall headless shutdown past the probe timeout and
+# to let foreign hooks interfere. Every cell off = a hermetic probe of grok's OWN hook.
+_GROK_COMPAT_OFF_TOML = (
+    "[compat.claude]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\n\n"
+    "[compat.cursor]\nskills = false\nrules = false\nagents = false\nmcps = false\nhooks = false\n"
+)
+
 # Passthrough env keys — MIRRORS cairn/kernel/walk.py::_Walk._build_env (the deny-by-default
 # baseline every real agent step gets). Kept in lockstep so the probe measures the same reality a
 # run experiences: USER/LOGNAME are load-bearing (macOS Keychain OAuth lookup), TMPDIR/HOME/LANG
@@ -306,11 +323,134 @@ class CodexHookRecipe(HookRecipe):
         )
 
 
-# The registered recipes. grok (C5) adds a "grok" entry (PreToolUse exit-2 branch) here and
-# implements the three methods — the engine below does not change.
+class GrokHookRecipe(HookRecipe):
+    """``grok`` — xAI Grok CLI. Verified against grok 0.2.82 (~/.grok/docs/user-guide/10-hooks.md).
+
+    Hook install without touching the user's real ``~/.grok``: ``GROK_HOME`` is relocated to the
+    canary and the probe hook is installed as a **GLOBAL** hook at
+    ``$GROK_HOME/hooks/cairn-probe.json``. Global hooks are ALWAYS trusted, so this sidesteps the
+    folder-trust gate that project hooks (``<project>/.grok/hooks``) require (``--trust`` /
+    ``/hooks-trust`` / ``GROK_FOLDER_TRUST``) — the probe never has to grant trust. Grok also scans
+    compat sources (``~/.claude/settings.json``, ``~/.cursor/hooks.json``) by default, which live
+    outside GROK_HOME (they follow ``$HOME``, which the probe passes through), so the canary
+    ``config.toml`` disables ``[compat.claude] hooks`` / ``[compat.cursor] hooks`` — the probe
+    measures grok's OWN hook, not whatever the user has under ``~/.claude``.
+
+    Auth seam (mirrors the codex recipe): a relocated GROK_HOME has no ``auth.json`` → every live
+    probe would be ``inconclusive`` (not logged in). When the real GROK_HOME (``$GROK_HOME`` first,
+    else ``~/.grok``) has an ``auth.json`` we copy that ONE file into the canary (source read-only,
+    0600, dies with the canary's ``rmtree``); any copy failure degrades to the unauthenticated path
+    (→ inconclusive), NEVER a crash. Live-verified: a GROK_HOME override with only ``auth.json``
+    copied authenticates headless.
+
+    Blocking mechanism: ``PreToolUse`` is the ONLY blocking event. The hook writes the marker, prints
+    the deny-JSON (``{"decision":"deny",...}`` — honored regardless of exit code), and exits 2 (an
+    explicit deny) — belt-and-braces. CONTAINMENT CAVEAT (inherited by the C3 guard engine): every
+    OTHER hook failure — timeout (default 5s), crash, malformed output, missing env — FAILS OPEN
+    (the tool runs). Only an explicit ``deny`` blocks. Docs state deny rules + PreToolUse hooks still
+    apply under ``bypassPermissions`` — the load-bearing headless posture (cairn/executors/grok.py).
+
+    Model: ``grok-composer-2.5-fast`` with ``--effort low`` — the cheapest path. On THIS install only
+    ``grok-composer-2.5-fast`` and ``grok-build`` exist (models_cache.json); don't cargo-cult the
+    model onto a machine with a different roster."""
+
+    name = "grok"
+    model = "grok-composer-2.5-fast"
+    effort = "low"  # cheapest; mirrored into --effort to match the executor's effort branch
+    posture = "under bypassPermissions"
+    mechanism = 'PreToolUse deny-JSON ({"decision":"deny"}) + exit 2'
+
+    # The global hook filename inside $GROK_HOME/hooks/ (deterministic; the fake CLI globs it).
+    _HOOK_FILE = "cairn-probe.json"
+
+    def extra_env(self, canary: Path) -> dict[str, str]:
+        return {"GROK_HOME": str(canary / ".grok")}
+
+    @staticmethod
+    def _real_grok_home() -> Path:
+        """The user's actual GROK_HOME ($GROK_HOME or ~/.grok) — read for auth.json ONLY."""
+        override = os.environ.get("GROK_HOME")
+        return Path(override) if override else Path(os.path.expanduser("~/.grok"))
+
+    @staticmethod
+    def _grok_deny_hook_command(marker: Path) -> str:
+        """A ``sh`` one-liner: create the marker proving the hook FIRED, print grok's deny-JSON,
+        then exit 2 (explicit deny) — so blocking is proven even if either path regresses."""
+        return (
+            f": > {shlex.quote(str(marker))}; "
+            f"printf '%s' {shlex.quote(_GROK_DENY_JSON)}; exit 2"
+        )
+
+    def write_canary(self, canary: Path, marker: Path, sidecar: Path) -> None:
+        home = canary / ".grok"
+        (home / "hooks").mkdir(parents=True, exist_ok=True)
+        # NO matcher → matches EVERY tool. Live-verified (grok 0.2.82): the composer/cursor agent's
+        # shell tool is named ``Shell``, NOT ``Bash``/``run_terminal_command`` — a ``"Bash"`` matcher
+        # silently misses it and the probe reads a false ``no_fire``. A catch-all is correct here:
+        # the prompt makes the agent use exactly one shell tool, so any-tool = that tool.
+        hook = {
+            "hooks": {
+                "PreToolUse": [
+                    {"hooks": [{"type": "command", "command": self._grok_deny_hook_command(marker)}]}
+                ]
+            }
+        }
+        (home / "hooks" / self._HOOK_FILE).write_text(json.dumps(hook, indent=2), encoding="utf-8")
+        # Disable ALL always-trusted compat sources (claude + cursor). These follow $HOME (outside
+        # GROK_HOME), so without this grok loads the user's ~/.claude MCP servers + permission rules
+        # into the canary — live-observed to STALL headless shutdown past the probe timeout (→ a
+        # false inconclusive), besides letting foreign hooks interfere. Every cell off = hermetic:
+        # the probe measures grok's OWN hook and nothing else.
+        (home / "config.toml").write_text(_GROK_COMPAT_OFF_TOML, encoding="utf-8")
+        # Auth seam (fail-safe): copy auth.json alone when the real home has one, so a live probe
+        # can authenticate. Any failure degrades to the unauthenticated path (→ inconclusive).
+        auth = self._real_grok_home() / "auth.json"
+        try:
+            if auth.is_file():
+                shutil.copyfile(auth, home / "auth.json")
+                (home / "auth.json").chmod(0o600)
+        except OSError:
+            pass
+
+    def build_invocation(
+        self, canary: Path, prompt_text: str, model: str
+    ) -> tuple[list[str], str | None]:
+        # LOCKSTEP with cairn/executors/grok.py::GrokExecutor._build_command (effort="low"
+        # branch) — pinned by test_grok_invocation_mirrors_real_executor_argv; change that
+        # executor and this recipe together. grok 0.2.82 delivers the prompt via --prompt-file
+        # (stdin is dead headless), so write it into the canary and reference it; return stdin=None.
+        # NO probe-only extra flag: the hook is GLOBAL (always trusted), so unlike codex there is
+        # no folder-trust to bypass — recipe argv == executor argv exactly.
+        prompt_file = canary / _PROBE_SUBDIR / "prompt.md"
+        prompt_file.parent.mkdir(parents=True, exist_ok=True)
+        prompt_file.write_text(prompt_text, encoding="utf-8")
+        argv = [
+            "grok",
+            "--prompt-file", str(prompt_file),
+            "--cwd", str(canary),
+            "-m", model,
+            "--output-format", "plain",
+            "--permission-mode", "bypassPermissions",
+            "--no-alt-screen",
+            "--no-auto-update",
+            "--effort", self.effort,
+        ]
+        return argv, None
+
+    def build_prompt(self, sidecar: Path) -> str:
+        return (
+            "Use the terminal to run exactly this shell command and nothing else:\n\n"
+            f"touch {shlex.quote(str(sidecar))}\n\n"
+            "Do not run any other command. Do not use any other tool. Do not explain."
+        )
+
+
+# The registered recipes. The engine touches NONE of a recipe's specifics: a new executor ships a
+# recipe and slots in unchanged (grok, C5, added its "grok" entry with no engine change).
 RECIPES: dict[str, HookRecipe] = {
     "claude": ClaudeHookRecipe(),
     "codex": CodexHookRecipe(),
+    "grok": GrokHookRecipe(),
 }
 
 
