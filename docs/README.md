@@ -52,8 +52,9 @@ system.
    nodes owned by the orchestrator. Gate answers are written to disk as artifacts — replayable,
    auditable, and resumable like everything else.
 6. **Small core, declarative surface.** Pipelines, agents, artifacts, gates, guards, tiers: YAML.
-   Skills: markdown. Only validators, guards, and executors are code. The kernel is ~2.5k lines of
-   dependency-light Python (stdlib + `pyyaml` + `jsonschema`); everything beyond it is a plugin.
+   Skills: markdown. Only validators, guards, and executors are code. The kernel is a small,
+   dependency-light body of Python (stdlib + `pyyaml` + `jsonschema`, no other runtime deps) —
+   ~5.7k lines as built; everything beyond it is a plugin.
 7. **AX is a design surface.** The *agent experience* — what a model sees when invoked — is a
    deterministic, auditable envelope (mission → contract → skills → trail context → doctrine →
    return protocol), rendered to a file before execution. No hidden context, no auto-magic loading,
@@ -226,7 +227,12 @@ resident daemon (the filesystem is the state).
 
 ## Status
 
-Design complete; nothing implemented. The build order is specified in
-[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md) (C0–C7, each independently verifiable). First
-decision point: confirm cairn replaces the straight port as the implementation target — then C0
-(kernel skeleton + planner, in-repo) begins.
+**C0–C1 built and green (460 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
+artifacts, trail/runstate, guards, expression + template engines, config, doctor, scaffold); all
+five executors (`shell`/`stub` live; `claude`/`codex`/`grok` code-complete and unit-tested against
+fake binaries, **not yet live-verified**); the workspace test layer (`cairn test` + `record`); and
+the full C1-scope CLI (`batch`/`learnings`/`gc`/`schedule` still stubbed → exit 2). The day-0
+pipeline runs end-to-end offline (`cairn run hello --headless`). Still ahead, per
+[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md) (C0–C7): live-model parity (C2/C3), the Codex
+headless-hook probe (C4), Grok live setup (C5), batch / CMS population / scheduling (C6), and
+package extraction to its own repo (C7).

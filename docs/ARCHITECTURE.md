@@ -1,8 +1,10 @@
 # cairn — Architecture
 
 How the kernel is built and exactly how execution behaves. Companion to `CONCEPTS.md` (the model)
-and `API.md` (the formats). Design constraint throughout: **~2,500 lines of kernel Python, stdlib +
-`pyyaml` + `jsonschema` only; everything else is a plugin.**
+and `API.md` (the formats). Design constraint throughout: **a small, dependency-light kernel —
+stdlib + `pyyaml` + `jsonschema` only; everything else is a plugin.** (The C1 kernel landed at
+~5,700 lines across 18 modules — larger than the initial ~2,500-line aspiration, but the two-
+dependency floor and the plugin boundary held.)
 
 ---
 
@@ -10,7 +12,7 @@ and `API.md` (the formats). Design constraint throughout: **~2,500 lines of kern
 
 ```
 ┌────────────────────────────────────────────────────────────────┐
-│ CLI  (cairn run/resume/plan/validate/trail/doctor/batch/new)   │
+│ CLI  plan·run·resume·gate·validate·trail·ps·doctor·test·new…   │
 ├────────────────────────────────────────────────────────────────┤
 │ KERNEL                                                          │
 │  plan.py      load → resolve → expand → verify → Plan           │
@@ -20,8 +22,10 @@ and `API.md` (the formats). Design constraint throughout: **~2,500 lines of kern
 │  gatekit.py   gate resolution (TTY built-in; UIs pluggable)     │
 │  guards.py    enforcement engine (hook/shim/post per executor)  │
 │  trail.py     event log read/write; status derivation           │
+│  + support:   config · expr · template · runstate · types ·     │
+│               errors · doctor · newkit · testkit · schemas      │
 ├────────────────────────────────────────────────────────────────┤
-│ EXECUTORS (plugins)   claude · codex · grok · shell · (yours)   │
+│ EXECUTORS (plugins)  claude·codex·grok·shell·stub · (yours)     │
 ├────────────────────────────────────────────────────────────────┤
 │ WORKSPACE (data)      pipelines/ agents/ skills/ schemas/       │
 │                       validators/ guards/ prompts/ cairn.toml   │
@@ -73,10 +77,12 @@ The walker consumes the Plan against a run dir. Per node kind:
 
 ### 3.2 `gate`
 Resolved decision at `gates/<name>.json`? → skip (this is what makes gates resumable and *never
-re-asked*). Otherwise: interactive → render question + artifact summary via the gate UI plugin
-(TTY default); headless → write the declared `default`. Either way the decision file is written
-first, then trail `gate` event. **No model is ever mid-conversation during a gate** — gates live
-*between* processes.
+re-asked*). Otherwise: a `--gate name=choice` preset resolves it (`by:"flag"`); interactive →
+render question + artifact summary via the gate UI plugin (TTY default, `by:"tty"`); headless →
+write the declared `default` (`by:"default"`). A `default` is **mandatory at plan time** (a gate
+without one is a config error), so a headless run always resolves every gate and never blocks on
+one. Either way the decision file is written first, then the trail `gate-answered` event. **No
+model is ever mid-conversation during a gate** — gates live *between* processes.
 
 ### 3.3 `parallel`
 `ThreadPoolExecutor(len(steps))` — each child step is its own OS process anyway; threads only
@@ -175,8 +181,9 @@ AX principles, enforceable because composition is code:
 
 ## 7. The STEP return protocol
 
-Final-message contract, executor-independent (Codex's `--output-schema` is used *additionally*
-where available, never relied on):
+Final-message contract, executor-independent. (Codex's native `--output-schema` is *reserved* as a
+future bonus where available, never relied on — the built CodexExecutor does not wire it yet; the
+sentinel block below is the sole contract on every executor today.)
 
 ```
 <<<STEP
@@ -211,7 +218,7 @@ it as a tool. Composition happens above the pipeline, never inside a step.
 | 3 | artifact gate failed | read validator reasons → `cairn resume` |
 | 4 | executor failure (spawn/auth/crash); also: run-lock contention (run is held by PID …) | `cairn doctor`, then resume |
 | 5 | timeout | inspect `logs/<step>.log`, resume |
-| 6 | halted at manual/gate in headless mode | answer externally (`cairn gate <run> <name>=<choice>`) or preset (`--gate`), then resume — the operator-pattern hook for coding agents |
+| 6 | needs a human: a `manual:` step in headless mode, or an interactive gate whose TTY was closed/interrupted (headless gates can't reach here — their `default` is mandatory) | answer externally (`cairn gate <run> <name>=<choice>`) or preset (`--gate`), then resume — the operator-pattern hook for coding agents |
 | 7 | budget exceeded (`SECURITY.md` §4) | raise the cap or accept the partial run, then resume |
 
 ## 10. Reproducibility

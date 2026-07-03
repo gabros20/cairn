@@ -208,12 +208,16 @@ requires a platform; with it, `tail -f` is the platform.
 |---|---|
 | `cairn plan <pipeline>` | resolve params → expand conditionals → **static-verify** (dataflow, schemas, agents, skills exist) → print the execution plan. No run. |
 | `cairn run <pipeline> --param k=v --executor codex` | plan + walk. `--step-executor review=claude` mixes fleets. |
-| `cairn resume <run-dir>` | re-plan against the recorded params, walk from the first invalid step. **Re-running is the retry mechanism.** |
-| `cairn validate <run-dir> [artifact]` | run validators ad-hoc. |
-| `cairn trail <run-dir> [--watch]` | pretty status tree from `trail.jsonl`. |
+| `cairn resume <run-dir> [--force]` | re-plan against the recorded params, walk from the first invalid step. **Re-running is the retry mechanism.** `--force` accepts pipeline-hash drift. |
+| `cairn gate <run-dir> <name>=<choice>` | answer a pending gate out-of-band → writes `gates/<name>.json` (`by:"external"`). Validates the run, the gate, and the choice, and **refuses to overwrite an already-answered gate** — the operator-pattern hook. |
+| `cairn validate <run-dir> [artifact]` | run validators ad-hoc over a run's done-step artifacts. |
+| `cairn trail <run-dir> [--watch\|--follow --json]` | status tree from `trail.jsonl`; `--follow --json` is the NDJSON monitor stream. |
+| `cairn ps [--json]` | cross-run fleet view (running / gate-waiting / halted), derived from `run.json` + trail recency. No daemon. |
 | `cairn doctor [--executor …]` | preflight every executor (auth, version, hook support) + workspace lint. |
-| `cairn batch <pipeline> --params-file sites.jsonl -j 8` | outer process pool of `cairn run`s — batch is *not* a kernel concept, just runs in parallel dirs. |
-| `cairn new pipeline\|agent\|skill\|validator <name>` | scaffolding. |
+| `cairn compose <pipeline> <step>` | render a step's envelope to stdout without executing — the AX previewer. |
+| `cairn test [suite] [--update]` · `cairn test record <run-dir>` | the offline L1 suites (validators/guards/pipelines/envelopes) + harvest a real run into fixtures (`TESTING.md`). |
+| `cairn batch <pipeline> --params-file sites.jsonl -j 8` | outer process pool of `cairn run`s — batch is *not* a kernel concept, just runs in parallel dirs. *(stub until C6+.)* |
+| `cairn new workspace\|pipeline\|agent\|skill\|validator <name>` | scaffolding. |
 
 ---
 

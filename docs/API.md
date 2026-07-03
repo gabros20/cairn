@@ -322,14 +322,18 @@ class Executor(Protocol):
     def render_workspace(self, ws: Workspace) -> None: ...    # AGENTS.md etc., idempotent
 ```
 
-Built-in `invoke` shapes (flags re-verified at doctor time; vendors drift):
+Built-in `invoke` shapes (as actually built; flags re-verified at doctor time — vendors drift).
+`[--effort …]`/`[-c …]` appear only when the tier didn't bake effort into the model alias:
 
 ```
-claude:  claude -p "$(cat envelope)" --model {model} --effort {effort} --output-format json
-codex:   codex exec -C {cwd} -m {model} -c model_reasoning_effort={effort}
-             --sandbox workspace-write -a never --output-schema {return_schema} - < envelope
-grok:    grok -p --cwd {cwd} -m {model} --output-format json --permission-mode dontAsk
+claude:  claude -p "<envelope text>" --model {model} [--effort {effort}] --output-format text
+             (prompt passed as the -p argument; nothing on stdin)
+codex:   codex exec -C {cwd} -m {model} --sandbox workspace-write -a never
+             [-c model_reasoning_effort={effort}]  < envelope
+             (prompt on stdin; --output-schema is NOT wired yet — the STEP sentinel is the contract)
+grok:    grok -p --cwd {cwd} -m {model} --output-format text --permission-mode dontAsk
              --no-alt-screen --no-auto-update < envelope
+             (prompt on stdin; effort is baked into the model alias — no effort flag exists)
 shell:   the run: command verbatim (this executor is how deterministic steps execute)
 stub:    copies tests/stubs/<pipeline>/<step>[.c<cycle>]/ into the run dir + returns a canned
          STEP — the L1 test executor (TESTING.md §5); selectable like any other, so a full
@@ -379,7 +383,7 @@ runs/<run-id>/
                  "versions": { "codex": "0.138.0" } },
   "models":  { "capture": "gpt-5.4/medium", "review": "opus/high" },
   "created_at": "…", "status": "running | done | halted",
-  "nodes": { "<node-id>": { "status": "done|skipped|halted", "at": "…", "cycles": 2 } } }
+  "nodes": { "<node-id>": { "status": "running|done|skipped|halted", "at": "…", "cycles": 2 } } }
 ```
 
 ### 8.2 Trail events (one JSON per line — the Trail Protocol, full spec: OBSERVABILITY.md)
@@ -415,7 +419,7 @@ cairn test [validators|guards|pipelines|envelopes] [--update]
                                         # L1 offline suite: fixtures + stub runs + envelope snapshots
                                         # (full spec: TESTING.md)
 cairn test record <run-dir> [--slim]    # harvest a real run into tests/stubs + tests/fixtures
-cairn compose <pipeline> <step> [--param k=v]...   # render a step's envelope without executing
+cairn compose <pipeline> <step> [--param k=v]... [--run-dir PATH]   # render a step's envelope without executing
 cairn trail <run-dir> [--watch] [--follow --json [--since SEQ]]
                                         # --follow --json = the canonical NDJSON stream for monitor
                                         # clients; --since resumes from a consumer offset

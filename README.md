@@ -13,7 +13,7 @@ as the only state.
 
 ## Status
 
-**C0–C1 built and green (~453 tests).** Implemented: the kernel (planner, walker, gatekit,
+**C0–C1 built and green (460 tests).** Implemented: the kernel (planner, walker, gatekit,
 composer, artifacts, trail/runstate, guards, expression + template engines, config); all five
 executors — `shell` and `stub` live, `claude`/`codex`/`grok` code-complete and unit-tested against
 fake binaries but **not yet live-verified**; the workspace test layer (`cairn test` — validators/
