@@ -82,6 +82,10 @@ testpaths = ["tests"]
 # Python variable directly — no version_toml entry (that is only for a static [project].version).
 version_variables = ["cairn/__init__.py:__version__"]
 tag_format = "v{version}"
+# PSR >=10 defaults allow_zero_version to false, which would jump the first automated release
+# straight to 1.0.0. We are pre-1.0, so keep it true: feat -> 0.2.0, fix -> 0.1.1. major_on_zero
+# stays at its default (true), so a BREAKING CHANGE still promotes 0.x -> 1.0.0 (RELEASING.md table).
+allow_zero_version = true
 # Runs inside the PSR action container: install uv, re-lock our own package at the bumped version,
 # stage the lockfile so it rides the release commit, then build sdist+wheel. $PACKAGE_NAME is
 # provided by PSR (the distribution name, cairn-pipelines).
