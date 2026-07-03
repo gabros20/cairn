@@ -42,7 +42,7 @@ from cairn.kernel.plan import (
     plan as build_plan,
     render_run_id,
 )
-from cairn.kernel.runstate import load_run
+from cairn.kernel.runstate import load_run, update_run
 from cairn.kernel.trail import derive_status, follow, read_trail
 from cairn.kernel.types import ExitCode
 from cairn.kernel.walk import bootstrap_run, walk
@@ -415,6 +415,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
     phash = _pipeline_hash(ws, args.pipeline)
 
     # Resolve the run dir: honor --run-dir, respect --idempotent (resume-or-no-op).
+    created = False
     if args.run_dir:
         run_dir = Path(args.run_dir).resolve()
         existing = (run_dir / "run.json").is_file()
@@ -424,6 +425,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 return fast
         elif not existing:
             run_dir = bootstrap_run(ws, p, now=now, run_dir=run_dir, pipeline_hash=phash)
+            created = True
         # existing without --idempotent → resume the given dir as-is.
     else:
         runs_root = _runs_root(ws, config)
@@ -436,8 +438,16 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 run_dir = candidate
             else:
                 run_dir = bootstrap_run(ws, p, now=now, runs_root=runs_root, pipeline_hash=phash)
+                created = True
         else:
             run_dir = bootstrap_run(ws, p, now=now, runs_root=runs_root, pipeline_hash=phash)
+            created = True
+
+    if created:
+        # Record the actual executor routing so `cairn resume` reconstructs the same fleet
+        # (mixed --executor / --step-executor) instead of silently falling back to defaults.
+        global_default = (None if stub_mode else args.executor) or config.workspace.default_executor or ""
+        _record_executor_routing(run_dir, now, global_default, _kv(args.step_executor))
 
     interactive = (not args.headless) and sys.stdin.isatty()
     try:
@@ -448,6 +458,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
     except CairnError as exc:
         print(f"cairn: {exc}", file=sys.stderr)
         return int(ExitCode.EXECUTOR)
+
+
+def _record_executor_routing(run_dir: Path, now: datetime, default: str, overrides: dict[str, str]) -> None:
+    """Persist the run's executor fleet into run.json (schema §8.1 ``executors``) so resume is
+    faithful. ``default`` is the effective global executor; ``overrides`` the ``--step-executor``
+    map. Versions stay empty (recording them is a cheap future add)."""
+
+    def mutate(doc: dict) -> None:
+        ex = doc.setdefault("executors", {})
+        ex["default"] = default
+        ex["overrides"] = dict(overrides)
+        ex.setdefault("versions", {})
+
+    update_run(run_dir, mutate)
 
 
 def _idempotent_shortcut(run_dir: Path) -> int | None:
@@ -488,8 +512,13 @@ def _cmd_resume(args: argparse.Namespace) -> int:
             return int(ExitCode.CONFIG)
         print(f"cairn: warning — resuming across pipeline-hash drift (--force) for {pipeline!r}", file=sys.stderr)
 
+    # Reconstruct the recorded fleet (§8.1 executors) so a mixed-executor run resumes on the
+    # same models, not the workspace defaults.
+    ex_doc = run_doc.get("executors") or {}
+    recorded_default = ex_doc.get("default") or None
+    recorded_overrides = {k: str(v) for k, v in (ex_doc.get("overrides") or {}).items()}
     try:
-        p = build_plan(ws, pipeline, params, now=now)
+        p = build_plan(ws, pipeline, params, executor=recorded_default, step_executors=recorded_overrides, now=now)
         config = load_config(ws)
     except ConfigError as exc:
         return _print_config_error(exc)
@@ -925,7 +954,6 @@ def _build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("test", help="the offline L1 suites (or `test record <run-dir>`)")
     sp.add_argument("suite", nargs="?", choices=sorted(_SUITES | {"record"}))
     sp.add_argument("rest", nargs="*")
-    sp.add_argument("--pipeline")
     sp.add_argument("--update", action="store_true")
     sp.add_argument("--slim", action="store_true")
     sp.set_defaults(func=_cmd_test)

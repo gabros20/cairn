@@ -33,6 +33,27 @@ def _pipeline_names(workspace_dir: Path) -> list[str]:
     return sorted(p.stem for p in d.glob("*.yaml"))
 
 
+def _required_without_default(workspace_dir: Path, name: str) -> list[str]:
+    """Params a pipeline declares ``required: true`` with no ``default`` — the ones that make a
+    bare plan impossible. A malformed/unreadable file returns ``[]`` so the real planner reports
+    the error precisely."""
+    import yaml
+
+    f = Path(workspace_dir) / "pipelines" / f"{name}.yaml"
+    try:
+        doc = yaml.safe_load(f.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return []
+    if not isinstance(doc, dict):
+        return []
+    out = []
+    for pname, spec in (doc.get("params") or {}).items():
+        spec = spec or {}
+        if isinstance(spec, dict) and spec.get("required") and "default" not in spec:
+            out.append(pname)
+    return out
+
+
 def run_doctor(
     workspace_dir: Path,
     *,
@@ -64,8 +85,16 @@ def run_doctor(
     for w in config.warnings:
         out(f"  ! {w.message}")
     names = _pipeline_names(workspace_dir)
-    planned, lint_errors = 0, 0
+    planned, lint_errors, skipped = 0, 0, 0
     for name in names:
+        # A pipeline whose required params have no defaults can't be planned bare — that's a
+        # normal shape (it needs `--param`s at run time), not a config error. Skip it with a
+        # note so a real workspace stays green; only genuine ConfigErrors fail the lint.
+        needs = _required_without_default(workspace_dir, name)
+        if needs:
+            skipped += 1
+            out(f"  ~ pipeline {name!r} skipped: requires params: {', '.join(needs)}")
+            continue
         try:
             build_plan(workspace_dir, name, {}, now=now, headless=True)
             planned += 1
@@ -74,7 +103,8 @@ def run_doctor(
             errors += 1
             out(f"{_BAD} workspace lint  pipeline {name!r}: {exc}")
     if lint_errors == 0:
-        out(f"{_OK} workspace lint  {planned} pipeline{'s' if planned != 1 else ''} plan green")
+        note = f" ({skipped} need params)" if skipped else ""
+        out(f"{_OK} workspace lint  {planned} pipeline{'s' if planned != 1 else ''} plan green{note}")
 
     # -- executors: the default + any named ---------------------------------- #
     scope = []

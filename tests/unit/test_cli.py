@@ -181,6 +181,57 @@ def test_run_stub_executor_offline(monkeypatch, tmp_path, capsys):
     assert rc == int(ExitCode.GATE_FAILED)
 
 
+def _twofleet_ws(tmp_path: Path) -> Path:
+    """A 2-agent pipeline where `stub` is a first-class named executor and `claude` is the
+    (deliberately non-runnable) default — so honoring a recorded stub override is observable:
+    a resume that fell back to `claude` would try to spawn it and fail."""
+    ws = newkit.new_workspace("fleet", tmp_path)
+    (ws / "cairn.toml").write_text(
+        (ws / "cairn.toml").read_text()
+        + "\n[executors.claude]\nenabled = true\n[executors.claude.tiers]\n"
+        "balanced = { model = \"sonnet\", effort = \"medium\" }\n"
+        "\n[executors.stub]\nenabled = true\n[executors.stub.tiers]\nbalanced = { model = \"stub\" }\n",
+        encoding="utf-8",
+    )
+    (ws / "agents" / "a1.yaml").write_text('description: "a1"\ntier: balanced\n', encoding="utf-8")
+    (ws / "agents" / "a2.yaml").write_text('description: "a2"\ntier: balanced\n', encoding="utf-8")
+    (ws / "pipelines" / "twofleet.yaml").write_text(
+        "pipeline: twofleet\nversion: 1\nrun_id: \"twofleet-{date}\"\n"
+        "artifacts:\n  art1: { path: art1.json, validator: validators/nonempty.py }\n"
+        "  art2: { path: art2.json, validator: validators/nonempty.py }\n"
+        "steps:\n  - id: s1\n    agent: a1\n    produces: [art1]\n"
+        "  - id: s2\n    agent: a2\n    needs: [art1]\n    produces: [art2]\n",
+        encoding="utf-8",
+    )
+    for step, art in (("s1", "art1"), ("s2", "art2")):
+        d = ws / "tests" / "stubs" / "twofleet" / step
+        d.mkdir(parents=True)
+        (d / f"{art}.json").write_text('{"ok": true}\n', encoding="utf-8")
+    return ws
+
+
+def test_run_records_executor_overrides(tmp_path, monkeypatch):
+    ws = _twofleet_ws(tmp_path)
+    monkeypatch.chdir(ws)
+    rc = main(["run", "twofleet", "--step-executor", "s1=stub", "--step-executor", "s2=stub", "--headless"])
+    assert rc == int(ExitCode.OK)
+    ex = json.loads((_run_dir(ws, "twofleet") / "run.json").read_text())["executors"]
+    assert ex["default"] == "claude"
+    assert ex["overrides"] == {"s1": "stub", "s2": "stub"}
+
+
+def test_resume_honors_recorded_executor_overrides(tmp_path, monkeypatch):
+    ws = _twofleet_ws(tmp_path)
+    monkeypatch.chdir(ws)
+    assert main(["run", "twofleet", "--step-executor", "s1=stub", "--step-executor", "s2=stub", "--headless"]) == 0
+    rd = _run_dir(ws, "twofleet")
+    (rd / "art2.json").unlink()  # force s2 to re-run on resume
+    # If resume fell back to the default (claude), spawning it would fail; a clean 0 proves the
+    # recorded stub override was honored.
+    assert main(["resume", str(rd)]) == int(ExitCode.OK)
+    assert (rd / "art2.json").is_file()
+
+
 # --------------------------------------------------------------------------- #
 # resume + gate verb.
 # --------------------------------------------------------------------------- #
@@ -322,6 +373,31 @@ def test_doctor_hello_green(hello_ws, monkeypatch, capsys):
     assert "plan green" in out
 
 
+def test_doctor_skips_param_required_pipeline_with_note(monkeypatch, capsys):
+    # brease-rebuild requires `url` with no default: doctor must note it, not fail the lint.
+    monkeypatch.chdir(BREASE_WS)
+    monkeypatch.setenv("PATH", f"{FAKEBIN}{os.pathsep}{os.environ['PATH']}")
+    rc = main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == int(ExitCode.OK)
+    assert "requires params: url" in out
+    assert "plan green" in out  # the workspace is still green overall
+
+
+def test_doctor_genuine_config_error_still_fails(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    monkeypatch.setenv("PATH", f"{FAKEBIN}{os.pathsep}{os.environ['PATH']}")
+    (hello_ws / "pipelines" / "broken.yaml").write_text(
+        "pipeline: broken\nversion: 1\nrun_id: \"broken-{date}\"\n"
+        "steps:\n  - id: x\n    run: \"echo hi\"\n    needs: [ghost]\n",  # ghost is never produced
+        encoding="utf-8",
+    )
+    rc = main(["doctor"])
+    out = capsys.readouterr().out
+    assert rc == int(ExitCode.CONFIG)
+    assert "broken" in out
+
+
 def test_doctor_missing_tool_prints_hint(hello_ws, monkeypatch, capsys):
     monkeypatch.chdir(hello_ws)
     monkeypatch.setenv("PATH", f"{FAKEBIN}{os.pathsep}{os.environ['PATH']}")
@@ -379,6 +455,14 @@ def test_test_exits_nonzero_and_shows_failures(hello_ws, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert rc == 1
     assert "FAIL:" in out
+
+
+def test_test_pipeline_flag_removed(hello_ws, monkeypatch):
+    # The silent no-op `--pipeline` filter was dropped; argparse now rejects it.
+    monkeypatch.chdir(hello_ws)
+    with pytest.raises(SystemExit) as exc:
+        main(["test", "validators", "--pipeline", "hello"])
+    assert exc.value.code == 2
 
 
 def test_test_record_harvests_run(hello_ws, monkeypatch, capsys):
