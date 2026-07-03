@@ -29,6 +29,7 @@ compose import them from this module.
 
 from __future__ import annotations
 
+import difflib
 import re
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -792,14 +793,32 @@ def _gather(raw_nodes: list) -> tuple[dict[str, list[str]], set[str]]:
     return producers, gates
 
 
+def _did_you_mean(name: str, ctx: _Ctx) -> str:
+    cands = difflib.get_close_matches(name, sorted(ctx.artifact_names | ctx.gate_names), n=3)
+    return f" (did you mean {cands}?)" if cands else ""
+
+
 def _add_produce(name: str, produced: set[str], in_loop: bool, node_id: str, ctx: _Ctx) -> None:
+    if name not in (ctx.artifact_names | ctx.gate_names):
+        _err(
+            f"step {node_id!r} produces {name!r}, which is not a declared artifact or gate"
+            f"{_did_you_mean(name, ctx)}",
+            ctx.file,
+        )
     if name in produced and not in_loop:
         _err(f"artifact {name!r} is produced more than once (by {node_id!r} and an earlier step)", ctx.file)
     produced.add(name)
 
 
 def _check_needs(node: StepNode, available: set[str], producers: dict[str, list[str]], ctx: _Ctx) -> None:
+    declared = ctx.artifact_names | ctx.gate_names
     for name in node.needs:
+        if name not in declared:
+            _err(
+                f"step {node.id!r} needs {name!r}, which is not a declared artifact or gate"
+                f"{_did_you_mean(name, ctx)}",
+                ctx.file,
+            )
         if name not in available:
             cands = [c for c in producers.get(name, []) if c != node.id]
             hint = (
@@ -809,8 +828,12 @@ def _check_needs(node: StepNode, available: set[str], producers: dict[str, list[
             )
             _err(f"step {node.id!r} needs {name!r}, which is not produced before it{hint}", ctx.file)
     for name in node.needs_optional:
-        if name not in (ctx.artifact_names | ctx.gate_names):
-            _err(f"step {node.id!r} needs_optional {name!r} is not a declared artifact or gate", ctx.file)
+        if name not in declared:
+            _err(
+                f"step {node.id!r} needs_optional {name!r} is not a declared artifact or gate"
+                f"{_did_you_mean(name, ctx)}",
+                ctx.file,
+            )
 
 
 def _verify_dataflow(nodes: list[Node], producers: dict[str, list[str]], ctx: _Ctx) -> None:

@@ -267,6 +267,36 @@ def test_typod_needs_names_the_step_and_artifact(tmp_path):
     assert "two" in str(exc.value) and "aa" in str(exc.value)
 
 
+def test_typod_produce_that_is_consumed_downstream_is_an_error(tmp_path):
+    # 'aa' is a typo of the declared 'a'; it is produced AND consumed, so dataflow alone
+    # is satisfied — only an undeclared-name check catches it (else it fails at runtime with
+    # a misleading "unanswered gate 'aa'").
+    steps = (
+        "  - { id: one, run: 'echo', produces: [aa] }\n"
+        "  - { id: two, run: 'echo', needs: [aa], produces: [b] }\n"
+    )
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    assert "aa" in str(exc.value) and "one" in str(exc.value)
+
+
+def test_typod_pure_needs_is_an_error(tmp_path):
+    steps = (
+        "  - { id: one, run: 'echo', produces: [a] }\n"
+        "  - { id: two, run: 'echo', needs: [aa], produces: [b] }\n"
+    )
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    assert "aa" in str(exc.value) and "two" in str(exc.value)
+
+
+def test_gate_name_is_a_valid_needs_target(hello_ws):
+    # hello's compose needs [greeting, tone] where tone is a GATE — gate names remain
+    # consumable, the new declared-name check must not reject them.
+    p = plan(hello_ws, "hello", {}, now=NOW)
+    assert set(_node(p, "compose").needs) == {"greeting", "tone"}
+
+
 def test_duplicate_produce_is_an_error(tmp_path):
     steps = "  - { id: one, run: 'echo', produces: [a] }\n  - { id: two, run: 'echo', produces: [a] }\n"
     with pytest.raises(ConfigError) as exc:
