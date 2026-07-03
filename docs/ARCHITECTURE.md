@@ -2,9 +2,9 @@
 
 How the kernel is built and exactly how execution behaves. Companion to `CONCEPTS.md` (the model)
 and `API.md` (the formats). Design constraint throughout: **a small, dependency-light kernel —
-stdlib + `pyyaml` + `jsonschema` only; everything else is a plugin.** (The C1 kernel landed at
-~5,700 lines across 18 modules — larger than the initial ~2,500-line aspiration, but the two-
-dependency floor and the plugin boundary held.)
+stdlib + `pyyaml` + `jsonschema` only; everything else is a plugin.** (With the hardening backlog in,
+the kernel sits on the order of ~9,000 lines across roughly two dozen modules — several times the
+initial ~2,500-line aspiration, but the two-dependency floor and the plugin boundary held.)
 
 ---
 
