@@ -1,0 +1,13 @@
+# Offline pipeline regression (zero tokens). Each row is planned, bootstrapped, and walked
+# through the StubExecutor — which replays the recorded artifacts under tests/stubs/ — so the
+# live codex run above is locked in as a repeatable check. `cairn test` binds this.
+
+smoke:
+  # Happy path: the stub replays tests/stubs/smoke/write_report/report.json; it validates
+  # against schemas/report.json → exit 0 (the default expectation).
+  - {}
+
+smokefail:
+  # Failure path: no stub is recorded for write_gated (its validator is unsatisfiable), so the
+  # artifact gate fails and the step halts after its retry — GATE_FAILED (exit 3).
+  - _expect: 3

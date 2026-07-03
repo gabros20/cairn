@@ -1,0 +1,28 @@
+# Live smoke workspace for the CODEX executor (tests/live/workspace-codex).
+#
+# This is the FIRST time cairn's CodexExecutor runs against the real `codex` CLI
+# (unit tests only ever drive a fake binary). It is deliberately tiny: one agent step,
+# one model, one small typed artifact — a token-minimal end-to-end proof that
+# compose → invoke → sentinel-parse → validate → trail works on the real vendor.
+#
+# NOT run by the offline `cairn test` suites of the main repo; it is its own workspace,
+# exercised live and regression-locked via `cairn test record`.
+
+[workspace]
+name             = "workspace-codex"
+doctrine         = "prompts/DOCTRINE.md"
+runs_dir         = "runs"
+default_executor = "codex"
+
+[defaults]
+step_timeout  = "10m"                            # codex exec is slower than haiku; headroom over the ~1min observed
+trail_context = { events = 12, learnings = 5 }
+
+# The ONLY place vendor model names live. Verified live on codex-cli 0.142.5 with a ChatGPT
+# account: gpt-5.5 is the ONLY accepted model (every -mini/-codex variant is rejected with
+# "not supported when using Codex with a ChatGPT account"), so `cheap` pins gpt-5.5 and the
+# smoke agents keep cost down via effort=low instead of a smaller model.
+[executors.codex]
+enabled = true
+[executors.codex.tiers]
+cheap = { model = "gpt-5.5" }

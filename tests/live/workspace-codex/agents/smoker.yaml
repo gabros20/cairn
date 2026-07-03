@@ -1,0 +1,14 @@
+description: "Smoke agent — writes one tiny typed report so the live codex executor can be verified end-to-end."
+
+tier: cheap             # → gpt-5.5 in cairn.toml (the only ChatGPT-plan model); cost is kept down by effort
+effort: low             # exercises the executor's `-c model_reasoning_effort=…` argv path on the real CLI
+
+skills: []
+
+tools:
+  allow: [read, write]  # the agent only needs to write its one report artifact
+  network: false
+
+env: []
+
+returns: schemas/step-return.json

@@ -1,0 +1,8 @@
+# Live run dirs — ephemeral, reproducible from the pipeline, never committed.
+runs/
+
+# Local secrets / machine env.
+.env
+
+# The active-run marker the orchestrator/hooks use.
+.cairn/.active-run
