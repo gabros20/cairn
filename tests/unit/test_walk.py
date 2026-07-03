@@ -11,6 +11,7 @@ node's recorded status, or the shape of the trail.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -710,6 +711,74 @@ def test_identity_env_passes_through_for_keychain_auth(ws: Path, tmp_path: Path,
     assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
     assert seen["USER"] == "tamas"
     assert seen["LOGNAME"] == "tamas"
+
+
+class _UniversalEnv(dict):
+    """A parent env that 'contains' EVERY key (synthesizing a value on demand).
+
+    Used to pin the walker's system-env passthrough set exactly: any future widening of
+    the baseline tuple pulls its new key out of this mapping and into the invocation env,
+    breaking the exact-set assertion below — a silent addition can never pass green.
+    """
+
+    def __contains__(self, key: object) -> bool:
+        return True
+
+    def __getitem__(self, key):
+        return super().__getitem__(key) if super().__contains__(key) else f"parent-{key}"
+
+    def get(self, key, default=None):
+        return self[key]
+
+
+def test_system_env_passthrough_is_exactly_the_pinned_set(ws: Path, tmp_path: Path, monkeypatch) -> None:
+    # SECURITY §1.2: the env baseline is deny-by-default and a security boundary. The parent
+    # env here "contains" every key, so the invocation env must equal EXACTLY the allowed
+    # system set + the CAIRN_* mechanics — widening the passthrough (e.g. a secret-bearing
+    # var slipping in) fails this test loudly and forces a deliberate decision.
+    monkeypatch.setattr(os, "environ", _UniversalEnv())
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    captured: dict = {}
+
+    def on_invoke(inv, _n):
+        captured["env"] = dict(inv.env)
+        (inv.cwd / "a.txt").write_text("ok")
+        return done_result()
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
+    assert set(captured["env"]) == {
+        # the allowed system passthrough — identity + locale + tmp, nothing more
+        "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME",
+        # the cairn mechanics the walker always injects
+        "CAIRN_RUN_DIR", "CAIRN_STEP", "CAIRN_WORKSPACE", "CLAUDE_PROJECT_DIR",
+    }
+
+
+def test_absent_baseline_vars_are_omitted_not_none(ws: Path, tmp_path: Path, monkeypatch) -> None:
+    # Absence tolerance: a parent env lacking USER/LOGNAME/TMPDIR/… simply omits those keys
+    # from the child env — never a None value, never a crash.
+    monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin:/bin", "HOME": "/tmp/h"})
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    captured: dict = {}
+
+    def on_invoke(inv, _n):
+        captured["env"] = dict(inv.env)
+        (inv.cwd / "a.txt").write_text("ok")
+        return done_result()
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
+    env = captured["env"]
+    assert set(env) == {
+        "PATH", "HOME",
+        "CAIRN_RUN_DIR", "CAIRN_STEP", "CAIRN_WORKSPACE", "CLAUDE_PROJECT_DIR",
+    }
+    assert None not in env.values()
 
 
 def test_dotenv_strips_quotes_and_tolerates_export(ws: Path, tmp_path: Path) -> None:
