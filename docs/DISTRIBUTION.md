@@ -87,18 +87,30 @@ works immediately, offline, with zero auth** — the day-0 experience uses only 
 
 ```
 <name>/
-├── cairn.toml               # default_executor = "claude"; tiers commented; one [tools] example
+├── cairn.toml               # default_executor = "claude"; [executors.claude] tiers active;
+│                            # [tools.gh] scoped needed_by=["open-pr"] — tool enforcement, dogfooded
 ├── pipelines/hello.yaml     # run: steps + one gate (default preset) — plans AND runs offline;
 │                            # a commented agent: step shows the first real upgrade
+├── pipelines/self-improve.yaml  # the learning loop's curate→promote (TOOLING §7): aggregate →
+│                            # curate → approve gate (headless default "no") → open-pr
 ├── agents/assistant.yaml    # minimal agent, ready for the uncommented step
+├── agents/curator.yaml      # the self-improve judge (tier-routed, executor-agnostic)
 ├── skills/cairn-operator/   # the operator skill (§6) — ships in every workspace
-├── schemas/step-return.json # + greeting.json — the hello pipeline's artifact schema
-├── validators/nonempty.py   # the starter validator (maturation ladder rung 0)
+├── skills/self-improve-curator/  # the curation doctrine — the workspace's policy seam
+├── schemas/step-return.json # + greeting.json + self-improve-proposals.json
+├── validators/nonempty.py   # + self-improve-proposals.py (targets stay in-workspace, unique ids)
+├── scripts/self-improve-open-pr.py  # worktree-isolated apply → branch → PR via gh
 ├── prompts/DOCTRINE.md      # stub: isolation invariant + artifact-authority rule
+├── tests/                   # matrix + fixtures + stubs — `cairn test` green out of the box,
+│                            # incl. the recorded headless walk proving the gate refuses ("no")
 ├── allowlist.yaml           # empty fragments with comments
 ├── .gitignore               # runs/
 └── README.md                # the TOOLING-AND-GROWTH maturation ladder, condensed
 ```
+
+Retrofit path for a workspace that predates the furniture: `cairn new pipeline self-improve`
+wires the same files into an existing workspace, append-only — it adds the test-matrix row and
+never clobbers customized companion files (no new CLI surface).
 
 A separate GitHub template repo is optional sugar: it is exactly this scaffold committed — never a
 kernel copy.

@@ -13,7 +13,7 @@ as the only state.
 
 ## Status
 
-**C0–C1 built and green (780 tests).** Implemented: the kernel (planner, walker, gatekit,
+**C0–C1 built and green (802 tests).** Implemented: the kernel (planner, walker, gatekit,
 composer, artifacts, trail/runstate, guards, expression + template engines, config); all five
 executors — `shell` and `stub` live, and the **`claude`, `codex`, and `grok` executors all
 live-verified** (the first live `claude -p` / `codex exec` / `grok --prompt-file` runs, captured
@@ -28,14 +28,17 @@ content-key idempotency); and the `cairn new` scaffold. **v0.1.0 is tagged.** Th
 backlog has since shipped too: opt-in `heartbeat` trail events, the webhook trail sink (tee, never
 authority), kernel-side secret redaction, cross-version resume gates, range-scoped tool
 enforcement at plan/run, batch failures that name their reason, and one aware-UTC clock behind
-every persisted timestamp.
+every persisted timestamp. The **learning loop is closed**: the curate→promote
+`self-improve.yaml` pipeline ships as scaffold furniture (mechanism from the framework, policy
+owned by the workspace) — aggregate → curate → human gate (headless default "no") → PR via a
+temporary git worktree, never a direct commit.
 Every module went implement → review → fix. The day-0 pipeline runs end-to-end offline:
 `uv run cairn run hello --headless`.
 
-**Not done yet:** the CMS-population branch, the learnings curate/promote pipeline
-(`self-improve.yaml`), and the brease-factory workspace migration (deferred;
-it remains cairn's eventual first workspace — the C4/C5 pipeline-parity runs against a real
-workspace are deferred with it). The doctor hook probe (`cairn doctor --probe-hooks`) now covers
+**Not done yet:** the brease-factory workspace migration (deferred;
+it remains cairn's eventual first workspace) — its scope includes the `brease=on` CMS-population
+branch (Brease is separate tooling, not a framework feature) and the C4/C5 pipeline-parity runs
+against a real workspace. The doctor hook probe (`cairn doctor --probe-hooks`) now covers
 all three vendor CLIs — on the dev machine Claude's, Codex's, and Grok's PreToolUse hooks all fire
 and block headlessly (hook-primary; a per-machine, per-CLI-version fact). Design package in
 [`docs/`](docs/): start with [`docs/README.md`](docs/README.md), then

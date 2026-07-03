@@ -169,19 +169,32 @@ promote      edits to skills/validators/guards/params           (the ladder, exe
              — on a branch, as a PR — never committed directly
 ```
 
-*Status: the `runtime`, `recall`, and `aggregate` rows are built — agents emit `learn` events,
+*Status: all five rows are built. `runtime`/`recall`/`aggregate` — agents emit `learn` events,
 envelope block 4 injects prior learnings, and the `aggregate` verb (`cairn learnings [--since]
 [--tag]`) scans every run's trail under the runs root and renders the ranked, deduped view (LIVE).
-The `curate`/`promote` rows — the `self-improve.yaml` promote pipeline that folds learnings into
-skills/validators/guards on a branch — remain future, see IMPLEMENTATION-PLAN.*
+The `curate`/`promote` rows shipped as **scaffolded workspace furniture** — the framework ships
+the mechanism, the workspace owns the policy; deliberately NOT a kernel verb and NOT a vendor
+skill (see IMPLEMENTATION-PLAN).*
 
-Two closure speeds, both already designed: **runtime closure** (block 4 — a learning recorded in
+Two closure speeds, both now built: **runtime closure** (block 4 — a learning recorded in
 run N is in run N+1's envelope with zero human action) and **design-time closure** (curation →
 ladder promotion → the learning becomes *structure* and its note can be retired).
 
-The curate→promote stage is itself naturally a cairn pipeline (`self-improve.yaml`: a `run:` step
-aggregating, an agent step curating against the doctrine, a gate for the human, a `run:` step
-opening the PR via gh) — the framework improving its own workspace with the same contracts,
-gates, and audit trail as any other work. Hard rule carried over from the current system's
-self-improver: **proposals arrive as branches/PRs, never as direct commits** — the learning loop
-has write access to suggestions, not to truth.
+The curate→promote stage *is* a cairn pipeline, and it ships in the workspace scaffold
+(DISTRIBUTION §4; retrofit into an existing workspace with `cairn new pipeline self-improve`).
+The shipped shape of `pipelines/self-improve.yaml`: an `aggregate` `run:` step (`cairn learnings
+--since/--tag` → a typed snapshot); a `curate` agent step judging against the doctrine skill
+(`skills/self-improve-curator/SKILL.md` — vendor-free and decidable: noise by default, only
+recurring (≥2) or high-value learnings promote, and the ladder table carries the exact promotion
+enum tokens) into schema+validator-checked `proposals.json`; an `approve` human gate whose
+headless default is **no** — a cron-fired run can never self-promote, and the scaffold's own
+recorded test proves it; and an `open-pr` `run:` script that applies only approved, re-validated,
+workspace-relative targets (no `../`, no absolute paths, no `runs/`/`.git`/`.env`, with a
+resolved-path backstop) inside a **temporary git worktree** — the working branch is structurally
+untouchable — on branch `self-improve/<run-id>`, opening the PR via `gh`; no approved edits means
+exit 1, not an empty PR, and a failed push keeps the branch for retry (a documented asymmetry).
+The scaffold's `[tools.gh] needed_by=["open-pr"]` dogfoods §2's tool enforcement. The framework
+improving its own workspace with the same contracts, gates, and audit trail as any other work —
+and the hard rules carried over from the current system's self-improver are unchanged:
+**proposals arrive as branches/PRs, never as direct commits**; **curation is never automatic**;
+**the human gate is mandatory** — the learning loop has write access to suggestions, not to truth.

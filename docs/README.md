@@ -228,7 +228,7 @@ resident daemon (the filesystem is the state).
 
 ## Status
 
-**C0–C1 built and green (780 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
+**C0–C1 built and green (802 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
 artifacts, trail/runstate, guards, expression + template engines, config, doctor, scaffold); all
 five executors (`shell`/`stub` live; the **`claude`, `codex`, and `grok` executors all
 live-verified** — the first live `claude -p` / `codex exec` / `grok --prompt-file` runs recorded as
@@ -241,9 +241,12 @@ workspace test layer (`cairn test` + `record`); and the full CLI — the `batch`
 tagged**, and the hardening backlog has since shipped: opt-in `heartbeat` events, the webhook
 trail sink, kernel-side secret redaction, cross-version resume gates, range-scoped tool
 enforcement, batch failures that name their reason, and one aware-UTC clock behind every persisted
-timestamp. The day-0 pipeline runs end-to-end offline (`cairn run hello --headless`).
+timestamp. The learning loop is now closed: the curate→promote `self-improve.yaml` pipeline ships
+as scaffold furniture — the framework provides the mechanism, the workspace owns the policy
+(TOOLING-AND-GROWTH §7). The day-0 pipeline runs end-to-end offline (`cairn run hello --headless`).
 The doctor hook probe (`cairn doctor --probe-hooks`) has shipped — on the dev machine it verifies
 that Claude's, Codex's, and Grok's PreToolUse hooks all fire and block headlessly. Still ahead, per
-[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md): the CMS-population branch, the learnings
-curate/promote pipeline (`self-improve.yaml`),
-and the brease-factory workspace migration (deferred — cairn's eventual first workspace).
+[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md):
+the brease-factory workspace migration (deferred — cairn's eventual first workspace), whose scope
+includes the `brease=on` CMS-population branch (Brease is separate tooling, not a framework
+feature) and the deferred parity runs.

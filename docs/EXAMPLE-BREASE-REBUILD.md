@@ -264,15 +264,16 @@ $ cairn batch brease-rebuild --params-file sites.jsonl -j 8 --to blueprint --gat
 | Run-dir isolation + wrong-run tripwire | kernel-owned cwd/env + envelope tripwire line |
 | SubagentStart brief / SubagentStop log+gate | envelope block 4 (trail context) / walker post-step (validate+trail) |
 | CLAUDE.md doctrine | `prompts/DOCTRINE.md` → envelope block 5 + `render_workspace` (AGENTS.md etc.) |
-| `learnings.jsonl` + self-improve loop | STEP `learnings[]` → trail `learn` events → `cairn learnings` aggregation *(aggregate verb LIVE; the promote pipeline is future)* |
+| `learnings.jsonl` + self-improve loop | STEP `learnings[]` → trail `learn` events → `cairn learnings` aggregation *(aggregate verb LIVE; the curate→promote `self-improve.yaml` ships in the workspace scaffold — TOOLING §7)* |
 
 Nothing in the current system failed to land *in the design* — every mechanism has a home above.
 Build status is a separate axis: this pipeline, its twelve agents, both gates, the parallel pair,
 the art-review loop, the conditional chains, and the guard block all **plan and stub-run today**
 (they are the C1 planner fixture, byte-for-byte). The ops verbs those rows lean on — `cairn batch`
-and the `cairn learnings` aggregation — are now **built and tested (LIVE)**; the executors behind
-the `agent:` steps are live (C2–C5 done), this pipeline's own live runs wait on the brease-factory
-workspace migration, and only the `learnings` promote pipeline
-remains future. Two things got *stronger* in translation: the batch guard is no longer fail-open
+and the `cairn learnings` aggregation — are now **built and tested (LIVE)**, and the `learnings`
+promote pipeline ships as scaffold furniture (`self-improve.yaml` — TOOLING §7); the executors
+behind the `agent:` steps are live (C2–C5 done), and this pipeline's own live runs — including its
+`brease=on` CMS branch — wait on the brease-factory
+workspace migration. Two things got *stronger* in translation: the batch guard is no longer fail-open
 (per-process env replaces the global pointer), and CMS population now fails closed and defaults to
 "no" headlessly.

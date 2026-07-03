@@ -16,7 +16,7 @@ ever debug one new thing at a time.
 
 - **C0 + C1 — complete.** Planner, walker, gatekit, composer, artifacts, trail/runstate, guards,
   expression + template engines, config, the `shell`/`stub` executors, the `cairn test` suite layer,
-  the scaffold, and every C1-scope CLI verb are built and green (780 tests).
+  the scaffold, and every C1-scope CLI verb are built and green (802 tests).
   *Deviation from the strict ordering:* built as parallel module waves with per-module
   implement→review→fix rather than strictly C0-then-C1. The C1 "synthetic-suite" verification bar is
   met by the suite + the offline `hello` end-to-end run + the testkit stub layer (a full
@@ -76,9 +76,25 @@ ever debug one new thing at a time.
   before minting) per TOOLING §2; and one aware-UTC clock behind every persisted timestamp
   (`{date}` buckets by UTC day). The `v0.1.0` tag is cut. Internal seam unification
   (batchkit/schedkit over one `proc.SubprocessRunner`) rode along. Learnings curate/promote was
-  deliberately NOT built — it stays the future `self-improve.yaml` PR pipeline (TOOLING §7).
-- **Still ahead:** the `brease=on` CMS-population branch, the learnings curate/promote pipeline,
-  and the brease-factory workspace migration (plus the C2–C5 parity runs deferred with it).
+  deliberately held out of this wave — it has since shipped (next bullet).
+- **Self-improve — shipped, as scaffold furniture.** The learning loop's `curate`/`promote` rows
+  are built per the placement ruling (user-approved): the framework ships the **mechanism**, the
+  workspace owns the **policy** — NOT a kernel verb, NOT a vendor skill. In the
+  `cairn new workspace` scaffold: `pipelines/self-improve.yaml` (aggregate `run:` — `cairn
+  learnings --since/--tag` → typed snapshot → curate agent step → schema+validator-checked
+  `proposals.json` → approve human gate with headless default **no** — a cron run cannot
+  self-promote, proven by the scaffold's own recorded test → open-pr `run:` script: temporary git
+  worktree so the working branch is structurally untouchable, applies only approved+re-validated
+  workspace-relative targets, branch `self-improve/<run-id>`, PR via `gh`, exit 1 rather than an
+  empty PR, branch kept on push failure for retry); `agents/curator.yaml` + the vendor-free
+  curation-doctrine skill (`skills/self-improve-curator/SKILL.md`); and `[tools.gh]
+  needed_by=["open-pr"]`, dogfooding tool enforcement. Retrofittable into an existing workspace
+  via `cairn new pipeline self-improve` (append-only, wires the test-matrix row, never clobbers
+  customized companions). Hard rules preserved: PRs only — suggestions, not truth; curation never
+  automatic; the human gate mandatory (TOOLING §7). Suite 780 → 802.
+- **Still ahead:** the brease-factory workspace migration — workspace #1, whose scope includes its
+  `brease=on` CMS-population branch (Brease is separate tooling, not a framework feature; see C6
+  note + EXAMPLE-BREASE-REBUILD) — plus the C2–C5 parity runs deferred with it.
 
 ---
 
@@ -172,7 +188,10 @@ the brease-rebuild workspace are deferred with the brease-factory migration (as 
 ## C6 — Batch + CMS branch
 
 *Status: batch, learnings, gc, and scheduling below are **built and tested (LIVE)** — shipped ahead
-of sequence. Only the `brease=on` CMS-population branch remains future.*
+of sequence. Scope note (user ruling): the `brease=on` CMS-population branch is not a framework
+milestone — Brease is separate tooling, and the branch belongs to the brease-factory **workspace
+migration** (workspace #1, specified in EXAMPLE-BREASE-REBUILD). The build/verify text below stays
+as the historical milestone description.*
 
 **Build:** `cairn batch` (process pool of `cairn run --headless`); the `brease=on` branch
 (brease-auth manual step, modeler, populate-approval gate with headless default **no**, populator,
