@@ -1,0 +1,12 @@
+{
+  "summary": "REJECTED by the schema: a proposal without a rationale is not reviewable.",
+  "proposals": [
+    {
+      "id": "no-rationale",
+      "promotion": "prompt",
+      "target": "prompts/DOCTRINE.md",
+      "action": "append",
+      "text": "a rule with no stated reason"
+    }
+  ]
+}

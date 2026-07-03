@@ -1,0 +1,24 @@
+{
+  "summary": "A well-formed curate output: one doctrine append, one new validator.",
+  "proposals": [
+    {
+      "id": "doctrine-source-of-truth",
+      "learning": "Agents kept re-deriving where the canonical input lives",
+      "occurrences": 2,
+      "promotion": "prompt",
+      "target": "prompts/DOCTRINE.md",
+      "action": "append",
+      "text": "\n## Canonical inputs\n\nRead inputs only from the artifacts named in your CONTRACT block.\n",
+      "rationale": "Recurred across two runs; belongs in the doctrine every agent inherits."
+    },
+    {
+      "id": "validator-output-has-title",
+      "occurrences": 3,
+      "promotion": "validator",
+      "target": "validators/has-title.py",
+      "action": "create",
+      "text": "#!/usr/bin/env python3\nraise SystemExit(0)\n",
+      "rationale": "Checked by eye three runs in a row — encode it as a validator."
+    }
+  ]
+}

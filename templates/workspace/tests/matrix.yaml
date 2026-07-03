@@ -1,0 +1,13 @@
+# The pipeline-suite matrix for `cairn test` (docs/TESTING.md §4.3): each row is one
+# HEADLESS walk through the stub executor — agent steps replay tests/stubs/<pipeline>/
+# <step>/, run: steps really run, gates resolve to `_gates` presets or their defaults.
+# Row keys are params; `_expect` is the expected exit code (default 0).
+
+hello:
+  - {}          # the day-0 walk: greet → tone gate (default) → compose
+
+self-improve:
+  # Headless, no presets: aggregate runs `cairn learnings`, curate replays the stub,
+  # and the approve gate resolves to its DEFAULT — "no" — so open-pr is SKIPPED.
+  # This row is the standing proof that an unattended run can never self-promote.
+  - {}

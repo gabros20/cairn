@@ -30,6 +30,19 @@ EXPECTED_FILES = [
     "allowlist.yaml",
     ".gitignore",
     "README.md",
+    # The self-improve furniture (TOOLING-AND-GROWTH §7 — the learning loop's
+    # curate→promote stages as packaged mechanism; policy stays workspace-owned).
+    "pipelines/self-improve.yaml",
+    "agents/curator.yaml",
+    "skills/self-improve-curator/SKILL.md",
+    "schemas/self-improve-proposals.json",
+    "validators/self-improve-proposals.py",
+    "scripts/self-improve-open-pr.py",
+    "tests/fixtures/proposals/valid-two-promotions.json",
+    "tests/fixtures/proposals/invalid-target-escapes.json",
+    "tests/fixtures/proposals/invalid-missing-rationale.json",
+    "tests/stubs/self-improve/curate/proposals.json",
+    "tests/matrix.yaml",
 ]
 
 WORKSPACE_PLACEHOLDER = "{{WORKSPACE_NAME}}"

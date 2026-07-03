@@ -1,0 +1,13 @@
+{
+  "summary": "REJECTED by the validator: the target climbs out of the workspace.",
+  "proposals": [
+    {
+      "id": "escape-attempt",
+      "promotion": "prompt",
+      "target": "../outside-the-workspace.md",
+      "action": "append",
+      "text": "must never land",
+      "rationale": "A proposal may only amend files inside the workspace."
+    }
+  ]
+}

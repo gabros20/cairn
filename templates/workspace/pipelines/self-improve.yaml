@@ -1,0 +1,96 @@
+# self-improve — the learning loop's curate→promote stages as workspace furniture
+# (docs/TOOLING-AND-GROWTH.md §7 in the cairn repo). cairn ships the MECHANISM; the
+# POLICY — what counts as promotable, where edits land — lives in the files this
+# pipeline reads and is yours to customize (skills/self-improve-curator/SKILL.md,
+# schemas/self-improve-proposals.json, scripts/self-improve-open-pr.py).
+#
+#   aggregate   run:    `cairn learnings [--since] [--tag]` → learnings-snapshot.txt
+#   curate      agent:  judge the snapshot against the doctrine → proposals.json
+#   approve     gate:   a HUMAN decides; the headless default is "no"
+#   open-pr     run:    apply the approved edits on a NEW branch, open a PR via gh
+#
+# HARD RULE (do not weaken when customizing): proposals arrive as branches/PRs, never
+# as direct commits — the learning loop has write access to suggestions, not to truth.
+#
+# Wiring this needs in cairn.toml (a fresh `cairn new workspace` already has both):
+#   * [executors.<default>] with tiers — the curate step is an agent step
+#   * [tools.gh] with needed_by = ["open-pr"] — see the note in cairn.toml
+pipeline: self-improve
+version: 1
+
+params:
+  since: { type: string, default: "" }  # ISO date/datetime lower bound (e.g. 2026-06-01); "" = all history
+  tag:   { type: string, default: "" }  # only learnings carrying this exact tag; "" = every tag
+
+run_id: "self-improve-{date}"
+
+artifacts:
+  learnings-snapshot:
+    path: learnings-snapshot.txt
+    validator: validators/nonempty.py
+    describe: >-
+      The ranked, deduped `cairn learnings` view — every run's `learn` trail events,
+      aggregated. This run curates FROM this snapshot, never from memory.
+  proposals:
+    path: proposals.json
+    schema: schemas/self-improve-proposals.json
+    validator: validators/self-improve-proposals.py
+    describe: >-
+      Ladder promotions the curator judged worth making: for each, the workspace file
+      to amend, a mechanical edit (create/append/replace), and the rationale. An empty
+      `proposals` list is a valid — and common — outcome (everything was noise).
+  pr-record:
+    path: pr.json
+    validator: validators/nonempty.py
+    describe: "Receipt of the open-pr step: branch name, PR URL, applied/skipped proposals."
+
+steps:
+  # 1. aggregate — deterministic, zero tokens: freeze the view this run judges.
+  #    Flags are passed only when the params are non-empty; `cairn learnings` resolves
+  #    its workspace from the cwd, so we cd to $CAIRN_WORKSPACE (the walker exports it;
+  #    the artifact reference below renders to an absolute path, so cd is safe).
+  - id: aggregate
+    run: >-
+      out="{artifact:learnings-snapshot}"; since="{params.since}"; tag="{params.tag}";
+      cd "$CAIRN_WORKSPACE" || exit 1; set --;
+      if [ -n "$since" ]; then set -- "$@" --since "$since"; fi;
+      if [ -n "$tag" ]; then set -- "$@" --tag "$tag"; fi;
+      cairn learnings "$@" > "$out"
+    produces: [learnings-snapshot]
+
+  # 2. curate — judgment, so it is an agent step. The curation doctrine (noise by
+  #    default; promote only recurring/high-value learnings; name the exact file and a
+  #    mechanical edit) lives in skills/self-improve-curator/SKILL.md — customize THAT,
+  #    not this step. The agent writes proposals.json and nothing else.
+  - id: curate
+    agent: curator
+    needs: [learnings-snapshot]
+    produces: [proposals]
+
+  # 3. approve — the human gate. The default is "no" ON PURPOSE: headless runs (cron,
+  #    `cairn batch`, --headless) resolve a gate to its default, so an unattended run
+  #    records the proposals and STOPS — it can never self-promote. Answer it
+  #    interactively, pin it with `cairn run self-improve --gate approve=yes`, or
+  #    answer a halted run out-of-band (`cairn gate <run> approve=yes` + resume).
+  #    To drop a single proposal, edit proposals.json before answering yes.
+  - gate: approve
+    reads: [proposals]
+    ask: "Promote these proposals into the workspace (new branch + PR)?"
+    options:
+      "yes": "Apply every proposal in proposals.json on a new branch and open a PR"
+      "no":  "Stop here — keep the proposals as a run record, change nothing"
+    default: "no"
+
+  # 4. open-pr — deterministic: apply the approved edits in a TEMPORARY WORKTREE on a
+  #    fresh branch, commit them by pathspec, push, `gh pr create`. It never commits to
+  #    the working branch (suggestions, not truth — see the script header). `gh` is
+  #    declared in cairn.toml [tools.gh] with needed_by = ["open-pr"]: `cairn plan`
+  #    flags the scoped requirement and `cairn run` hard-stops before minting anything
+  #    when the check fails on this machine.
+  - id: open-pr
+    when: "gates.approve.choice == 'yes'"
+    run: >-
+      python3 "$CAIRN_WORKSPACE/scripts/self-improve-open-pr.py"
+      "{artifact:proposals}" "{artifact:pr-record}"
+    needs: [proposals, approve]
+    produces: [pr-record]

@@ -1,0 +1,25 @@
+{
+  "summary": "Canned curate output for `cairn test` (the stub executor replays this tree): two promotions of the shape a real curation run produces.",
+  "proposals": [
+    {
+      "id": "doctrine-source-of-truth",
+      "learning": "Agents kept re-deriving where the canonical input lives; two runs read a stale copy",
+      "occurrences": 2,
+      "promotion": "prompt",
+      "target": "prompts/DOCTRINE.md",
+      "action": "append",
+      "text": "\n## Canonical inputs\n\nRead inputs only from the artifacts named in your CONTRACT block — never from a path remembered from an earlier run.\n",
+      "rationale": "Recurred across two runs and caused rework; belongs in the doctrine every agent inherits."
+    },
+    {
+      "id": "validator-output-has-title",
+      "learning": "The operator eyeballs every run's output for a missing title field",
+      "occurrences": 3,
+      "promotion": "validator",
+      "target": "validators/has-title.py",
+      "action": "create",
+      "text": "#!/usr/bin/env python3\n\"\"\"has-title — the artifact carries a non-empty title. argv: run_dir, name, path.\"\"\"\nimport json, sys\nfrom pathlib import Path\n\ndoc = json.loads((Path(sys.argv[1]) / sys.argv[3]).read_text(encoding=\"utf-8\"))\nif not doc.get(\"title\"):\n    print(\"missing or empty 'title'\")\n    raise SystemExit(1)\n",
+      "rationale": "Checked by eye three runs in a row — the maturation ladder says encode it as a validator."
+    }
+  ]
+}

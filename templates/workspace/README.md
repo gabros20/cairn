@@ -25,7 +25,11 @@ checks that the agent, its skills, and its artifacts all exist before anything r
 |---|---|
 | `cairn.toml` | workspace config — executors, model tiers, defaults, `[tools]` preflight |
 | `pipelines/hello.yaml` | the day-0 pipeline; grow it by uncommenting the `agent:` step |
+| `pipelines/self-improve.yaml` | the learning loop: aggregate → curate → approve (gate) → PR |
 | `agents/assistant.yaml` | a minimal agent, ready for that first agent step |
+| `agents/curator.yaml` · `skills/self-improve-curator/` | the self-improve judge + its curation doctrine (customize the skill) |
+| `scripts/` | deterministic helpers `run:` steps call (e.g. self-improve's open-pr) |
+| `tests/` | `cairn test` furniture: artifact fixtures, stub replays, the pipeline matrix |
 | `skills/cairn-operator/` | how a coding agent drives cairn as an operator (ships in every workspace) |
 | `schemas/` · `validators/` | artifact contracts (JSON Schema) and acceptance checks |
 | `prompts/DOCTRINE.md` | the isolation + artifact-authority invariants every agent inherits |
@@ -50,3 +54,14 @@ validators, guards, gates, and skills are all *additive* declarations.
 
 Full guide: `docs/TOOLING-AND-GROWTH.md` in the cairn repo. The loop is always **author → plan (static
 verify) → smoke-test a slice (`--from/--to`) → harden (promote checks to validators)**.
+
+## Closing the loop — `cairn run self-improve`
+
+The ladder is powered by noticing; `self-improve` makes the noticing systematic. It
+aggregates every run's `learn` events (`cairn learnings`), has the curator agent judge them
+against the doctrine — noise by default; the policy is yours in
+`skills/self-improve-curator/SKILL.md` — and then STOPS at a human gate. Only an explicit
+"yes" lets the final step apply the approved edits, on a new branch, as a PR via `gh`
+(declared in `[tools.gh]`, so `cairn run` refuses up front when it's missing). Never a
+direct commit: the loop writes suggestions, not truth. Headless runs (cron, `cairn batch`)
+resolve the gate to its default "no", so an unattended run can never self-promote.

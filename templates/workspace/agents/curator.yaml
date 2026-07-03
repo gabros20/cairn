@@ -1,0 +1,17 @@
+# The self-improve curator — the judgment stage of the learning loop (the `curate`
+# step of pipelines/self-improve.yaml). Executor-agnostic: `tier` is abstract and
+# resolves to a concrete model per executor in cairn.toml [executors.*.tiers].
+description: "Judges the aggregated learnings snapshot against the workspace doctrine and proposes maturation-ladder promotions as mechanical, reviewable edits — noise by default; suggestions, not truth."
+
+tier: reasoning         # curation is judgment — route it to the strongest tier
+effort: high
+
+skills: [self-improve-curator]   # the curation doctrine — the seam a workspace customizes
+
+tools:
+  allow: [read, write]  # read the snapshot + workspace files; write ONLY the proposals artifact
+  network: false        # everything the curator judges is already on disk
+
+env: []
+
+returns: schemas/step-return.json

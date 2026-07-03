@@ -103,9 +103,16 @@ sys.exit(0)
 
 
 def build_ws(tmp_path: Path) -> Path:
-    """A real workspace: the template + an agent pipeline, a manual pipeline, a toy guard."""
+    """A real workspace: the template + an agent pipeline, a manual pipeline, a toy guard.
+
+    The shipped self-improve furniture (its pipeline + tests/ fixtures, stubs, matrix) is
+    stripped: these tests exercise the KERNEL suites against a minimal, known universe —
+    hello + the three synthetic pipelines — not the scaffold's own furniture (which is
+    covered by test_self_improve_template.py)."""
     ws = tmp_path / "ws"
     shutil.copytree(REPO / "templates/workspace", ws)
+    shutil.rmtree(ws / "tests")
+    (ws / "pipelines/self-improve.yaml").unlink()
     (ws / "cairn.toml").write_text(_CAIRN_TOML, encoding="utf-8")
     (ws / "pipelines/agentic.yaml").write_text(_AGENTIC, encoding="utf-8")
     (ws / "pipelines/manualp.yaml").write_text(_MANUALP, encoding="utf-8")

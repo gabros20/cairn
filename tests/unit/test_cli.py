@@ -310,11 +310,10 @@ def _twofleet_ws(tmp_path: Path) -> Path:
     (deliberately non-runnable) default — so honoring a recorded stub override is observable:
     a resume that fell back to `claude` would try to spawn it and fail."""
     ws = newkit.new_workspace("fleet", tmp_path)
+    # The scaffold already declares [executors.claude] (with tiers); only `stub` is added.
     (ws / "cairn.toml").write_text(
         (ws / "cairn.toml").read_text()
-        + "\n[executors.claude]\nenabled = true\n[executors.claude.tiers]\n"
-        "balanced = { model = \"sonnet\", effort = \"medium\" }\n"
-        "\n[executors.stub]\nenabled = true\n[executors.stub.tiers]\nbalanced = { model = \"stub\" }\n",
+        + "\n[executors.stub]\nenabled = true\n[executors.stub.tiers]\nbalanced = { model = \"stub\" }\n",
         encoding="utf-8",
     )
     (ws / "agents" / "a1.yaml").write_text('description: "a1"\ntier: balanced\n', encoding="utf-8")
@@ -790,13 +789,16 @@ def test_test_binds_pipeline_suite_green(hello_ws, monkeypatch, capsys):
 
 
 def test_test_surfaces_suite_notes(hello_ws, monkeypatch, capsys):
-    # A day-0 workspace with no fixtures still surfaces the "(no fixtures)" coverage signal —
-    # not just bare passed/failed counts.
+    # The scaffold ships validator fixtures + a pipeline matrix (the self-improve
+    # furniture), so those two suites report real day-0 counts; the suites without
+    # fixtures (guards, envelopes) still surface the "(no fixtures)" coverage signal.
     monkeypatch.chdir(hello_ws)
     rc = main(["test"])
     out = capsys.readouterr().out
     assert rc == int(ExitCode.OK)
-    assert out.count("(no fixtures)") == 4  # one per suite
+    assert out.count("(no fixtures)") == 2  # guards + envelopes
+    assert "validators: 3 passed, 0 failed" in out  # the shipped proposals fixtures
+    assert "pipelines: 2 passed, 0 failed" in out  # hello + self-improve matrix rows
 
 
 def test_test_envelopes_update_is_reachable(hello_ws, monkeypatch, capsys):

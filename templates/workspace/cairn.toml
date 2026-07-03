@@ -17,24 +17,38 @@ step_timeout  = "30m"                            # per-step wall clock; a step m
 trail_context = { events = 12, learnings = 5 }   # how much history an agent envelope carries
 
 # ---------------------------------------------------------------------------
-# Model tiers — the ONLY place vendor model names live. The day-0 `hello`
-# pipeline needs none of this (it runs on `run:` steps alone). Uncomment when
-# you add your first agent: step; an agent picks a tier (reasoning | balanced |
-# cheap) and this maps that tier to a concrete model + effort per executor.
+# Model tiers — the ONLY place vendor model names live. An agent picks a tier
+# (reasoning | balanced | cheap); this maps that tier to a concrete model +
+# effort per executor. The day-0 `hello` pipeline needs none of this (it runs
+# on `run:` steps alone); the `self-improve` curate step is this scaffold's
+# first agent step and routes through it. Point these at whatever models your
+# executor serves.
 # ---------------------------------------------------------------------------
-# [executors.claude]
-# enabled = true
-# [executors.claude.tiers]
-# reasoning = { model = "opus",   effort = "high" }
-# balanced  = { model = "sonnet", effort = "medium" }
-# cheap     = { model = "haiku",  effort = "low" }
+[executors.claude]
+enabled = true
+
+[executors.claude.tiers]
+reasoning = { model = "opus",   effort = "high" }
+balanced  = { model = "sonnet", effort = "medium" }
+cheap     = { model = "haiku",  effort = "low" }
 
 # ---------------------------------------------------------------------------
-# External tools — machine preflight verified by `cairn doctor`. One example;
-# add a [tools.X] block per CLI a pipeline drives. `check` is a presence+auth
-# probe (exit 0 = ok); `needed_by` scopes a failure to the steps that use it
-# (full doc: docs/TOOLING-AND-GROWTH.md §2).
+# External tools — machine preflight. `check` is a presence+auth probe
+# (exit 0 = ok, run by `cairn doctor`); `needed_by` scopes the requirement to
+# the steps that use it (full doc: docs/TOOLING-AND-GROWTH.md §2).
+#
+# `gh` is needed only by self-improve's `open-pr` step. The scoping dogfoods
+# the tool enforcement: `cairn plan self-improve` flags the requirement as a
+# warning (plan never runs checks), and `cairn run self-improve` runs the
+# check and HARD-STOPS before minting a run dir when it fails — while every
+# other pipeline stays unaffected.
 # ---------------------------------------------------------------------------
+[tools.gh]
+check     = "gh auth status"
+install   = "install the GitHub CLI (https://cli.github.com), then run: gh auth login"
+needed_by = ["open-pr"]
+
+# Add a [tools.X] block per CLI your pipelines drive, e.g.:
 # [tools.crawl4ai]
 # check   = "uv run python -c 'import crawl4ai'"
 # install = "uv sync && uv run playwright install chromium"

@@ -61,6 +61,50 @@ def new_workspace(name: str, dest_dir: Path | None = None) -> Path:
 
 
 # --------------------------------------------------------------------------- #
+# Packaged pipelines — furniture copied from the template, not stubbed.
+#
+# `cairn new pipeline self-improve` retrofits the learning-loop furniture
+# (docs/TOOLING-AND-GROWTH.md §7) into an EXISTING workspace: the pipeline plus its
+# curator agent, curation-doctrine skill, proposals schema + validator, open-pr
+# script, and test fixtures/stubs/matrix. The pipeline file itself refuses to
+# overwrite; companion files that already exist are left untouched (never clobber a
+# customization). cairn.toml is never edited — the pipeline's header comment names
+# the two blocks ([executors.*] tiers, [tools.gh]) an older workspace wires by hand.
+# --------------------------------------------------------------------------- #
+
+_PACKAGED_PIPELINE_FILES: dict[str, tuple[str, ...]] = {
+    "self-improve": (
+        "pipelines/self-improve.yaml",
+        "agents/curator.yaml",
+        "skills/self-improve-curator/SKILL.md",
+        "schemas/self-improve-proposals.json",
+        "validators/self-improve-proposals.py",
+        "scripts/self-improve-open-pr.py",
+        "tests/fixtures/proposals/valid-two-promotions.json",
+        "tests/fixtures/proposals/invalid-target-escapes.json",
+        "tests/fixtures/proposals/invalid-missing-rationale.json",
+        "tests/stubs/self-improve/curate/proposals.json",
+        "tests/matrix.yaml",
+    ),
+}
+
+
+def _copy_packaged_pipeline(name: str, workspace_dir: Path) -> Path:
+    src = templates_dir()
+    pipeline_rel = f"pipelines/{name}.yaml"
+    pipeline_path = workspace_dir / pipeline_rel
+    if pipeline_path.exists():
+        raise FileExistsError(f"{pipeline_path} already exists")
+    for rel in _PACKAGED_PIPELINE_FILES[name]:
+        dest = workspace_dir / rel
+        if dest.exists() and rel != pipeline_rel:
+            continue  # keep the workspace's customized copy
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src / rel, dest)  # copy2 keeps the exec bit on validators/scripts
+    return pipeline_path
+
+
+# --------------------------------------------------------------------------- #
 # Single-file stubs — tiny + plan-valid.
 # --------------------------------------------------------------------------- #
 
@@ -124,6 +168,8 @@ def new_stub(kind: str, name: str, workspace_dir: Path) -> Path:
     ``kind`` ∈ {pipeline, agent, skill, validator}. Refuses to overwrite an existing file.
     """
     workspace_dir = Path(workspace_dir)
+    if kind == "pipeline" and name in _PACKAGED_PIPELINE_FILES:
+        return _copy_packaged_pipeline(name, workspace_dir)
     if kind == "pipeline":
         path = workspace_dir / "pipelines" / f"{name}.yaml"
         body = _PIPELINE_STUB.format(name=name)

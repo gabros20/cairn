@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "self-improve proposals",
+  "description": "The typed contract between curate, the approve gate, and open-pr: maturation-ladder promotions expressed as mechanical edits. An empty `proposals` array is valid — it means everything in the snapshot was noise.",
+  "type": "object",
+  "required": ["proposals"],
+  "additionalProperties": false,
+  "properties": {
+    "summary": {
+      "type": "string",
+      "description": "One or two sentences for the human at the gate: what recurred, what was noise."
+    },
+    "proposals": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "promotion", "target", "action", "text", "rationale"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "learning": {
+            "type": "string",
+            "description": "The learning note(s) this promotes, quoted from the snapshot."
+          },
+          "occurrences": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "How many snapshot lines carry this lesson."
+          },
+          "promotion": {
+            "enum": ["skill", "validator", "guard", "param", "prompt", "agent", "pipeline"],
+            "description": "The maturation-ladder rung this edit executes."
+          },
+          "target": {
+            "type": "string",
+            "minLength": 1,
+            "description": "Workspace-relative file the edit amends (never absolute, never ..)."
+          },
+          "action": { "enum": ["create", "append", "replace"] },
+          "find": {
+            "type": "string",
+            "minLength": 1,
+            "description": "For replace: the exact text to replace (must occur exactly once in target)."
+          },
+          "text": { "type": "string", "minLength": 1 },
+          "rationale": {
+            "type": "string",
+            "minLength": 1,
+            "description": "For the human reviewer: which learnings, how often, why this rung."
+          }
+        }
+      }
+    }
+  }
+}
