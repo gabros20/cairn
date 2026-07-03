@@ -46,6 +46,17 @@ T3_NOTICE = (
 )
 
 
+def _flatten(text: str) -> str:
+    """Collapse newlines to spaces so interpolated text stays on one line.
+
+    Trail notes/tags (T2 data an earlier step wrote) and validator retry reasons are the
+    only agent-influenced strings the composer interpolates. An embedded newline lets one
+    forge a `# RETURN` header or a `<<<STEP`/`STEP>>>` sentinel in a *later* envelope —
+    a cross-step injection persistence channel — so both are flattened at this chokepoint.
+    """
+    return text.replace("\r", " ").replace("\n", " ")
+
+
 # --------------------------------------------------------------------------- #
 # The strict path renderer (shared, byte-for-byte, with the walker).
 # --------------------------------------------------------------------------- #
@@ -178,7 +189,9 @@ class Composer:
         if retry_reasons:
             lines += ["", "## PREVIOUS ATTEMPT FAILED VALIDATION:"]
             for reason in retry_reasons:
-                lines.append(reason)
+                # Flatten each reason to one line: a validator reason carrying an embedded
+                # newline could otherwise forge a block header / STEP sentinel here.
+                lines.append(_flatten(reason))
 
         return "\n".join(lines)
 
@@ -254,8 +267,11 @@ class Composer:
             lines += ["", "Learnings:"]
             for ev in recent:
                 data = ev.get("data") or {}
-                note = data.get("note", "")
-                tag = data.get("tag")
+                # Trail text is T2 data an earlier step wrote — flatten newlines so a stored
+                # note/tag can't forge a `# RETURN` header or `<<<STEP`/`STEP>>>` sentinel in
+                # THIS envelope (a cross-step injection persistence channel).
+                note = _flatten(str(data.get("note", "")))
+                tag = _flatten(str(data.get("tag"))) if data.get("tag") else None
                 lines.append(f"- {note}" + (f" [{tag}]" if tag else ""))
         return "\n".join(lines)
 
@@ -278,6 +294,11 @@ class Composer:
             path = self.workspace_dir / rel
             if path.is_file():
                 lines.append(path.read_text(encoding="utf-8").rstrip("\n"))
+                lines.append("")
+            else:
+                # A configured-but-absent doctrine is security-relevant — never omit it
+                # silently; make the vanishing visible in the envelope itself.
+                lines.append(f"(doctrine file missing: {rel})")
                 lines.append("")
         lines.append("## Untrusted content")
         lines.append("")
