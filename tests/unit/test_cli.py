@@ -367,6 +367,21 @@ def test_run_run_dir_existing_refuses_cross_major_version(hello_ws, monkeypatch,
     assert f"resume {rd} --force" in err
 
 
+def test_run_run_dir_existing_unreadable_run_json_is_clean_config_error(hello_ws, monkeypatch, capsys):
+    # A dir explicitly chosen for resume whose manifest can't be read is a config error —
+    # fail loud like `cairn resume`, never degrade to a misleading "no cairn version"
+    # warning followed by an uncaught traceback in the walk.
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=friendly"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    (rd / "run.json").write_text("{corrupt", encoding="utf-8")
+    rc = main(["run", "hello", "--headless", "--run-dir", str(rd)])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "cannot read" in err and "run.json" in err
+    assert "records no cairn version" not in err  # no misleading version warning
+
+
 def test_run_run_dir_existing_clean_path_resumes(hello_ws, monkeypatch):
     # Same pipeline, same version → the guards stay silent and the resume completes.
     monkeypatch.chdir(hello_ws)
@@ -967,6 +982,55 @@ def test_run_idempotent_incomplete_match_refuses_pipeline_drift(hello_ws, monkey
     # The remedy must name the command that actually takes --force (`cairn run` has no
     # --force flag), pointing at the drifted run dir.
     assert f"cairn resume {before[0]} --force" in err
+    assert sorted((hello_ws / "runs").iterdir()) == before  # nothing resumed, nothing minted
+
+
+_MANUALFLOW = (
+    "pipeline: manualflow\nversion: 1\nrun_id: \"manualflow-{date}\"\n"
+    "artifacts:\n  token: { path: token.txt, validator: validators/nonempty.py }\n"
+    "steps:\n"
+    "  - id: approve\n    manual: \"write token.txt\"\n    produces: [token]\n"
+    "  - id: after\n    run: \"echo done\"\n    needs: [token]\n"
+)
+
+
+def test_run_idempotent_incomplete_match_refuses_cross_major_version(hello_ws, monkeypatch, capsys):
+    # A timer re-fire on a run dir minted by a different cairn MAJOR must refuse like
+    # `cairn resume` does — `cairn run` has no --force, so the remedy names resume.
+    monkeypatch.chdir(hello_ws)
+    (hello_ws / "pipelines" / "manualflow.yaml").write_text(_MANUALFLOW, encoding="utf-8")
+    assert main(["run", "manualflow", "--headless", "--idempotent"]) == int(ExitCode.NEEDS_HUMAN)
+    before = sorted((hello_ws / "runs").iterdir())
+    _set_run_version(before[0], "9.0.0")
+
+    capsys.readouterr()
+    rc = main(["run", "manualflow", "--headless", "--idempotent"])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "9.0.0" in err and cairn.__version__ in err  # names both versions
+    assert f"cairn resume {before[0]} --force" in err
+    assert sorted((hello_ws / "runs").iterdir()) == before  # nothing resumed, nothing minted
+
+
+def test_run_idempotent_match_with_invalid_run_json_is_clean_config_error(hello_ws, monkeypatch, capsys):
+    # A key-matching run.json that fails the cairn:run schema (valid JSON, so schedkit still
+    # matches it) must fail loud at the guard — exit CONFIG with the read error, not warn
+    # "records no cairn version" and then blow up (exit 4) inside the walk.
+    monkeypatch.chdir(hello_ws)
+    (hello_ws / "pipelines" / "manualflow.yaml").write_text(_MANUALFLOW, encoding="utf-8")
+    assert main(["run", "manualflow", "--headless", "--idempotent"]) == int(ExitCode.NEEDS_HUMAN)
+    before = sorted((hello_ws / "runs").iterdir())
+    rd = before[0]
+    doc = json.loads((rd / "run.json").read_text())
+    del doc["cairn_version"]  # schema-required — load_run refuses, idempotency key still matches
+    (rd / "run.json").write_text(json.dumps(doc, indent=2), encoding="utf-8")
+
+    capsys.readouterr()
+    rc = main(["run", "manualflow", "--headless", "--idempotent"])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "cannot read" in err and "run.json" in err
+    assert "records no cairn version" not in err  # no misleading version warning
     assert sorted((hello_ws / "runs").iterdir()) == before  # nothing resumed, nothing minted
 
 

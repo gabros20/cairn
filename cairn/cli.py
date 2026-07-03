@@ -458,14 +458,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             # An existing --run-dir resumes (with or without --idempotent) — through the same
             # guards as every other resume entrance (drift → version). `cairn run` has no
             # --force; the refusals name `cairn resume <run-dir> --force` as the escape hatch.
-            try:
-                recorded = load_run(run_dir)
-            except (OSError, ValueError, ConfigError):
-                recorded = {}
-            fail = _pipeline_drift_guard(recorded.get("pipeline_hash"), phash, p.pipeline, run_dir, force=False)
-            if fail is not None:
-                return fail
-            fail = _version_compat_guard(recorded.get("cairn_version"), run_dir, force=False)
+            fail = _resume_guards(run_dir, phash, p.pipeline, force=False)
             if fail is not None:
                 return fail
     else:
@@ -483,20 +476,10 @@ def _cmd_run(args: argparse.Namespace) -> int:
             return int(ExitCode.OK)
         if match is not None:
             # Incomplete equivalent run → resume it, never mint a variant — but through the
-            # same drift guard `cairn resume` enforces: a timer re-fire after a pipeline edit
-            # must fail loud, not silently resume the old run against the new file.
-            try:
-                recorded = load_run(match.run_dir)
-                recorded_hash = recorded.get("pipeline_hash")
-                recorded_version = recorded.get("cairn_version")
-            except (OSError, ValueError, ConfigError):
-                recorded_hash = recorded_version = None
-            fail = _pipeline_drift_guard(recorded_hash, phash, p.pipeline, match.run_dir, force=False)
-            if fail is not None:
-                return fail
-            # `cairn run` has no --force flag; a cross-major run-dir can only be resumed via
-            # `cairn resume … --force`, so the idempotent re-fire refuses it here too.
-            fail = _version_compat_guard(recorded_version, match.run_dir, force=False)
+            # same guards `cairn resume` enforces: a timer re-fire after a pipeline edit or
+            # a cross-major cairn upgrade must fail loud, not silently resume. `cairn run`
+            # has no --force flag; only `cairn resume … --force` can override.
+            fail = _resume_guards(match.run_dir, phash, p.pipeline, force=False)
             if fail is not None:
                 return fail
             run_dir = match.run_dir
@@ -609,6 +592,25 @@ def _version_compat_guard(recorded: str | None, run_dir: Path, *, force: bool) -
         file=sys.stderr,
     )
     return None
+
+
+def _resume_guards(run_dir: Path, phash: str, pipeline: str, *, force: bool) -> int | None:
+    """The shared gate for ``cairn run``'s two resume entrances (``--run-dir <existing>``
+    and ``--idempotent``'s auto-match): read the manifest fail-loud, then drift → version —
+    the same order ``cairn resume`` applies them. A dir chosen for resume whose run.json
+    can't be read (or fails the cairn:run schema) is a config error: degrading to ``{}``
+    would print a misleading "records no cairn version" warning and then crash later inside
+    the walk. Returns the exit code to fail with, or None to proceed. (``_cmd_resume`` stays
+    separate — its force comes from argv and it needs the run doc for params/executors.)"""
+    try:
+        recorded = load_run(run_dir)
+    except (OSError, ValueError, ConfigError) as exc:
+        print(f"cairn: cannot read {run_dir}/run.json: {exc}", file=sys.stderr)
+        return int(ExitCode.CONFIG)
+    fail = _pipeline_drift_guard(recorded.get("pipeline_hash"), phash, pipeline, run_dir, force=force)
+    if fail is not None:
+        return fail
+    return _version_compat_guard(recorded.get("cairn_version"), run_dir, force=force)
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:
