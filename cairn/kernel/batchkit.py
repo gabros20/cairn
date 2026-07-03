@@ -42,7 +42,7 @@ Clock = Callable[[], float]
 # whole batch (one per line, all held at once), so we keep only a small legible TAIL — the end,
 # where the actual failure (gate reason / config / executor error) is — never the whole stream.
 _ERROR_TAIL_MAX_LINES = 20
-_ERROR_TAIL_MAX_BYTES = 2000  # chars; an approximate byte cap (kept simple to avoid mid-codepoint splits)
+_ERROR_TAIL_MAX_CHARS = 2000  # str characters (not bytes) — a simple cap that can't split a codepoint
 
 
 # --------------------------------------------------------------------------- #
@@ -174,9 +174,9 @@ def default_spawn(argv: list[str], cwd: Path) -> tuple[int, str, str]:
 def _error_tail(stderr: str) -> str | None:
     """The bounded, legible tail of a failed child's stderr, or None if it wrote nothing.
 
-    Keeps the LAST ``_ERROR_TAIL_MAX_LINES`` lines then caps to ``_ERROR_TAIL_MAX_BYTES`` chars
-    (from the end) — the end is where the actual failure surfaces, and the cap keeps a runaway
-    child from ballooning the RunOutcome held for the whole batch."""
+    Keeps the LAST ``_ERROR_TAIL_MAX_LINES`` lines then caps to ``_ERROR_TAIL_MAX_CHARS``
+    characters (from the end) — the end is where the actual failure surfaces, and the cap keeps
+    a runaway child from ballooning the RunOutcome held for the whole batch."""
     text = stderr.strip()
     if not text:
         return None
@@ -184,8 +184,8 @@ def _error_tail(stderr: str) -> str | None:
     if len(lines) > _ERROR_TAIL_MAX_LINES:
         lines = lines[-_ERROR_TAIL_MAX_LINES:]
     tail = "\n".join(lines)
-    if len(tail) > _ERROR_TAIL_MAX_BYTES:
-        tail = tail[-_ERROR_TAIL_MAX_BYTES:]
+    if len(tail) > _ERROR_TAIL_MAX_CHARS:
+        tail = tail[-_ERROR_TAIL_MAX_CHARS:]
     return tail
 
 
@@ -304,8 +304,20 @@ def run_batch(
 
 def _progress(out: TextIO, done: int, total: int, o: RunOutcome) -> None:
     rd = o.run_dir.name if o.run_dir is not None else "?"
-    # ONE line per completion (pinned): compact a multi-line error tail to its first line here;
+    # ONE line per completion (pinned): compact a multi-line error tail to a one-line preview;
     # the full tail is rendered in the CLI's end-of-batch summary block.
-    tail = f"  {o.error.splitlines()[0]}" if o.error else ""
+    tail = f"  {_preview_line(o.error)}" if o.error else ""
     out.write(f"[{done}/{total}] {rd}  exit {o.exit_code}  {o.duration_s:.1f}s{tail}\n")
     out.flush()
+
+
+def _preview_line(error: str) -> str:
+    """The one-line preview of an error tail: the LAST line — where tracebacks and error
+    messages terminate — except a trailing run-outcome marker (``cairn: … → run_dir``), which
+    the progress line already conveys (run dir + exit code); skip past those to the last
+    substantive line. Falls back to the true last line if the tail is all marker."""
+    lines = error.splitlines()
+    for line in reversed(lines):
+        if not ("cairn:" in line and "→ " in line):
+            return line
+    return lines[-1]

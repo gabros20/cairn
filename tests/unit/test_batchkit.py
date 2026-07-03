@@ -295,7 +295,7 @@ def test_error_tail_is_bounded_for_a_runaway_child(tmp_path):
     err = res.outcomes[0].error
     assert err is not None
     # bounded: far smaller than the multi-MB flood, and both bounds are honored
-    assert len(err) <= batchkit._ERROR_TAIL_MAX_BYTES
+    assert len(err) <= batchkit._ERROR_TAIL_MAX_CHARS
     assert len(err.splitlines()) <= batchkit._ERROR_TAIL_MAX_LINES
     # the tail (the real reason) is what we keep; the head noise is gone
     assert "FATAL: the real reason" in err
@@ -317,18 +317,39 @@ def test_failed_child_with_empty_stderr_has_none_error(tmp_path):
 
 def test_progress_line_stays_single_line_for_multiline_error(tmp_path):
     # A failed child with a multi-line stderr tail must still stream ONE progress line
-    # (the per-completion contract) — the progress compacts the error to its first line.
+    # (the per-completion contract) — the progress compacts the error to a one-line preview:
+    # the LAST line (where tracebacks/errors terminate), not the first.
     pf = _write_jsonl(tmp_path / "s.jsonl", ['{"url": "a"}'])
 
     def spawn(argv, cwd):
-        return 4, "", "first failure line\nsecond line\nthird line\n"
+        return 4, "", "Traceback (most recent call last):\nsecond line\nValueError: the reason\n"
 
     out = io.StringIO()
     batchkit.run_batch(tmp_path, "hello", pf, jobs=1, out=out, spawn=spawn)
     lines = [ln for ln in out.getvalue().splitlines() if ln.strip()]
     assert len(lines) == 1
-    assert "first failure line" in lines[0]
+    assert "ValueError: the reason" in lines[0]
     assert "second line" not in lines[0]
+
+
+def test_progress_preview_skips_trailing_run_outcome_marker(tmp_path):
+    # A halted cairn child ends its stderr with the marker line (`cairn: run halted … → dir`),
+    # which the progress line already conveys (run dir + exit code) — the preview skips past
+    # it to the last SUBSTANTIVE line (the actual halt reason).
+    pf = _write_jsonl(tmp_path / "s.jsonl", ['{"url": "a"}'])
+
+    def spawn(argv, cwd):
+        stderr = (
+            "cairn: gate 'design' halted: fidelity below threshold\n"
+            "cairn: run halted (exit 6) → /runs/a\n"
+        )
+        return 6, "", stderr
+
+    out = io.StringIO()
+    batchkit.run_batch(tmp_path, "hello", pf, jobs=1, out=out, spawn=spawn)
+    line = out.getvalue().strip()
+    assert "fidelity below threshold" in line
+    assert "run halted (exit 6)" not in line
 
 
 # --------------------------------------------------------------------------- #
