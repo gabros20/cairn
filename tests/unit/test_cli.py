@@ -782,6 +782,9 @@ def test_run_idempotent_incomplete_match_refuses_pipeline_drift(hello_ws, monkey
     err = capsys.readouterr().err
     assert rc == int(ExitCode.CONFIG)
     assert "hash drift" in err
+    # The remedy must name the command that actually takes --force (`cairn run` has no
+    # --force flag), pointing at the drifted run dir.
+    assert f"cairn resume {before[0]} --force" in err
     assert sorted((hello_ws / "runs").iterdir()) == before  # nothing resumed, nothing minted
 
 

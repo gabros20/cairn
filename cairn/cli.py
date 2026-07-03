@@ -473,7 +473,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
                 recorded_hash = load_run(match.run_dir).get("pipeline_hash")
             except (OSError, ValueError, ConfigError):
                 recorded_hash = None
-            fail = _pipeline_drift_guard(recorded_hash, phash, p.pipeline, force=False)
+            fail = _pipeline_drift_guard(recorded_hash, phash, p.pipeline, match.run_dir, force=False)
             if fail is not None:
                 return fail
             run_dir = match.run_dir
@@ -525,17 +525,19 @@ def _idempotent_shortcut(run_dir: Path) -> int | None:
     return None
 
 
-def _pipeline_drift_guard(recorded: str | None, current_hash: str, pipeline: str, *, force: bool) -> int | None:
+def _pipeline_drift_guard(recorded: str | None, current_hash: str, pipeline: str, run_dir: Path, *, force: bool) -> int | None:
     """The pipeline-hash drift check shared by ``cairn resume`` and ``run --idempotent``'s
     resume path: a recorded hash that matches neither the current file nor the pre-hash
     sentinel means the pipeline changed under the run. Returns the exit code to fail with,
-    or None to proceed (with a warning when ``force`` overrode a real drift)."""
+    or None to proceed (with a warning when ``force`` overrode a real drift). The remedy
+    names the command that actually takes ``--force`` (``cairn run`` has no such flag)."""
     if not recorded or recorded in ("sha256:unknown", current_hash):
         return None
     if not force:
         print(
             f"cairn: pipeline {pipeline!r} has changed since this run was planned "
-            f"(hash drift). Re-run with --force to resume against the current file.",
+            f"(hash drift). Run `cairn resume {run_dir} --force` to resume against "
+            f"the current file.",
             file=sys.stderr,
         )
         return int(ExitCode.CONFIG)
@@ -561,7 +563,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         print(f"cairn: cannot resume — pipeline file {pfile} no longer exists", file=sys.stderr)
         return int(ExitCode.CONFIG)
 
-    fail = _pipeline_drift_guard(run_doc.get("pipeline_hash"), _pipeline_hash(ws, pipeline), pipeline, force=args.force)
+    fail = _pipeline_drift_guard(run_doc.get("pipeline_hash"), _pipeline_hash(ws, pipeline), pipeline, run_dir, force=args.force)
     if fail is not None:
         return fail
 
