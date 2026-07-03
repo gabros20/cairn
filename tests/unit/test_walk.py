@@ -504,12 +504,19 @@ def test_manual_tty_interrupt_halts_needs_human(ws: Path, tmp_path: Path, monkey
 
 
 def test_manual_step_resumes_once_its_produce_exists(ws: Path, tmp_path: Path) -> None:
-    art = ArtifactDecl("ctx", "ctx.txt", validator=_nonempty(ws))
+    # Schema-validated (in-process) artifact — no subprocess validator in the resume-decision
+    # path, so the skip verdict is a pure function of disk state, deterministic under any
+    # ordering/load. The behaviour under test is the halt→operator→resume-skip semantics.
+    art = ArtifactDecl("ctx", "ctx.json", schema=_verdict_schema(ws))
     plan = make_plan([manual_step("m", "do it", produces=["ctx"])], {"ctx": art})
     run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
 
     assert _walk(ws, plan, run_dir, {}) == ExitCode.NEEDS_HUMAN  # first pass halts
-    (run_dir / "ctx.txt").write_text("operator did it")          # answered out of band
+    # The needs-human halt records the NODE as "running" (not "halted") — that is what lets a
+    # resume satisfy it via the artifact predicate instead of force-re-running it.
+    assert node_status(load_run(run_dir), "m") == "running"
+
+    (run_dir / "ctx.json").write_text(json.dumps({"verdict": "operator did it"}))  # answered out of band
     assert _walk(ws, plan, run_dir, {}) == ExitCode.OK           # resume skips the manual
     assert node_status(load_run(run_dir), "m") == "done"
 
