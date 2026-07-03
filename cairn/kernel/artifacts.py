@@ -161,7 +161,11 @@ def resolve_path(decl: ArtifactDecl, rendered_path: str, run_dir: Path) -> Resol
         )
 
     if _is_glob(rendered_path):
-        paths = sorted(run_dir.glob(rendered_path))
+        # A glob names a set of *files*: drop directory matches, and expand a trailing
+        # bare ``**`` to ``**/*`` (pathlib's bare ``**`` matches directories only), so the
+        # kernel and the scaffold's nonempty.py agree on what ``blueprints/**`` means.
+        pattern = f"{rendered_path}/*" if rendered_path.endswith("**") else rendered_path
+        paths = sorted(p for p in run_dir.glob(pattern) if p.is_file())
     else:
         paths = [run_dir / rendered_path]
     return ResolvedArtifact(name=decl.name, paths=paths, rendered_path=rendered_path)
@@ -216,13 +220,20 @@ def _rel(path: Path, run_dir: Path) -> str:
 
 
 def _schema_reasons(resolved: ResolvedArtifact, schema_file: Path, run_dir: Path) -> list[str]:
-    """JSON-Schema every matched ``.json`` file: parse errors and violations become reasons."""
+    """JSON-Schema every matched ``.json`` file: parse errors and violations become reasons.
+
+    A schema that matched *no* JSON file (a plain path that is a directory, or a glob
+    hitting only non-JSON files) is a failure, not a silent pass — otherwise declaring a
+    schema over the wrong path would validate nothing yet report done.
+    """
     schema = json.loads(schema_file.read_text(encoding="utf-8"))
     validator = jsonschema.Draft202012Validator(schema)
     reasons: list[str] = []
+    checked = 0
     for path in resolved.paths:
         if path.suffix != ".json" or not path.is_file():
             continue
+        checked += 1
         rel = _rel(path, run_dir)
         try:
             document = json.loads(path.read_text(encoding="utf-8"))
@@ -233,6 +244,8 @@ def _schema_reasons(resolved: ResolvedArtifact, schema_file: Path, run_dir: Path
             location = "/".join(str(p) for p in error.path)
             where = f" at {location}" if location else ""
             reasons.append(f"{rel}{where}: {error.message}")
+    if checked == 0:
+        reasons.append(f"schema declared but no JSON matched: {resolved.rendered_path}")
     return reasons
 
 
@@ -273,7 +286,9 @@ def _validator_reasons(
     if proc.returncode == 1:
         lines = [ln for ln in proc.stdout.splitlines() if ln.strip()]
         return lines if lines else ["validator failed without reasons"]
-    return [f"validator {validator.name} exited with code {proc.returncode}"]
+    stderr_lines = [ln for ln in proc.stderr.splitlines() if ln.strip()]
+    detail = f": {stderr_lines[-1]}" if stderr_lines else ""
+    return [f"validator {validator.name} exited with code {proc.returncode}{detail}"]
 
 
 # --------------------------------------------------------------------------- #

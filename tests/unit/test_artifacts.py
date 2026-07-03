@@ -329,3 +329,55 @@ def test_count_cycles_stops_at_first_gap(tmp_path):
 def test_count_cycles_zero_when_none_exist(tmp_path):
     decl = ArtifactDecl(name="art-review", path="qa/art-review-r{cycle}.json", schema=tmp_path)
     assert count_cycles(decl, tmp_path, lambda c: f"qa/art-review-r{c}.json") == 0
+
+
+# --------------------------------------------------------------------------- #
+# No-false-green: a schema that matched zero JSON files must NOT pass
+# --------------------------------------------------------------------------- #
+
+
+def test_schema_on_plain_directory_is_not_false_green(tmp_path):
+    # A plain path that resolves to a directory: it "exists" but nothing JSON was checked.
+    schema = _schema(tmp_path, {"type": "object", "required": ["url"]})
+    (tmp_path / "outdir").mkdir()
+    decl = _decl(name="d", path="outdir", schema=schema)
+    result = validate(resolve_path(decl, "outdir", tmp_path), decl, tmp_path, tmp_path)
+    assert result.ok is False
+    assert any("no JSON matched" in r for r in result.reasons)
+
+
+def test_schema_glob_matching_only_non_json_is_not_false_green(tmp_path):
+    schema = _schema(tmp_path, {"type": "object", "required": ["url"]})
+    (tmp_path / "bp").mkdir()
+    (tmp_path / "bp" / "a.txt").write_text("hi")
+    decl = ArtifactDecl(name="bp", path="bp/**", schema=schema)
+    result = validate(resolve_path(decl, "bp/**", tmp_path), decl, tmp_path, tmp_path)
+    assert result.ok is False
+    assert any("no JSON matched" in r for r in result.reasons)
+
+
+# --------------------------------------------------------------------------- #
+# Glob resolution matches files only; a trailing bare ** recurses
+# --------------------------------------------------------------------------- #
+
+
+def test_glob_matches_nested_files_not_intermediate_dirs(tmp_path):
+    (tmp_path / "x" / "sub").mkdir(parents=True)
+    (tmp_path / "x" / "a.json").write_text("{}")
+    (tmp_path / "x" / "sub" / "b.json").write_text("{}")
+    resolved = resolve_path(_decl(name="x", path="x/**"), "x/**", tmp_path)
+    names = sorted(p.name for p in resolved.paths)
+    assert names == ["a.json", "b.json"]  # nested file included, "sub" dir excluded
+
+
+# --------------------------------------------------------------------------- #
+# Crash reason carries the last stderr line
+# --------------------------------------------------------------------------- #
+
+
+def test_unexpected_exit_reason_includes_last_stderr_line(tmp_path):
+    (tmp_path / "out.json").write_text("{}")
+    decl = _decl(validator="crash_stderr.py")
+    result = validate(resolve_path(decl, "out.json", tmp_path), decl, tmp_path, VALIDATORS)
+    assert result.ok is False
+    assert any("crash_stderr.py" in r and "boom-last-line" in r for r in result.reasons)
