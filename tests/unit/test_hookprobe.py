@@ -211,6 +211,24 @@ def test_render_lines_are_legible():
 # --------------------------------------------------------------------------- #
 
 
+def test_env_passthrough_matches_walker_baseline_tuple():
+    """Full-tuple lockstep guard: ``_ENV_PASSTHROUGH`` must equal the walker's deny-by-default
+    baseline in walk.py::_Walk._build_env. The walker inlines its tuple (no named constant, and
+    walk.py is not this package's to edit), so the guard reads it from the source of the ONE
+    method that owns it — if that loop is reshaped or renamed, this fails loudly and the
+    lockstep must be re-verified by hand."""
+    import inspect
+    import re
+
+    from cairn.kernel import walk
+
+    src = inspect.getsource(walk._Walk._build_env)
+    m = re.search(r"for key in \(([^)]*)\):", src)
+    assert m, "walk.py _build_env baseline loop not found — re-verify the env lockstep"
+    walker_keys = tuple(s.strip().strip("\"'") for s in m.group(1).split(",") if s.strip())
+    assert walker_keys == hookprobe._ENV_PASSTHROUGH
+
+
 def test_build_probe_env_mirrors_walker_baseline(tmp_path, monkeypatch):
     monkeypatch.setenv("PATH", "/usr/bin")
     monkeypatch.setenv("HOME", str(tmp_path))
@@ -415,6 +433,24 @@ def test_codex_auth_defaults_to_home_dot_codex(tmp_path, monkeypatch):
     canary, marker, sidecar = _codex_canary(tmp_path)
     CodexHookRecipe().write_canary(canary, marker, sidecar)
     assert (canary / ".codex" / "auth.json").exists()
+
+
+def test_codex_auth_copy_oserror_degrades_to_unauthenticated(tmp_path, monkeypatch):
+    # A failing copy (disk/permissions) must degrade to the unauthenticated path — the live
+    # probe then reports inconclusive — and must NEVER crash write_canary.
+    real_home = tmp_path / "realhome" / ".codex"
+    _write_real_codex_home(real_home, with_auth=True)
+    monkeypatch.setenv("CODEX_HOME", str(real_home))
+    monkeypatch.setattr(
+        hookprobe.shutil, "copyfile",
+        lambda src, dst: (_ for _ in ()).throw(OSError("disk says no")),
+    )
+
+    canary, marker, sidecar = _codex_canary(tmp_path)
+    CodexHookRecipe().write_canary(canary, marker, sidecar)  # must not raise
+    assert not (canary / ".codex" / "auth.json").exists()
+    # The rest of the canary is intact — only the auth material is missing.
+    assert (canary / ".codex" / "hooks.json").exists()
 
 
 def test_codex_copied_auth_dies_with_the_canary(fakebin, tmp_path, monkeypatch):

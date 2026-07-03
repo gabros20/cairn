@@ -522,8 +522,7 @@ def render(result: ProbeResult, blocking_hooks: bool | None) -> tuple[str, str]:
     else:  # None / False — the probe is deciding, so no concrete outcome is an error
         level = "warning" if result.outcome == "inconclusive" else "info"
 
+    # One space after every mark: "✔ "/"✗ " lead full-width; "  ! "/"  · " carry their own
+    # two-space indent inside the mark, matching doctor's warning/info convention.
     mark = {"ok": _OK, "error": _BAD, "warning": "  !", "info": "  ·"}[level]
-    # ok/error lead with a full-width mark + space; warning/info marks already carry the indent.
-    sep = " " if mark in (_OK, _BAD) else " "
-    line = f"{mark}{sep}hook probe {result.executor}   {msg}"
-    return level, line
+    return level, f"{mark} hook probe {result.executor}   {msg}"
