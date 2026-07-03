@@ -337,6 +337,10 @@ def _static_check_paths(expr: Expr, label: str, ctx: _Ctx) -> None:
     short-circuited ``&&``/``||``, so a misspelling on the lazy branch
     (``gates.g.choice=='yes' && params.NOPE=='z'``) can no longer hide until runtime.
     Runtime roots (artifacts/gates/run/cycle) are not checked — they are unknowable now.
+
+    Known limitation: a node dropped by its own plan-time ``when:``/``unless:`` is never
+    parsed, so a params/dims typo *inside that dropped subtree* is not checked here — such a
+    typo surfaces only in the modes where the node is live (and is caught then).
     """
     for root, parts in expr.paths():
         if root not in ("params", "dims"):
