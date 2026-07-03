@@ -201,6 +201,33 @@ def test_keep_last_counts_a_live_run_toward_m(tmp_path):
     assert any("running" in reason for _, reason in plan.skipped)
 
 
+def test_naive_created_at_is_read_as_utc_not_a_crash(tmp_path):
+    # Real run.json files carry a NAIVE created_at (walk.py writes datetime.now().isoformat());
+    # plan_gc's aware `now` must not TypeError on them — a naive created_at reads as UTC and
+    # is age-evaluated under keep_days and ranked under keep_last like any other run.
+    for run_id, created_at in (
+        ("naive-old-20260601", "2026-06-01T12:00:00"),
+        ("naive-fresh-20260702", "2026-07-02T12:00:00"),
+    ):
+        run_dir = tmp_path / run_id
+        run_dir.mkdir()
+        (run_dir / "run.json").write_text(
+            json.dumps({"run_id": run_id, "pipeline": "p", "created_at": created_at, "status": "done"})
+        )
+        w = TrailWriter(run_dir, run_id)
+        w.emit("run-done")
+        w.close()
+
+    # keep_days: the old naive run is age-evaluated (~32 days) and selected; the fresh kept.
+    by_days = plan_gc(tmp_path, keep_days=7, now=NOW)
+    assert [c.run_id for c in by_days.candidates] == ["naive-old-20260601"]
+    assert by_days.candidates[0].age_days is not None and by_days.candidates[0].age_days > 30
+
+    # keep_last: both rank normally — newest-1 keeps the fresh run, selects the old one.
+    by_last = plan_gc(tmp_path, keep_last=1, now=NOW)
+    assert [c.run_id for c in by_last.candidates] == ["naive-old-20260601"]
+
+
 def test_no_selection_rule_selects_nothing(tmp_path):
     _make_run(tmp_path, "old-20260601", age_days=99)
     plan = plan_gc(tmp_path, now=NOW)

@@ -27,7 +27,7 @@ import fcntl
 import json
 import shutil
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from cairn.kernel.runstate import LOCK_NAME, RUN_JSON
@@ -90,9 +90,14 @@ class _RunInfo:
 
 def _parse_dt(value: str) -> datetime | None:
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except (AttributeError, ValueError):
         return None
+    if dt.tzinfo is None:
+        # walk.py writes naive created_at timestamps — pin them to UTC so arithmetic
+        # against the aware `now` never raises.
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _load_info(run_dir: Path) -> _RunInfo | None:
