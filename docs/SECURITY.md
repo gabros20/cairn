@@ -24,14 +24,17 @@ VERCEL_TOKEN = { needed_by = ["deploy"] }
 
 Sources, in order: process env → workspace `.env` (gitignored; scaffold ships it with placeholder
 values — the operator fills it in, never pastes secrets into a chat or a prompt) → per-run files
-where a tool demands them (the `.brease/context.json` pattern). `cairn doctor` checks *presence*
+where a tool demands them (the `.brease/context.json` pattern). The `.env` reader is deliberately
+lenient — it tolerates a leading `export ` and strips matching surrounding quotes off a value — so
+a file copied from a shell profile just works. `cairn doctor` checks *presence*
 of declared names, `cairn plan` fails a range whose steps need an absent secret — both without
 ever reading the value into a message.
 
 ### 1.2 Pass-through — deny by default
 
-A step's process env is **scrubbed baseline** (PATH, HOME, locale, `CAIRN_*`) **plus only what its
-agent declares**:
+A step's process env is a **scrubbed baseline** (`PATH`, `HOME`, `LANG`/`LC_ALL`, `TMPDIR`, the
+`CAIRN_RUN_DIR`/`CAIRN_STEP`/`CAIRN_WORKSPACE` run vars, and `CLAUDE_PROJECT_DIR`) **plus only what
+its agent declares**:
 
 ```yaml
 # agents/populator.yaml
@@ -143,6 +146,7 @@ separate machinery.
   [--artifacts-only]` deletes or slims old runs (`--artifacts-only` keeps `run.json` + trail +
   envelopes — the audit skeleton — while dropping bulk payloads). Never automatic; runs are the
   audit record and deleting them is an operator's decision.
+  *Status: designed; the `gc` verb is a stub today (exit 2) — lands C6, see IMPLEMENTATION-PLAN.*
 
 ## 6. Non-features, named
 

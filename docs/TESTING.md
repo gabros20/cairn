@@ -45,8 +45,8 @@ tests/
 ├── fixtures/<artifact>/valid-*.{json,md} invalid-*.{json,md}   # validator + schema fixtures
 ├── guards/<guard>/allow-*.json deny-*.json                     # guard-check fixtures (stdin payloads)
 ├── stubs/<pipeline>/<step>[.c<cycle>]/…                        # canned artifacts for stub runs
-├── envelopes/<step>.golden.md                                  # composed-envelope snapshots
-└── matrix.yaml                                                 # param sets for stub runs
+├── envelopes/<pipeline>.<step>.golden.md                       # composed-envelope snapshots
+└── matrix.yaml                                                 # param sets for stub runs (rows may carry _gates + _expect)
 ```
 
 ```yaml
@@ -57,6 +57,10 @@ brease-rebuild:
   - { mode: reimagine, brease: "off" }             # exercises strategy + full conditional chain
   - { mode: redesign,  brease: "on", _gates: { populate-approval: "no" } }   # quote YAML-boolean enums (API.md §2.1)
 ```
+
+Two reserved row keys tune a stub run: **`_gates`** presets gate choices (as above), and
+**`_expect`** is the exit code the row must terminate with (defaults to `0`) — a row that should
+halt at a validator or a capped loop asserts that by setting `_expect: 3`.
 
 ## 4. `cairn test` — four suites, one command
 
@@ -84,7 +88,9 @@ stub artifacts themselves satisfy the schemas+validators (fixtures and contracts
 apart silently).
 
 **4.4 envelopes** — `cairn compose <pipeline> <step> --params …` renders the six-block envelope
-without executing; diff against `tests/envelopes/<step>.golden.md` (`--update` to accept). Catches
+without executing; diff against `tests/envelopes/<pipeline>.<step>.golden.md` (`--update` to
+accept). Absolute paths are normalized to `<WORKSPACE>` / `<RUN_DIR>` tokens before the diff, so a
+golden depends only on the workspace, never on where it was checked out. Catches
 the quiet killers: a skill edit bloating every prompt, a doctrine change dropping the tripwire, a
 contract description going stale. Snapshots make prompt changes *reviewable in diffs*.
 
@@ -95,8 +101,10 @@ false, output_schema: false, session_capture: None}`), selectable like any other
 means a *human* can `cairn run … --executor stub` to watch a full pipeline "execute" offline.
 
 Stubs come from reality, not imagination: **`cairn test record <run-dir>`** harvests a completed
-real run into `tests/stubs/` + `tests/fixtures/` (`--slim` truncates bulky payloads — image
-binaries become 1-px placeholders; validators must not depend on payload weight). The workflow:
+real run into `tests/stubs/` + `tests/fixtures/` (each single-`.json` artifact also lands as a
+`fixtures/<artifact>/valid-recorded.json`). `--slim` truncates only bulky **non-`.json`** payloads
+(>64 KiB) to a marker line; a schema/validator-bound `.json` is copied whole — slimming it would
+seed a stub its own validator could never re-pass, a permanently-red row. The workflow:
 first real run of a new pipeline → record it → wiring is regression-locked forever at zero tokens.
 Invalid fixtures are then authored by deliberately breaking copies of recorded ones ("what must
 this validator catch?") — each `invalid-*` fixture documents a failure class.
@@ -117,9 +125,11 @@ this validator catch?") — each `invalid-*` fixture documents a failure class.
 ```yaml
 # workspace CI — no tokens, no secrets, < 1 min
 - uv tool install cairn…                # pinned by requires
-- cairn plan --all                      # L0 over every pipeline
+- cairn doctor                          # L0/L2 lint: every workspace pipeline plans green
 - cairn test                            # L1: validators · guards · stub matrix · envelopes
 ```
+(There is no `cairn plan --all` flag — `plan` takes one pipeline; `doctor` is what lints the whole
+workspace, planning every pipeline. `cairn test` also plans each pipeline inside its suites.)
 The cairn repo's own CI additionally runs the C1 synthetic suite. L2–L4 are human-triggered by
 design: they need machines, auth, and budget — CI proves *correctness of the workspace*, not *the
 health of a machine* or *the behavior of a vendor model*.

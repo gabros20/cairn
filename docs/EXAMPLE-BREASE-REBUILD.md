@@ -264,8 +264,13 @@ $ cairn batch brease-rebuild --params-file sites.jsonl -j 8 --to blueprint --gat
 | Run-dir isolation + wrong-run tripwire | kernel-owned cwd/env + envelope tripwire line |
 | SubagentStart brief / SubagentStop log+gate | envelope block 4 (trail context) / walker post-step (validate+trail) |
 | CLAUDE.md doctrine | `prompts/DOCTRINE.md` → envelope block 5 + `render_workspace` (AGENTS.md etc.) |
-| `learnings.jsonl` + self-improve loop | STEP `learnings[]` → trail `learn` events → `cairn learnings` aggregation (plugin) |
+| `learnings.jsonl` + self-improve loop | STEP `learnings[]` → trail `learn` events → `cairn learnings` aggregation *(verb stubbed — C6)* |
 
-Nothing in the current system failed to land. Two things got *stronger* in translation: the batch
-guard is no longer fail-open (per-process env replaces the global pointer), and CMS population now
-fails closed and defaults to "no" headlessly.
+Nothing in the current system failed to land *in the design* — every mechanism has a home above.
+Build status is a separate axis: this pipeline, its twelve agents, both gates, the parallel pair,
+the art-review loop, the conditional chains, and the guard block all **plan and stub-run today**
+(they are the C1 planner fixture, byte-for-byte). The rows that are still stubs at the verb level —
+`cairn batch` and the `cairn learnings` aggregation — land in C6 (see IMPLEMENTATION-PLAN); the live
+agent execution behind the `agent:` steps arrives across C2–C5. Two things got *stronger* in
+translation: the batch guard is no longer fail-open (per-process env replaces the global pointer),
+and CMS population now fails closed and defaults to "no" headlessly.

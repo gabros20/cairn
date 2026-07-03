@@ -46,10 +46,13 @@ needed_by = ["model-cms", "populate"]
 ```
 
 Semantics:
-- `cairn doctor` runs every `check`; failures print the `install` hint. Exit non-zero if a tool
-  needed by the *requested* pipeline range is missing.
-- `cairn plan` warns when a step's `needed_by` tools are unverified; `cairn run` hard-stops on them
-  (fail-fast beats a P6 crash after a 90-minute build).
+- `cairn doctor` runs every `check`; a failure prints the `install` hint and its `needed_by`
+  scope. Tool checks are **advisory** — a failing tool is a warning, never a hard exit on its own
+  (doctor's exit is driven only by a workspace-lint error or a broken in-scope executor).
+- *Designed, not yet built:* range-scoped tool enforcement — `cairn plan` warning when a step's
+  `needed_by` tools are unverified and `cairn run` hard-stopping before it (fail-fast beats a P6
+  crash after a 90-minute build). Today `needed_by` annotates doctor's output but does not gate a
+  run — lands with the guard/tools milestone, see IMPLEMENTATION-PLAN.
 - **Machine setup vs run setup:** `[tools]` is per-machine (doctor's job). Per-run auth — like
   `brease login` scoped into a run dir — stays a `manual:` step in the pipeline, where it is
   checkable and resumable (see `brease-auth` in the example pipeline).
@@ -73,10 +76,12 @@ readonly-plus-screenshot:
   - "npx agent-browser *"
 ```
 
-Executors render fragments to their native permission surface (Claude `permissions.allow`, Codex
-Rules, Grok `[permission]`) via `render_workspace` — authored once. Destructive verbs of an allowed
-tool get a `guards:` entry on top (the F18 pattern): allowlist says *may run*, guard says *checked
-before running*.
+The design: executors render fragments to their native permission surface (Claude
+`permissions.allow`, Codex Rules, Grok `[permission]`) — authored once. Destructive verbs of an
+allowed tool get a `guards:` entry on top (the F18 pattern): allowlist says *may run*, guard says
+*checked before running*. *Status: today the planner parses the fragments (agents reference them
+via `tools.bash`) but `render_workspace` emits only `CLAUDE.md`/`AGENTS.md`; rendering fragments to
+executor-native permission formats lands with the per-executor milestones — see IMPLEMENTATION-PLAN.*
 
 ## 4. Use: agentic vs deterministic
 
@@ -160,6 +165,10 @@ curate       a human or agent reviews: which learnings are      (judgment — ne
 promote      edits to skills/validators/guards/params           (the ladder, executed)
              — on a branch, as a PR — never committed directly
 ```
+
+*Status: the `runtime` and `recall` rows are built — agents emit `learn` events and envelope block
+4 injects prior learnings. The `aggregate` verb (`cairn learnings`) is a stub today (exit 2); it
+and the `self-improve.yaml` curate→promote pipeline land C6, see IMPLEMENTATION-PLAN.*
 
 Two closure speeds, both already designed: **runtime closure** (block 4 — a learning recorded in
 run N is in run N+1's envelope with zero human action) and **design-time closure** (curation →

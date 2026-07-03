@@ -16,17 +16,22 @@ designatives/cairn                     # the tool's own repo
 │     dependencies = ["pyyaml", "jsonschema"]        # the FULL list — additions need a design reason
 │     [project.scripts]  cairn = "cairn.cli:main"
 │     [project.entry-points."cairn.executors"]
+│       shell  = "cairn.executors.shell:ShellExecutor"
+│       stub   = "cairn.executors.stub:StubExecutor"     # the offline test executor (TESTING §5)
 │       claude = "cairn.executors.claude:ClaudeExecutor"
 │       codex  = "cairn.executors.codex:CodexExecutor"
 │       grok   = "cairn.executors.grok:GrokExecutor"
-│       shell  = "cairn.executors.shell:ShellExecutor"
 ├── cairn/                             # kernel (ARCHITECTURE §1) + executors + py.typed
-├── templates/workspace/               # what `cairn new workspace` instantiates (§4)
+├── templates/workspace/               # what `cairn new workspace` instantiates (§4);
+│                                      #   force-included into the wheel as cairn/_templates/workspace
 └── tests/                             # the C1 synthetic suite — the release gate
 ```
 
-Until C7, the identical tree lives in brease-factory as `cairn/` + `pyproject.toml`
-(`uv run cairn …`) — same anatomy, no publishing.
+Build backend is **hatchling**; the wheel ships `packages = ["cairn"]` and force-includes
+`templates/workspace` → `cairn/_templates/workspace` so `cairn new workspace` works from an
+installed copy (`newkit.templates_dir()` resolves that path first). Until C7, the identical tree
+lives in brease-factory as `cairn/` + `pyproject.toml` (`uv run cairn …`) — same anatomy, no
+publishing.
 
 ## 2. Install channels
 
@@ -53,6 +58,11 @@ Workspace side: `cairn.toml → requires = ">=0.1,<0.2"`, enforced at plan time 
 installed vs required range). `run.json` records the exact tool version, executor versions, and
 pipeline content-hash — so any old run is diagnosable regardless of what's installed today.
 
+*Status: of the three surfaces, only run-dir **pipeline-hash** drift is enforced today — `cairn
+resume` refuses a changed pipeline without `--force`. The `requires`-pin plan-time check and the
+schema/protocol/version gates are parsed-but-not-yet-enforced; they harden with the C7 extraction
+(IMPLEMENTATION-PLAN), when a workspace first pins an installed tool version.*
+
 Release discipline: a git tag is releasable iff the synthetic suite is green and `cairn plan`
 passes over the example + brease workspaces. CHANGELOG entry per tag; migration notes on any
 schema-surface change. Nothing more ceremonial than that.
@@ -69,7 +79,7 @@ works immediately, offline, with zero auth** — the day-0 experience uses only 
 │                            # a commented agent: step shows the first real upgrade
 ├── agents/assistant.yaml    # minimal agent, ready for the uncommented step
 ├── skills/cairn-operator/   # the operator skill (§6) — ships in every workspace
-├── schemas/step-return.json
+├── schemas/step-return.json # + greeting.json — the hello pipeline's artifact schema
 ├── validators/nonempty.py   # the starter validator (maturation ladder rung 0)
 ├── prompts/DOCTRINE.md      # stub: isolation invariant + artifact-authority rule
 ├── allowlist.yaml           # empty fragments with comments
@@ -85,18 +95,26 @@ kernel copy.
 ```console
 $ uv tool install git+https://github.com/designatives/cairn@v0.1.0
 $ cd my-workspace && cairn doctor
-  ✔ cairn 0.1.0 satisfies requires >=0.1,<0.2
-  ✔ executor claude   (claude 2.x, auth ok, hooks: blocking)
-  ✗ executor codex    codex not found → `npm i -g @openai/codex` · pin 0.138
+  ✔ cairn 0.1.0.dev0
+  ✔ workspace lint  3 pipelines plan green
+  ✔ executor claude   healthy
+  ✗ executor codex    codex not found → npm i -g @openai/codex          # only when --executor codex
   ✔ tool crawl4ai
-  ✗ tool vercel       `vercel whoami` failed → `pnpm add -g vercel && vercel login` (needed by: deploy)
-  ✔ workspace lint    3 pipelines plan green
+  ✗ tool vercel       `vercel whoami` failed → pnpm add -g vercel && vercel login (needed by: deploy)
+  ✔ secret BREASE_TOKEN    present
+  ✔ guard runner    cairn.kernel.guards imports
 ```
 
-Rules: doctor checks the *default* executor + any named via `--executor`; `[tools]` failures are
-scoped by `needed_by` (a missing vercel blocks nothing until a deploy step is in the requested
-range); every failure prints its fix. Per-run auth (e.g. `brease login` into a run dir) is not
-doctor's job — it's a `manual:` step in the pipeline (TOOLING §2).
+Real order today: version · workspace lint · in-scope executors · `[tools]` · `[secrets]` presence ·
+guard-runner import; `--probe-hooks` adds a `hook probe: not implemented (C4)` line. Rules: doctor
+checks the *default* executor + any named via `--executor`, and only a lint error or a broken
+in-scope executor fails its exit — `[tools]`/`[secrets]`/guard-runner problems are **warnings**
+(a missing vercel prints its `needed_by` scope but blocks nothing). Per-run auth (e.g. `brease
+login` into a run dir) is not doctor's job — it's a `manual:` step in the pipeline (TOOLING §2).
+
+*Status: the per-executor line currently reports `healthy`/its first finding; the richer
+`(version, auth ok, hooks: blocking)` detail and the `satisfies requires …` line arrive as the live
+executors and the version-pin check land (C2/C4/C7 — IMPLEMENTATION-PLAN).*
 
 ## 6. The operator skill — coding agents driving cairn
 

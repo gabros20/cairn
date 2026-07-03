@@ -7,6 +7,13 @@ one-command installation into the host, and idempotent invocations that a timer 
 Lineage: `certbot renew`, `restic` + systemd timers, terraform-in-CI — the tool is
 schedule-*ready*; the platform schedules.
 
+> **Status: designed; lands C6 — see IMPLEMENTATION-PLAN.** The `cairn schedule` verb is a stub
+> today (exit 2); `schedules.yaml` and the host-backend installers (cron/launchd/systemd) are not
+> yet built. The primitives this doc leans on *are* built and load-bearing already: `cairn run
+> --idempotent` (§3, resume-or-skip on an existing run dir), per-run locking, and `cairn ps` as the
+> morning-after view. The `--headless` gate defaults and the (still-designed) budgets/webhook-sink of
+> §4 are covered in SECURITY/OBSERVABILITY. Everything schedule-specific below is the intended shape.
+
 ---
 
 ## 1. Declared schedules — `schedules.yaml`
