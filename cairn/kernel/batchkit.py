@@ -15,7 +15,6 @@ stdlib only. Threads (not asyncio) pool the subprocess-bound children — the do
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -25,12 +24,21 @@ from pathlib import Path
 from typing import TextIO
 
 from cairn.kernel.errors import ConfigError
+from cairn.kernel.proc import SubprocessRunner
 from cairn.kernel.types import ExitCode
+
+# The one production runner behind default_spawn — the shared subprocess seam (proc.py), the
+# same implementation schedkit injects as a Runner. Stateless, so a module-level singleton.
+_RUNNER = SubprocessRunner()
 
 # Sensible fallback pool size; the CLI passes ``-j`` explicitly (docs/API.md shows ``-j 8``).
 DEFAULT_JOBS = 4
 
-# spawn(argv, cwd) -> (exit_code, stdout, stderr). Injected in tests; default = subprocess.
+# spawn(argv, cwd) -> (exit_code, stdout, stderr). Injected in tests; default = default_spawn,
+# a thin adapter over the shared subprocess seam (cairn.kernel.proc.SubprocessRunner — the same
+# implementation schedkit injects as a Runner). Batch's seam is a bare callable returning a TUPLE
+# (not schedkit's Runner object / RunResult) because the per-line thread pool wants a tuple and
+# batch never pipes stdin; proc.py documents the two-shapes-one-implementation split.
 # stdout/stderr are kept SEPARATE (not merged): the ``→ run_dir`` marker lands on stdout for a
 # success but on stderr for a failure/awaiting-human (cli.py), so parse_run_dir sees both, while
 # the failure tail (RunOutcome.error) is drawn from stderr alone.
@@ -166,9 +174,15 @@ def default_spawn(argv: list[str], cwd: Path) -> tuple[int, str, str]:
     """Run one child to completion, capturing stdout and stderr SEPARATELY. Never raises on a
     non-zero child — the exit code IS the signal batch collects. The streams are kept apart so
     the failure reason (stderr) can be surfaced without the marker parse depending on a clean
-    stdout: the ``→ run_dir`` marker is on stdout for a success but on stderr for a failure."""
-    proc = subprocess.run(argv, cwd=str(cwd), capture_output=True, text=True)
-    return proc.returncode, (proc.stdout or ""), (proc.stderr or "")
+    stdout: the ``→ run_dir`` marker is on stdout for a success but on stderr for a failure.
+
+    A thin adapter over the shared :class:`cairn.kernel.proc.SubprocessRunner` (the same seam
+    schedkit injects as a ``Runner``): the subprocess capture lives once in proc.py; batch's
+    ``spawn`` seam stays a bare ``(argv, cwd) -> (int, str, str)`` callable because that tuple
+    shape is what the per-line thread pool wants, and batch never pipes stdin (schedkit's
+    ``input=``) — so a bare callable, not a Runner object, is the right injection here."""
+    result = _RUNNER.run(argv, cwd=cwd)
+    return result.returncode, result.stdout, result.stderr
 
 
 def _error_tail(stderr: str) -> str | None:

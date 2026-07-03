@@ -39,11 +39,13 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, NoReturn, Protocol, TextIO
+from typing import Any, NoReturn, TextIO
 
 import yaml
 
 from cairn.kernel.errors import ConfigError
+from cairn.kernel.proc import RunResult as RunResult  # re-export for back-compat (cli.py, tests)
+from cairn.kernel.proc import Runner as Runner  # re-export for back-compat
 from cairn.kernel.types import Finding
 
 SCHEDULES_YAML = "schedules.yaml"
@@ -568,24 +570,10 @@ def render_systemd(
 # --------------------------------------------------------------------------- #
 
 
-@dataclass(frozen=True)
-class RunResult:
-    """The outcome of one injected host-command invocation."""
-
-    returncode: int
-    stdout: str = ""
-    stderr: str = ""
-
-
-class Runner(Protocol):
-    """The injected effect boundary — the only thing that actually touches the host.
-
-    Tests pass a fake; the CLI (Wave 2) passes a subprocess-backed adapter. Keeping this the
-    sole side-effect surface is what lets every render/plan path stay pure and offline.
-    """
-
-    def run(self, argv: list[str], *, input: str | None = None, cwd: Path | None = None) -> RunResult:
-        ...
+# RunResult / Runner now live in cairn.kernel.proc (the shared subprocess seam, unified with
+# batchkit's spawn) and are re-exported at the top of this module for back-compat. See proc.py
+# for why schedkit injects a Runner OBJECT (needs input=/optional cwd) while batchkit injects a
+# bare (argv, cwd) -> tuple callable over the same SubprocessRunner.
 
 
 @dataclass(frozen=True)
