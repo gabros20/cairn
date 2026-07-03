@@ -175,7 +175,7 @@ def test_step_executor_map_overrides_default_but_not_pin():
     )
     # grok's reasoning tier omits effort → the agent's effort passes through (ARCHITECTURE
     # §2 / prompt rule: "agent effort passes through unless the tier spec fixes it"). The grok
-    # executor later nulls it at invoke time (Invocation.effort None when baked into the alias).
+    # executor passes it natively via --effort (grok 0.2.82).
     assert p.resolved_models["build"] == ("grok", "grok-4.3-high", "medium")
 
 
