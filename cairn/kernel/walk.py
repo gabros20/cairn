@@ -30,7 +30,7 @@ validator_reasons, exit_code}``, partial artifacts left in place, and the proces
 code from the §9 taxonomy. The whole walk holds the run's advisory lock so two resumes
 can never interleave.
 
-Out of scope here (TODO): budgets, heartbeat, trail sinks, guard shims, redaction.
+Out of scope here (TODO): budgets, guard shims.
 Stdlib + pinned kernel modules only.
 """
 
@@ -82,8 +82,9 @@ from cairn.kernel.runstate import (
     update_run,
 )
 from cairn.kernel.schemas import get_schema
+from cairn.kernel.sinks import build_tee_sinks
 from cairn.kernel.template import HELPERS, TemplateContext, TemplateError, render
-from cairn.kernel.trail import format_at
+from cairn.kernel.trail import format_at, make_redactor
 from cairn.kernel.types import ExitCode, Invocation
 
 # The template placeholder + helper shapes, mirrored here so lenient command rendering can
@@ -241,6 +242,7 @@ class _Walk:
         # children keep the trail single-writer and the manifest consistent (OBSERVABILITY §1).
         self._lock = threading.RLock()
         self._trail = None  # set in run()
+        self._redactor: Callable[[str], str] | None = None  # built in run() from [secrets]
         self._schema_path = self.run_dir / ".cairn" / "step-return.json"
 
     # -- top-level orchestration -------------------------------------------- #
@@ -252,7 +254,15 @@ class _Walk:
         run_id = run_doc["run_id"]
         self._write_step_return_schema()
 
-        with TrailWriter(self.run_dir, run_id) as trail:
+        # Redaction (SECURITY §1.3) + sinks (OBSERVABILITY §2) are wired once, here, and shared:
+        # the same value-scrubber goes into the trail (every event line) and into each step's
+        # Invocation (the executor's log-write path). Tee sinks push each redacted event.
+        self._redactor = make_redactor(self._secret_values())
+        tee_sinks = build_tee_sinks(self.config.sinks)
+
+        with TrailWriter(
+            self.run_dir, run_id, redactor=self._redactor, tee_sinks=tee_sinks
+        ) as trail:
             self._trail = trail
             self._emit(
                 "run-start",
@@ -394,6 +404,7 @@ class _Walk:
                 timeout_s=step.timeout_s,
                 log_path=log_path,
                 return_schema=self._schema_path,
+                redactor=self._redactor,
             )
             try:
                 with self._heartbeat(step.id, attempt, cycle, log_path):
@@ -691,6 +702,28 @@ class _Walk:
                 raise _Halt(ExitCode.CONFIG, step.id, f"secret {name!r} is not set (env or workspace .env)")
             env[name] = value
         return env
+
+    def _secret_values(self) -> dict[str, str]:
+        """Resolve every declared ``[secrets]`` value for the run-wide redactor (SECURITY §1.3).
+
+        Same source order as :meth:`_build_env` (process env → workspace ``.env``), but over the
+        *declared* names rather than one step's ``env:`` — a secret must be scrubbed wherever it
+        surfaces, not only in the steps that carry it. Only *resolved* values are returned (an
+        undeclared/absent secret cannot leak, so there is nothing to scrub); a value is never
+        logged anywhere, including on failure. Absent secrets are simply skipped here — the hard
+        "secret required but unset" halt stays in :meth:`_build_env`, per step.
+        """
+        out: dict[str, str] = {}
+        dotenv: dict[str, str] | None = None
+        for name in self.config.secrets:
+            value = os.environ.get(name)
+            if value is None:
+                if dotenv is None:
+                    dotenv = self._load_dotenv()
+                value = dotenv.get(name)
+            if value:
+                out[name] = value
+        return out
 
     def _load_dotenv(self) -> dict[str, str]:
         path = self.workspace_dir / ".env"

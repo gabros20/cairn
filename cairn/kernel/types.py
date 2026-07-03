@@ -10,6 +10,7 @@ docs/SECURITY.md §4 (budget exit code).
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
@@ -63,6 +64,10 @@ class Invocation:
     timeout_s: int
     log_path: Path
     return_schema: Path
+    # Literal-value scrubber (SECURITY.md §1.3) threaded into the executor's log-write path,
+    # so declared secrets are redacted from logs/<step>.log line-by-line as they stream. None
+    # (no secret resolved) ⇒ the log is teed verbatim, byte-for-byte as before.
+    redactor: Callable[[str], str] | None = None
 
 
 @dataclass(frozen=True)

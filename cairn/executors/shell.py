@@ -46,6 +46,7 @@ class ShellExecutor:
             cwd=inv.cwd,
             timeout_s=inv.timeout_s,
             log_path=inv.log_path,
+            redactor=inv.redactor,
         )
         return Result(
             step=parse_step_sentinel(output),

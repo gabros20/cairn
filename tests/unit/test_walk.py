@@ -996,6 +996,69 @@ def test_run_command_nonzero_exit_fails_even_when_produces_validate(ws: Path, tm
 
 
 # --------------------------------------------------------------------------- #
+# 13b. Redaction — declared secrets scrubbed from the log AND the trail (SECURITY §1.3).
+# --------------------------------------------------------------------------- #
+
+
+def test_declared_secret_is_redacted_from_step_log_and_trail(tmp_path: Path, monkeypatch) -> None:
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "cairn.toml").write_text(
+        '[workspace]\nname = "sec-ws"\ndefault_executor = "shell"\n\n'
+        '[secrets]\nTOKEN = { needed_by = ["leak"] }\n',
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("TOKEN", "sk-live-DEADBEEF")
+
+    # A run step that (a) echoes the secret from its env to stdout → logs/leak.log, and
+    # (b) smuggles it into a STEP learning note → a `learn` trail event. Both must be scrubbed.
+    command = (
+        'echo "token=$TOKEN"; '
+        'echo "<<<STEP {\\"status\\":\\"done\\",\\"summary\\":\\"ok\\",'
+        '\\"artifacts\\":[],\\"learnings\\":[{\\"note\\":\\"saw $TOKEN\\"}]} STEP>>>"'
+    )
+    step = StepNode(
+        id="leak", kind="run", agent=None, command=command, args={},
+        needs=(), needs_optional=(), produces=(),
+        when_runtime=None, timeout_s=1800, retry=(0, False), skippable=False,
+        executor=None, tier=None, effort=None, env=("TOKEN",), network=False,
+    )
+    plan = make_plan([step], {})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    code = _walk(ws, plan, run_dir, {"shell": ShellExecutor()})
+    assert code == ExitCode.OK  # redaction never fails or slows the run
+
+    log_text = (run_dir / "logs" / "leak.log").read_text()
+    assert "sk-live-DEADBEEF" not in log_text
+    assert "∎REDACTED:TOKEN∎" in log_text
+
+    trail_text = (run_dir / "trail.jsonl").read_text()
+    assert "sk-live-DEADBEEF" not in trail_text  # the learn event was scrubbed
+    assert "∎REDACTED:TOKEN∎" in trail_text
+
+
+def test_no_redaction_when_secret_is_unset(tmp_path: Path, monkeypatch) -> None:
+    # A declared-but-unset secret resolves to nothing → no redactor → output is verbatim.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "cairn.toml").write_text(
+        '[workspace]\nname = "sec-ws"\ndefault_executor = "shell"\n\n'
+        '[secrets]\nTOKEN = { needed_by = ["say"] }\n',
+        encoding="utf-8",
+    )
+    monkeypatch.delenv("TOKEN", raising=False)
+
+    step = run_step("say", 'echo "plain output ∎REDACTED:TOKEN∎-shaped but real"')
+    plan = make_plan([step], {})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    assert _walk(ws, plan, run_dir, {"shell": ShellExecutor()}) == ExitCode.OK
+    # Nothing resolved → the line is teed verbatim (the marker-shaped literal survives untouched).
+    assert "plain output" in (run_dir / "logs" / "say.log").read_text()
+
+
+# --------------------------------------------------------------------------- #
 # 14. bootstrap — -v2 collision suffix.
 # --------------------------------------------------------------------------- #
 

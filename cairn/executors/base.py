@@ -14,6 +14,7 @@ import signal
 import subprocess
 import threading
 import time
+from collections.abc import Callable
 from pathlib import Path
 
 from cairn.kernel.errors import CairnError
@@ -91,12 +92,20 @@ def run_process(
     cwd: Path,
     timeout_s: float,
     log_path: Path,
+    redactor: Callable[[str], str] | None = None,
 ) -> tuple[int, str, float]:
     """Run one subprocess with EXACTLY ``env`` (never os.environ), streaming combined
     stdout+stderr to ``log_path`` as it arrives while also capturing it.
 
     Returns ``(exit_code, captured_output, duration_s)``. On timeout the process group is
     killed and :class:`ExecTimeout` is raised. Never uses ``shell=True``.
+
+    ``redactor`` (SECURITY.md §1.3), when given, scrubs each line *before* it is written to the
+    log or captured — so declared secret values never land on disk in ``logs/<step>.log`` (and
+    never in the returned output the walker parses for the STEP block). It runs per line in the
+    pump thread; a secret split across two lines is not caught (tokens are single-line), and the
+    trail's own redactor is the belt-and-suspenders scrub for any event payload. ``None`` ⇒ the
+    stream is teed verbatim, byte-for-byte as before.
     """
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -120,6 +129,8 @@ def run_process(
         assert proc.stdout is not None
         with open(log_path, "w", encoding="utf-8") as log:
             for line in proc.stdout:
+                if redactor is not None:
+                    line = redactor(line)
                 captured.append(line)
                 log.write(line)
                 log.flush()

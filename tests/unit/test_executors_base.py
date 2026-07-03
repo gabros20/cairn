@@ -239,6 +239,43 @@ def test_run_process_tolerates_non_utf8_output(tmp_path):
     assert "tail" in (tmp_path / "l.log").read_text()  # and still teed to the log
 
 
+def test_run_process_redacts_the_log_and_captured_output(tmp_path):
+    # A redactor threaded into run_process scrubs each line before it hits disk OR the return
+    # value — so a declared secret never lands in logs/<step>.log (SECURITY.md §1.3).
+    def redact(line: str) -> str:
+        return line.replace("sk-live-DEADBEEF", "∎REDACTED:TOKEN∎")
+
+    log = tmp_path / "out.log"
+    code, out, _ = run_process(
+        ["/bin/sh", "-c", "printf 'token=sk-live-DEADBEEF\\ndone\\n'"],
+        stdin_text=None,
+        env={"PATH": "/usr/bin:/bin"},
+        cwd=tmp_path,
+        timeout_s=10,
+        log_path=log,
+        redactor=redact,
+    )
+    assert code == 0
+    on_disk = log.read_text()
+    assert "sk-live-DEADBEEF" not in on_disk and "∎REDACTED:TOKEN∎" in on_disk
+    assert "sk-live-DEADBEEF" not in out and "∎REDACTED:TOKEN∎" in out
+
+
+def test_run_process_without_redactor_is_byte_identical(tmp_path):
+    # No redactor ⇒ the stream is teed verbatim (the default path stays unchanged).
+    log = tmp_path / "out.log"
+    _code, out, _ = run_process(
+        ["/bin/sh", "-c", "printf 'a\\nb\\n'"],
+        stdin_text=None,
+        env={"PATH": "/usr/bin:/bin"},
+        cwd=tmp_path,
+        timeout_s=10,
+        log_path=log,
+    )
+    assert out == "a\nb\n"
+    assert log.read_text() == "a\nb\n"
+
+
 def test_exectimeout_is_a_cairn_error():
     assert issubclass(ExecTimeout, CairnError)
 
