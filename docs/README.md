@@ -1,37 +1,88 @@
-# cairn — artifact-native pipelines over coding-agent CLIs
+# cairn documentation
 
 > **A cairn is a stack of stones travelers leave to mark a trail.** Every step of a cairn pipeline
 > leaves a validated artifact on disk; the trail of artifacts *is* the execution state. Resume means
 > walking the trail to the last valid cairn. Nothing else remembers anything.
 
-`cairn` is the framework distilled from the brease-factory pipeline and its port design
-(`docs/porting-research/PORT-DESIGN.md`): a small, declarative orchestrator for **multi-phase agentic
-pipelines that delegate work to coding-agent CLIs** (Claude Code, Codex, Grok, …) as headless
-subprocesses, with **typed artifacts as the only interface between steps**.
+This folder is the complete documentation set for cairn — a small, declarative orchestrator for
+**multi-phase agentic pipelines that delegate work to coding-agent CLIs** (Claude Code, Codex, Grok, …)
+as headless subprocesses, with **typed artifacts as the only interface between steps**.
 
-It is what we would build *instead of* porting brease-factory three times — and what we would
-migrate the existing Claude Code implementation onto. The PORT-DESIGN's driver + `CliAdapter` is the
-embryo of this framework; cairn is that seam generalized, named, and given a real DX.
+The docs are organised by the [Diátaxis](https://diataxis.fr) framework — every page is one of a
+**tutorial** (learning), a **how-to** (a task), **reference** (lookup), or **explanation**
+(understanding). Find the mode that matches what you're trying to do; this file itself is the top-level
+**explanation** — the index above the fold, the vision below it.
 
 ---
 
-## Why this exists (and why not LangGraph / Sandcastle / CI)
+## Find your way
 
-We evaluated the alternatives seriously (see the conversation record + PORT-DESIGN §8):
+| Doc | Mode | Answers |
+|---|---|---|
+| **[GETTING-STARTED.md](GETTING-STARTED.md)** | Tutorial | *I've never seen cairn — walk me from install to a real run.* |
+| **[API.md](API.md)** | Reference | *What's the exact syntax for `cairn.toml` / a pipeline / an agent / the CLI?* |
+| **[CONCEPTS.md](CONCEPTS.md)** | Explanation | *What are the moving parts, and why does each exist?* |
+| **[ARCHITECTURE.md](ARCHITECTURE.md)** | Explanation | *How is the kernel built and how does execution actually behave?* |
+| **README.md** (this file) | Explanation | *Why does cairn exist, and why not LangGraph / CI / a vendor SDK?* |
+| **[EXAMPLE-BREASE-REBUILD.md](EXAMPLE-BREASE-REBUILD.md)** | Worked example | *Show me a real, full-scale pipeline expressed in cairn.* |
+| **[TESTING.md](TESTING.md)** | How-to + Explanation | *How do I test a workspace offline, and what does each test layer catch?* |
+| **[OBSERVABILITY.md](OBSERVABILITY.md)** | How-to + Explanation | *How do I watch a run — the trail, webhooks, `cairn ps`, OTel?* |
+| **[SECURITY.md](SECURITY.md)** | How-to + Explanation | *How do I handle secrets, untrusted content, blast radius, and budgets?* |
+| **[SCHEDULING.md](SCHEDULING.md)** | How-to + Explanation | *How do I run a pipeline on a schedule without a daemon?* |
+| **[TOOLING-AND-GROWTH.md](TOOLING-AND-GROWTH.md)** | How-to + Explanation | *How do external tools enter a pipeline, and how does a workspace mature?* |
+| **[DISTRIBUTION.md](DISTRIBUTION.md)** | How-to + Explanation | *How is cairn packaged, versioned, and embedded in a coding agent?* |
+| **RELEASING.md** | How-to | *How do we cut a release?* *(being written alongside this doc.)* |
+| **[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md)** | Historical record | *In what order was cairn built, and against what verifications?* |
+
+The "How-to + Explanation" pages are labelled honestly: each opens by explaining a subsystem, then gives
+the concrete recipes for operating it. If you want only the recipe, skip to that page's task sections.
+
+### Reading paths
+
+- **I want to *use* cairn** → the [repo README](../README.md) for the pitch → **[GETTING-STARTED.md](GETTING-STARTED.md)** for the first run → **[API.md](API.md)** when you need the exact shape of a file.
+- **I want to *understand* it** → **[CONCEPTS.md](CONCEPTS.md)** (the noun/verb model) → **[ARCHITECTURE.md](ARCHITECTURE.md)** (execution semantics) → the vision below on this page (why these choices).
+- **I want to *operate / contribute*** → **[TESTING.md](TESTING.md)** (prove a change offline) → **[OBSERVABILITY.md](OBSERVABILITY.md)** (watch it run) → **[SECURITY.md](SECURITY.md)** (contain it) → **RELEASING.md** (ship it).
+
+```mermaid
+flowchart TD
+  subgraph Use
+    GS[GETTING-STARTED · tutorial] --> API[API · reference]
+  end
+  subgraph Understand
+    C[CONCEPTS] --> A[ARCHITECTURE] --> V[README · vision]
+  end
+  subgraph Operate
+    T[TESTING] --> O[OBSERVABILITY] --> S[SECURITY] --> R[RELEASING]
+  end
+  EX[EXAMPLE-BREASE-REBUILD] -.worked example.-> API
+  TG[TOOLING-AND-GROWTH] -.grow the workspace.-> Understand
+  D[DISTRIBUTION] -.package & embed.-> Operate
+```
+
+---
+
+# Why cairn exists
+
+The rest of this page is the **explanation** doc — the reasoning behind the design. It is the same
+vision that framed the project; the reference and how-to pages above turn it into detail.
+
+## Why not LangGraph / Sandcastle / CI
+
+We evaluated the alternatives seriously:
 
 | | Orchestrates | State model | Agents are | Verdict for our problem |
 |---|---|---|---|---|
 | **LangGraph** | in-process LLM graphs | checkpointer DB (competes with disk) | SDK calls sharing message state | Wrong layer. Its checkpointer and our artifacts would be two authorities on "where is this run?" — a bug class our design structurally lacks. |
 | **Sandcastle** | agent CLI subprocesses | git branches merged back | code-editing sessions | Right layer, wrong center of gravity: built for *edit-code-and-merge*; our agents are *artifact generators in run dirs*. We'd use it with its core feature off. |
 | **CI runners** (GH Actions…) | shell jobs | opaque per-job workspaces | not a concept | Right skeleton (declarative steps, artifacts) but no agent envelope, no gates-as-data, no validation edges, cloud-shaped. |
-| **Claude Code native** (today) | skills + Workflow JS | artifacts (ours) + session | subagents (one vendor) | What we're generalizing away from: the orchestration is welded to one CLI's primitives. |
-| **cairn** | agent CLI subprocesses | **the filesystem, validated** | fresh headless processes | Every concept below exists because the brease pipeline needed it; nothing else got in. |
+| **Claude Code native** (the origin) | skills + Workflow JS | artifacts (ours) + session | subagents (one vendor) | What we generalized away from: the orchestration was welded to one CLI's primitives. |
+| **cairn** | agent CLI subprocesses | **the filesystem, validated** | fresh headless processes | Every concept below exists because a real pipeline needed it; nothing else got in. |
 
 The one good idea in graph frameworks — *topology as data* — we keep. Everything else they sell
 (checkpointers, interrupts, streaming state) our filesystem already does better for this class of
 system.
 
-## The philosophy (inherited, now enforced by a framework)
+## The philosophy (enforced by a framework)
 
 1. **The filesystem is the state machine.** All run state = files in one run directory. `run.json`
    (pinned schema), `trail.jsonl` (event log), artifacts, gate decisions, logs, rendered prompts.
@@ -39,9 +90,8 @@ system.
    loses at most one step's work.
 2. **Agents are processes.** Every delegation is one fresh headless CLI invocation (`claude -p`,
    `codex exec`, `grok --prompt-file`). Full context isolation is a property of the OS, not a
-   framework promise.
-   The CLI is a swappable **executor** — pipelines don't know which one is running, and different
-   steps of one run may use different executors ("mixed fleet").
+   framework promise. The CLI is a swappable **executor** — pipelines don't know which one is running,
+   and different steps of one run may use different executors ("mixed fleet").
 3. **Contracts over conversation.** A step's interface is `needs` (input artifacts) → `produces`
    (output artifacts, schema-validated) + a typed return summary. Transcripts are never parsed for
    state. If it matters, it's in a file with a schema.
@@ -54,12 +104,11 @@ system.
    auditable, and resumable like everything else.
 6. **Small core, declarative surface.** Pipelines, agents, artifacts, gates, guards, tiers: YAML.
    Skills: markdown. Only validators, guards, and executors are code. The kernel is a small,
-   dependency-light body of Python (stdlib + `pyyaml` + `jsonschema`, no other runtime deps) —
-   ~5.7k lines as built; everything beyond it is a plugin.
+   dependency-light body of Python (stdlib + `pyyaml` + `jsonschema`, no other runtime deps).
 7. **AX is a design surface.** The *agent experience* — what a model sees when invoked — is a
    deterministic, auditable envelope (mission → contract → skills → trail context → doctrine →
    return protocol), rendered to a file before execution. No hidden context, no auto-magic loading,
-   absolute paths always. See `ARCHITECTURE.md §6`.
+   absolute paths always. See [ARCHITECTURE.md §6](ARCHITECTURE.md).
 
 ## What it looks like
 
@@ -117,75 +166,20 @@ $ cairn plan brease-rebuild --param mode=reimagine # static verify + printed exe
 | **Run** | one execution = one directory | `runs/<id>/` | `API.md §8` |
 | **Trail** | append-only event log of a run | `runs/<id>/trail.jsonl` | `API.md §8.2` |
 
-## Documents in this folder
-
-- **[CONCEPTS.md](CONCEPTS.md)** — the noun/verb model: every moving part, why it exists, what
-  breaks without it.
-- **[ARCHITECTURE.md](ARCHITECTURE.md)** — kernel layout, execution semantics (plan → walk → done →
-  resume → halt), loop/parallel/gate semantics, guard enforcement matrix, batch, reproducibility,
-  extension points.
-- **[API.md](API.md)** — the complete file-format and code reference: `cairn.toml`, pipeline schema,
-  agents schema, expression grammar, the prompt envelope (AX spec), the STEP return protocol, the
-  `Executor` protocol, CLI reference, run layout + trail event schema.
-- **[EXAMPLE-BREASE-REBUILD.md](EXAMPLE-BREASE-REBUILD.md)** — the entire brease-rebuild pipeline
-  (all three modes, gates, the P4.5 loop, CMS branch, deploy) expressed in cairn — the proof the
-  abstraction covers the real system.
-- **[TOOLING-AND-GROWTH.md](TOOLING-AND-GROWTH.md)** — how external tools (crawl4ai, vercel, gh,
-  brease…) enter a pipeline (verify / teach / permit / use), the workspace maturation ladder, and
-  authoring workspaces with a coding agent (`cairn plan` as the agent's typecheck).
-- **[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md)** — the build order (C0–C7): kernel proven
-  deterministically first (synthetic no-LLM suite), then Claude → Codex → Grok, batch + CMS,
-  extraction. Supersedes PORT-DESIGN §7's M0–M7 once cairn is confirmed as the target.
-- **[DISTRIBUTION.md](DISTRIBUTION.md)** — the mechanics behind §Packaging & embedding: package
-  anatomy + entry points, the three compatibility surfaces (pipeline schema / executor protocol /
-  run-dir format), the workspace scaffold spec, `cairn doctor` onboarding, and the operator skill
-  that integrates cairn with any coding agent.
-- **[TESTING.md](TESTING.md)** — the five-layer validation pyramid; the workspace test layer
-  (`cairn test`): validator/guard fixtures (killing false-green), **stub-executor pipeline runs**
-  (full wiring verified offline through production code, zero tokens), envelope snapshots, and
-  `cairn test record` (harvest a real run into regression fixtures).
-- **[OBSERVABILITY.md](OBSERVABILITY.md)** — the Trail Protocol: the append-only event log
-  formalized (versioned envelope, monotonic `seq` offsets, single-writer guarantees), three
-  consumption tiers (follow the file / webhook sinks / OTel export mapping), `gate-pending` +
-  `heartbeat` events, and `cairn ps` for the cross-run fleet view. Lineage: Bazel BEP, Kafka,
-  Nextflow weblog — no servers, no DBs.
-- **[SECURITY.md](SECURITY.md)** — containment over trust: the secrets contract (names declared,
-  values env-only, per-agent pass-through deny-by-default, kernel-side redaction), the
-  prompt-injection posture for scraped content (trust tiers + the cage: allowlist/guard/gate/
-  isolation), network declarations, budgets (exit 7), run locking, and `cairn gc` retention.
-- **[SCHEDULING.md](SCHEDULING.md)** — first-class scheduling without a scheduler: `schedules.yaml`
-  declared in the workspace, installed into the host scheduler, fired as idempotent invocations;
-  unattended safety = headless gate defaults + budgets + locks + webhook notification.
-
-## Relation to PORT-DESIGN.md
-
-PORT-DESIGN answered *"how do we run the existing pipeline on three CLIs?"* — its answer (external
-driver + `CliAdapter` + portable core) is correct and **cairn is that answer promoted to a product**:
-
-- PORT-DESIGN `driver/brease_run.py` → the cairn **kernel walker**
-- PORT-DESIGN `CliAdapter` (5 ops) → the cairn **Executor protocol** (same five responsibilities)
-- PORT-DESIGN `core/pipeline.yaml` + `agents.yaml` → cairn's **pipeline + agent files** (generalized)
-- PORT-DESIGN §3.3 control-flow shapes → cairn's **five node kinds** (step, gate, parallel, loop, manual)
-- PORT-DESIGN §4 enforcement → cairn's **guard engine** with the same defense-in-depth
-
-Adopting cairn changes the port plan's framing, not its milestones: M0/M1 *become* "build the cairn
-kernel + ClaudeExecutor and express brease-rebuild as a cairn workspace"; M2–M5 become "add
-CodexExecutor/GrokExecutor". Same order, same verifications, same risks (the Codex headless-hook
-test is unchanged) — but the deliverable is a reusable framework plus brease-factory as its first
-workspace, instead of a one-off port.
+New here? Don't read this table cold — walk it in [GETTING-STARTED.md](GETTING-STARTED.md), where each
+concept appears as you hit it.
 
 ## What we knowingly give up
 
-Honesty section. Migrating off Claude-Code-native orchestration costs:
+Honesty section. cairn generalizes away from Claude-Code-native orchestration, and that costs:
 
-- **The interactive session UX** — a native `/brease-rebuild` conversation with inline
-  AskUserQuestion is nicer than a TTY driver for single-site exploratory runs. *Mitigation:* keep a
-  thin Claude skill that shells out to `cairn run` and relays gates; the loss is small because every
-  long run is mostly unattended anyway.
-- **Native subagent ergonomics** — Claude's Agent tool gives in-session spawn with zero process
-  management. cairn re-buys this with OS processes, which is more fidelity but more moving parts
-  (timeouts, logs, zombie cleanup — all kernel-owned).
-- **Anthropic's Workflow JS engine** for ad-hoc fan-outs. cairn pipelines are declared, not scripted;
+- **The interactive session UX** — a native in-CLI conversation with inline questions is nicer than a
+  TTY driver for single-site exploratory runs. *Mitigation:* keep a thin skill that shells out to
+  `cairn run` and relays gates; the loss is small because every long run is mostly unattended anyway.
+- **Native subagent ergonomics** — an in-session spawn primitive gives zero process management. cairn
+  re-buys this with OS processes, which is more fidelity but more moving parts (timeouts, logs, zombie
+  cleanup — all kernel-owned).
+- **An ad-hoc scripting engine** for one-off fan-outs. cairn pipelines are declared, not scripted;
   truly ad-hoc orchestration stays in whatever CLI you're chatting with.
 
 We judge all three acceptable; none touches the pipeline's correctness properties.
@@ -193,14 +187,14 @@ We judge all three acceptable; none touches the pipeline's correctness propertie
 ## Packaging & embedding
 
 cairn is a **build tool** and distributes like one (dbt / terraform / make): three layers, one
-answer each — never a vendored kernel copy per project. (This section is the philosophy; the
-operational mechanics — package anatomy, versioning surfaces, scaffold, onboarding, the operator
-skill — are specified in [DISTRIBUTION.md](DISTRIBUTION.md).)
+answer each — never a vendored kernel copy per project. (This is the philosophy; the operational
+mechanics — package anatomy, versioning surfaces, scaffold, onboarding, the operator skill — are in
+[DISTRIBUTION.md](DISTRIBUTION.md).)
 
 | Layer | What | Distributed as |
 |---|---|---|
-| **Tool** | the `cairn` CLI (kernel + built-in executors) | versioned Python package — its own standalone repo (`cairn/` + pyproject, run in place with `uv run cairn`), packaged + tagged at API stability (`uv tool install git+…@v0.1.0`), PyPI only if open-sourced |
-| **Workspace** | pipelines/agents/skills/validators + `cairn.toml` | a git repo (brease-factory is workspace #1); starter via `cairn new workspace` (a template repo is optional sugar over that) |
+| **Tool** | the `cairn` CLI (kernel + built-in executors) | a versioned Python package — its own standalone repo, run in place with `uv run cairn`, packaged + tagged at API stability, published to PyPI as `cairn-pipelines` (the command stays `cairn`) |
+| **Workspace** | pipelines/agents/skills/validators + `cairn.toml` | a git repo; starter via `cairn new workspace` (a template repo is optional sugar over that) |
 | **Runs** | `runs/<id>/` | gitignored artifacts, never distributed |
 
 The workspace pins its tool (`cairn.toml: requires = ">=0.1,<0.2"`, checked at plan time);
@@ -210,43 +204,56 @@ The workspace pins its tool (`cairn.toml: requires = ">=0.1,<0.2"`, checked at p
 1. **Terminal** (primary) — foreground process, TTY gates; `--headless` for CI/batch. No
    daemon: when no run is active, cairn doesn't exist.
 2. **Operated by a coding agent** — the agent drives cairn through Bash like any build tool. Gates
-   resolve via the **operator pattern**: an unanswered gate exits code 6 → the agent reads
-   `cairn trail --json`, asks the human through its *own* UI, answers with
+   resolve via the **operator pattern**: an unanswered gate exits with a distinct code → the agent
+   reads `cairn trail --json`, asks the human through its *own* UI, answers with
    `cairn gate <run-dir> <name>=<choice>`, then `cairn resume`. This embeds cairn in any
-   conversational agent with zero integration code — the thin `/brease-rebuild` wrapper skill is
-   ~20 lines of run/watch/relay/resume.
+   conversational agent with almost no integration code.
 3. **Agents inside cairn** — the executors. The symmetry is intentional: the same CLI can operate a
    run from above and execute steps within it; every boundary is a process + artifacts.
 4. **Scheduled** — declared in `schedules.yaml`, installed into the *host* scheduler
-   (`cairn schedule install` → cron/launchd/systemd), fired as idempotent invocations
-   (`--idempotent`: re-fire = resume-or-no-op, failure catch-up = the next firing resumes). cairn
+   (`cairn schedule install` → cron/launchd/systemd), fired as idempotent invocations. cairn
    owns schedulability, never the clock — no daemon ([SCHEDULING.md](SCHEDULING.md)).
 
 Ruled out: vendored kernels (the drift disease, one level up), `curl|bash` installers (uv exists),
 MCP-server-first (a later plugin at most — the operator pattern already works everywhere), and any
 resident daemon (the filesystem is the state).
 
+## Lineage — from a port design to a product
+
+cairn was distilled from a real Claude-Code-native pipeline and its port design (the internal research
+that asked *"how do we run the existing pipeline on three different CLIs?"*). That research answered:
+an external driver + a small CLI adapter + a portable core. cairn is that answer promoted to a product:
+
+- the driver became the cairn **kernel walker**;
+- the adapter's five operations became the cairn **Executor protocol**;
+- the port's pipeline + agent files became cairn's **pipeline + agent files**, generalized;
+- its control-flow shapes became cairn's **five node kinds** (step, gate, parallel, loop, manual);
+- its enforcement design became cairn's **guard engine**, with the same defense-in-depth.
+
+The deliverable changed from a one-off port into a reusable framework — with the original pipeline as
+its first workspace — but the build order, verifications, and risks carried over unchanged. The full
+sequence is in [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md).
+
 ## Status
 
-**C0–C1 built and green (802 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
+**Kernel built and green (802 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
 artifacts, trail/runstate, guards, expression + template engines, config, doctor, scaffold); all
-five executors (`shell`/`stub` live; the **`claude`, `codex`, and `grok` executors all
-live-verified** — the first live `claude -p` / `codex exec` / `grok --prompt-file` runs recorded as
-offline stub regressions in `tests/live/workspace-claude`, `tests/live/workspace-codex`, and
-`tests/live/workspace-grok` — plus a live-proven **mixed fleet**: one pipeline spanning
-codex → claude → grok, per-step models recorded in `run.json`, in `tests/live/workspace-fleet`); the
-workspace test layer (`cairn test` + `record`); and the full CLI — the `batch`/`learnings`/`gc`/
-`schedule` verbs are now **LIVE** (no longer stubbed), with first-class **scheduling shipped**
-(`schedules.yaml`, cron/launchd/systemd installers, content-key idempotency). **v0.1.0 is
-tagged**, and the hardening backlog has since shipped: opt-in `heartbeat` events, the webhook
-trail sink, kernel-side secret redaction, cross-version resume gates, range-scoped tool
-enforcement, batch failures that name their reason, and one aware-UTC clock behind every persisted
-timestamp. The learning loop is now closed: the curate→promote `self-improve.yaml` pipeline ships
-as scaffold furniture — the framework provides the mechanism, the workspace owns the policy
-(TOOLING-AND-GROWTH §7). The day-0 pipeline runs end-to-end offline (`cairn run hello --headless`).
-The doctor hook probe (`cairn doctor --probe-hooks`) has shipped — on the dev machine it verifies
-that Claude's, Codex's, and Grok's PreToolUse hooks all fire and block headlessly. Still ahead, per
-[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md):
-the brease-factory workspace migration (deferred — cairn's eventual first workspace), whose scope
-includes the `brease=on` CMS-population branch (Brease is separate tooling, not a framework
-feature) and the deferred parity runs.
+five executors (`shell`/`stub` live; the **`claude`, `codex`, and `grok` executors all live-verified**,
+with the first live runs recorded as offline stub regressions, plus a live-proven **mixed fleet** —
+one pipeline spanning codex → claude → grok, per-step models recorded in `run.json`); the workspace
+test layer (`cairn test` + `record`); and the full CLI — `batch` / `learnings` / `gc` / `schedule` are
+**live** (no longer stubbed), with first-class **scheduling shipped** (`schedules.yaml`,
+cron/launchd/systemd installers, content-key idempotency).
+
+**v0.1.0 is tagged.** The hardening backlog has since shipped: opt-in `heartbeat` events, the webhook
+trail sink, kernel-side secret redaction, cross-version resume gates, range-scoped tool enforcement,
+batch failures that name their reason, and one aware-UTC clock behind every persisted timestamp. The
+learning loop is closed: the curate→promote `self-improve.yaml` pipeline ships as scaffold furniture —
+the framework provides the mechanism, the workspace owns the policy
+([TOOLING-AND-GROWTH.md §7](TOOLING-AND-GROWTH.md)). The day-0 pipeline runs end-to-end offline
+(`cairn run hello --headless`), and `cairn doctor --probe-hooks` verifies that Claude's, Codex's, and
+Grok's PreToolUse hooks all fire and block headlessly.
+
+Still ahead, per [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md): migrating the first real workspace
+(the pipeline cairn was distilled from — deferred), whose scope includes its CMS-population branch
+(separate tooling, not a framework feature) and the deferred parity runs.
