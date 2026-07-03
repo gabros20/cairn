@@ -5,6 +5,49 @@ needs; semantics live in `ARCHITECTURE.md`.
 
 ---
 
+## 0. Workspace layout — the orientation map
+
+Every path in this reference is relative to the workspace root. This is exactly what `cairn new
+workspace <name>` scaffolds — a workspace that plans *and* runs `hello` offline the moment it exists,
+already carrying the `self-improve` learning-loop furniture:
+
+```
+<name>/
+├── cairn.toml                     # §1 — the one config file; every relative path resolves here
+├── README.md                      # the workspace's own docs (smoke target, tiers to wire, …)
+├── allowlist.yaml                 # bash command allowlist fragments, referenced by agents (§3)
+├── pipelines/                     # §2 — the trails
+│   ├── hello.yaml                 #   day-0: plans + runs offline, zero auth (run: steps + one gate)
+│   └── self-improve.yaml          #   the curate→promote learning loop (TOOLING-AND-GROWTH §7)
+├── agents/                        # §3 — worker declarations (tier · effort · skills · tools)
+│   ├── assistant.yaml
+│   └── curator.yaml
+├── skills/                        # markdown capability packs, inlined into envelopes (CONCEPTS §7)
+│   ├── cairn-operator/SKILL.md
+│   └── self-improve-curator/SKILL.md
+├── schemas/                       # JSON Schemas for artifacts + the STEP return
+│   ├── greeting.json
+│   ├── step-return.json           # §7
+│   └── self-improve-proposals.json
+├── validators/                    # §4 — pure acceptance checks (argv: run_dir, name, path)
+│   ├── nonempty.py
+│   └── self-improve-proposals.py
+├── prompts/
+│   └── DOCTRINE.md                # workspace doctrine, inlined into every agent envelope
+├── scripts/                       # helper scripts a run: step may shell out to
+│   └── self-improve-open-pr.py
+├── tests/                         # §TESTING — the offline L1 suite
+│   ├── matrix.yaml                #   param sets the stub runs exercise
+│   ├── fixtures/proposals/…       #   valid-*/invalid-* validator fixtures
+│   └── stubs/self-improve/…       #   canned artifacts for stub runs
+└── runs/                          # §8 — every execution, self-describing (gitignored, never shared)
+```
+
+Two directories are conventional, added when a workspace needs them (they are *not* in the day-0
+scaffold): **`guards/`** holds command-policy checks (§5), and **`tests/guards/`** their fixtures.
+The run skeleton under `runs/<id>/` (§8) is fixed and not author-configurable — the legibility
+invariant (ARCHITECTURE §11).
+
 ## 1. `cairn.toml` — workspace config
 
 ```toml
@@ -382,14 +425,26 @@ validation outranks this block in both directions (ARCHITECTURE §7).
 
 ## 8. Run directory layout & schemas
 
+The skeleton (`run.json`, `trail.jsonl`, `gates/`, `logs/`) is identical in every cairn run on earth;
+only the artifact paths under it are author-controlled (each artifact's `path:`). A populated run:
+
 ```
-runs/<run-id>/
-├── run.json            # schemas/run.schema.json (below)
-├── trail.jsonl         # append-only events (below)
-├── gates/<name>.json
-├── logs/<step>[.rN][.cK].{log,prompt.md}     # rN = retry, cK = loop cycle
-└── <artifacts as declared>
+runs/acme-redesign-20260703/
+├── run.json                       # the pinned manifest — schemas/run.schema.json (§8.1)
+├── trail.jsonl                    # append-only event log — the authority (§8.2)
+├── gates/
+│   └── scope.json                 # one decision file per answered gate ({choice, by, at})
+├── logs/                          # one pair per step attempt — the exact record of what ran
+│   ├── capture.prompt.md          #   the rendered envelope (the prompt IS an artifact)
+│   ├── capture.log                #   the executor's stdout/stderr
+│   ├── build.r2.prompt.md         #   .rN = retry attempt N (r2 = second attempt)
+│   ├── review.c1.log              #   .cK = loop cycle K (art-review cycle 1)
+│   └── review.c1.prompt.md
+└── captures/  blueprints/  qa/ …  # the artifacts themselves, at each artifact's declared path:
 ```
+
+Log stems are `<step>[.rN][.cK].{log,prompt.md}` — the retry suffix (`.rN`, N>1) precedes the loop-cycle
+suffix (`.cK`), both omitted when they're 1 / absent.
 
 ### 8.1 `run.json` (pinned — resolves today's live drift)
 ```json
