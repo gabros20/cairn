@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import TextIO
 
 from cairn.kernel.errors import ConfigError
+from cairn.kernel.types import ExitCode
 
 # Sensible fallback pool size; the CLI passes ``-j`` explicitly (docs/API.md shows ``-j 8``).
 DEFAULT_JOBS = 4
@@ -43,13 +44,16 @@ Clock = Callable[[], float]
 class RunOutcome:
     """One child run's result. ``index`` is the 0-based input line order (summary is sorted
     by it, never by completion order). ``run_dir`` is parsed from the child's terminal
-    marker line; None if the child printed none (e.g. it crashed before bootstrapping)."""
+    marker line; None if the child printed none (e.g. it crashed before bootstrapping).
+    ``error`` carries the exception text when the SPAWN itself raised (exit_code=EXECUTOR);
+    None for a child that ran to an exit code, even a failing one."""
 
     index: int
     params: dict
     run_dir: Path | None
     exit_code: int
     duration_s: float
+    error: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -177,8 +181,10 @@ def parse_run_dir(output: str) -> Path | None:
 def aggregate_exit_code(exit_codes: list[int]) -> int:
     """PINNED: 0 iff every run exited 0; otherwise the HIGHEST exit code among failed runs.
 
-    The ExitCode enum is ordered by escalation (CONFIG=2 … NEEDS_HUMAN=6, BUDGET=7): the max
-    surfaces the outcome most needing a human. Deterministic regardless of completion order.
+    The rule is plain ``max`` over the failing codes — deterministic regardless of completion
+    order, and roughly tracking the ExitCode enum's escalation (CONFIG=2 … NEEDS_HUMAN=6,
+    BUDGET=7). It is a tie-break heuristic, not a strict severity ranking (BUDGET outranks
+    NEEDS_HUMAN under max); per-run codes are in the outcomes for anything finer.
     """
     failures = [c for c in exit_codes if c != 0]
     return max(failures) if failures else 0
@@ -221,7 +227,19 @@ def run_batch(
     def one(index: int, params: dict) -> RunOutcome:
         argv = build_run_argv(pipeline, params, gate_presets, extra_args)
         start = clock()
-        code, output = spawn(argv, workspace_dir)
+        try:
+            code, output = spawn(argv, workspace_dir)
+        except Exception as exc:  # noqa: BLE001 — crash containment IS the failure policy:
+            # a spawn that raises (missing interpreter, bad cwd, OS error) becomes a failed
+            # outcome, never a fleet abort — siblings keep running.
+            return RunOutcome(
+                index=index,
+                params=params,
+                run_dir=None,
+                exit_code=int(ExitCode.EXECUTOR),
+                duration_s=clock() - start,
+                error=f"{type(exc).__name__}: {exc}",
+            )
         duration = clock() - start
         return RunOutcome(
             index=index,
@@ -249,5 +267,6 @@ def run_batch(
 
 def _progress(out: TextIO, done: int, total: int, o: RunOutcome) -> None:
     rd = o.run_dir.name if o.run_dir is not None else "?"
-    out.write(f"[{done}/{total}] {rd}  exit {o.exit_code}  {o.duration_s:.1f}s\n")
+    tail = f"  {o.error}" if o.error else ""
+    out.write(f"[{done}/{total}] {rd}  exit {o.exit_code}  {o.duration_s:.1f}s{tail}\n")
     out.flush()

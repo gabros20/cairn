@@ -193,6 +193,72 @@ def test_awaiting_human_marker_is_parsed(tmp_path):
     assert batchkit.parse_run_dir(out) == Path("/runs/x")
 
 
+def test_parse_run_dir_last_marker_wins():
+    # a child can print more than one marker line; the TERMINAL outcome is last
+    out = (
+        "cairn: already done → /runs/stale\n"
+        "some interleaved child output\n"
+        "cairn: run complete → /runs/final\n"
+    )
+    assert batchkit.parse_run_dir(out) == Path("/runs/final")
+
+
+# --------------------------------------------------------------------------- #
+# Spawn crash containment — an exception is a failed outcome, never a fleet abort.
+# --------------------------------------------------------------------------- #
+
+
+def test_spawn_exception_becomes_failed_outcome_not_batch_abort(tmp_path):
+    pf = _write_jsonl(tmp_path / "s.jsonl", ['{"url": "a"}', '{"url": "b"}', '{"url": "c"}'])
+
+    def spawn(argv, cwd):
+        p = _params_of(argv)
+        if p["url"] == "b":
+            raise FileNotFoundError("no such workspace dir")
+        return 0, f"cairn: run complete → /runs/{p['url']}\n"
+
+    out = io.StringIO()
+    res = batchkit.run_batch(tmp_path, "hello", pf, jobs=1, out=out, spawn=spawn)
+
+    # siblings kept running: all three outcomes present, input order
+    assert [o.params["url"] for o in res.outcomes] == ["a", "b", "c"]
+    crashed = res.outcomes[1]
+    assert crashed.exit_code == int(ExitCode.EXECUTOR) == 4
+    assert crashed.run_dir is None
+    assert [o.exit_code for o in res.outcomes] == [0, 4, 0]
+    assert res.exit_code == int(ExitCode.EXECUTOR)
+    # progress still streamed one line per completion, the crash line naming the exception
+    lines = [ln for ln in out.getvalue().splitlines() if ln.strip()]
+    assert len(lines) == 3
+    assert "no such workspace dir" in out.getvalue()
+
+
+# --------------------------------------------------------------------------- #
+# Summary determinism — input order even when completion order is reversed.
+# --------------------------------------------------------------------------- #
+
+
+def test_summary_is_input_ordered_despite_reordered_completion(tmp_path):
+    pf = _write_jsonl(tmp_path / "s.jsonl", [f'{{"url": "{i}"}}' for i in range(4)])
+    completion_order: list[str] = []
+    lock = threading.Lock()
+
+    def spawn(argv, cwd):
+        p = _params_of(argv)
+        # line 0 finishes LAST; later lines finish first
+        time.sleep(0.08 if p["url"] == "0" else 0.01 * (int(p["url"]) + 1))
+        with lock:
+            completion_order.append(p["url"])
+        return 0, f"cairn: run complete → /runs/{p['url']}\n"
+
+    res = batchkit.run_batch(tmp_path, "hello", pf, jobs=4, out=io.StringIO(), spawn=spawn)
+
+    assert completion_order[-1] == "0"  # completion really was reordered
+    assert completion_order != ["0", "1", "2", "3"]
+    # summary stays input-ordered regardless
+    assert [o.params["url"] for o in res.outcomes] == ["0", "1", "2", "3"]
+
+
 def test_streams_one_progress_line_per_completion(tmp_path):
     pf = _write_jsonl(tmp_path / "s.jsonl", ['{"url": "a"}', '{"url": "b"}', '{"url": "c"}'])
     out = io.StringIO()
