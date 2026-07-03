@@ -2,7 +2,8 @@
 
 Every subcommand parses its flags, wires kernel objects together, and prints; the logic
 stays in the kernel. Verbs (docs/API.md §9): plan/run/resume/gate/validate/trail/ps/doctor/
-test/compose/new are live; batch/learnings/gc/schedule remain stubs (exit 2).
+test/compose/new plus the fleet verbs batch/learnings/gc/schedule are all live — each is a
+thin binding over its kernel module (batchkit/learnkit/gckit/schedkit).
 
 Guard wiring (the pinned contract): in run/resume, a plan's ``shim``-enforced guards get a
 fresh PATH-shim dir per run (:func:`~cairn.kernel.guards.build_shims`), and every executor is
@@ -17,9 +18,10 @@ import dataclasses
 import hashlib
 import json
 import shutil
+import subprocess
 import sys
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from importlib.metadata import entry_points
 from pathlib import Path
 from typing import Any
@@ -28,11 +30,14 @@ import cairn
 from cairn.kernel import doctor as doctor_mod
 from cairn.kernel import newkit
 from cairn.kernel.artifacts import resolve_path, validate
+from cairn.kernel.batchkit import run_batch
 from cairn.kernel.compose import make_composer, render_artifact_path
 from cairn.kernel.config import Config, ExecutorConfig, load_config
 from cairn.kernel.errors import CairnError, ConfigError
 from cairn.kernel.gatekit import answer_gate, is_answered, read_choice
+from cairn.kernel.gckit import apply_gc, plan_gc
 from cairn.kernel.guards import build_shims
+from cairn.kernel.learnkit import collect_learnings, render_learnings
 from cairn.kernel.plan import (
     GateNode,
     LoopNode,
@@ -40,9 +45,18 @@ from cairn.kernel.plan import (
     Plan,
     StepNode,
     plan as build_plan,
-    render_run_id,
 )
 from cairn.kernel.runstate import load_run, update_run
+from cairn.kernel.schedkit import (
+    RunResult,
+    diff_schedules,
+    find_idempotent_run,
+    install as install_schedules,
+    list_installed,
+    load_schedules,
+    run_schedule,
+    uninstall as uninstall_schedules,
+)
 from cairn.kernel.trail import derive_status, follow, read_trail
 from cairn.kernel.types import ExitCode
 from cairn.kernel.walk import bootstrap_run, walk
@@ -66,7 +80,8 @@ SUBCOMMANDS: list[str] = [
     "schedule",
 ]
 
-_STUB_VERBS = {"batch", "learnings", "gc", "schedule"}
+# No stub verbs remain — batch/learnings/gc/schedule are wired to their kernel modules below.
+_STUB_VERBS: set[str] = set()
 
 
 # --------------------------------------------------------------------------- #
@@ -443,16 +458,19 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # existing without --idempotent → resume the given dir as-is.
     else:
         runs_root = _runs_root(ws, config)
-        if args.idempotent:
-            candidate = runs_root / render_run_id(p, now)
-            if (candidate / "run.json").is_file():
-                fast = _idempotent_shortcut(candidate)
-                if fast is not None:
-                    return fast
-                run_dir = candidate
-            else:
-                run_dir = bootstrap_run(ws, p, now=now, runs_root=runs_root, pipeline_hash=phash)
-                created = True
+        # Idempotency's single source of truth is schedkit.find_idempotent_run — it matches by
+        # the (pipeline, params, {date}) content key a scheduled `--idempotent` firing would use,
+        # not by run-id string. Complete match → no-op; incomplete → resume; none → fresh run.
+        match = (
+            find_idempotent_run(runs_root, pipeline=p.pipeline, params=p.params, now=now)
+            if args.idempotent
+            else None
+        )
+        if match is not None and match.complete:
+            print(f"cairn: already done → {match.run_dir}")
+            return int(ExitCode.OK)
+        if match is not None:
+            run_dir = match.run_dir  # incomplete equivalent run → resume it, never mint a variant
         else:
             run_dir = bootstrap_run(ws, p, now=now, runs_root=runs_root, pipeline_hash=phash)
             created = True
@@ -936,13 +954,239 @@ def _cmd_new(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------- #
-# stubs (C6+)
+# batch — a pool of `cairn run --headless` children over a JSONL params file.
 # --------------------------------------------------------------------------- #
 
 
-def _cmd_stub(args: argparse.Namespace) -> int:
-    print(f"cairn: {args.command} is not implemented — see IMPLEMENTATION-PLAN C6+", file=sys.stderr)
+def _cmd_batch(args: argparse.Namespace) -> int:
+    ws = _workspace(args)
+    gate_presets = _kv(args.gate)  # _Usage → exit 2 via main()
+    try:
+        result = run_batch(
+            ws,
+            args.pipeline,
+            Path(args.params_file),
+            jobs=args.jobs,
+            gate_presets=gate_presets,
+            out=sys.stdout,
+        )
+    except ConfigError as exc:
+        return _print_config_error(exc)
+
+    print(f"cairn: batch {result.pipeline} — {result.total} run(s), {len(result.failed)} failed")
+    for o in result.failed:
+        rd = o.run_dir.name if o.run_dir is not None else "?"
+        extra = f" — {o.error}" if o.error else ""
+        print(f"  ✗ [{o.index}] {rd}  exit {o.exit_code}{extra}", file=sys.stderr)
+    return int(result.exit_code)
+
+
+# --------------------------------------------------------------------------- #
+# learnings — aggregate `learn` trail events across every run.
+# --------------------------------------------------------------------------- #
+
+
+def _cmd_learnings(args: argparse.Namespace) -> int:
+    ws = _workspace(args)
+    try:
+        config = load_config(ws)
+    except ConfigError as exc:
+        return _print_config_error(exc)
+    runs_root = _runs_root(ws, config)
+
+    warnings: list[str] = []
+    try:
+        learnings = collect_learnings(runs_root, since=args.since, tag=args.tag, warnings=warnings)
+    except ValueError as exc:
+        print(f"cairn: invalid --since {args.since!r}: {exc}", file=sys.stderr)
+        return int(ExitCode.CONFIG)
+    for w in warnings:
+        print(f"cairn: {w}", file=sys.stderr)
+    print(render_learnings(learnings))
+    return int(ExitCode.OK)
+
+
+# --------------------------------------------------------------------------- #
+# gc — explicit retention over the runs root (dry-run by default; --apply deletes).
+# --------------------------------------------------------------------------- #
+
+
+def _cmd_gc(args: argparse.Namespace) -> int:
+    ws = _workspace(args)
+    try:
+        config = load_config(ws)
+    except ConfigError as exc:
+        return _print_config_error(exc)
+    runs_root = _runs_root(ws, config)
+
+    if args.keep_days is None and args.keep_last is None:
+        print(
+            "cairn: gc needs a retention rule — pass at least one of --keep-days N or --keep-last M",
+            file=sys.stderr,
+        )
+        return int(ExitCode.CONFIG)
+
+    plan = plan_gc(
+        runs_root,
+        keep_days=args.keep_days,
+        keep_last=args.keep_last,
+        artifacts_only=args.artifacts_only,
+        now=datetime.now(timezone.utc),  # gckit requires an aware UTC clock
+        include_needs_human=args.include_needs_human,
+    )
+
+    if not args.apply:
+        _print_gc_plan(plan)
+        return int(ExitCode.OK)
+
+    result = apply_gc(plan)
+    _print_gc_result(result, plan)
+    return int(ExitCode.OK)
+
+
+def _human_bytes(n: int) -> str:
+    size = float(n)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024 or unit == "TB":
+            return f"{int(size)}{unit}" if unit == "B" else f"{size:.1f}{unit}"
+        size /= 1024
+    return f"{n}B"
+
+
+def _print_gc_plan(plan) -> None:
+    verb = "slim" if plan.artifacts_only else "delete"
+    if plan.candidates:
+        print(f"cairn: gc dry-run — {len(plan.candidates)} run(s) would {verb} (pass --apply to execute):")
+        for c in plan.candidates:
+            age = f"{c.age_days:.1f}d" if c.age_days is not None else "?"
+            print(f"  ⌫ {c.run_id}  ({c.reason}, age {age})")
+    else:
+        print("cairn: gc dry-run — no runs selected (pass --apply once a rule matches something)")
+    for run_id, reason in plan.skipped:
+        print(f"  ─ {run_id}  skipped: {reason}")
+
+
+def _print_gc_result(result, plan) -> None:
+    verb = "slimmed" if plan.artifacts_only else "deleted"
+    print(f"cairn: gc {verb} {len(result.deleted)} run(s), freed {_human_bytes(result.freed_bytes)}")
+    for run_id in result.deleted:
+        print(f"  ⌫ {run_id}")
+    for run_id, reason in result.errors:
+        print(f"  ! {run_id}: {reason}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------- #
+# schedule — sync schedules.yaml into the host scheduler (install/list/run/uninstall).
+# --------------------------------------------------------------------------- #
+
+
+class _SubprocessRunner:
+    """The schedkit ``Runner`` adapter — the CLI's one bridge to the real host scheduler.
+
+    schedkit keeps every side effect (crontab / launchctl / systemctl / a child ``cairn``)
+    behind this injected boundary; this is its only production implementation. Combined
+    stdout/stderr are captured so ``schedule run`` can propagate the child's exit verbatim.
+    """
+
+    def run(self, argv: list[str], *, input: str | None = None, cwd: Path | None = None) -> RunResult:
+        proc = subprocess.run(
+            [str(a) for a in argv],
+            input=input,
+            cwd=str(cwd) if cwd is not None else None,
+            capture_output=True,
+            text=True,
+        )
+        return RunResult(returncode=proc.returncode, stdout=proc.stdout or "", stderr=proc.stderr or "")
+
+
+def _resolve_cairn_bin() -> str:
+    """The command host timer entries invoke. schedkit renders it as a single shlex-quoted
+    token (no multi-token ``python -m cairn`` form), so resolve the console script honestly:
+    its absolute path when on PATH, else the bare name with a doctor-style warning."""
+    found = shutil.which("cairn")
+    if found:
+        return found
+    print(
+        "cairn: warning — 'cairn' is not on PATH; installed timer entries will invoke the bare "
+        "name 'cairn' and may fail to launch. Install the console script (pip/uv) or add it to PATH.",
+        file=sys.stderr,
+    )
+    return "cairn"
+
+
+def _schedule_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
+    """The per-user default target dirs for the host-file backends (overridable via flags)."""
+    launchd = Path(args.launchd_dir).expanduser() if args.launchd_dir else Path.home() / "Library" / "LaunchAgents"
+    systemd = Path(args.systemd_dir).expanduser() if args.systemd_dir else Path.home() / ".config" / "systemd" / "user"
+    return launchd, systemd
+
+
+def _cmd_schedule(args: argparse.Namespace) -> int:
+    ws = _workspace(args)
+    backend = args.backend
+    runner = _SubprocessRunner()
+    launchd_dir, systemd_dir = _schedule_dirs(args)
+
+    try:
+        if args.action == "run":
+            if not args.name:
+                print("cairn: `cairn schedule run` needs a schedule name", file=sys.stderr)
+                return int(ExitCode.CONFIG)
+            schedules = load_schedules(ws)
+            # Propagate the child's exit code verbatim (SCHEDULING.md §2).
+            return run_schedule(schedules, args.name, workspace_dir=ws, runner=runner, cairn_bin=_resolve_cairn_bin())
+
+        if args.action == "install":
+            schedules = load_schedules(ws)
+            install_schedules(
+                schedules,
+                backend,
+                workspace_dir=ws,
+                runner=runner,
+                cairn_bin=_resolve_cairn_bin(),
+                launchd_dir=launchd_dir,
+                systemd_dir=systemd_dir,
+            )
+            print(f"cairn: installed {len(schedules)} schedule(s) into the {backend} backend")
+            return int(ExitCode.OK)
+
+        if args.action == "uninstall":
+            uninstall_schedules(
+                backend,
+                workspace_dir=ws,
+                runner=runner,
+                launchd_dir=launchd_dir,
+                systemd_dir=systemd_dir,
+            )
+            print(f"cairn: removed cairn-managed schedules from the {backend} backend")
+            return int(ExitCode.OK)
+
+        if args.action == "list":
+            schedules = load_schedules(ws)
+            installed = list_installed(
+                backend, runner=runner, launchd_dir=launchd_dir, systemd_dir=systemd_dir
+            )
+            _print_schedule_diff(diff_schedules(schedules, installed), backend)
+            return int(ExitCode.OK)
+    except ConfigError as exc:
+        return _print_config_error(exc)
+
+    print(f"cairn: unknown schedule action {args.action!r}", file=sys.stderr)
     return int(ExitCode.CONFIG)
+
+
+def _print_schedule_diff(diff, backend: str) -> None:
+    print(f"cairn: schedules (declared vs installed on {backend}):")
+    rows = (
+        [(n, "+ declared, not installed") for n in diff.added]
+        + [(n, "~ changed (re-run install)") for n in diff.changed]
+        + [(n, "- installed, not declared") for n in diff.removed]
+        + [(n, "= in sync") for n in diff.unchanged]
+    )
+    if not rows:
+        print("  (none)")
+    for name, note in sorted(rows):
+        print(f"  {note:32} {name}")
 
 
 # --------------------------------------------------------------------------- #
@@ -1044,10 +1288,37 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--run-dir")
     sp.set_defaults(func=_cmd_compose)
 
-    # stubs (C6+)
-    for name in ("batch", "learnings", "gc", "schedule"):
-        sp = sub.add_parser(name, help=f"{name} (not implemented — C6+)")
-        sp.set_defaults(func=_cmd_stub)
+    # batch — a pool of `cairn run --headless` children over a JSONL params file
+    sp = sub.add_parser("batch", help="run a pipeline over every line of a JSONL params file")
+    sp.add_argument("pipeline")
+    sp.add_argument("--params-file", required=True, metavar="FILE", help="JSONL: one param object per line")
+    sp.add_argument("-j", "--jobs", type=int, default=4, help="max concurrent child runs (default 4)")
+    sp.add_argument("--gate", action="append", metavar="NAME=CHOICE", help="preset a gate for every child (repeatable)")
+    sp.set_defaults(func=_cmd_batch)
+
+    # learnings — aggregate `learn` trail events across every run
+    sp = sub.add_parser("learnings", help="aggregate learn events across all runs")
+    sp.add_argument("--since", metavar="DATE", help="only events on/after this ISO date/datetime")
+    sp.add_argument("--tag", help="only events with this exact tag")
+    sp.set_defaults(func=_cmd_learnings)
+
+    # gc — explicit retention (dry-run by default; --apply deletes)
+    sp = sub.add_parser("gc", help="retention over the runs root (dry-run unless --apply)")
+    sp.add_argument("--keep-days", type=int, metavar="N", help="delete runs older than N days")
+    sp.add_argument("--keep-last", type=int, metavar="M", help="keep the newest M runs per pipeline")
+    sp.add_argument("--artifacts-only", action="store_true", help="slim runs to the audit skeleton, not delete")
+    sp.add_argument("--include-needs-human", action="store_true", help="also consider gate/needs-human runs")
+    sp.add_argument("--apply", action="store_true", help="actually delete/slim (default is a dry-run plan)")
+    sp.set_defaults(func=_cmd_gc)
+
+    # schedule — sync schedules.yaml into the host scheduler
+    sp = sub.add_parser("schedule", help="sync schedules.yaml → host scheduler (install/list/run/uninstall)")
+    sp.add_argument("action", choices=["install", "list", "run", "uninstall"])
+    sp.add_argument("name", nargs="?", help="schedule name (required for `run`)")
+    sp.add_argument("--backend", choices=["cron", "launchd", "systemd"], default="cron", help="host backend (default cron)")
+    sp.add_argument("--launchd-dir", help="override the launchd LaunchAgents dir")
+    sp.add_argument("--systemd-dir", help="override the systemd user-unit dir")
+    sp.set_defaults(func=_cmd_schedule)
 
     return parser
 

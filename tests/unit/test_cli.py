@@ -95,11 +95,7 @@ def test_no_subcommand_returns_config_and_prints_help(capsys):
     assert "usage" in capsys.readouterr().err.lower()
 
 
-@pytest.mark.parametrize("cmd", ["batch", "learnings", "gc", "schedule"])
-def test_stub_verbs_not_implemented(cmd, capsys):
-    rc = main([cmd])
-    assert rc == int(ExitCode.CONFIG)
-    assert "not implemented" in capsys.readouterr().err
+# batch/learnings/gc/schedule are wired (C6+); their behavior is exercised in the sections below.
 
 
 # --------------------------------------------------------------------------- #
@@ -696,3 +692,285 @@ def test_wheel_ships_templates_and_new_workspace_works_installed(tmp_path):
     planned = subprocess.run([str(cairn_bin), "plan", "hello"], cwd=str(work / "x"), capture_output=True, text=True)
     assert planned.returncode == 0, planned.stderr
     assert "hello" in planned.stdout
+
+
+# --------------------------------------------------------------------------- #
+# batch (C6+ wiring — real `python -m cairn run` children on the hello scaffold).
+# --------------------------------------------------------------------------- #
+
+
+def test_batch_runs_each_line_and_reports(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    pf = hello_ws / "sites.jsonl"
+    pf.write_text('{"name": "Ada"}\n{"name": "Bob"}\n', encoding="utf-8")
+    rc = main(["batch", "hello", "--params-file", str(pf), "-j", "2"])
+    out = capsys.readouterr().out
+    assert rc == int(ExitCode.OK)
+    dirs = [d for d in (hello_ws / "runs").iterdir() if d.is_dir()]
+    assert len(dirs) == 2  # one child run dir per JSONL line
+    assert "2 run(s)" in out and "0 failed" in out
+
+
+def test_batch_bad_params_file_is_config_error(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    pf = hello_ws / "bad.jsonl"
+    pf.write_text("this is not json\n", encoding="utf-8")
+    rc = main(["batch", "hello", "--params-file", str(pf)])
+    assert rc == int(ExitCode.CONFIG)
+    assert "not valid JSON" in capsys.readouterr().err
+
+
+def test_batch_aggregates_child_failure_exit(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    pf = hello_ws / "s.jsonl"
+    pf.write_text('{"name": "Ada"}\n', encoding="utf-8")
+    # A child `cairn run nope-pipeline` exits CONFIG(2); batch surfaces the worst child code.
+    rc = main(["batch", "nope-pipeline", "--params-file", str(pf)])
+    assert rc == int(ExitCode.CONFIG)
+    assert "1 failed" in capsys.readouterr().out
+
+
+# --------------------------------------------------------------------------- #
+# run --idempotent reconciliation (delegates to schedkit.find_idempotent_run).
+# --------------------------------------------------------------------------- #
+
+
+def test_run_idempotent_resumes_incomplete_equivalent_run(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    # A manual step halts the first run NEEDS_HUMAN → a genuinely incomplete (status != done) dir.
+    (hello_ws / "pipelines" / "manualflow.yaml").write_text(
+        "pipeline: manualflow\nversion: 1\nrun_id: \"manualflow-{date}\"\n"
+        "artifacts:\n  token: { path: token.txt, validator: validators/nonempty.py }\n"
+        "steps:\n"
+        "  - id: approve\n    manual: \"write token.txt\"\n    produces: [token]\n"
+        "  - id: after\n    run: \"echo done\"\n    needs: [token]\n",
+        encoding="utf-8",
+    )
+    assert main(["run", "manualflow", "--headless", "--idempotent"]) == int(ExitCode.NEEDS_HUMAN)
+    before = sorted((hello_ws / "runs").iterdir())
+    assert len(before) == 1
+    rd = before[0]
+    (rd / "token.txt").write_text("ok\n", encoding="utf-8")  # satisfy the manual step
+
+    capsys.readouterr()
+    # A fresh --idempotent firing must RESUME that same dir (same date/params key), not mint one.
+    rc = main(["run", "manualflow", "--headless", "--idempotent"])
+    assert rc == int(ExitCode.OK)
+    after = sorted((hello_ws / "runs").iterdir())
+    assert after == before  # resumed in place, no variant created
+
+
+# --------------------------------------------------------------------------- #
+# learnings.
+# --------------------------------------------------------------------------- #
+
+
+def test_learnings_empty_runs_root(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    main(["run", "hello", "--headless"])  # a shell-only run emits no learn events
+    capsys.readouterr()
+    rc = main(["learnings"])
+    assert rc == int(ExitCode.OK)
+    assert "no learnings found" in capsys.readouterr().out
+
+
+def test_learnings_aggregates_and_filters_by_tag(hello_ws, monkeypatch, capsys):
+    from cairn.kernel.trail import TrailWriter
+
+    monkeypatch.chdir(hello_ws)
+    rd = hello_ws / "runs" / "hello-world-20260703"
+    rd.mkdir(parents=True)
+    (rd / "run.json").write_text('{"pipeline": "hello"}', encoding="utf-8")
+    w = TrailWriter(rd, "hello-world-20260703")
+    w.emit("run-start")
+    w.emit("learn", node="greet", data={"note": "keep it short", "tag": "copy"})
+    w.emit("learn", node="greet", data={"note": "sites never idle", "tag": "crawl"})
+    w.close()
+
+    capsys.readouterr()
+    assert main(["learnings"]) == int(ExitCode.OK)
+    out = capsys.readouterr().out
+    assert "keep it short" in out and "sites never idle" in out
+
+    capsys.readouterr()
+    assert main(["learnings", "--tag", "copy"]) == int(ExitCode.OK)
+    out = capsys.readouterr().out
+    assert "keep it short" in out and "sites never idle" not in out
+
+
+def test_learnings_bad_since_is_config_error(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    rc = main(["learnings", "--since", "not-a-date"])
+    assert rc == int(ExitCode.CONFIG)
+    assert "invalid --since" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# gc (dry-run by default; --apply deletes).
+# --------------------------------------------------------------------------- #
+
+
+def _make_gc_run(runs_root: Path, run_id: str, *, created_at: str, pipeline: str = "hello") -> Path:
+    from cairn.kernel.trail import TrailWriter
+
+    rd = runs_root / run_id
+    rd.mkdir(parents=True, exist_ok=True)
+    (rd / "run.json").write_text(
+        json.dumps({"run_id": run_id, "pipeline": pipeline, "created_at": created_at, "status": "done"}),
+        encoding="utf-8",
+    )
+    w = TrailWriter(rd, run_id)
+    w.emit("run-start")
+    w.emit("run-done")
+    w.close()
+    (rd / "artifacts").mkdir(exist_ok=True)
+    (rd / "artifacts" / "big.json").write_text("x" * 2048, encoding="utf-8")
+    return rd
+
+
+def test_gc_no_rule_is_config_error(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    rc = main(["gc"])
+    assert rc == int(ExitCode.CONFIG)
+    assert "at least one" in capsys.readouterr().err
+
+
+def test_gc_dry_run_lists_and_deletes_nothing(hello_ws, monkeypatch, capsys):
+    from datetime import datetime, timezone
+
+    monkeypatch.chdir(hello_ws)
+    runs = hello_ws / "runs"
+    old = _make_gc_run(runs, "hello-old-20260101", created_at="2026-01-01T00:00:00Z")
+    fresh = _make_gc_run(runs, "hello-fresh", created_at=datetime.now(timezone.utc).isoformat())
+
+    capsys.readouterr()
+    rc = main(["gc", "--keep-days", "7"])
+    out = capsys.readouterr().out
+    assert rc == int(ExitCode.OK)
+    assert "dry-run" in out and "hello-old-20260101" in out
+    assert old.exists() and fresh.exists()  # dry-run deletes nothing
+
+
+def test_gc_apply_deletes_selected_run(hello_ws, monkeypatch, capsys):
+    from datetime import datetime, timezone
+
+    monkeypatch.chdir(hello_ws)
+    runs = hello_ws / "runs"
+    old = _make_gc_run(runs, "hello-old-20260101", created_at="2026-01-01T00:00:00Z")
+    fresh = _make_gc_run(runs, "hello-fresh", created_at=datetime.now(timezone.utc).isoformat())
+
+    capsys.readouterr()
+    rc = main(["gc", "--keep-days", "7", "--apply"])
+    out = capsys.readouterr().out
+    assert rc == int(ExitCode.OK)
+    assert "deleted 1 run(s)" in out
+    assert not old.exists() and fresh.exists()
+
+
+# --------------------------------------------------------------------------- #
+# schedule — a FAKE runner + tmp target dirs; NEVER the real crontab/launchctl/systemctl.
+# --------------------------------------------------------------------------- #
+
+
+class _FakeRunner:
+    """Records every host invocation and returns canned results — the schedkit effect seam,
+    substituted so no test touches the real crontab / launchctl / systemctl."""
+
+    def __init__(self, returncode: int = 0, crontab: str = ""):
+        self.returncode = returncode
+        self.calls: list[dict] = []
+        self._crontab = crontab
+
+    def run(self, argv, *, input=None, cwd=None):
+        from cairn.kernel.schedkit import RunResult
+
+        self.calls.append({"argv": list(argv), "input": input, "cwd": cwd})
+        if list(argv[:2]) == ["crontab", "-l"]:
+            return RunResult(0 if self._crontab else 1, self._crontab, "")
+        return RunResult(self.returncode, "", "")
+
+
+def _write_schedules(ws: Path) -> None:
+    (ws / "schedules.yaml").write_text(
+        'nightly:\n  cron: "30 2 * * *"\n  run: [run, hello, --headless, --idempotent]\n',
+        encoding="utf-8",
+    )
+
+
+def _inject_runner(monkeypatch, fake: _FakeRunner) -> None:
+    from cairn import cli
+
+    monkeypatch.setattr(cli, "_SubprocessRunner", lambda: fake)
+
+
+def test_schedule_install_cron_pipes_managed_block(hello_ws, monkeypatch):
+    _write_schedules(hello_ws)
+    fake = _FakeRunner()
+    _inject_runner(monkeypatch, fake)
+    monkeypatch.chdir(hello_ws)
+    rc = main(["schedule", "install", "--backend", "cron"])
+    assert rc == int(ExitCode.OK)
+    write = next(c for c in fake.calls if c["argv"] == ["crontab", "-"])
+    assert "schedule run nightly" in write["input"]  # the managed block, piped to `crontab -`
+
+
+def test_schedule_launchd_install_list_uninstall_roundtrip(hello_ws, monkeypatch, tmp_path, capsys):
+    _write_schedules(hello_ws)
+    _inject_runner(monkeypatch, _FakeRunner())
+    monkeypatch.chdir(hello_ws)
+    ld = tmp_path / "LaunchAgents"
+
+    assert main(["schedule", "install", "--backend", "launchd", "--launchd-dir", str(ld)]) == int(ExitCode.OK)
+    assert list(ld.glob("io.cairn.*.plist"))  # plist written to the INJECTED dir, not ~/Library
+
+    capsys.readouterr()
+    assert main(["schedule", "list", "--backend", "launchd", "--launchd-dir", str(ld)]) == int(ExitCode.OK)
+    assert "nightly" in capsys.readouterr().out
+
+    assert main(["schedule", "uninstall", "--backend", "launchd", "--launchd-dir", str(ld)]) == int(ExitCode.OK)
+    assert not list(ld.glob("io.cairn.*.plist"))
+
+
+def test_schedule_run_propagates_child_exit_verbatim(hello_ws, monkeypatch):
+    _write_schedules(hello_ws)
+    fake = _FakeRunner(returncode=3)
+    _inject_runner(monkeypatch, fake)
+    monkeypatch.chdir(hello_ws)
+    rc = main(["schedule", "run", "nightly"])
+    assert rc == 3  # the child cairn's exit code, verbatim
+    child = fake.calls[-1]
+    assert child["argv"][1:] == ["run", "hello", "--headless", "--idempotent"]
+
+
+def test_schedule_run_unknown_name_is_config_error(hello_ws, monkeypatch, capsys):
+    _write_schedules(hello_ws)
+    _inject_runner(monkeypatch, _FakeRunner())
+    monkeypatch.chdir(hello_ws)
+    rc = main(["schedule", "run", "ghost"])
+    assert rc == int(ExitCode.CONFIG)
+    assert "no schedule named 'ghost'" in capsys.readouterr().err
+
+
+def test_schedule_run_requires_a_name(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    rc = main(["schedule", "run"])
+    assert rc == int(ExitCode.CONFIG)
+    assert "needs a schedule name" in capsys.readouterr().err
+
+
+def test_schedule_missing_yaml_is_config_error(hello_ws, monkeypatch, capsys):
+    _inject_runner(monkeypatch, _FakeRunner())
+    monkeypatch.chdir(hello_ws)
+    rc = main(["schedule", "install"])
+    assert rc == int(ExitCode.CONFIG)
+    assert "schedules.yaml" in capsys.readouterr().err
+
+
+def test_subprocess_runner_actually_shells_out():
+    # The real Runner adapter (no fake): proves it shells out and maps stdout/returncode —
+    # a regression guard for the `import subprocess` the fake-runner tests never exercised.
+    from cairn.cli import _SubprocessRunner
+
+    res = _SubprocessRunner().run([sys.executable, "-c", "import sys; print('hi'); sys.exit(7)"])
+    assert res.returncode == 7
+    assert res.stdout.strip() == "hi"
