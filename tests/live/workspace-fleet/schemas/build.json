@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "cairn:fleet/build",
   "title": "fleet build artifact",
-  "description": "The tiny typed artifact the codex-pinned build step writes.",
+  "description": "The tiny typed artifact the codex-pinned build step writes. The `executor` const pins this leg to codex, so a mis-routed step or re-record fails the schema loudly.",
   "type": "object",
   "required": ["executor", "ok"],
   "properties": {
