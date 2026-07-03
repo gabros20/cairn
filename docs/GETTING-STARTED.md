@@ -109,8 +109,11 @@ demo
 ├── prompts
 │   └── DOCTRINE.md            # isolation + artifact-authority rules every agent inherits
 ├── tests
-│   └── matrix.yaml            # the offline test matrix for `cairn test`
+│   ├── matrix.yaml            # the offline test matrix for `cairn test`
+│   ├── fixtures/              # artifact fixtures the validator tests check against
+│   └── stubs/                 # recorded agent outputs the stub executor replays
 ├── allowlist.yaml             # named command fragments agents may run
+├── .gitignore                 # ignores runs/ and local cruft
 └── README.md                  # the workspace's own guide
 ```
 
@@ -148,6 +151,8 @@ runs/hello-world-20260703
     └── compose.log   ·  compose.prompt.md
 ```
 
+*(Abridged — omits internal bookkeeping: a `.cairn/` state dir and a `.cairn.lock` run lock.)*
+
 The two artifacts are the actual output:
 
 ```console
@@ -177,7 +182,7 @@ $ cat runs/hello-world-20260703/gates/tone.json
 ```console
 $ cairn trail runs/hello-world-20260703
    1  run-start        -                {"dims": {}, "executors": {"default": "claude"}, "params": {"name": "world"}}
-   2  plan             -                {"nodes": ["greet", "tone", "compose"], "pipeline_hash": "sha256:8240…"}
+   2  plan             -                {"models": {}, "nodes": ["greet", "tone", "compose"], "pipeline_hash": "sha256:8240…"}
    3  step-start       greet            {"log_path": "logs/greet.log", "model": "shell"}
    4  step-done        greet            {"artifacts": ["greeting.json"], "duration_s": 0.021}
    5  gate-answered    tone             {"by": "default", "choice": "friendly"}
@@ -327,10 +332,16 @@ $ cairn doctor
 ```
 
 On a machine **without** that CLI (or not logged in), the executor line fails with the fix inline and
-`doctor` exits non-zero, so CI catches it before a run does:
+`doctor` exits non-zero (code 2), so CI catches it before a run does — the rest of the checks still
+report:
 
 ```console
-✗ executor claude   claude CLI not found on PATH → install Claude Code, then `claude login`
+$ cairn doctor
+✔ cairn 0.1.0
+✔ workspace lint  2 pipelines plan green
+✗ executor claude   executor 'claude' not found → install Claude Code and run `claude login`
+✔ tool gh
+✔ guard runner    cairn.kernel.guards imports
 ```
 
 To actually enable the step: declare an `elaborated` artifact (with a schema or validator) under

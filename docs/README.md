@@ -31,7 +31,7 @@ The docs are organised by the [Diátaxis](https://diataxis.fr) framework — eve
 | **[SCHEDULING.md](SCHEDULING.md)** | How-to + Explanation | *How do I run a pipeline on a schedule without a daemon?* |
 | **[TOOLING-AND-GROWTH.md](TOOLING-AND-GROWTH.md)** | How-to + Explanation | *How do external tools enter a pipeline, and how does a workspace mature?* |
 | **[DISTRIBUTION.md](DISTRIBUTION.md)** | How-to + Explanation | *How is cairn packaged, versioned, and embedded in a coding agent?* |
-| **RELEASING.md** | How-to | *How do we cut a release?* *(being written alongside this doc.)* |
+| **[RELEASING.md](RELEASING.md)** | How-to | *How do we cut a release?* |
 | **[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md)** | Historical record | *In what order was cairn built, and against what verifications?* |
 
 The "How-to + Explanation" pages are labelled honestly: each opens by explaining a subsystem, then gives
@@ -41,7 +41,7 @@ the concrete recipes for operating it. If you want only the recipe, skip to that
 
 - **I want to *use* cairn** → the [repo README](../README.md) for the pitch → **[GETTING-STARTED.md](GETTING-STARTED.md)** for the first run → **[API.md](API.md)** when you need the exact shape of a file.
 - **I want to *understand* it** → **[CONCEPTS.md](CONCEPTS.md)** (the noun/verb model) → **[ARCHITECTURE.md](ARCHITECTURE.md)** (execution semantics) → the vision below on this page (why these choices).
-- **I want to *operate / contribute*** → **[TESTING.md](TESTING.md)** (prove a change offline) → **[OBSERVABILITY.md](OBSERVABILITY.md)** (watch it run) → **[SECURITY.md](SECURITY.md)** (contain it) → **RELEASING.md** (ship it).
+- **I want to *operate / contribute*** → **[TESTING.md](TESTING.md)** (prove a change offline) → **[OBSERVABILITY.md](OBSERVABILITY.md)** (watch it run) → **[SECURITY.md](SECURITY.md)** (contain it) → **[RELEASING.md](RELEASING.md)** (ship it).
 
 ```mermaid
 flowchart TD
