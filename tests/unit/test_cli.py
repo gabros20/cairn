@@ -760,6 +760,31 @@ def test_run_idempotent_resumes_incomplete_equivalent_run(hello_ws, monkeypatch,
     assert after == before  # resumed in place, no variant created
 
 
+def test_run_idempotent_incomplete_match_refuses_pipeline_drift(hello_ws, monkeypatch, capsys):
+    # A timer re-fire after a pipeline edit must fail loud (the same drift guard `cairn
+    # resume` enforces), never silently resume the old run against the new file.
+    monkeypatch.chdir(hello_ws)
+    pfile = hello_ws / "pipelines" / "manualflow.yaml"
+    pfile.write_text(
+        "pipeline: manualflow\nversion: 1\nrun_id: \"manualflow-{date}\"\n"
+        "artifacts:\n  token: { path: token.txt, validator: validators/nonempty.py }\n"
+        "steps:\n"
+        "  - id: approve\n    manual: \"write token.txt\"\n    produces: [token]\n"
+        "  - id: after\n    run: \"echo done\"\n    needs: [token]\n",
+        encoding="utf-8",
+    )
+    assert main(["run", "manualflow", "--headless", "--idempotent"]) == int(ExitCode.NEEDS_HUMAN)
+    before = sorted((hello_ws / "runs").iterdir())
+
+    pfile.write_text(pfile.read_text() + "# edited since the run was planned\n", encoding="utf-8")
+    capsys.readouterr()
+    rc = main(["run", "manualflow", "--headless", "--idempotent"])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "hash drift" in err
+    assert sorted((hello_ws / "runs").iterdir()) == before  # nothing resumed, nothing minted
+
+
 # --------------------------------------------------------------------------- #
 # learnings.
 # --------------------------------------------------------------------------- #
@@ -876,10 +901,12 @@ class _FakeRunner:
     """Records every host invocation and returns canned results — the schedkit effect seam,
     substituted so no test touches the real crontab / launchctl / systemctl."""
 
-    def __init__(self, returncode: int = 0, crontab: str = ""):
+    def __init__(self, returncode: int = 0, crontab: str = "", stdout: str = "", stderr: str = ""):
         self.returncode = returncode
         self.calls: list[dict] = []
         self._crontab = crontab
+        self._stdout = stdout
+        self._stderr = stderr
 
     def run(self, argv, *, input=None, cwd=None):
         from cairn.kernel.schedkit import RunResult
@@ -887,7 +914,7 @@ class _FakeRunner:
         self.calls.append({"argv": list(argv), "input": input, "cwd": cwd})
         if list(argv[:2]) == ["crontab", "-l"]:
             return RunResult(0 if self._crontab else 1, self._crontab, "")
-        return RunResult(self.returncode, "", "")
+        return RunResult(self.returncode, self._stdout, self._stderr)
 
 
 def _write_schedules(ws: Path) -> None:
@@ -933,13 +960,48 @@ def test_schedule_launchd_install_list_uninstall_roundtrip(hello_ws, monkeypatch
 
 def test_schedule_run_propagates_child_exit_verbatim(hello_ws, monkeypatch):
     _write_schedules(hello_ws)
-    fake = _FakeRunner(returncode=3)
+    # 9 is outside the ExitCode enum — proves the child code passes through unremapped.
+    fake = _FakeRunner(returncode=9)
     _inject_runner(monkeypatch, fake)
     monkeypatch.chdir(hello_ws)
     rc = main(["schedule", "run", "nightly"])
-    assert rc == 3  # the child cairn's exit code, verbatim
+    assert rc == 9  # the child cairn's exit code, verbatim
     child = fake.calls[-1]
     assert child["argv"][1:] == ["run", "hello", "--headless", "--idempotent"]
+
+
+def test_schedule_run_reemits_child_output_verbatim(hello_ws, monkeypatch, capsys):
+    # A cron-fired halt must produce output: the Runner captures the child's streams, and
+    # `schedule run` re-emits them so the host mailer delivers the halt + resume hint.
+    _write_schedules(hello_ws)
+    fake = _FakeRunner(
+        returncode=6,
+        stdout="child progress line\n",
+        stderr="cairn: halted awaiting a human → /runs/r  (answer + `cairn resume /runs/r`)\n",
+    )
+    _inject_runner(monkeypatch, fake)
+    monkeypatch.chdir(hello_ws)
+    rc = main(["schedule", "run", "nightly"])
+    captured = capsys.readouterr()
+    assert rc == 6
+    assert "child progress line" in captured.out
+    assert "cairn resume /runs/r" in captured.err  # the resume hint reaches stderr
+
+
+def test_schedule_run_missing_cairn_binary_is_clean_config_error(hello_ws, monkeypatch, capsys):
+    _write_schedules(hello_ws)
+
+    class MissingBinaryRunner:
+        def run(self, argv, *, input=None, cwd=None):
+            raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+    _inject_runner(monkeypatch, MissingBinaryRunner())
+    monkeypatch.chdir(hello_ws)
+    rc = main(["schedule", "run", "nightly"])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)  # a clean exit 2, not an uncaught traceback
+    assert "cannot execute" in err and "PATH" in err
+    assert "console script" in err  # names the remedy
 
 
 def test_schedule_run_unknown_name_is_config_error(hello_ws, monkeypatch, capsys):

@@ -80,10 +80,6 @@ SUBCOMMANDS: list[str] = [
     "schedule",
 ]
 
-# No stub verbs remain — batch/learnings/gc/schedule are wired to their kernel modules below.
-_STUB_VERBS: set[str] = set()
-
-
 # --------------------------------------------------------------------------- #
 # Small shared helpers.
 # --------------------------------------------------------------------------- #
@@ -470,7 +466,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
             print(f"cairn: already done → {match.run_dir}")
             return int(ExitCode.OK)
         if match is not None:
-            run_dir = match.run_dir  # incomplete equivalent run → resume it, never mint a variant
+            # Incomplete equivalent run → resume it, never mint a variant — but through the
+            # same drift guard `cairn resume` enforces: a timer re-fire after a pipeline edit
+            # must fail loud, not silently resume the old run against the new file.
+            try:
+                recorded_hash = load_run(match.run_dir).get("pipeline_hash")
+            except (OSError, ValueError, ConfigError):
+                recorded_hash = None
+            fail = _pipeline_drift_guard(recorded_hash, phash, p.pipeline, force=False)
+            if fail is not None:
+                return fail
+            run_dir = match.run_dir
         else:
             run_dir = bootstrap_run(ws, p, now=now, runs_root=runs_root, pipeline_hash=phash)
             created = True
@@ -519,6 +525,24 @@ def _idempotent_shortcut(run_dir: Path) -> int | None:
     return None
 
 
+def _pipeline_drift_guard(recorded: str | None, current_hash: str, pipeline: str, *, force: bool) -> int | None:
+    """The pipeline-hash drift check shared by ``cairn resume`` and ``run --idempotent``'s
+    resume path: a recorded hash that matches neither the current file nor the pre-hash
+    sentinel means the pipeline changed under the run. Returns the exit code to fail with,
+    or None to proceed (with a warning when ``force`` overrode a real drift)."""
+    if not recorded or recorded in ("sha256:unknown", current_hash):
+        return None
+    if not force:
+        print(
+            f"cairn: pipeline {pipeline!r} has changed since this run was planned "
+            f"(hash drift). Re-run with --force to resume against the current file.",
+            file=sys.stderr,
+        )
+        return int(ExitCode.CONFIG)
+    print(f"cairn: warning — resuming across pipeline-hash drift (--force) for {pipeline!r}", file=sys.stderr)
+    return None
+
+
 def _cmd_resume(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
     ws = _workspace(args)
@@ -537,17 +561,9 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         print(f"cairn: cannot resume — pipeline file {pfile} no longer exists", file=sys.stderr)
         return int(ExitCode.CONFIG)
 
-    current_hash = _pipeline_hash(ws, pipeline)
-    recorded = run_doc.get("pipeline_hash")
-    if recorded and recorded not in ("sha256:unknown", current_hash):
-        if not args.force:
-            print(
-                f"cairn: pipeline {pipeline!r} has changed since this run was planned "
-                f"(hash drift). Re-run with --force to resume against the current file.",
-                file=sys.stderr,
-            )
-            return int(ExitCode.CONFIG)
-        print(f"cairn: warning — resuming across pipeline-hash drift (--force) for {pipeline!r}", file=sys.stderr)
+    fail = _pipeline_drift_guard(run_doc.get("pipeline_hash"), _pipeline_hash(ws, pipeline), pipeline, force=args.force)
+    if fail is not None:
+        return fail
 
     # Reconstruct the recorded fleet (§8.1 executors) so a mixed-executor run resumes on the
     # same models, not the workspace defaults.
@@ -1133,8 +1149,18 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 print("cairn: `cairn schedule run` needs a schedule name", file=sys.stderr)
                 return int(ExitCode.CONFIG)
             schedules = load_schedules(ws)
-            # Propagate the child's exit code verbatim (SCHEDULING.md §2).
-            return run_schedule(schedules, args.name, workspace_dir=ws, runner=runner, cairn_bin=_resolve_cairn_bin())
+            # Propagate the child's exit code verbatim (SCHEDULING.md §2), and thread our
+            # real streams through so the Runner-captured child output — halt reasons, the
+            # resume hint — is re-emitted: a cron-fired halt must mail, never rot silently.
+            return run_schedule(
+                schedules,
+                args.name,
+                workspace_dir=ws,
+                runner=runner,
+                cairn_bin=_resolve_cairn_bin(),
+                out=sys.stdout,
+                err=sys.stderr,
+            )
 
         if args.action == "install":
             schedules = load_schedules(ws)
@@ -1170,6 +1196,16 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
             return int(ExitCode.OK)
     except ConfigError as exc:
         return _print_config_error(exc)
+    except FileNotFoundError as exc:
+        # The Runner shelled out to a binary the host can't find (a bare `cairn` off PATH,
+        # or a missing crontab/launchctl/systemctl) — a clean exit 2, never a traceback.
+        missing = exc.filename or "cairn"
+        print(
+            f"cairn: cannot execute {missing!r} — the binary is not on PATH. Install the cairn "
+            "console script (pip/uv tool install cairn) or put it on the PATH the scheduler uses.",
+            file=sys.stderr,
+        )
+        return int(ExitCode.CONFIG)
 
     print(f"cairn: unknown schedule action {args.action!r}", file=sys.stderr)
     return int(ExitCode.CONFIG)
