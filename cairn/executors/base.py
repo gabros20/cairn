@@ -60,14 +60,16 @@ def parse_step_sentinel(text: str) -> dict | None:
     """
     if not text:
         return None
-    blocks = _STEP_RE.findall(text)
-    if not blocks:
-        return None
-    try:
-        obj = json.loads(blocks[-1])
-    except (ValueError, TypeError):
-        return None
-    return obj if isinstance(obj, dict) else None
+    # Scan matched blocks last→first; the LAST well-formed (json-object) block wins, so a
+    # trailing broken/partial block never masks a good one earlier in the output.
+    for block in reversed(_STEP_RE.findall(text)):
+        try:
+            obj = json.loads(block)
+        except (ValueError, TypeError):
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
 
 
 def _kill_process_group(proc: subprocess.Popen) -> None:
@@ -109,6 +111,7 @@ def run_process(
         cwd=str(cwd),
         env=dict(env),
         text=True,
+        errors="replace",  # one non-utf8 byte from a CLI must not kill the pump thread
         bufsize=1,
         start_new_session=True,  # own process group so a timeout can group-kill children
     )
@@ -139,6 +142,16 @@ def run_process(
     if reader.is_alive() or proc.poll() is None:
         _kill_process_group(proc)
         reader.join(2)
+        # Reap the killed process (and re-kill best-effort if it lingers) so a long-lived
+        # walker doesn't accumulate defunct children.
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            _kill_process_group(proc)
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         raise ExecTimeout(
             f"{argv[0]} exceeded timeout of {timeout_s}s after "
             f"{time.monotonic() - start:.1f}s"

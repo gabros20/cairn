@@ -114,6 +114,15 @@ def test_non_object_json_returns_none():
     assert parse_step_sentinel('<<<STEP [1, 2, 3] STEP>>>') is None
 
 
+def test_last_WELL_FORMED_block_wins_over_a_trailing_broken_block():
+    # A good block followed by a broken one: fall back to the last block that parses.
+    text = (
+        '<<<STEP {"status": "done", "summary": "good"} STEP>>>\n'
+        '<<<STEP {broken,,} STEP>>>'
+    )
+    assert parse_step_sentinel(text) == {"status": "done", "summary": "good"}
+
+
 # --------------------------------------------------------------------------- #
 # run_process
 # --------------------------------------------------------------------------- #
@@ -187,6 +196,47 @@ def test_run_process_timeout_kills_and_raises(tmp_path):
             log_path=tmp_path / "l.log",
         )
     assert time.monotonic() - start < 5  # returned promptly, did not wait out the sleep
+
+
+def test_run_process_timeout_reaps_the_child(tmp_path, monkeypatch):
+    from cairn.executors import base as basemod
+
+    real_popen = basemod.subprocess.Popen
+    created: list = []
+
+    def capture(*args, **kwargs):
+        proc = real_popen(*args, **kwargs)
+        created.append(proc)
+        return proc
+
+    monkeypatch.setattr(basemod.subprocess, "Popen", capture)
+    with pytest.raises(ExecTimeout):
+        run_process(
+            ["/bin/sh", "-c", "sleep 10"],
+            stdin_text=None,
+            env={"PATH": "/usr/bin:/bin"},
+            cwd=tmp_path,
+            timeout_s=0.4,
+            log_path=tmp_path / "l.log",
+        )
+    proc = created[0]
+    assert proc.returncode is not None  # waited on → reaped, not left a zombie
+
+
+def test_run_process_tolerates_non_utf8_output(tmp_path):
+    # A lone 0xFF byte would blow up strict utf-8 decoding and silently kill the pump thread.
+    code, out, _ = run_process(
+        ["/bin/sh", "-c", "printf '\\377'; printf 'tail\\n'"],
+        stdin_text=None,
+        env={"PATH": "/usr/bin:/bin"},
+        cwd=tmp_path,
+        timeout_s=10,
+        log_path=tmp_path / "l.log",
+    )
+    assert code == 0
+    assert "�" in out  # 0xFF decoded to the replacement char, not an exception
+    assert "tail" in out  # output after the bad byte still captured
+    assert "tail" in (tmp_path / "l.log").read_text()  # and still teed to the log
 
 
 def test_exectimeout_is_a_cairn_error():
