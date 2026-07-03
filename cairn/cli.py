@@ -45,6 +45,7 @@ from cairn.kernel.plan import (
     StepNode,
     plan as build_plan,
 )
+from cairn.kernel.proc import SubprocessRunner as _SubprocessRunner
 from cairn.kernel.runstate import load_run, update_run
 from cairn.kernel.schedkit import (
     diff_schedules,
@@ -1178,11 +1179,8 @@ def _print_gc_result(result, plan) -> None:
 # --------------------------------------------------------------------------- #
 
 
-# The schedkit ``Runner`` adapter — the CLI's one bridge to the real host scheduler — is now
-# the shared production runner from ``cairn.kernel.proc`` (the single subprocess-capture seam,
-# unified with batchkit's spawn). Aliased under the CLI's historical name so ``schedule``'s
-# injection point and the tests that monkeypatch ``cli._SubprocessRunner`` stay stable.
-from cairn.kernel.proc import SubprocessRunner as _SubprocessRunner
+# The schedkit ``Runner`` adapter is ``_SubprocessRunner`` — imported at the top of this file
+# as an alias of ``cairn.kernel.proc.SubprocessRunner`` (the shared subprocess seam).
 
 
 def _resolve_cairn_bin() -> str:
