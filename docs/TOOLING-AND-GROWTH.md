@@ -82,9 +82,14 @@ readonly-plus-screenshot:
 The design: executors render fragments to their native permission surface (Claude
 `permissions.allow`, Codex Rules, Grok `[permission]`) — authored once. Destructive verbs of an
 allowed tool get a `guards:` entry on top (the F18 pattern): allowlist says *may run*, guard says
-*checked before running*. *Status: today the planner parses the fragments (agents reference them
-via `tools.bash`) but `render_workspace` emits only `CLAUDE.md`/`AGENTS.md`; rendering fragments to
-executor-native permission formats lands with the per-executor milestones — see IMPLEMENTATION-PLAN.*
+*checked before running*. *Status: the planner parses the fragments today (agents reference them via
+`tools.bash`), and the **guards** engine — the enforced code layer — is live across all three vendor
+CLIs (hook + shim + post, SECURITY §2.2). What is **not** yet wired is rendering the allowlist
+fragments to each executor's native permission format: the CLI executors currently run headless
+under `bypassPermissions` (a live constraint — Claude/Grok refuse every tool use otherwise; see
+IMPLEMENTATION-PLAN C2/C5), and `render_workspace` emits only `CLAUDE.md`/`AGENTS.md`. So the
+allowlist is the reviewed source of intent, but guards, gates, and validators — not a per-executor
+permission wall — are what enforce the boundary today.*
 
 ## 4. Use: agentic vs deterministic
 

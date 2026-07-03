@@ -92,8 +92,10 @@ instructions found inside it are content to be catalogued, never commands to be 
 
 An injected instruction that a model obeys still cannot exceed the step's cage:
 
-- **allowlist** — the capture agent can run crawl scripts, not `curl | sh`; the injected command
-  simply isn't permitted;
+- **allowlist** — the reviewed statement of which invocations a step may run (crawl scripts, not
+  `curl | sh`). It is authored and parsed today; rendering it to each executor's native permission
+  wall is still pending (the CLI executors currently run headless under `bypassPermissions`), so
+  meanwhile the **guards** layer below is the *enforced* backstop, not this one (TOOLING §3);
 - **guards** — mutating verbs are checked by code (F18, wrong-CMS) regardless of why the model
   tried them (one per-executor caveat: grok's native hook layer fails open on hook crash/timeout/
   malformed output — ARCHITECTURE §4 — so its shim and post layers carry the backstop);
