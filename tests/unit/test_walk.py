@@ -199,7 +199,8 @@ def test_hello_pipeline_runs_end_to_end_headless(tmp_path: Path) -> None:
     assert (run_dir / "message.txt").read_text().strip() == "Friendly hello, world!"
 
     tone = json.loads((run_dir / "gates/tone.json").read_text())
-    assert tone == {"choice": "friendly", "by": "flag", "at": NOW.isoformat()}
+    # gate `at` is trail.format_at's canonical shape (UTC, ms, Z; naive NOW read as UTC).
+    assert tone == {"choice": "friendly", "by": "flag", "at": "2026-07-03T11:04:00.000Z"}
 
     events = [e["event"] for e in read_trail(run_dir)]
     assert events[0] == "run-start"
@@ -604,7 +605,7 @@ def test_gate_tty_reprompts_then_records(ws: Path, tmp_path: Path, monkeypatch) 
     answers = iter(["nope", "b"])
     monkeypatch.setattr("builtins.input", lambda *_: next(answers))
     assert _walk(ws, plan, run_dir, {}, interactive=True) == ExitCode.OK
-    assert json.loads(gate_path(run_dir, "tone").read_text()) == {"choice": "b", "by": "tty", "at": NOW.isoformat()}
+    assert json.loads(gate_path(run_dir, "tone").read_text()) == {"choice": "b", "by": "tty", "at": "2026-07-03T11:04:00.000Z"}
 
 
 def test_externally_answered_gate_is_honored_on_walk(ws: Path, tmp_path: Path) -> None:

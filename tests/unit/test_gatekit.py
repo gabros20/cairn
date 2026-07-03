@@ -9,6 +9,7 @@ re-prompt loop, the headless-no-default halt, and the external answer path.
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 
@@ -71,7 +72,9 @@ def test_preset_writes_by_flag_and_emits_answered(tmp_path: Path) -> None:
 
     assert choice == "formal"
     payload = json.loads(gate_path(tmp_path, "tone").read_text(encoding="utf-8"))
-    assert payload == {"choice": "formal", "by": "flag", "at": NOW.isoformat()}
+    # `at` is trail.format_at's canonical shape (UTC, ms, Z) — a naive `now` (the legacy
+    # clock) is read as UTC, so pre-fix callers still produce the one system-wide shape.
+    assert payload == {"choice": "formal", "by": "flag", "at": "2026-07-03T11:04:00.000Z"}
     assert [e for e, _ in rec.events] == ["gate-answered"]
 
 
@@ -152,5 +155,6 @@ def test_answer_gate_writes_by_external(tmp_path: Path) -> None:
     payload = json.loads(gate_path(tmp_path, "tone").read_text(encoding="utf-8"))
     assert payload["choice"] == "formal"
     assert payload["by"] == "external"
-    assert "at" in payload
+    # Canonical trail.format_at shape — UTC, millisecond precision, Z-terminated.
+    assert re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z", payload["at"])
     assert is_answered(tmp_path, "tone")

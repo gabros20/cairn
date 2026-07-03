@@ -24,6 +24,7 @@ from typing import Callable
 
 from cairn.kernel.errors import CairnError, ConfigError
 from cairn.kernel.plan import GateNode
+from cairn.kernel.trail import format_at
 
 GATE_DIR = "gates"
 
@@ -102,7 +103,7 @@ def answer_gate(run_dir: Path, name: str, choice: str) -> None:
     payload = {
         "choice": choice,
         "by": "external",
-        "at": datetime.now(timezone.utc).isoformat(),
+        "at": format_at(datetime.now(timezone.utc)),
     }
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -112,7 +113,7 @@ def answer_gate(run_dir: Path, name: str, choice: str) -> None:
 def _commit(path: Path, gate: GateNode, choice: str, by: str, emit, now) -> str:
     """Write the decision file (atomically) then trail ``gate-answered``."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"choice": choice, "by": by, "at": now.isoformat()}
+    payload = {"choice": choice, "by": by, "at": format_at(now)}
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
