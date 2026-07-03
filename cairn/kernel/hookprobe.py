@@ -224,9 +224,13 @@ class CodexHookRecipe(HookRecipe):
     ``--dangerously-bypass-hook-trust`` flag for automation). A ``PreToolUse`` hook blocks via the
     same ``hookSpecificOutput.permissionDecision = "deny"`` payload (binary's embedded
     ``PreToolUsePermissionDecisionWire``). CODEX_HOME is relocated to the canary so we install the
-    canary hook WITHOUT touching the user's real ``~/.codex``. NOTE (live-run caveat): a relocated
-    CODEX_HOME has no auth.json, so a live codex probe reports ``inconclusive`` (not logged in)
-    until auth is provisioned into the canary — deferred to the orchestrator (see C4 brief)."""
+    canary hook WITHOUT touching the user's real ``~/.codex`` — with one deliberate exception:
+    the AUTH MATERIAL. A relocated CODEX_HOME has no ``auth.json``, which would make every live
+    probe ``inconclusive`` (not logged in), so when the real CODEX_HOME has an ``auth.json`` we
+    copy that ONE file into the canary (source read-only; NEVER hooks.json/config.toml —
+    isolation is the point); it dies with the canary's ``rmtree``. Absent auth → inconclusive,
+    exactly as before. Trade-off: the probe briefly holds a credential copy inside the
+    throwaway tempdir (0600, lifetime = one invocation)."""
 
     name = "codex"
     # Live-verified on codex-cli 0.142.5 with a ChatGPT account: gpt-5.5 is the ONLY accepted
@@ -239,6 +243,12 @@ class CodexHookRecipe(HookRecipe):
 
     def extra_env(self, canary: Path) -> dict[str, str]:
         return {"CODEX_HOME": str(canary / ".codex")}
+
+    @staticmethod
+    def _real_codex_home() -> Path:
+        """The user's actual CODEX_HOME ($CODEX_HOME or ~/.codex) — read for auth.json ONLY."""
+        override = os.environ.get("CODEX_HOME")
+        return Path(override) if override else Path(os.path.expanduser("~/.codex"))
 
     def write_canary(self, canary: Path, marker: Path, sidecar: Path) -> None:
         home = canary / ".codex"
@@ -253,6 +263,16 @@ class CodexHookRecipe(HookRecipe):
         (home / "hooks.json").write_text(json.dumps(hooks, indent=2), encoding="utf-8")
         # A present-but-empty config keeps codex from falling back to the user's config.toml.
         (home / "config.toml").write_text("", encoding="utf-8")
+        # Auth seam (fail-safe): copy auth.json alone when the real home has one, so a live
+        # probe can authenticate. Any copy failure degrades to the unauthenticated path
+        # (→ inconclusive), never to a probe crash.
+        auth = self._real_codex_home() / "auth.json"
+        try:
+            if auth.is_file():
+                shutil.copyfile(auth, home / "auth.json")
+                (home / "auth.json").chmod(0o600)
+        except OSError:
+            pass
 
     def build_invocation(
         self, canary: Path, prompt_text: str, model: str

@@ -94,6 +94,8 @@ def fakebin(tmp_path: Path, monkeypatch) -> Path:
         f.write_text(body, encoding="utf-8")
         f.chmod(f.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
     monkeypatch.setenv("PATH", f"{bindir}{os.pathsep}{os.environ['PATH']}")
+    # Hermetic: point the codex auth-seam at an empty dir so unit tests never read ~/.codex.
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "no-such-codex-home"))
     return bindir
 
 
@@ -305,6 +307,85 @@ def test_codex_recipe_default_model_is_gpt_5_5():
     # Live-verified: this ChatGPT account rejects every -mini/-codex model variant with a 400;
     # only gpt-5.5 is accepted (documented in tests/live/workspace-codex/cairn.toml).
     assert CodexHookRecipe().model == "gpt-5.5"
+
+
+# --------------------------------------------------------------------------- #
+# Codex auth seam: copy auth.json (ONLY) into the canary CODEX_HOME when present.
+# --------------------------------------------------------------------------- #
+
+
+def _write_real_codex_home(home: Path, *, with_auth: bool) -> None:
+    home.mkdir(parents=True, exist_ok=True)
+    if with_auth:
+        (home / "auth.json").write_text('{"token": "real-auth-material"}', encoding="utf-8")
+    # Real-home config that must NEVER leak into the canary (isolation is the point).
+    (home / "hooks.json").write_text('{"hooks": {"Stop": [{"hooks": []}]}}', encoding="utf-8")
+    (home / "config.toml").write_text('model = "user-model"\n', encoding="utf-8")
+
+
+def _codex_canary(tmp_path: Path) -> tuple[Path, Path, Path]:
+    canary = tmp_path / "canary"
+    (canary / ".cairn-probe").mkdir(parents=True)
+    return canary, canary / ".cairn-probe" / "marker", canary / ".cairn-probe" / "sidecar"
+
+
+def test_codex_auth_present_is_copied_alone(tmp_path, monkeypatch):
+    real_home = tmp_path / "realhome" / ".codex"
+    _write_real_codex_home(real_home, with_auth=True)
+    monkeypatch.setenv("CODEX_HOME", str(real_home))
+
+    canary, marker, sidecar = _codex_canary(tmp_path)
+    CodexHookRecipe().write_canary(canary, marker, sidecar)
+
+    canary_home = canary / ".codex"
+    # Auth material copied — a live probe can authenticate…
+    assert (canary_home / "auth.json").read_text() == '{"token": "real-auth-material"}'
+    # …but ONLY auth: the canary keeps its own probe hooks.json and empty config.toml.
+    hooks = json.loads((canary_home / "hooks.json").read_text())
+    assert "PreToolUse" in hooks["hooks"] and "Stop" not in hooks["hooks"]
+    assert (canary_home / "config.toml").read_text() == ""
+
+
+def test_codex_auth_absent_leaves_canary_unauthenticated(tmp_path, monkeypatch):
+    real_home = tmp_path / "realhome" / ".codex"
+    _write_real_codex_home(real_home, with_auth=False)
+    monkeypatch.setenv("CODEX_HOME", str(real_home))
+
+    canary, marker, sidecar = _codex_canary(tmp_path)
+    CodexHookRecipe().write_canary(canary, marker, sidecar)
+    assert not (canary / ".codex" / "auth.json").exists()  # → inconclusive live, as today
+
+
+def test_codex_auth_defaults_to_home_dot_codex(tmp_path, monkeypatch):
+    # Without $CODEX_HOME the real home is ~/.codex (expanduser honors $HOME).
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(tmp_path / "fakehome"))
+    _write_real_codex_home(tmp_path / "fakehome" / ".codex", with_auth=True)
+
+    canary, marker, sidecar = _codex_canary(tmp_path)
+    CodexHookRecipe().write_canary(canary, marker, sidecar)
+    assert (canary / ".codex" / "auth.json").exists()
+
+
+def test_codex_copied_auth_dies_with_the_canary(fakebin, tmp_path, monkeypatch):
+    real_home = tmp_path / "realhome" / ".codex"
+    _write_real_codex_home(real_home, with_auth=True)
+    monkeypatch.setenv("CODEX_HOME", str(real_home))
+
+    created: list[Path] = []
+    real_mkdtemp = hookprobe.tempfile.mkdtemp
+
+    def spy(*a, **k):
+        d = real_mkdtemp(*a, **k)
+        created.append(Path(d))
+        return d
+
+    monkeypatch.setattr(hookprobe.tempfile, "mkdtemp", spy)
+    r = _run(CodexHookRecipe(), "fires_blocks", tmp_path)
+    assert r.outcome == "fires_blocks"
+    assert created and not created[0].exists(), "canary (incl. copied auth.json) must be rmtree'd"
+    # And the real home was never touched.
+    assert (real_home / "auth.json").read_text() == '{"token": "real-auth-material"}'
 
 
 def test_claude_invocation_carries_bypass_permissions(tmp_path):
