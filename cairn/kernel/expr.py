@@ -143,8 +143,8 @@ class _Node:
     def eval(self, resolver: Resolver) -> Any:  # pragma: no cover - overridden
         raise NotImplementedError
 
-    def roots(self, acc: set[str]) -> None:
-        pass
+    def paths(self, acc: set[tuple[str, tuple[str, ...]]]) -> None:
+        """Collect every (root, parts) reference under this node — purely syntactic."""
 
 
 @dataclass(frozen=True)
@@ -171,8 +171,8 @@ class _Path(_Node):
         except (KeyError, IndexError, TypeError, AttributeError) as e:
             raise EvalError(f"unknown path: {self._dotted()}") from e
 
-    def roots(self, acc: set[str]) -> None:
-        acc.add(self.root)
+    def paths(self, acc: set[tuple[str, tuple[str, ...]]]) -> None:
+        acc.add((self.root, self.parts))
 
 
 @dataclass(frozen=True)
@@ -182,8 +182,8 @@ class _Not(_Node):
     def eval(self, resolver: Resolver) -> bool:
         return not bool(self.child.eval(resolver))
 
-    def roots(self, acc: set[str]) -> None:
-        self.child.roots(acc)
+    def paths(self, acc: set[tuple[str, tuple[str, ...]]]) -> None:
+        self.child.paths(acc)
 
 
 @dataclass(frozen=True)
@@ -206,9 +206,9 @@ class _Cmp(_Node):
                 f"'in' needs an iterable right operand, got {type(right).__name__}"
             ) from e
 
-    def roots(self, acc: set[str]) -> None:
-        self.left.roots(acc)
-        self.right.roots(acc)
+    def paths(self, acc: set[tuple[str, tuple[str, ...]]]) -> None:
+        self.left.paths(acc)
+        self.right.paths(acc)
 
 
 @dataclass(frozen=True)
@@ -223,9 +223,9 @@ class _BinBool(_Node):
         # 'and'
         return bool(self.right.eval(resolver)) if bool(self.left.eval(resolver)) else False
 
-    def roots(self, acc: set[str]) -> None:
-        self.left.roots(acc)
-        self.right.roots(acc)
+    def paths(self, acc: set[tuple[str, tuple[str, ...]]]) -> None:
+        self.left.paths(acc)
+        self.right.paths(acc)
 
 
 # --- parser ------------------------------------------------------------------
@@ -330,11 +330,22 @@ class Expr:
         """Evaluate against ``resolver(root, parts) -> Any``."""
         return self._node.eval(resolver)
 
+    def paths(self) -> frozenset[tuple[str, tuple[str, ...]]]:
+        """Every path reference as (root, parts), collected from ALL branches.
+
+        Purely syntactic — the symmetric counterpart to :meth:`roots`. Includes
+        the dead side of short-circuited ``&&``/``||``, inside parens/negation,
+        and both operands of comparisons, so the planner can leaf-check every
+        ``params``/``dims`` path against the schema even where evaluation would
+        skip it (misspellings on a lazy branch must not hide until runtime).
+        """
+        acc: set[tuple[str, tuple[str, ...]]] = set()
+        self._node.paths(acc)
+        return frozenset(acc)
+
     def roots(self) -> set[str]:
         """The set of path root names this expression touches (e.g. {'params'})."""
-        acc: set[str] = set()
-        self._node.roots(acc)
-        return acc
+        return {root for root, _ in self.paths()}
 
     def __repr__(self) -> str:  # pragma: no cover - debugging aid
         return f"Expr({self.source!r})"

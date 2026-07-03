@@ -151,6 +151,45 @@ def test_roots_includes_cycle_and_gates():
     assert parse("cycle == 1 || gates.scope == 'all'").roots() == {"cycle", "gates"}
 
 
+# ---- paths() — static path inventory for plan-time leaf checks ---------------
+
+def test_paths_collects_both_sides_of_a_comparison():
+    e = parse("gates.g.choice == 'yes' && params.NOPE == 'z'")
+    assert e.paths() == frozenset(
+        {("gates", ("g", "choice")), ("params", ("NOPE",))}
+    )
+
+
+def test_paths_includes_dead_branch_of_short_circuit():
+    # the whole point: a typo on the lazy branch is still inventoried
+    e = parse("false && params.typo")
+    assert e.paths() == frozenset({("params", ("typo",))})
+    e2 = parse("true || dims.oops")
+    assert e2.paths() == frozenset({("dims", ("oops",))})
+
+
+def test_paths_reaches_through_parens_and_negation():
+    e = parse("!(params.a || (dims.b && cycle))")
+    assert e.paths() == frozenset(
+        {("params", ("a",)), ("dims", ("b",)), ("cycle", ())}
+    )
+
+
+def test_paths_of_bare_path_and_literal_only():
+    assert parse("run.count").paths() == frozenset({("run", ("count",))})
+    assert parse("true").paths() == frozenset()
+    assert parse("'x' == 'y'").paths() == frozenset()
+
+
+def test_paths_returns_a_frozenset():
+    assert isinstance(parse("params.a").paths(), frozenset)
+
+
+def test_roots_still_matches_the_roots_of_paths():
+    e = parse("gates.g.choice == 'yes' && params.NOPE == 'z' || cycle")
+    assert e.roots() == {root for root, _ in e.paths()}
+
+
 # ---- syntax errors carry a position -----------------------------------------
 
 @pytest.mark.parametrize(
