@@ -53,7 +53,8 @@ Dispatching the workflow runs two jobs:
 
 There is nothing to run locally. To preview what *would* be released without doing it, from a full
 checkout: `uvx python-semantic-release version --print` (prints the next version) — this never
-writes, commits, or tags.
+writes, commits, or tags. Note it needs an `origin` remote to resolve the release branch, so it
+only works once the GitHub repo exists and is set as `origin` (see the activation checklist).
 
 ## Activation checklist
 
@@ -76,6 +77,10 @@ fails or publishes nowhere.
       anything reaches PyPI.
 - [ ] **Confirm Actions can write** — **Settings → Actions → General → Workflow permissions** must
       allow read/write (PSR pushes the version commit and tag with the built-in `GITHUB_TOKEN`).
+- [ ] **Allow the release job past branch protection** — if `main` is protected, the built-in
+      `GITHUB_TOKEN` push of the version commit + tag is rejected. Either exempt the repo's
+      GitHub Actions bot in the branch/tag protection rules (bypass list), or run releases from an
+      unprotected release branch. Without this the `release` job fails at the push step.
 - [ ] **Dispatch the workflow** (see [Cutting a release](#cutting-a-release)). The first run
       releases whatever the commits since `v0.1.0` warrant; if that's nothing yet, make a
       `feat:`/`fix:` commit first.
