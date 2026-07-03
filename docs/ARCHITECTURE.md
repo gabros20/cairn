@@ -105,6 +105,13 @@ then walks; every done node skips, the first not-done node re-executes. If the h
 failure and the step declares `retry.feedback`, the failed attempt's reasons are already in the
 trail and get injected into the recomposed envelope.
 
+**Operator note — don't hand-fix a halted step's artifact.** A node halted on validation is recorded
+`halted`, and on resume a recorded halt outranks the artifact predicate: the step **re-runs and will
+overwrite** any artifact a human edited in place, so the hand-fix is silently lost. The supported
+path is to fix the *inputs* — the workspace, the upstream artifacts, or the step's config — and let
+the step regenerate its output. (Answering an operator-blocked `manual`/`gate` out of band is the
+one sanctioned by-hand action, because those halt as needs-human, not as a validation failure.)
+
 ### 3.6 `manual`
 Print instructions + the validation criterion, wait for Enter (headless: halt with "requires
 operator"), then validate `produces` like any step.
