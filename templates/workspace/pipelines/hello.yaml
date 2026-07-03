@@ -53,9 +53,10 @@ steps:
 
   # ── Your first upgrade: a step that needs judgment becomes an agent: step ────
   # When the right command isn't something you can spell out, delegate to a model.
-  # To enable: uncomment [executors.claude] in cairn.toml, declare the `elaborated`
-  # artifact above (with a schema or validator), then uncomment this node.
-  # `cairn plan hello` typechecks it — dataflow, agent, skills — before any run.
+  # cairn.toml already ships [executors.claude] enabled (with tiers), so to enable:
+  # declare the `elaborated` artifact above (with a schema or validator), then
+  # uncomment this node. `cairn plan hello` typechecks it — dataflow, agent,
+  # skills — before any run.
   #
   # - id: elaborate
   #   agent: assistant               # → agents/assistant.yaml (tier + skills + tools)
