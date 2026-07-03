@@ -4,12 +4,53 @@ The complete noun/verb model. For each concept: what it is, where it lives, why 
 breaks without it. If a proposed feature doesn't strengthen one of these concepts, it doesn't go in
 the kernel — it goes in a plugin or it doesn't go in at all.
 
+## The model at a glance
+
+Boxes are the nouns; edge labels are the verbs. Everything below is one of these parts, and every
+part exists to serve one of these relationships — the whole of the kernel's vocabulary in one map.
+
+```mermaid
+graph TD
+  WS[Workspace]
+
+  WS --> PIPE[Pipeline]
+  WS --> AG[Agent]
+  WS --> SK[Skill]
+  WS --> VAL[Validator]
+  WS --> GRD[Guard]
+
+  PIPE -->|ordered nodes| STEP[Step]
+  PIPE --> GATE[Gate]
+  PIPE --> PAR[Parallel]
+  PIPE --> LOOP[Loop]
+  PIPE --> MAN[Manual]
+
+  STEP -->|delegates to| AG
+  STEP -.->|inlines| SK
+  STEP -->|needs / produces| ART[Artifact]
+  AG -->|bound at invocation| EX["Executor<br/>claude · codex · grok · shell"]
+  GRD -.->|hook · shim · post| STEP
+
+  ART -->|"done ⇔ passes"| VAL
+  GATE -->|writes decision| ART
+
+  EX -->|one fresh process| RUN[Run dir]
+  RUN --> TRAIL[Trail]
+  RUN --> ART
+```
+
+Read it as sentences: a *pipeline* orders *steps* (and four other node kinds); a *step* delegates to
+an *agent*, which binds an *executor* only at invocation; a step *produces* *artifacts* that are
+*done* exactly when their *validator* passes; a *gate* writes its decision as an artifact too; a
+*guard* wraps a step's commands; an *executor* runs as one fresh process inside a *run dir* whose
+*trail* is the event log. The rest of this page is that map, one concept per section.
+
 ---
 
 ## 1. Workspace
 
 **Is:** a directory that holds everything a family of pipelines needs — the unit of versioning and
-sharing. brease-factory becomes cairn's first workspace.
+sharing. brease-factory — the pipeline cairn was distilled from — is the intended first workspace.
 
 ```
 my-factory/
@@ -35,8 +76,8 @@ whole pipeline system. **Without it:** paths and configs scatter per-CLI (exactl
 *declared* through artifact `needs`/`produces` and **cross-checked** against the order at plan time
 (a step consuming an artifact no earlier node produces is a config error before anything runs).
 
-**Why "DAG in our terms":** analysis of the real system (PORT-DESIGN §3.3) showed the topology is a
-sequence with three local deviations (a mid-phase gate, one concurrent pair, one bounded loop). Five
+**Why "DAG in our terms":** analysis of the real pipeline cairn was distilled from showed the topology
+is a sequence with three local deviations (a mid-phase gate, one concurrent pair, one bounded loop). Five
 node kinds cover it with room to spare; generic edge-lists would buy nothing and cost static
 verifiability. Order-explicit + dataflow-checked is strictly more auditable than order-inferred.
 
@@ -125,8 +166,9 @@ even determinism goes through the same interface).
 **Capabilities are declared, not assumed** (`blocking_hooks`, `output_schema`, `session_capture`),
 and the guard engine adapts enforcement to them.
 
-**Why:** this is PORT-DESIGN's `CliAdapter` verbatim — the seam both the Codex and Grok mappings
-independently demanded. **Without it:** N pipelines × M CLIs = N×M ports. With it: N + M.
+**Why:** this is the `CliAdapter` seam from cairn's originating port design verbatim — the boundary
+both the Codex and Grok mappings independently demanded. **Without it:** N pipelines × M CLIs = N×M
+ports. With it: N + M.
 
 ## 7. Skill
 
@@ -180,7 +222,7 @@ all three probe-verified fires+blocks on the dev machine, `doctor --probe-hooks`
 `post` = a validator that catches what slipped through, before the next step can consume it.
 
 **Why:** the F18 lesson — "don't do X" in a prompt is not enforcement. **Without layered guards:**
-the weakest CLI's hook support becomes the whole system's safety ceiling (PORT-DESIGN's top risk).
+the weakest CLI's hook support becomes the whole system's safety ceiling — the port design's top risk.
 
 ## 10. Validator
 
