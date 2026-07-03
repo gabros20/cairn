@@ -54,7 +54,12 @@ def test_skip_git_repo_check_present(tmp_path, monkeypatch):
 
 
 def test_effort_override_omitted_when_none(tmp_path, monkeypatch):
-    _, _, argv, _, _ = _invoke(tmp_path, monkeypatch, effort=None)
+    _, inv, argv, _, _ = _invoke(tmp_path, monkeypatch, effort=None)
+    # Exact pin of the no-effort argv so drift in this branch fails loudly too.
+    assert argv[1:] == [
+        "exec", "-C", str(inv.cwd), "-m", "gpt-5.5",
+        "--sandbox", "workspace-write", "--skip-git-repo-check",
+    ]
     assert not any(a.startswith("model_reasoning_effort=") for a in argv)
     assert "-c" not in argv
 
