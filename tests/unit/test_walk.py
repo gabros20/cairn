@@ -1038,6 +1038,33 @@ def test_declared_secret_is_redacted_from_step_log_and_trail(tmp_path: Path, mon
     assert "∎REDACTED:TOKEN∎" in trail_text
 
 
+def test_tee_sinks_are_closed_when_trailwriter_init_fails(ws: Path, tmp_path: Path, monkeypatch) -> None:
+    # Sinks are built before the TrailWriter; if its construction raises, the webhook daemon
+    # threads must still be closed — never leaked past the walk.
+    import cairn.kernel.walk as walkmod
+
+    closed: list[bool] = []
+
+    class RecordingSink:
+        def emit(self, event: dict) -> None:
+            pass
+
+        def close(self) -> None:
+            closed.append(True)
+
+    def boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(walkmod, "build_tee_sinks", lambda spec: [RecordingSink()])
+    monkeypatch.setattr("cairn.kernel.trail.TrailWriter.__init__", boom)
+
+    plan = make_plan([run_step("noop", "true")], {})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    with pytest.raises(OSError):
+        _walk(ws, plan, run_dir, {"shell": ShellExecutor()})
+    assert closed == [True]
+
+
 def test_no_redaction_when_secret_is_unset(tmp_path: Path, monkeypatch) -> None:
     # A declared-but-unset secret resolves to nothing → no redactor → output is verbatim.
     ws = tmp_path / "ws"

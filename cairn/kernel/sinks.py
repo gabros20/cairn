@@ -10,6 +10,11 @@ Built-ins: `jsonl` (sink #0, owned by :class:`~cairn.kernel.trail.TrailWriter`) 
 (the shipped push target). OTel/Slack are post-C7 plugins registered via the ``cairn.sinks``
 entry point (API.md §6) — not built here. Stdlib only: ``urllib`` for the POST, a bounded
 ``queue`` + one daemon thread per webhook so emit never blocks the walker.
+
+Warnings here go through ``logging`` (logger ``cairn.sinks``) rather than the CLI's
+print-to-stderr idiom — a deliberate library-layer choice: sink failures surface from daemon
+threads inside kernel code where the caller owns the terminal. With no logging config, Python's
+lastResort handler still prints WARNING+ to stderr; an embedder can silence or route ``cairn.*``.
 """
 
 from __future__ import annotations
@@ -164,6 +169,16 @@ class WebhookSink:
         )
         with urllib.request.urlopen(req, timeout=timeout_s) as resp:  # noqa: S310 — configured URL
             resp.read()
+
+    def flush(self) -> None:
+        """Block until every enqueued event has been fully worked (delivered or dropped).
+
+        The public settle point — ``queue.join()`` over the worker's ``task_done()`` contract,
+        so it returns only after in-flight deliveries finish, not merely when the queue looks
+        empty. For tests and orderly shutdown; the walker itself never calls it (a tee must
+        never make the run wait).
+        """
+        self._queue.join()
 
     def close(self, timeout_s: float = 2.0) -> None:
         """Signal the worker to finish draining, then join (bounded). Idempotent."""

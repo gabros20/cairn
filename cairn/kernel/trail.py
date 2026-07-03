@@ -24,6 +24,10 @@ from cairn.kernel.sinks import JsonlSink, Sink
 TRAIL_NAME = "trail.jsonl"
 ENVELOPE_VERSION = 1
 
+# Sink warnings go through `logging` (not the CLI's print-to-stderr idiom) deliberately: they
+# fire from library code, possibly on daemon threads, where the caller owns the terminal. With
+# no logging config, Python's lastResort handler still surfaces WARNING+ on stderr; an embedder
+# can silence or route "cairn.*" loggers without cairn growing a logging config of its own.
 _log = logging.getLogger("cairn.trail")
 
 # The literal-match redaction marker (SECURITY.md §1.3). ``NAME`` is the declared secret's
@@ -60,6 +64,29 @@ def make_redactor(secrets: Mapping[str, str]) -> Callable[[str], str] | None:
         return text
 
     return redact
+
+
+def _redact_obj(obj: object, redactor: Callable[[str], str]) -> object:
+    """Apply ``redactor`` to every string in ``obj``, recursively (dicts/lists/strings).
+
+    Redaction must run on the *values themselves*, before ``json.dumps``: a scrub of the
+    serialized line would (a) miss a secret whose characters JSON escapes (``"``/``\\`` land
+    as ``\\"``/``\\\\`` — the literal no longer matches, the secret ships recoverable) and
+    (b) let a secret that resembles JSON syntax corrupt the authority line when substituted
+    (invalid JSON → the reader drops it → ``_last_seq`` skips it → a resumed writer reuses
+    the seq). Walking the object kills both failure modes structurally. Dict *keys* are
+    scrubbed too — a secret has no business being a key, but it must not survive as one.
+    """
+    if isinstance(obj, str):
+        return redactor(obj)
+    if isinstance(obj, dict):
+        return {
+            (redactor(k) if isinstance(k, str) else k): _redact_obj(v, redactor)
+            for k, v in obj.items()
+        }
+    if isinstance(obj, (list, tuple)):
+        return [_redact_obj(v, redactor) for v in obj]
+    return obj
 
 
 def format_at(dt: datetime) -> str:
@@ -108,7 +135,8 @@ class TrailWriter:
     configured `tee_sinks` — a best-effort push of the same (redacted) event. Tee sinks are
     **never authority**: one that raises is logged and ignored, so a dead webhook can neither
     fail nor slow the run (OBSERVABILITY §2). Redaction (SECURITY §1.3) is applied here, once,
-    to the serialized line — so both the file and every tee see the scrubbed form.
+    to the envelope *object* before serialization — so the file, every tee, and emit's return
+    value all carry the same scrubbed form (see :func:`_redact_obj` for why pre-serialization).
     """
 
     def __init__(
@@ -136,7 +164,8 @@ class TrailWriter:
         cycle: int | None = None,
         data: dict | None = None,
     ) -> dict:
-        """Append one envelope line; return the event dict that was written."""
+        """Append one envelope line; return the **redacted** envelope dict — exactly what
+        landed on disk and what every tee sink received, never the raw values."""
         self._seq += 1
         envelope = {
             "v": ENVELOPE_VERSION,
@@ -149,26 +178,21 @@ class TrailWriter:
             "cycle": cycle,
             "data": data if data is not None else {},
         }
-        serialized = json.dumps(envelope, ensure_ascii=False)
+        # Redact the OBJECT, then serialize (see _redact_obj for why order matters): the
+        # authority line can never be corrupted by a JSON-syntax-shaped secret, an escaped
+        # secret can never slip through, and the tee gets the same redacted dict directly.
         if self._redactor is not None:
-            serialized = self._redactor(serialized)
+            envelope = _redact_obj(envelope, self._redactor)
         # Authority first: an IO failure here is fatal (the run's record of truth).
-        self._jsonl.write_line(serialized)
-        # Then tee the *redacted* event (parsed back so the file and the tee agree exactly).
-        if self._tee_sinks:
+        self._jsonl.write_line(json.dumps(envelope, ensure_ascii=False))
+        for sink in self._tee_sinks:
             try:
-                teed = json.loads(serialized)
-            except json.JSONDecodeError:
-                teed = None  # never fall back to the unredacted envelope — skip this tee
-            if teed is not None:
-                for sink in self._tee_sinks:
-                    try:
-                        sink.emit(teed)
-                    except Exception:  # noqa: BLE001 — a tee must never fail the run
-                        _log.warning(
-                            "cairn: trail sink %r raised on emit — ignored.",
-                            getattr(sink, "_name", type(sink).__name__),
-                        )
+                sink.emit(envelope)
+            except Exception:  # noqa: BLE001 — a tee must never fail the run
+                _log.warning(
+                    "cairn: trail sink %r raised on emit — ignored.",
+                    getattr(sink, "_name", type(sink).__name__),
+                )
         return envelope
 
     def close(self) -> None:

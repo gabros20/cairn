@@ -259,10 +259,21 @@ class _Walk:
         # Invocation (the executor's log-write path). Tee sinks push each redacted event.
         self._redactor = make_redactor(self._secret_values())
         tee_sinks = build_tee_sinks(self.config.sinks)
+        try:
+            trail_writer = TrailWriter(
+                self.run_dir, run_id, redactor=self._redactor, tee_sinks=tee_sinks
+            )
+        except BaseException:
+            # TrailWriter owns closing the tees once constructed; if construction itself
+            # fails, close them here so no webhook daemon thread outlives the walk.
+            for sink in tee_sinks:
+                try:
+                    sink.close()
+                except Exception:  # noqa: BLE001 — best-effort cleanup on the failure path
+                    pass
+            raise
 
-        with TrailWriter(
-            self.run_dir, run_id, redactor=self._redactor, tee_sinks=tee_sinks
-        ) as trail:
+        with trail_writer as trail:
             self._trail = trail
             self._emit(
                 "run-start",

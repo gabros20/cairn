@@ -10,9 +10,6 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
-
-import pytest
 
 from cairn.kernel.sinks import JsonlSink, WebhookSink, build_tee_sinks
 
@@ -40,11 +37,9 @@ def test_jsonl_sink_creates_missing_parent(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
-def _drain(sink: WebhookSink, timeout: float = 2.0) -> None:
-    """Wait until the sink's queue has been fully worked, then stop it."""
-    deadline = time.monotonic() + timeout
-    while not sink._queue.empty() and time.monotonic() < deadline:
-        time.sleep(0.01)
+def _drain(sink: WebhookSink) -> None:
+    """Settle then stop: the public flush() (queue.join over task_done) + close()."""
+    sink.flush()
     sink.close()
 
 

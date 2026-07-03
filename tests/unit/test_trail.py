@@ -120,9 +120,9 @@ def test_follow_resumes_from_since(tmp_path):
     assert [ev["seq"] for ev in seen] == [2]
 
 
-def test_redactor_is_applied_to_the_serialized_line(tmp_path):
-    def scrub(line: str) -> str:
-        return line.replace("sk-secret-123", "∎REDACTED:BREASE_TOKEN∎")
+def test_redactor_scrubs_the_line_that_lands_on_disk(tmp_path):
+    def scrub(text: str) -> str:
+        return text.replace("sk-secret-123", "∎REDACTED:BREASE_TOKEN∎")
 
     w = TrailWriter(tmp_path, RUN_ID, redactor=scrub)
     w.emit("guard-deny", data={"command": "curl -H 'Authorization: sk-secret-123'"})
@@ -131,6 +131,85 @@ def test_redactor_is_applied_to_the_serialized_line(tmp_path):
     raw = (tmp_path / "trail.jsonl").read_text()
     assert "sk-secret-123" not in raw
     assert "∎REDACTED:BREASE_TOKEN∎" in raw
+
+
+def test_redactor_reaches_nested_data_strings_and_keys(tmp_path):
+    # The redactor walks the envelope recursively: dict values, dict keys, list items.
+    redact = make_redactor({"TOKEN": "sk-abc"})
+    w = TrailWriter(tmp_path, RUN_ID, redactor=redact)
+    w.emit(
+        "step-fail",
+        data={
+            "reasons": ["saw sk-abc in output", "other"],
+            "nested": {"sk-abc": {"deep": "value sk-abc here"}},
+        },
+    )
+    w.close()
+
+    raw = (tmp_path / "trail.jsonl").read_text()
+    assert "sk-abc" not in raw
+    ev = json.loads(raw)
+    assert ev["data"]["reasons"][0] == "saw ∎REDACTED:TOKEN∎ in output"
+    assert ev["data"]["nested"]["∎REDACTED:TOKEN∎"]["deep"] == "value ∎REDACTED:TOKEN∎ here"
+
+
+def test_a_secret_containing_quotes_is_redacted_despite_json_escaping(tmp_path):
+    # json.dumps escapes `"` to `\"` — a literal match run on the SERIALIZED line would miss
+    # the escaped form and land the secret on disk recoverable. Redaction must therefore run
+    # on the envelope's string values BEFORE serialization.
+    secret = 'pa"ss"word'
+    w = TrailWriter(tmp_path, RUN_ID, redactor=make_redactor({"TOKEN": secret}))
+    w.emit("step-fail", node="build", data={"error": f"auth failed for {secret}"})
+    w.close()
+
+    raw = (tmp_path / "trail.jsonl").read_text()
+    assert secret not in raw
+    assert 'pa\\"ss\\"word' not in raw  # not recoverable in the escaped form either
+    assert "∎REDACTED:TOKEN∎" in raw
+
+
+def test_a_secret_containing_backslashes_is_redacted(tmp_path):
+    secret = "back\\slash\\secret"
+    w = TrailWriter(tmp_path, RUN_ID, redactor=make_redactor({"TOKEN": secret}))
+    w.emit("step-fail", data={"error": secret})
+    w.close()
+
+    raw = (tmp_path / "trail.jsonl").read_text()
+    assert secret not in raw
+    assert "back\\\\slash" not in raw  # nor the doubled-escape form
+    assert "∎REDACTED:TOKEN∎" in raw
+
+
+def test_a_json_syntax_shaped_secret_cannot_corrupt_the_authority_line(tmp_path):
+    # A secret matching JSON structural syntax, substituted into the SERIALIZED line, would
+    # yield invalid JSON — read_trail would drop it, _last_seq would skip it, and a resumed
+    # writer would REUSE the seq (monotonicity broken). Pre-serialization redaction kills
+    # this structurally: the marker replaces the value inside the string, the line stays JSON.
+    secret = '", "event": "'
+    redact = make_redactor({"TOKEN": secret})
+    w = TrailWriter(tmp_path, RUN_ID, redactor=redact)
+    w.emit("step-fail", data={"error": f"saw {secret} in output"})
+    w.close()
+
+    lines = (tmp_path / "trail.jsonl").read_text().splitlines()
+    ev = json.loads(lines[0])  # the authority line MUST still parse
+    assert ev["seq"] == 1
+    assert "∎REDACTED:TOKEN∎" in ev["data"]["error"]
+    assert secret not in ev["data"]["error"]
+
+    # And a crashed-then-resumed writer keeps the offset strictly monotonic.
+    w2 = TrailWriter(tmp_path, RUN_ID, redactor=redact)
+    assert w2.emit("run-halt")["seq"] == 2
+    w2.close()
+    assert [e["seq"] for e in read_trail(tmp_path)] == [1, 2]
+
+
+def test_emit_returns_the_redacted_envelope(tmp_path):
+    w = TrailWriter(tmp_path, RUN_ID, redactor=make_redactor({"TOKEN": "sk-abc"}))
+    returned = w.emit("step-fail", data={"error": "sk-abc rejected"})
+    w.close()
+    # What emit hands back is what was written — the scrubbed form, never the raw value.
+    assert returned["data"]["error"] == "∎REDACTED:TOKEN∎ rejected"
 
 
 def test_jsonl_is_byte_identical_with_and_without_tee_sinks(tmp_path, monkeypatch):
