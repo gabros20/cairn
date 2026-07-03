@@ -24,7 +24,8 @@ ever debug one new thing at a time.
 - **C2 — partial.** Envelope composer and the `claude`/`codex`/`grok` executors are code-complete and
   unit-tested against fake binaries; the live `claude` parity run is still pending.
 - **C4 — pending:** the Codex headless-hook (blocking-pretool) probe.
-- **C5–C7 — not started:** Grok live setup, batch / CMS population / scheduling, site extraction.
+- **C5–C7 — not started:** Grok live setup, batch / CMS population / scheduling, package extraction
+  (cairn to its own repo per DISTRIBUTION.md).
 
 ---
 

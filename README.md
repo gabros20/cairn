@@ -22,7 +22,7 @@ guards/pipelines/envelopes + `record`); the full CLI (every C1-scope verb; `batc
 The day-0 pipeline runs end-to-end offline: `uv run cairn run hello --headless`.
 
 **Not done yet:** live-model parity runs (C2/C3 verify), the Codex headless-hook probe (C4), Grok
-live setup (C5), batch / CMS population / scheduling (C6), site extraction (C7). Design package in
+live setup (C5), batch / CMS population / scheduling (C6), package extraction to its own repo (C7). Design package in
 [`docs/`](docs/): start with [`docs/README.md`](docs/README.md), then
 [`docs/CONCEPTS.md`](docs/CONCEPTS.md), [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), and the
 build order in [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md) (C0–C7).
