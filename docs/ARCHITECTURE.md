@@ -127,6 +127,10 @@ Guards declare `enforce:` layers; the engine wires what each executor supports a
 | `shim` (PATH wrapper) | ✓ | ✓ | ✓ | ✓ |
 | `post` (validator backstop) | ✓ | ✓ | ✓ | ✓ |
 
+*Status: designed. The `post` (validator backstop) layer is what the built kernel wires today; the
+`hook`/`shim` engine and the empirical hook-firing probe land with the live executors — guard engine
+C3, the doctor hook probe C4 (see IMPLEMENTATION-PLAN).*
+
 `cairn doctor` empirically probes hook firing per executor (spawn a canary invocation that attempts
 a guarded command) and records the result — PORT-DESIGN's "highest risk" becomes a diagnosed,
 per-machine fact instead of an assumption. The check script contract is one file, one convention
@@ -205,7 +209,7 @@ it as a tool. Composition happens above the pipeline, never inside a step.
 | 0 | run complete | — |
 | 2 | config error (plan-time) | fix workspace file named in the error |
 | 3 | artifact gate failed | read validator reasons → `cairn resume` |
-| 4 | executor failure (spawn/auth/crash) | `cairn doctor`, then resume |
+| 4 | executor failure (spawn/auth/crash); also: run-lock contention (run is held by PID …) | `cairn doctor`, then resume |
 | 5 | timeout | inspect `logs/<step>.log`, resume |
 | 6 | halted at manual/gate in headless mode | answer externally (`cairn gate <run> <name>=<choice>`) or preset (`--gate`), then resume — the operator-pattern hook for coding agents |
 | 7 | budget exceeded (`SECURITY.md` §4) | raise the cap or accept the partial run, then resume |

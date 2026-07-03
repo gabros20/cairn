@@ -45,6 +45,11 @@ One event stream per run: `runs/<id>/trail.jsonl`. Envelope:
 | liveness | `heartbeat` *(optional)* | log_bytes, last_line |
 | knowledge | `learn` | note, tag |
 
+*Status: the run/plan/step/gate/loop/`learn` events above are emitted by the C1 walker today.
+`guard-deny` lands with the guard engine (C3); `heartbeat` is opt-in config the walker parses but
+does not yet emit (deferred — see IMPLEMENTATION-PLAN); `usage` fields populate once executors
+report tokens/cost (C2+).*
+
 Two events earn their keep specially: **`gate-pending`** turns the operator pattern from "poll and
 infer" into "wait for the event" (an operating agent watches for it, asks the human, answers,
 resumes). **`heartbeat`** (opt-in: `[defaults] heartbeat = "60s"`) makes a 90-minute build step
@@ -80,6 +85,9 @@ events = ["run-*", "halt", "gate-pending", "guard-deny"]   # glob filter; defaul
 
 Sinks are **tee — never authority**: fire-and-forget with bounded retry; a dead webhook cannot
 slow or halt a run. Slack/desktop-notify/OTel are the documented plugin examples.
+
+*Status: designed. Today `[sinks.jsonl]` (trail.jsonl itself, sink #0) is the only built sink; the
+`[sinks.webhook]` push and the OTel exporter are post-C7 plugins — see IMPLEMENTATION-PLAN.*
 
 ### Tier 3 — OTel export (mapping, not dependency)
 For fleets that live in Grafana/Datadog/Honeycomb: an **exporter plugin** maps the trail onto

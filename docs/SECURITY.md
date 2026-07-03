@@ -50,6 +50,10 @@ a validator's job where it matters (e.g. the deploy validator asserts no token-s
 `deploy.json`). Redaction is damage limitation, not permission — the pass-through rule above is
 the actual control.
 
+*Status: the declaration + deny-by-default pass-through (§1.1–1.2) are built and tested in C1; the
+literal scrubber activates in C2–C3, when live executors first produce output/logs to scrub — see
+IMPLEMENTATION-PLAN.*
+
 ## 2. Untrusted content — the prompt-injection posture
 
 The pipeline's raw material is **scraped third-party web content**, read by agents that hold
@@ -109,6 +113,10 @@ blueprint/build/review core runs air-gapped, which is both a security property a
 property (no mid-build fetching).
 
 ## 4. Budgets — governance for headless fleets
+
+*Status: designed. `ExitCode.BUDGET` (7) is reserved in the kernel today, but no budget is enforced
+yet — `usage`-tracked budgets and the exit-7 halt activate in C2–C3, once executors report
+tokens/cost — see IMPLEMENTATION-PLAN.*
 
 A 16-site batch with a looping art-review must have a ceiling. Budgets are declared, tracked from
 the trail's `usage` data, and enforced by the walker:

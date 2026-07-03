@@ -269,7 +269,8 @@ is the artifact's rendered, run-dir-relative path (a glob artifact receives its 
 `blueprints/**`), so a generic validator can locate the file without knowing the logical name. Guard
 checks:
 `stdin = {"command": "...", "env": {...}, "run_dir": "..."}` JSON; exit 0 allow; exit 2 deny with
-stderr reason. Both must be side-effect-free.
+stderr reason. Both must be side-effect-free. `env` is the **`CAIRN_*`-only safe subset** of the
+step's environment (`guards._safe_env`) — secrets a step holds never cross to a check process.
 
 ## 5. Expression grammar (the whole thing)
 
@@ -421,11 +422,11 @@ cairn trail <run-dir> [--watch] [--follow --json [--since SEQ]]
 cairn ps [--workspace .] [--json]       # cross-run fleet view (running/gate-waiting/halted) —
                                         # derived from run.json + trail recency; no daemon, no registry
 cairn doctor [--executor X] [--probe-hooks]
-cairn batch <pipeline> --params-file sites.jsonl [-j 8] [--gate NAME=CHOICE]...
-cairn learnings [--since DATE] [--tag TAG]      # aggregate learn events across all runs
+cairn batch <pipeline> --params-file sites.jsonl [-j 8] [--gate NAME=CHOICE]...  # stub — exit 2 until C6+
+cairn learnings [--since DATE] [--tag TAG]      # stub — exit 2 until C6+; aggregate learn events across all runs
                                                 # (the learning loop: TOOLING-AND-GROWTH §7)
-cairn gc [--keep-days N] [--keep-last M] [--artifacts-only]   # retention — never automatic
-cairn schedule install|list|run <name>|uninstall [--backend cron|launchd|systemd]
+cairn gc [--keep-days N] [--keep-last M] [--artifacts-only]   # stub — exit 2 until C6+; retention — never automatic
+cairn schedule install|list|run <name>|uninstall [--backend cron|launchd|systemd]  # stub — exit 2 until C6+
                                                 # sync schedules.yaml → host scheduler; the installed
                                                 # entry always calls `cairn schedule run <name>` (SCHEDULING.md)
 cairn new workspace|pipeline|agent|skill|validator <name>

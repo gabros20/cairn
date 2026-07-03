@@ -73,9 +73,10 @@ def render_artifact_path(
 ) -> str:
     """Render ``decl.path`` to its run-dir-relative concrete path (API §2.8).
 
-    Implemented exactly as the walker inlines it: a :class:`TemplateContext` with
+    The single source of the path recipe: a :class:`TemplateContext` with
     ``artifact_refs_allowed=False`` (a path can never depend on another artifact's path),
-    then :func:`template.render`. Kept semantically identical to the walker on purpose.
+    then :func:`template.render`. The walker imports this function rather than re-deriving it,
+    so run-dir path resolution stays identical across compose and walk by construction.
     """
     ctx = TemplateContext(
         params=params,
