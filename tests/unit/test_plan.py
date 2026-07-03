@@ -371,6 +371,108 @@ def test_parallel_children_must_produce_disjoint_artifacts(tmp_path):
 # --------------------------------------------------------------------------- #
 
 
+# --------------------------------------------------------------------------- #
+# (A) Static params/dims leaf check — a typo on the lazy side of &&/|| must not
+#     hide behind short-circuit evaluation (defeats "misspellings disable steps").
+# --------------------------------------------------------------------------- #
+
+
+def test_params_typo_on_lazy_branch_is_caught(tmp_path):
+    # gates.g is a runtime root, so `&&` short-circuits before params.NOPE is ever
+    # evaluated — the static path check must catch it anyway.
+    steps = "  - { id: one, run: 'echo', produces: [a], when: \"gates.g.choice == 'yes' && params.NOPE == 'z'\" }\n"
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    assert "NOPE" in str(exc.value) and "one" in str(exc.value)
+
+
+def test_params_typo_stays_caught_with_flipped_operands(tmp_path):
+    steps = "  - { id: one, run: 'echo', produces: [a], when: \"params.NOPE == 'z' && gates.g.choice == 'yes'\" }\n"
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    assert "NOPE" in str(exc.value)
+
+
+def test_dims_typo_in_unless_is_caught(tmp_path):
+    steps = "  - { id: one, run: 'echo', produces: [a], unless: \"dims.NOPE == 'x'\" }\n"
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    assert "NOPE" in str(exc.value)
+
+
+def test_valid_lazy_branch_params_path_still_plans_green(tmp_path):
+    # params.x exists; the lazy gates.g branch keeps the node runtime-conditional.
+    steps = "  - { id: one, run: 'echo', produces: [a], when: \"params.x == 'hi' && gates.g.choice == 'yes'\" }\n"
+    p = _plan_p(tmp_path, steps)
+    assert _node(p, "one").when_runtime is not None
+
+
+def test_unless_runtime_predicate_is_negated_into_when_runtime(tmp_path):
+    # A runtime-only unless: survives as when_runtime = !(unless) — active iff the
+    # predicate is false.
+    steps = "  - { id: one, run: 'echo', produces: [a], unless: \"artifacts.a.ok == true\" }\n"
+    p = _plan_p(tmp_path, steps)
+    predicate = _node(p, "one").when_runtime
+    assert predicate is not None
+
+    def resolver(root, parts):
+        assert (root, parts) == ("artifacts", ("a", "ok"))
+        return True  # unless-condition holds → node inactive
+
+    assert bool(predicate.evaluate(resolver)) is False
+    assert bool(predicate.evaluate(lambda r, p: False)) is True  # unless false → node runs
+
+
+# --------------------------------------------------------------------------- #
+# (C) Loop re-production exemption is scoped to before-loop artifacts only.
+# --------------------------------------------------------------------------- #
+
+_LOOP_HEAD = """pipeline: p
+version: 1
+run_id: "p-{date}"
+artifacts:
+  seed: { path: seed.json, schema: schemas/s.json }
+  rev:  { path: "rev-r{cycle}.json", schema: schemas/s.json }
+steps:
+  - { id: seed, run: 'echo', produces: [seed] }
+  - loop: lp
+    min: 1
+    max: { interactive: 2, headless: 1 }
+    until: "artifacts.rev.ok == true"
+    body:
+"""
+
+
+def test_loop_body_reproducing_a_new_name_twice_is_an_error(tmp_path):
+    body = (
+        "      - { id: one, run: 'echo', needs: [seed], produces: [rev] }\n"
+        "      - { id: two, run: 'echo', needs: [seed], produces: [rev] }\n"
+    )
+    ws = _write_ws(tmp_path, _LOOP_HEAD + body)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    assert "rev" in str(exc.value) and "lp" in str(exc.value)
+
+
+def test_loop_body_may_reproduce_an_artifact_produced_before_the_loop(tmp_path):
+    # `seed` is produced before the loop; a body step re-producing it is the sanctioned
+    # re-production (§2.6) and must plan green.
+    body = (
+        "      - { id: check, run: 'echo', needs: [seed], produces: [rev] }\n"
+        "      - { id: fix, run: 'echo', needs: [rev], produces: [seed] }\n"
+    )
+    ws = _write_ws(tmp_path, _LOOP_HEAD + body)
+    p = plan(ws, "p", {}, now=NOW)
+    assert isinstance(_node(p, "lp"), LoopNode)
+
+
+def test_to_node_into_a_loop_body_is_an_error():
+    # slicing is over top-level nodes; a loop-body step id ('review') is not sliceable.
+    with pytest.raises(ConfigError) as exc:
+        plan(BREASE_WS, "brease-rebuild", {"url": "https://acme.com", "mode": "redesign"}, to_node="review", now=NOW)
+    assert "review" in str(exc.value)
+
+
 def test_unused_artifact_and_missing_skill_are_warnings(tmp_path):
     yaml_text = (
         "pipeline: p\nversion: 1\nrun_id: \"p-{date}\"\n"

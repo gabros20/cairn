@@ -330,6 +330,24 @@ def _cond_value(expr: Expr, label: str, ctx: _Ctx) -> Any:
         _err(f"{label}: {exc}", ctx.file)
 
 
+def _static_check_paths(expr: Expr, label: str, ctx: _Ctx) -> None:
+    """Leaf-check every ``params.``/``dims.`` path syntactically — independent of evaluation.
+
+    ``Expr.paths()`` sees both operands of every comparison and *both sides* of a
+    short-circuited ``&&``/``||``, so a misspelling on the lazy branch
+    (``gates.g.choice=='yes' && params.NOPE=='z'``) can no longer hide until runtime.
+    Runtime roots (artifacts/gates/run/cycle) are not checked — they are unknowable now.
+    """
+    for root, parts in expr.paths():
+        if root not in ("params", "dims"):
+            continue
+        table = ctx.params if root == "params" else ctx.dims
+        if not parts:
+            _err(f"{label}: bare {{{root}}} is not a value — use {root}.<name>", ctx.file)
+        if parts[0] not in table:
+            _err(f"{label}: unknown path {root}.{parts[0]}", ctx.file)
+
+
 def _expand_condition(raw: dict, label: str, ctx: _Ctx) -> tuple[str, Expr | None, str | None]:
     """Settle ``when:``/``unless:`` as far as params/dims allow.
 
@@ -337,7 +355,9 @@ def _expand_condition(raw: dict, label: str, ctx: _Ctx) -> tuple[str, Expr | Non
     A predicate the resolver can settle now decides drop/keep here; one that touches a
     runtime root is combined into a single runtime Expr on the kept node.
     """
-    runtime: list[tuple[str, str]] = []
+    # Parse + statically leaf-check every condition FIRST, so a params/dims typo is caught
+    # even when short-circuit would settle the node (drop) before that branch is evaluated.
+    conds: list[tuple[str, str, Expr]] = []
     for key in ("when", "unless"):
         src = raw.get(key)
         if src is None:
@@ -345,6 +365,11 @@ def _expand_condition(raw: dict, label: str, ctx: _Ctx) -> tuple[str, Expr | Non
         if not isinstance(src, str):
             _err(f"{label}: {key}: must be an expression string", ctx.file)
         expr = _parse_cond(src, f"{label} {key}", ctx)
+        _static_check_paths(expr, f"{label} {key}", ctx)
+        conds.append((key, src, expr))
+
+    runtime: list[tuple[str, str]] = []
+    for key, src, expr in conds:
         value = _cond_value(expr, f"{label} {key}", ctx)
         if value is _DEFER:
             runtime.append((key, src))
@@ -686,6 +711,7 @@ def _parse_loop(raw: dict, ctx: _Ctx, when_runtime: Expr | None, children: list[
     until = None
     if raw.get("until") is not None:
         until = _parse_cond(str(raw["until"]), f"loop {name!r} until", ctx)
+        _static_check_paths(until, f"loop {name!r} until", ctx)
     on_cap = raw.get("on_cap", "halt")
     if on_cap not in ("halt", "continue"):
         _err(f"loop {name!r}: on_cap must be 'halt' or 'continue', got {on_cap!r}", ctx.file)
@@ -813,13 +839,29 @@ def _verify_dataflow(nodes: list[Node], producers: dict[str, list[str]], ctx: _C
                 for name in child.produces:
                     _add_produce(name, produced, in_loop=False, node_id=child.id, ctx=ctx)
         elif isinstance(node, LoopNode):
+            # The sanctioned re-production (§2.6) is a body step re-writing an artifact that
+            # existed BEFORE the loop. A brand-new name introduced twice inside the body is a
+            # real duplicate — so exempt only names present at loop entry.
+            before_loop = set(produced)
+            loop_new: dict[str, str] = {}
             for child in node.body:
+                names = child.produces if isinstance(child, StepNode) else (child.name,)
+                cid = child.id if isinstance(child, StepNode) else child.name
                 if isinstance(child, StepNode):
                     _check_needs(child, produced, producers, ctx)
-                    for name in child.produces:
-                        _add_produce(name, produced, in_loop=True, node_id=child.id, ctx=ctx)
-                elif isinstance(child, GateNode):
-                    _add_produce(child.name, produced, in_loop=True, node_id=child.name, ctx=ctx)
+                for name in names:
+                    if name in before_loop:
+                        produced.add(name)  # sanctioned re-production
+                    elif name in loop_new:
+                        _err(
+                            f"loop {node.name!r}: {name!r} is produced by both {loop_new[name]!r} "
+                            f"and {cid!r} within the body (only re-production of an artifact "
+                            f"produced before the loop is allowed)",
+                            ctx.file,
+                        )
+                    else:
+                        loop_new[name] = cid
+                        produced.add(name)
 
 
 # --------------------------------------------------------------------------- #
@@ -852,6 +894,7 @@ def _parse_guards(raw_guards: Any, ctx: _Ctx) -> list[GuardDecl]:
         src = g.get("when")
         if src is not None:
             expr = _parse_cond(str(src), f"guard {name!r} when", ctx)
+            _static_check_paths(expr, f"guard {name!r} when", ctx)
             value = _cond_value(expr, f"guard {name!r} when", ctx)
             if value is _DEFER:
                 when_runtime = expr
