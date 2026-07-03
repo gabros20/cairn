@@ -340,6 +340,44 @@ def test_resume_cross_minor_version_warns_and_proceeds(hello_ws, monkeypatch, ca
     assert (rd / "message.txt").exists()
 
 
+def test_run_run_dir_existing_refuses_pipeline_drift(hello_ws, monkeypatch, capsys):
+    # `run --run-dir <existing>` (no --idempotent) resumes — it must pass the same drift
+    # guard as `cairn resume`, not silently resume the old run against an edited file.
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=friendly"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    pfile = hello_ws / "pipelines" / "hello.yaml"
+    pfile.write_text(pfile.read_text() + "\n# drift\n", encoding="utf-8")
+    rc = main(["run", "hello", "--headless", "--run-dir", str(rd)])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "hash drift" in err
+    assert f"resume {rd} --force" in err  # the remedy names the flag-bearing command
+
+
+def test_run_run_dir_existing_refuses_cross_major_version(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=friendly"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    _set_run_version(rd, "9.0.0")
+    rc = main(["run", "hello", "--headless", "--run-dir", str(rd)])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "9.0.0" in err and cairn.__version__ in err  # names both versions
+    assert f"resume {rd} --force" in err
+
+
+def test_run_run_dir_existing_clean_path_resumes(hello_ws, monkeypatch):
+    # Same pipeline, same version → the guards stay silent and the resume completes.
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=friendly"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    (rd / "message.txt").unlink()
+    rc = main(["run", "hello", "--headless", "--run-dir", str(rd)])
+    assert rc == int(ExitCode.OK)
+    assert (rd / "message.txt").exists()
+
+
 def test_resume_same_version_is_silent(hello_ws, monkeypatch, capsys):
     monkeypatch.chdir(hello_ws)
     assert main(["run", "hello", "--headless", "--gate", "tone=friendly"]) == 0

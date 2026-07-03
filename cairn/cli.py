@@ -451,7 +451,20 @@ def _cmd_run(args: argparse.Namespace) -> int:
         elif not existing:
             run_dir = bootstrap_run(ws, p, now=now, run_dir=run_dir, pipeline_hash=phash)
             created = True
-        # existing without --idempotent → resume the given dir as-is.
+        if existing:
+            # An existing --run-dir resumes (with or without --idempotent) — through the same
+            # guards as every other resume entrance (drift → version). `cairn run` has no
+            # --force; the refusals name `cairn resume <run-dir> --force` as the escape hatch.
+            try:
+                recorded = load_run(run_dir)
+            except (OSError, ValueError, ConfigError):
+                recorded = {}
+            fail = _pipeline_drift_guard(recorded.get("pipeline_hash"), phash, p.pipeline, run_dir, force=False)
+            if fail is not None:
+                return fail
+            fail = _version_compat_guard(recorded.get("cairn_version"), run_dir, force=False)
+            if fail is not None:
+                return fail
     else:
         runs_root = _runs_root(ws, config)
         # Idempotency's single source of truth is schedkit.find_idempotent_run — it matches by
