@@ -23,13 +23,14 @@ stdlib only.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from cairn.kernel.runstate import LOCK_NAME, RUN_JSON, LockHeldError, run_lock
+from cairn.kernel.runstate import LOCK_NAME, RUN_JSON
 from cairn.kernel.trail import TRAIL_NAME, derive_status
 
 # The audit skeleton that survives an `--artifacts-only` slim — everything else in the run
@@ -116,12 +117,29 @@ def _load_info(run_dir: Path) -> _RunInfo | None:
 
 
 def _lock_free(run_dir: Path) -> bool:
-    """True if the run's advisory lock can be taken right now (i.e. no walker holds it)."""
+    """True if no walker holds the run's advisory lock right now — WITHOUT touching the dir.
+
+    An absent lockfile means nothing holds it (runstate.run_lock creates the file when it
+    takes the lock). When one exists it is opened read-only and flock-probed non-blocking;
+    the probe never creates, truncates, or writes the lockfile, keeping plan_gc a true
+    dry-run.
+    """
+    lock_path = run_dir / LOCK_NAME
+    if not lock_path.exists():
+        return True
     try:
-        with run_lock(run_dir):
-            return True
-    except LockHeldError:
-        return False
+        fh = lock_path.open("r", encoding="utf-8")
+    except OSError:
+        return False  # can't even open it — treat as held, never as reclaimable
+    try:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return False
+        fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        return True
+    finally:
+        fh.close()
 
 
 def plan_gc(
@@ -139,6 +157,11 @@ def plan_gc(
     pipeline. With both, a run survives if *either* rule retains it (deleted only when it is
     both too old AND not among the newest-M of its pipeline). With neither, nothing is
     selected. `now` is injected (never `datetime.now()`) so selection is deterministic.
+
+    keep_last ranks *all* legible runs of a pipeline — in-flight (running/locked/gate) runs
+    count toward M, so "keep the newest 2" means the 2 newest runs, not the 2 newest already
+    reclaimable ones. Runs without a parseable `created_at` are unevaluable by either rule
+    and are skipped (reported in `skipped`), never selected.
     """
     root = Path(runs_root)
     skipped: list[tuple[str, str]] = []
@@ -187,16 +210,15 @@ def plan_gc(
         if keep_days is None and keep_last is None:
             continue  # no rule → nothing selected
 
-        age_days: float | None = None
-        old_enough = False
-        if keep_days is not None:
-            if info.created_dt is None:
-                skipped.append((info.run_id, "unevaluable: missing/invalid created_at"))
-                continue
-            age_days = (now - info.created_dt).total_seconds() / 86400.0
-            old_enough = info.created_dt < (now - timedelta(days=keep_days))
-        elif info.created_dt is not None:
-            age_days = (now - info.created_dt).total_seconds() / 86400.0
+        # Both rules reason from created_at (age for keep_days, newest-M rank for keep_last).
+        # A run without a parseable created_at can't be evaluated by EITHER — it is skipped,
+        # never selected, so bad data can never cause a deletion.
+        if info.created_dt is None:
+            skipped.append((info.run_id, "unevaluable: missing/invalid created_at"))
+            continue
+
+        age_days = (now - info.created_dt).total_seconds() / 86400.0
+        old_enough = keep_days is not None and info.created_dt < (now - timedelta(days=keep_days))
 
         retained_by_days = keep_days is not None and not old_enough
         retained_by_last = keep_last is not None and info.run_dir.as_posix() in kept_by_last
@@ -269,6 +291,9 @@ def apply_gc(plan: GcPlan) -> GcResult:
 
     Each candidate is re-checked for its advisory lock at apply time (a run may have been
     resumed since planning); a now-locked run is skipped as an error, never force-deleted.
+    The lock is not held across the deletion itself, so a walker starting in the window
+    between the re-check and the rmtree is an inherent (accepted) race — gc is an explicit
+    operator action on runs already judged dead, not a concurrent-safe primitive.
     Full delete removes the run dir; `artifacts_only` slims it to the audit skeleton. A
     candidate whose dir escaped `plan.runs_root` is refused — apply never deletes outside root.
     """

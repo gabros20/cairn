@@ -136,6 +136,71 @@ def test_junk_dirs_are_skipped_not_fatal(tmp_path):
     assert any("no-run-json" in name for name, _ in plan.skipped)
 
 
+def test_missing_created_at_is_never_selected_under_keep_last_only(tmp_path):
+    # CRITICAL repro: a run whose run.json lacks created_at can't be ranked by keep_last —
+    # it must be skipped as unevaluable, never fall through to a full-delete candidate.
+    _make_run(tmp_path, "ranked-a-20260601", pipeline="p", age_days=30)
+    _make_run(tmp_path, "ranked-b-20260702", pipeline="p", age_days=1)
+    broken = tmp_path / "no-created-at-20260601"
+    broken.mkdir()
+    (broken / "run.json").write_text(
+        json.dumps({"run_id": "no-created-at-20260601", "pipeline": "p", "status": "done"})
+    )
+    w = TrailWriter(broken, "no-created-at-20260601")
+    w.emit("run-start")
+    w.emit("run-done")
+    w.close()
+
+    plan = plan_gc(tmp_path, keep_last=2, now=NOW)
+
+    assert "no-created-at-20260601" not in [c.run_id for c in plan.candidates]
+    assert any(
+        name == "no-created-at-20260601" and "created_at" in reason
+        for name, reason in plan.skipped
+    )
+
+
+def test_invalid_created_at_is_never_selected_under_any_rule(tmp_path):
+    bad = tmp_path / "bad-date-20260601"
+    bad.mkdir()
+    (bad / "run.json").write_text(
+        json.dumps({"run_id": "bad-date-20260601", "pipeline": "p", "created_at": "not-a-date", "status": "done"})
+    )
+    w = TrailWriter(bad, "bad-date-20260601")
+    w.emit("run-done")
+    w.close()
+
+    for kwargs in ({"keep_days": 7}, {"keep_last": 1}, {"keep_days": 7, "keep_last": 1}):
+        plan = plan_gc(tmp_path, now=NOW, **kwargs)
+        assert plan.candidates == [], f"selected under {kwargs}"
+        assert any("created_at" in reason for _, reason in plan.skipped)
+
+
+def test_plan_gc_is_pure_and_creates_no_lock_files(tmp_path):
+    # plan_gc must not leave a .cairn.lock behind in run dirs that never had one —
+    # a dry-run that mutates every run dir it probes isn't a dry-run.
+    run_dir = _make_run(tmp_path, "old-20260601", age_days=30)
+    assert not (run_dir / ".cairn.lock").exists()
+
+    plan = plan_gc(tmp_path, keep_days=7, now=NOW)
+
+    assert [c.run_id for c in plan.candidates] == ["old-20260601"]
+    assert not (run_dir / ".cairn.lock").exists()
+
+
+def test_keep_last_counts_a_live_run_toward_m(tmp_path):
+    # The newest run is in flight; keep_last=2 still counts it toward M, so only the
+    # oldest of the three is reclaimed (the live one is additionally protected anyway).
+    _make_run(tmp_path, "p-oldest-20260601", pipeline="p", age_days=30)
+    _make_run(tmp_path, "p-middle-20260615", pipeline="p", age_days=15)
+    _make_run(tmp_path, "p-live-20260702", pipeline="p", status="running", age_days=1, last_event="step-start")
+
+    plan = plan_gc(tmp_path, keep_last=2, now=NOW)
+
+    assert [c.run_id for c in plan.candidates] == ["p-oldest-20260601"]
+    assert any("running" in reason for _, reason in plan.skipped)
+
+
 def test_no_selection_rule_selects_nothing(tmp_path):
     _make_run(tmp_path, "old-20260601", age_days=99)
     plan = plan_gc(tmp_path, now=NOW)

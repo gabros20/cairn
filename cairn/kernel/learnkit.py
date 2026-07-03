@@ -43,11 +43,19 @@ class Learning:
 
 
 def _parse_at(at: str) -> datetime | None:
-    """Parse an envelope `at` (…Z) to an aware datetime; None if unparseable."""
+    """Parse an envelope `at` (…Z) to an aware datetime; None if unparseable.
+
+    Real trails always write Z-terminated UTC, but junk must never crash the scan: a
+    tz-less (naive) `at` is pinned to be read AS UTC, so it stays comparable to the
+    aware `since` bound instead of raising TypeError.
+    """
     try:
-        return datetime.fromisoformat(at.replace("Z", "+00:00"))
+        dt = datetime.fromisoformat(at.replace("Z", "+00:00"))
     except (AttributeError, ValueError):
         return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
 
 
 def _parse_since(since: str) -> datetime:

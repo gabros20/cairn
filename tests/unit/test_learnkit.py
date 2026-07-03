@@ -97,6 +97,43 @@ def test_since_filter_is_an_inclusive_date_lower_bound(tmp_path):
     assert [lg.note for lg in got] == ["new"]
 
 
+def test_naive_at_with_since_filter_never_crashes_and_reads_as_utc(tmp_path):
+    # A junk trail can carry a tz-less `at`; with --since active this must not raise
+    # (naive vs aware comparison) — a naive `at` is treated as UTC.
+    run_dir = tmp_path / "naive-20260703"
+    run_dir.mkdir()
+    (run_dir / "run.json").write_text('{"pipeline": "p"}')
+    w = TrailWriter(run_dir, "naive-20260703")
+    w.emit("learn", node="n", data={"note": "before", "tag": "t"})
+    w.emit("learn", node="n", data={"note": "after", "tag": "t"})
+    w.close()
+    import json as _json
+
+    evs = [_json.loads(x) for x in (run_dir / "trail.jsonl").read_text().splitlines()]
+    evs[0]["at"] = "2026-07-02T23:59:00"  # naive — no Z, no offset
+    evs[1]["at"] = "2026-07-03T00:00:01"  # naive — no Z, no offset
+    (run_dir / "trail.jsonl").write_text("\n".join(_json.dumps(e) for e in evs) + "\n")
+
+    got = collect_learnings(tmp_path, since="2026-07-03")
+
+    assert [lg.note for lg in got] == ["after"]
+
+
+def test_collects_valid_lines_around_garbage_mid_file(tmp_path):
+    # Garbage in the MIDDLE of a trail (not just a torn tail) must not lose the valid
+    # learn events on either side of it.
+    run_dir = _run(tmp_path, "mid-junk-20260701", [("n", "before-junk", "t")])
+    with (run_dir / "trail.jsonl").open("a", encoding="utf-8") as fh:
+        fh.write("{corrupt mid-file line\n")
+    w = TrailWriter(run_dir, "mid-junk-20260701")
+    w.emit("learn", node="n", data={"note": "after-junk", "tag": "t"})
+    w.close()
+
+    got = collect_learnings(tmp_path)
+
+    assert [lg.note for lg in got] == ["before-junk", "after-junk"]
+
+
 def test_tolerates_junk_dirs_and_missing_trails_with_counted_warnings(tmp_path):
     _run(tmp_path, "good-20260701", [("n", "real", "t")])
     (tmp_path / "not-a-run").mkdir()  # dir with no trail
