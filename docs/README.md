@@ -227,7 +227,7 @@ resident daemon (the filesystem is the state).
 
 ## Status
 
-**C0–C1 built and green (659 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
+**C0–C1 built and green (664 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
 artifacts, trail/runstate, guards, expression + template engines, config, doctor, scaffold); all
 five executors (`shell`/`stub` live; the **`claude` and `codex` executors now live-verified** — the
 first live `claude -p` / `codex exec` runs recorded as offline stub regressions in

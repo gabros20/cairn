@@ -16,7 +16,7 @@ ever debug one new thing at a time.
 
 - **C0 + C1 — complete.** Planner, walker, gatekit, composer, artifacts, trail/runstate, guards,
   expression + template engines, config, the `shell`/`stub` executors, the `cairn test` suite layer,
-  the scaffold, and every C1-scope CLI verb are built and green (659 tests).
+  the scaffold, and every C1-scope CLI verb are built and green (664 tests).
   *Deviation from the strict ordering:* built as parallel module waves with per-module
   implement→review→fix rather than strictly C0-then-C1. The C1 "synthetic-suite" verification bar is
   met by the suite + the offline `hello` end-to-end run + the testkit stub layer (a full
