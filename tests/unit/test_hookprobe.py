@@ -744,6 +744,15 @@ def _hello_ws(tmp_path):
     return newkit.new_workspace("demo", tmp_path)
 
 
+def _healthy_executor_check(monkeypatch):
+    # The workspace's default executor is claude; its health check is environment-dependent
+    # (the CLI is absent on CI runners, present on the dev machine) and would contaminate the
+    # exit code. Pin it healthy — the probe's exit contribution is what these tests assert.
+    from cairn.kernel import doctor
+
+    monkeypatch.setattr(doctor, "_doctor_executor", lambda *a, **kw: 0)
+
+
 def test_doctor_probe_lines_only_with_flag(tmp_path, monkeypatch):
     ws = _hello_ws(tmp_path)
     # Stub the probe so this stays hermetic (no subprocess); assert wiring, not mechanics.
@@ -764,6 +773,7 @@ def test_doctor_probe_lines_only_with_flag(tmp_path, monkeypatch):
 
 def test_doctor_probe_falsification_fails_exit(tmp_path, monkeypatch):
     ws = _hello_ws(tmp_path)
+    _healthy_executor_check(monkeypatch)
     # blocking_hooks=True but the probe says hooks don't fire → error → non-zero exit.
     monkeypatch.setattr(
         hookprobe, "probe",
@@ -780,6 +790,7 @@ def test_doctor_probe_falsification_fails_exit(tmp_path, monkeypatch):
 
 def test_doctor_prints_probe_warnings(tmp_path, monkeypatch):
     ws = _hello_ws(tmp_path)
+    _healthy_executor_check(monkeypatch)
     leftover = "canary dir left behind at /tmp/cairn-hookprobe-x (it may contain copied auth material)"
     monkeypatch.setattr(
         hookprobe, "probe",
@@ -799,6 +810,7 @@ def test_doctor_prints_probe_warnings(tmp_path, monkeypatch):
 
 def test_doctor_probe_inconclusive_only_warns(tmp_path, monkeypatch):
     ws = _hello_ws(tmp_path)
+    _healthy_executor_check(monkeypatch)
     monkeypatch.setattr(
         hookprobe, "probe",
         lambda recipe, **kw: ProbeResult("claude", "inconclusive", "no auth", "v", "under bypassPermissions", "deny"),
