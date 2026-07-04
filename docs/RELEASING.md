@@ -61,14 +61,13 @@ only works once the GitHub repo exists and is set as `origin` (see the activatio
 These are one-time steps before the **first** publish. Until they are done, the workflow either
 fails or publishes nowhere.
 
-- [ ] **Create the GitHub repo** and push `main` plus the existing `v0.1.0` tag
-      (`git push origin main --tags`). The repo currently has no remote.
-- [ ] **Fill `[project.urls]` in `pyproject.toml`** — replace every `OWNER` placeholder with the
-      real GitHub owner/org. (Grep for `OWNER` to find them.)
+- [x] **Create the GitHub repo** and push `main` plus the existing `v0.1.0` tag —
+      done: [`gabros20/cairn`](https://github.com/gabros20/cairn) (public).
+- [x] **Fill `[project.urls]` in `pyproject.toml`** — done: all URLs point at `gabros20/cairn`.
 - [ ] **Configure the PyPI Trusted Publisher** for the `cairn-pipelines` project. On PyPI, add a
       *pending* publisher (the project does not exist yet) under **Your projects → Publishing**:
    - PyPI Project Name: `cairn-pipelines`
-   - Owner: your GitHub owner/org · Repository: `cairn`
+   - Owner: `gabros20` · Repository: `cairn`
    - Workflow name: `release.yml`
    - Environment name: `pypi`
 - [ ] **Create the `pypi` environment** in the GitHub repo (**Settings → Environments → New
@@ -96,7 +95,7 @@ The import package and the console script are both `cairn`. The **PyPI distribut
 - **Do not install both `cairn` and `cairn-pipelines`** into the same environment — they collide on
   the `cairn` import package and the `cairn` console script.
 - Pre-publish, installing from git still works and is name-agnostic:
-  `uv tool install git+https://github.com/OWNER/cairn@v0.1.0`.
+  `uv tool install git+https://github.com/gabros20/cairn@v0.1.0`.
 
 ## Reference
 

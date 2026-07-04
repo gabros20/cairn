@@ -35,12 +35,11 @@ classifiers = [
 dependencies = ["pyyaml", "jsonschema"]
 
 [project.urls]
-# TODO(activation): replace OWNER before the first publish (docs/RELEASING.md § activation).
-Homepage = "https://github.com/OWNER/cairn"
-Repository = "https://github.com/OWNER/cairn"
-Documentation = "https://github.com/OWNER/cairn/tree/main/docs"
-Changelog = "https://github.com/OWNER/cairn/blob/main/CHANGELOG.md"
-Issues = "https://github.com/OWNER/cairn/issues"
+Homepage = "https://github.com/gabros20/cairn"
+Repository = "https://github.com/gabros20/cairn"
+Documentation = "https://github.com/gabros20/cairn/tree/main/docs"
+Changelog = "https://github.com/gabros20/cairn/blob/main/CHANGELOG.md"
+Issues = "https://github.com/gabros20/cairn/issues"
 
 [project.scripts]
 cairn = "cairn.cli:main"
