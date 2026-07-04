@@ -118,6 +118,26 @@ Tools tend to **graduate downward**: they enter agentic (you don't yet know the 
 and once the trail shows the agent running essentially the same command every run, you demote the
 step to `run:` — cheaper, faster, deterministic. The trail is what makes the graduation visible.
 
+**Long-lived services across steps (the serve-wrap pattern).** Every step is its own process;
+cairn holds no live process between steps, and run dirs are the only cross-step state. So when
+several steps need the *same* running service — a dev server that a build-verify `run:` step and a
+later art-review gate both hit — don't background it in one step and connect from the next: cairn
+does not own that process's lifecycle, and a server leaked past its step breaks `cairn batch`'s
+per-run isolation. Instead scope the service to a single step with a wrapper that boots it, waits
+until it is ready, does the step's real work against it, and tears it down — so it lives exactly as
+long as that step's process:
+
+```yaml
+- id: verify-demo
+  run: "scripts/serve-verify.sh {artifact:frontend}"   # boots the server, waits ready,
+  needs: [frontend]                                    # runs the checks, kills it on exit
+  produces: [qa-report]
+```
+
+If two steps each need the service, each wraps its own boot/teardown — idempotent and isolated,
+never a shared daemon. (A persistent-service node type is a possible future; the wrapper is the
+standard idiom today, not a workaround.)
+
 ## 5. The maturation ladder — how a workspace grows
 
 brease-factory's actual history ("crawl4ai capture starter" → six-phase pipeline system), with the
