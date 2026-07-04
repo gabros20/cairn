@@ -50,7 +50,8 @@ an *agent*, which binds an *executor* only at invocation; a step *produces* *art
 ## 1. Workspace
 
 **Is:** a directory that holds everything a family of pipelines needs — the unit of versioning and
-sharing. brease-factory — the pipeline cairn was distilled from — is the intended first workspace.
+sharing. brease-factory — the pipeline cairn was distilled from — became the first real workspace
+(its `v2` branch, 2026-07-04).
 
 ```
 my-factory/

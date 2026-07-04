@@ -3,8 +3,11 @@
 > **What this is.** A worked example, not a shipped cairn workspace. *brease-rebuild* is a real,
 > six-phase website-rebuild pipeline that runs today as an **internal Claude-Code system**
 > (brease-factory) — the origin pipeline cairn was distilled from. This page expresses that whole
-> pipeline as **one cairn workspace** to prove the abstraction covers a real system end to end;
-> actually porting it is the planned **first workspace migration** (future work — IMPLEMENTATION-PLAN).
+> pipeline as **one cairn workspace** to prove the abstraction covers a real system end to end.
+> That port has since **landed** (2026-07-04): brease-factory's `v2` branch is the first real
+> workspace — note it evolved past this page's single-pipeline sketch into **one pipeline per track**
+> (clone / redesign / reimagine), so treat this page as the historical worked mapping, not the
+> as-built shape.
 > Two things it references are **separate from cairn itself**: the *Brease CMS* (third-party content
 > tooling the `brease=on` branch drives — not a cairn feature) and the vendor coding-agent CLIs the
 > `agent:` steps call.
@@ -279,8 +282,9 @@ the art-review loop, the conditional chains, and the guard block all **plan and 
 (they are the C1 planner fixture, byte-for-byte). The ops verbs those rows lean on — `cairn batch`
 and the `cairn learnings` aggregation — are now **built and tested (LIVE)**, and the `learnings`
 promote pipeline ships as scaffold furniture (`self-improve.yaml` — TOOLING §7); the executors
-behind the `agent:` steps are live (C2–C5 done), and this pipeline's own live runs — including its
-`brease=on` CMS branch — wait on the brease-factory
-workspace migration. Two things got *stronger* in translation: the batch guard is no longer fail-open
+behind the `agent:` steps are live (C2–C5 done), and the brease-factory workspace migration has
+**landed** (2026-07-04 — as one pipeline per track rather than this page's single pipeline); what
+still waits is the first live run + parity benchmark, and the `brease=on` CMS branch remains gated
+on the separate Brease CLI. Two things got *stronger* in translation: the batch guard is no longer fail-open
 (per-process env replaces the global pointer), and CMS population now fails closed and defaults to
 "no" headlessly.

@@ -3,9 +3,10 @@
 > **Historical build record — read as history, not as a roadmap.** This is the plan cairn was built
 > against, kept for provenance: what got built, in what order, and against which verifications.
 > Milestones **C0–C5**, the post-C5 hardening backlog, and the self-improve scaffold are **complete**
-> (802 tests green; the `v0.1.0` tag is cut). The one thing still ahead is the **brease-factory
-> workspace migration** — porting the origin pipeline in as workspace #1 (EXAMPLE-BREASE-REBUILD),
-> which the deferred C2–C5 live-parity items ride along with. The milestone *bodies* below are left
+> (802 tests green; the `v0.1.0` tag is cut). The **brease-factory workspace migration is now done**
+> (2026-07-04 — its `v2` branch is workspace #1, three track pipelines on cairn ≥0.3; the migration's
+> findings shipped as the 0.3.0 flexibility fixes). Still riding with it: the deferred C2–C5
+> **live-parity** items (native v1 vs cairn v2 on a real site). The milestone *bodies* below are left
 > as-written (a record); the dated Status section beneath this banner is the current-state summary.
 > References to *PORT-DESIGN* point at an earlier design doc in the origin pipeline's repo, kept here
 > only as historical citation.
@@ -100,9 +101,13 @@ only ever debugged one new thing at a time.
   via `cairn new pipeline self-improve` (append-only, wires the test-matrix row, never clobbers
   customized companions). Hard rules preserved: PRs only — suggestions, not truth; curation never
   automatic; the human gate mandatory (TOOLING §7). Suite 780 → 802.
-- **Still ahead:** the brease-factory workspace migration — workspace #1, whose scope includes its
-  `brease=on` CMS-population branch (Brease is separate tooling, not a framework feature; see C6
-  note + EXAMPLE-BREASE-REBUILD) — plus the C2–C5 parity runs deferred with it.
+- **2026-07-04 — brease-factory workspace migration DONE:** workspace #1 is live (brease-factory's
+  `v2` branch: three track pipelines — clone/redesign/reimagine — on cairn ≥0.3; the migration's
+  findings shipped as the 0.3.0 flexibility fixes: gate/consumer lint, unknown-agent-key warnings,
+  agent-effort precedence + `escalate.effort`, batch `--to/--from`). Its `brease=on` CMS branch stays
+  gated on the separate Brease CLI (not a framework feature; see C6 note).
+- **Still ahead:** the C2–C5 **live-parity** runs (native v1 vs cairn v2 on the same site), riding on
+  workspace #1's first live executions.
 
 ---
 

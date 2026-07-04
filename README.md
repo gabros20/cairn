@@ -217,9 +217,11 @@ events, a webhook sink, kernel-side secret redaction, cross-version resume gates
 one aware-UTC clock). The self-improve pipeline ships as scaffold furniture — the framework provides
 the mechanism, the workspace owns the policy.
 
-**Deferred:** migrating the brease-factory pipeline (see Lineage) onto cairn as its first real
-workspace — including that pipeline's CMS-population branch, which is separate tooling rather than a
-framework feature. See [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md) and
+**Done (2026-07-04):** brease-factory (see Lineage) now runs as cairn's first real workspace — its
+`v2` branch is a three-pipeline workspace (clone / redesign / reimagine tracks) on cairn ≥0.3, and
+its migration findings drove the 0.3.0 flexibility fixes. Its CMS-population branch stays gated on
+the separate Brease CLI. **Deferred:** the live parity benchmark (native v1 vs cairn v2 on the same
+site). See [`docs/IMPLEMENTATION-PLAN.md`](docs/IMPLEMENTATION-PLAN.md) and
 [CHANGELOG.md](CHANGELOG.md).
 
 ## Lineage
