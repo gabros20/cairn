@@ -1103,6 +1103,13 @@ def _cmd_new(args: argparse.Namespace) -> int:
 def _cmd_batch(args: argparse.Namespace) -> int:
     ws = _workspace(args)
     gate_presets = _kv(args.gate)  # _Usage → exit 2 via main()
+    # --to/--from are pass-through: appended to every child `cairn run` argv verbatim, so each
+    # child validates the range exactly as an interactive run (an unknown node fails it CONFIG).
+    extra_args: list[str] = []
+    if args.to:
+        extra_args += ["--to", args.to]
+    if args.from_node:
+        extra_args += ["--from", args.from_node]
     try:
         result = run_batch(
             ws,
@@ -1110,6 +1117,7 @@ def _cmd_batch(args: argparse.Namespace) -> int:
             Path(args.params_file),
             jobs=args.jobs,
             gate_presets=gate_presets,
+            extra_args=extra_args,
             out=sys.stdout,
         )
     except ConfigError as exc:
@@ -1452,6 +1460,8 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--params-file", required=True, metavar="FILE", help="JSONL: one param object per line")
     sp.add_argument("-j", "--jobs", type=int, default=4, help="max concurrent child runs (default 4)")
     sp.add_argument("--gate", action="append", metavar="NAME=CHOICE", help="preset a gate for every child (repeatable)")
+    sp.add_argument("--to", help="stop each child run at this node (pass-through to `cairn run`)")
+    sp.add_argument("--from", dest="from_node", help="start each child run at this node (pass-through to `cairn run`)")
     sp.set_defaults(func=_cmd_batch)
 
     # learnings — aggregate `learn` trail events across every run

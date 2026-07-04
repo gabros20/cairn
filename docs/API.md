@@ -528,10 +528,12 @@ cairn doctor [--executor X] [--probe-hooks]
                                         # never cached (a fresh per-machine fact). Exit policy: a declared
                                         # blocking_hooks=True that the probe falsifies → error; None + a
                                         # concrete outcome → informational; inconclusive → warning, never error
-cairn batch <pipeline> --params-file sites.jsonl [-j 8] [--gate NAME=CHOICE]...
+cairn batch <pipeline> --params-file sites.jsonl [-j 8] [--gate NAME=CHOICE]... [--to P] [--from P]
                                         # process pool of `cairn run --headless` children, one per JSONL line;
-                                        # a failed child's summary names its reason — a bounded stderr tail
-                                        # (last lines, capped) + a pointer to the child's run dir
+                                        # --to/--from pass through to every child verbatim (same node-range
+                                        # semantics + validation as `cairn run`), so a batch can farm just a
+                                        # sub-range (e.g. the credential-free `--to P2`); a failed child's
+                                        # summary names its reason — a bounded stderr tail + a run-dir pointer
 cairn learnings [--since DATE] [--tag TAG]      # aggregate learn events across all runs, ranked
                                                 # (the learning loop: TOOLING-AND-GROWTH §7)
 cairn gc [--keep-days N] [--keep-last M] [--artifacts-only] [--include-needs-human] [--apply]

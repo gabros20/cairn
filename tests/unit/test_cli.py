@@ -1047,6 +1047,57 @@ def test_batch_summary_renders_failed_stderr_tail(hello_ws, monkeypatch, capsys)
 
 
 # --------------------------------------------------------------------------- #
+# batch --to/--from — pass-through to each child `cairn run`, same semantics.
+# --------------------------------------------------------------------------- #
+
+
+def _capture_batch(monkeypatch):
+    from cairn.kernel.batchkit import BatchResult
+
+    captured: dict = {}
+
+    def fake(ws, pipeline, params_file, **kw):
+        captured.update(kw)
+        return BatchResult(pipeline=pipeline, outcomes=(), exit_code=0)
+
+    monkeypatch.setattr("cairn.cli.run_batch", fake)
+    return captured
+
+
+def test_batch_forwards_to_and_from_to_each_child(hello_ws, monkeypatch):
+    monkeypatch.chdir(hello_ws)
+    pf = hello_ws / "s.jsonl"
+    pf.write_text('{"name": "Ada"}\n', encoding="utf-8")
+    captured = _capture_batch(monkeypatch)
+    rc = main(["batch", "hello", "--params-file", str(pf), "--to", "tone", "--from", "greet"])
+    assert rc == int(ExitCode.OK)
+    assert captured["extra_args"] == ["--to", "tone", "--from", "greet"]
+
+
+def test_batch_without_range_forwards_no_extra_args(hello_ws, monkeypatch):
+    monkeypatch.chdir(hello_ws)
+    pf = hello_ws / "s.jsonl"
+    pf.write_text('{"name": "Ada"}\n', encoding="utf-8")
+    captured = _capture_batch(monkeypatch)
+    rc = main(["batch", "hello", "--params-file", str(pf)])
+    assert rc == int(ExitCode.OK)
+    assert captured["extra_args"] == []
+
+
+def test_batch_invalid_to_step_fails_like_run(hello_ws, monkeypatch, capsys):
+    # A real child `cairn run hello --to nope` rejects the unknown node with CONFIG; batch
+    # forwards the flag verbatim and aggregates that exit code — the same failure `run` gives.
+    monkeypatch.chdir(hello_ws)
+    pf = hello_ws / "s.jsonl"
+    pf.write_text('{"name": "Ada"}\n', encoding="utf-8")
+    rc = main(["batch", "hello", "--params-file", str(pf), "--to", "nope"])
+    err = capsys.readouterr()
+    assert rc == int(ExitCode.CONFIG)
+    assert "1 failed" in err.out
+    assert "nope" in err.err  # the child's unknown-node config error bubbles up
+
+
+# --------------------------------------------------------------------------- #
 # run --idempotent reconciliation (delegates to schedkit.find_idempotent_run).
 # --------------------------------------------------------------------------- #
 
