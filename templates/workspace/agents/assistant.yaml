@@ -1,7 +1,7 @@
 description: "General-purpose assistant — the workspace's first agent, wired to hello.yaml's commented `elaborate` step."
 
 tier: balanced          # reasoning | balanced | cheap — abstract; resolved to a model per executor in cairn.toml
-effort: medium          # low | medium | high | xhigh (honored by flag executors like Claude/Codex)
+effort: medium          # low | medium | high | xhigh — this pin wins over the tier's effort (honored by flag executors like Claude/Codex)
 
 skills: []              # capability packs from skills/ this agent should load, e.g. [cairn-operator]
 

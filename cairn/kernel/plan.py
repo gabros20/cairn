@@ -1007,7 +1007,10 @@ def _resolve_exec(node: StepNode, executor_arg: str | None, step_executors: dict
     tier_spec = ec.tiers.get(node.tier)
     if tier_spec is None:
         _err(f"step {node.id!r}: executor {exec_name!r} has no model mapped for tier {node.tier!r}", file)
-    effort = tier_spec.effort if tier_spec.effort is not None else node.effort
+    # Effort precedence (specific over general): the agent's own `effort:` wins; the tier
+    # spec's effort is the fallback when the agent pins none; None last (the executor applies
+    # its own default). A per-agent effort must never be silently overridden by a tier-baked one.
+    effort = node.effort if node.effort is not None else tier_spec.effort
     return exec_name, tier_spec.model, effort
 
 

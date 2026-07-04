@@ -110,8 +110,10 @@ def test_reimagine_keeps_strategy_and_art_review():
 
 def test_redesign_escalates_the_builder_tier_to_reasoning():
     p = _brease("redesign")
-    # frontend-builder escalate: dims.design != 'reproduce' fires → reasoning tier
-    assert p.resolved_models["build"] == ("claude", "opus", "high")
+    # frontend-builder escalate: dims.design != 'reproduce' fires → reasoning tier (opus).
+    # Escalation swaps the tier (sonnet → opus) but the agent's pinned effort: medium wins
+    # over the reasoning tier's effort=high (agent effort beats tier effort).
+    assert p.resolved_models["build"] == ("claude", "opus", "medium")
     assert "art-review" in _ids(p.nodes)
     assert "strategy" not in _ids(p.nodes)  # content=keep → strategy still dropped
 
@@ -159,8 +161,11 @@ def test_executor_override_and_per_step_pin():
         executor="codex",
         now=NOW,
     )
-    # global override moves agents to codex, but the review step's hard pin stays claude
-    assert p.resolved_models["build"] == ("codex", "gpt-5.5", "high")
+    # global override moves agents to codex, but the review step's hard pin stays claude.
+    # frontend-builder pins effort: medium in its frontmatter, which now wins over codex's
+    # reasoning-tier effort=high (agent effort beats tier effort — specific over general).
+    assert p.resolved_models["build"] == ("codex", "gpt-5.5", "medium")
+    # design-director pins effort: high, matching claude's reasoning tier — high either way.
     assert p.resolved_models["review"] == ("claude", "opus", "high")
     assert _node(p, "build").executor == "codex"
 
@@ -173,10 +178,64 @@ def test_step_executor_map_overrides_default_but_not_pin():
         step_executors={"build": "grok"},
         now=NOW,
     )
-    # grok's reasoning tier omits effort → the agent's effort passes through (ARCHITECTURE
-    # §2 / prompt rule: "agent effort passes through unless the tier spec fixes it"). The grok
+    # grok's reasoning tier omits effort → the agent's effort applies (medium). The grok
     # executor passes it natively via --effort (grok 0.2.82).
     assert p.resolved_models["build"] == ("grok", "grok-4.3-high", "medium")
+
+
+# --------------------------------------------------------------------------- #
+# Effort precedence: agent frontmatter wins, tier spec is the fallback, executor
+# default last (specific-over-general — a per-agent `effort:` is never silently
+# overridden by a tier-baked effort).
+# --------------------------------------------------------------------------- #
+
+
+def _effort_ws(tmp_path: Path, *, agent_effort: str | None, tier_effort: str | None) -> Path:
+    ws = tmp_path / "ws"
+    (ws / "pipelines").mkdir(parents=True)
+    (ws / "schemas").mkdir()
+    (ws / "agents").mkdir()
+    tier = (
+        f'balanced = {{ model = "sonnet", effort = "{tier_effort}" }}'
+        if tier_effort
+        else 'balanced = { model = "sonnet" }'
+    )
+    (ws / "cairn.toml").write_text(
+        '[workspace]\nname = "t"\ndefault_executor = "claude"\n'
+        "[executors.claude]\nenabled = true\n[executors.claude.tiers]\n" + tier + "\n",
+        encoding="utf-8",
+    )
+    (ws / "schemas" / "s.json").write_text('{"type":"object"}', encoding="utf-8")
+    agent_line = f"effort: {agent_effort}\n" if agent_effort else ""
+    (ws / "agents" / "worker.yaml").write_text(
+        "tier: balanced\n" + agent_line + "tools: { allow: [read] }\n", encoding="utf-8"
+    )
+    (ws / "pipelines" / "p.yaml").write_text(
+        'pipeline: p\nversion: 1\nrun_id: "p-{date}"\n'
+        "artifacts:\n  a: { path: a.json, schema: schemas/s.json }\n"
+        "steps:\n  - { id: one, agent: worker, produces: [a] }\n",
+        encoding="utf-8",
+    )
+    return ws
+
+
+def test_agent_effort_wins_over_tier_effort(tmp_path):
+    ws = _effort_ws(tmp_path, agent_effort="high", tier_effort="medium")
+    p = plan(ws, "p", {}, now=NOW)
+    assert p.resolved_models["one"] == ("claude", "sonnet", "high")
+
+
+def test_tier_effort_applies_when_agent_omits_it(tmp_path):
+    ws = _effort_ws(tmp_path, agent_effort=None, tier_effort="medium")
+    p = plan(ws, "p", {}, now=NOW)
+    assert p.resolved_models["one"] == ("claude", "sonnet", "medium")
+
+
+def test_no_effort_anywhere_resolves_to_none(tmp_path):
+    # Neither the agent nor the tier fixes effort → None (the executor's own default applies).
+    ws = _effort_ws(tmp_path, agent_effort=None, tier_effort=None)
+    p = plan(ws, "p", {}, now=NOW)
+    assert p.resolved_models["one"] == ("claude", "sonnet", None)
 
 
 # --------------------------------------------------------------------------- #

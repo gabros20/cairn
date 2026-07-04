@@ -19,7 +19,9 @@ trail_context = { events = 12, learnings = 5 }   # how much history an agent env
 # ---------------------------------------------------------------------------
 # Model tiers — the ONLY place vendor model names live. An agent picks a tier
 # (reasoning | balanced | cheap); this maps that tier to a concrete model +
-# effort per executor. The day-0 `hello` pipeline needs none of this (it runs
+# effort per executor. The tier's `effort` is only a FALLBACK — an agent that
+# pins its own `effort:` wins (specific over general). The day-0 `hello`
+# pipeline needs none of this (it runs
 # on `run:` steps alone); the `self-improve` curate step is this scaffold's
 # first agent step and routes through it. Point these at whatever models your
 # executor serves.

@@ -97,9 +97,12 @@ balanced  = { model = "grok-build",             effort = "medium" }
 cheap     = { model = "grok-composer-2.5-fast", effort = "low" }
 ```
 
-Effort values are the shared enum `low | medium | high | xhigh`; a tier entry may fix effort or
-accept the agent's `effort:` — all three vendor executors take it as a flag (Claude/Codex natively;
-Grok since 0.2.82's headless `--effort`, which takes exactly this enum).
+Effort values are the shared enum `low | medium | high | xhigh`. Precedence is specific-over-general:
+an agent's own `effort:` wins; a tier entry's `effort` is the fallback used when the agent pins none;
+if neither sets it, effort is `None` and the executor applies its own default. So a tier may supply a
+default effort for the agents that omit one, but it never overrides an agent that pinned its own. All
+three vendor executors take effort as a flag (Claude/Codex natively; Grok since 0.2.82's headless
+`--effort`, which takes exactly this enum).
 
 ## 2. Pipeline file — `pipelines/<name>.yaml`
 
@@ -290,7 +293,7 @@ validators like everything else — never a config knob that quietly writes else
 ```yaml
 description: "P0 worker: crawls the source site into structured captures/"
 tier: balanced                   # reasoning | balanced | cheap
-effort: medium                   # low | medium | high | xhigh (flag executors)
+effort: medium                   # low | medium | high | xhigh — wins over the tier's effort (§1)
 escalate:                        # optional conditional tier bump
   when: "dims.design != 'reproduce'"
   tier: reasoning
