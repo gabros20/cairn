@@ -459,6 +459,11 @@ def _apply_escalate(doc: dict, name: str, base_tier: str, ctx: _Ctx, file: str) 
     return esc_tier if fires else base_tier
 
 
+# The keys `_load_agent` actually reads, plus `description` (human-facing, used by the scaffold's
+# agents). Anything else is warned about — see the loop in _load_agent.
+_AGENT_KEYS = {"tier", "effort", "escalate", "skills", "tools", "env", "returns", "description"}
+
+
 def _load_agent(name: str, ctx: _Ctx) -> AgentSpec:
     path = ctx.workspace_dir / "agents" / f"{name}.yaml"
     if not path.is_file():
@@ -469,6 +474,21 @@ def _load_agent(name: str, ctx: _Ctx) -> AgentSpec:
         _err(f"agent {name!r}: invalid YAML: {exc}", str(path))
     if not isinstance(doc, dict):
         _err(f"agent {name!r}: file is not a mapping", str(path))
+
+    # An agent file is a config, not a prompt — the only keys cairn reads are the ones below
+    # (`description:` is a harmless human-facing convention the scaffold uses). Any other key is
+    # a silent-data-loss trap: an author who writes `prompt:`/`mission:` there thinks the agent
+    # reads it; cairn ignores it. Warn (never error — an unknown key breaks nothing) so the loss
+    # is visible. Behavior belongs in skills, not agent config.
+    for key in doc:
+        if key not in _AGENT_KEYS:
+            ctx.warnings.append(
+                Finding(
+                    "warning",
+                    f"agent {name!r}: unknown key {key!r} in agents/{name}.yaml — cairn ignores "
+                    f"it (agent files are config, not prompts; behavior lives in skills)",
+                )
+            )
 
     tier = doc.get("tier", "balanced")
     if tier not in TIERS:

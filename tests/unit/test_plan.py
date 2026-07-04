@@ -790,3 +790,37 @@ def test_tool_requirements_includes_pipeline_scope(tmp_path):
 def test_tool_requirements_absent_when_no_tools_declared(tmp_path):
     ws = _write_ws(tmp_path, _HEADER + _TWO_STEPS)
     assert plan(ws, "p", {}, now=NOW).tool_requirements == ()
+
+
+# --------------------------------------------------------------------------- #
+# Unknown agent-YAML keys warn (silent-data-loss trap: behavior text an author
+# THINKS the agent reads — cairn ignores it, so say so).
+# --------------------------------------------------------------------------- #
+
+
+def test_unknown_agent_key_warns_naming_key_and_file(tmp_path):
+    steps = "  - { id: one, agent: worker, produces: [a] }\n"
+    agent = "tier: balanced\nprompt: 'do the thing'\ntools: { allow: [read] }\n"
+    p = _plan_p(tmp_path, steps, agents={"worker": agent})
+    hits = [w for w in p.warnings if "prompt" in w.message]
+    assert hits and hits[0].level == "warning"
+    assert "worker" in hits[0].message and "worker.yaml" in hits[0].message
+
+
+def test_description_key_does_not_warn(tmp_path):
+    # `description:` is a harmless human-facing convention the scaffold already uses.
+    steps = "  - { id: one, agent: worker, produces: [a] }\n"
+    agent = "description: 'a worker'\ntier: balanced\ntools: { allow: [read] }\n"
+    p = _plan_p(tmp_path, steps, agents={"worker": agent})
+    assert not any("description" in w.message for w in p.warnings)
+
+
+def test_known_read_keys_do_not_warn(tmp_path):
+    steps = "  - { id: one, agent: worker, produces: [a] }\n"
+    agent = (
+        "tier: balanced\neffort: medium\n"
+        "escalate: { when: \"params.x == 'hi'\", tier: reasoning }\n"
+        "skills: []\ntools: { allow: [read] }\nenv: [OK_TOKEN]\nreturns: schemas/s.json\n"
+    )
+    p = _plan_p(tmp_path, steps, agents={"worker": agent})
+    assert not any("ignores" in w.message for w in p.warnings)

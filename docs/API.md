@@ -307,6 +307,11 @@ env: []                          # secrets passed to this agent's processes — 
 returns: schemas/step-return.json   # default; override for special agents
 ```
 
+The keys above (plus `description`) are the whole surface cairn reads — an agent file is config,
+not a prompt. Any other key (e.g. `prompt:`, `mission:`) is **ignored with a plan warning** naming
+the key and file: behavior belongs in a skill (loaded into the envelope), never in agent config, so
+a stray behavior key is silent data loss unless surfaced.
+
 ## 4. Validator & guard-check contract
 
 Any executable. Validators: `argv = [run_dir, artifact_name, artifact_path]`; exit 0 pass; exit 1
