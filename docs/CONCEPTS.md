@@ -191,11 +191,10 @@ deterministic inlining:** each CLI's headless loader quirks become correctness b
 
 ```yaml
 - gate: scope
-  when: params.pages == 'gate'
   reads: [discovery]
   ask: "Which pages should we capture?"
   options: { recommended: "nav-linked core pages", all: "everything discovered", core: "home+core only" }
-  default: all          # what a headless run resolves to
+  default: all          # what a headless run resolves to (unconditional gate → always resolves)
 ```
 
 **Why decisions-as-artifacts:** replayable (`cairn resume` never re-asks answered gates), auditable

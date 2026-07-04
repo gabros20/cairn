@@ -824,3 +824,66 @@ def test_known_read_keys_do_not_warn(tmp_path):
     )
     p = _plan_p(tmp_path, steps, agents={"worker": agent})
     assert not any("ignores" in w.message for w in p.warnings)
+
+
+# --------------------------------------------------------------------------- #
+# Conditional-gate consumer lint: a gate carrying `when:` is inactive whenever
+# its condition is false; a consumer of {gate:x}/gates.x that is not guarded by
+# the same condition dies at runtime. Catch it at plan time.
+# --------------------------------------------------------------------------- #
+
+_SEED_GATE = (
+    "  - { id: seed, run: 'echo', produces: [a] }\n"
+    "  - gate: g\n"
+    "    when: \"params.x == 'go'\"\n"
+    "    options: { keep: 'k', drop: 'd' }\n"
+    "    default: keep\n"
+)
+
+
+def test_conditional_gate_with_unconditional_consumer_is_a_config_error(tmp_path):
+    steps = _SEED_GATE + "  - { id: consume, run: 'echo {gate:g}', needs: [a], produces: [b] }\n"
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    assert "consume" in str(exc.value) and "g" in str(exc.value)
+
+
+def test_conditional_gate_consumer_with_mismatched_when_warns(tmp_path):
+    steps = _SEED_GATE + (
+        "  - { id: consume, run: 'echo {gate:g}', when: \"params.x == 'other'\", "
+        "needs: [a], produces: [b] }\n"
+    )
+    p = _plan_p(tmp_path, steps)  # a warning, not an error — plan returns
+    hits = [w for w in p.warnings if "conditional gate" in w.message and "consume" in w.message]
+    assert hits and hits[0].level == "warning"
+
+
+def test_conditional_gate_consumer_guarded_by_same_condition_is_clean(tmp_path):
+    steps = _SEED_GATE + (
+        "  - { id: consume, run: 'echo {gate:g}', when: \"params.x == 'go'\", "
+        "needs: [a], produces: [b] }\n"
+    )
+    p = _plan_p(tmp_path, steps)
+    assert not any("conditional gate" in w.message for w in p.warnings)
+
+
+def test_conditional_gate_consumer_via_expr_when_is_clean_when_conjunct_matches(tmp_path):
+    # consumer references gates.g in its own when AND carries the gate's condition as a conjunct.
+    steps = _SEED_GATE + (
+        "  - { id: consume, run: 'echo', "
+        "when: \"params.x == 'go' && gates.g.choice == 'keep'\", needs: [a], produces: [b] }\n"
+    )
+    p = _plan_p(tmp_path, steps)
+    assert not any("conditional gate" in w.message for w in p.warnings)
+
+
+def test_unconditional_gate_consumed_unconditionally_is_untouched(tmp_path):
+    steps = (
+        "  - { id: seed, run: 'echo', produces: [a] }\n"
+        "  - gate: g\n"
+        "    options: { keep: 'k', drop: 'd' }\n"
+        "    default: keep\n"
+        "  - { id: consume, run: 'echo {gate:g}', needs: [a], produces: [b] }\n"
+    )
+    p = _plan_p(tmp_path, steps)  # no when: on the gate → nothing to prove
+    assert not any("conditional gate" in w.message for w in p.warnings)

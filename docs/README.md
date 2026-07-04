@@ -120,7 +120,6 @@ steps:
     produces: [discovery]
 
   - gate: scope                      # human decision, owned by the orchestrator
-    when: params.pages == 'gate'
     reads: [discovery]
     default: all                     # headless runs resolve from defaults
 

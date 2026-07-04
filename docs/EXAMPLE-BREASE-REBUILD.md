@@ -22,7 +22,7 @@ version: 1
 params:
   url:    { type: string, required: true }
   mode:   { type: enum, values: [rebuild, redesign, reimagine], default: rebuild }
-  pages:  { type: string, default: gate }        # <n> | all | gate
+  pages:  { type: string, default: all }         # <n> | all — the scope gate always asks (headless → default)
   brease: { type: enum, values: ["on", "off"], default: "off" }   # quote! bare on/off are YAML booleans
   deploy: { type: enum, values: ["on", "off"], default: "on" }
   asset_budget: { type: int, default: 5 }
@@ -80,7 +80,6 @@ steps:
     timeout: 15m
 
   - gate: scope
-    when: params.pages == 'gate'
     reads: [discovery]
     ask: "Which pages should we capture?"
     options:

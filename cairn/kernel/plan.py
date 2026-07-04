@@ -930,6 +930,129 @@ def _verify_dataflow(nodes: list[Node], producers: dict[str, list[str]], ctx: _C
 
 
 # --------------------------------------------------------------------------- #
+# Step 4 (part) — conditional-gate consumer lint.
+#
+# A gate carrying `when:` is dropped (or runtime-inactive) whenever its condition
+# is false. A node that consumes that gate — `{gate:x}` in a run/manual command or
+# args value, or `gates.x` in a when/unless/until expr — then dies at runtime with
+# a TemplateError/EvalError (a CONFIG halt) unless it is guarded by the SAME
+# condition. This lint proves that guard at plan time: an unguarded consumer is a
+# hard error, a consumer whose guard can't be shown to include the gate's condition
+# is a warning. Mode-independent (over raw nodes), so it fires even in a param set
+# where the gate happens to be kept.
+# --------------------------------------------------------------------------- #
+
+
+def _normalize_cond(src: str) -> str:
+    """Whitespace-stripped form for the conjunct-containment approximation."""
+    return re.sub(r"\s+", "", src)
+
+
+def _conditional_gate_whens(raw_nodes: list) -> dict[str, str]:
+    """Every gate carrying a non-empty ``when:`` → its raw condition string (whole pipeline)."""
+    out: dict[str, str] = {}
+
+    def visit(rn: Any) -> None:
+        if not isinstance(rn, dict):
+            return
+        if "gate" in rn:
+            w = rn.get("when")
+            if isinstance(w, str) and w.strip():
+                out[str(rn["gate"])] = w
+        elif "parallel" in rn:
+            for c in rn.get("steps", []) or []:
+                visit(c)
+        elif "loop" in rn:
+            for c in rn.get("body", []) or []:
+                visit(c)
+
+    for rn in raw_nodes:
+        visit(rn)
+    return out
+
+
+def _gates_consumed(rn: dict) -> set[str]:
+    """The gate names a raw node references: ``{gate:X}`` in its run/manual command and args
+    string values, plus ``gates.X`` in its when/unless/until expressions."""
+    gates: set[str] = set()
+    texts: list[str] = [rn[k] for k in ("run", "manual") if isinstance(rn.get(k), str)]
+    args = rn.get("args")
+    if isinstance(args, dict):
+        texts.extend(v for v in args.values() if isinstance(v, str))
+    for text in texts:
+        for ph in scan(text):
+            if ph.kind == "reference" and ph.ref_type == "gate" and ph.ref_name:
+                gates.add(ph.ref_name)
+    for key in ("when", "unless", "until"):
+        src = rn.get(key)
+        if isinstance(src, str) and src.strip():
+            try:
+                expr = parse_expr(src)
+            except ExprError:
+                continue  # a malformed expr is reported by the normal parse path
+            for root, parts in expr.paths():
+                if root == "gates" and parts:
+                    gates.add(parts[0])
+    return gates
+
+
+def _lint_conditional_gates(raw_nodes: list, ctx: _Ctx) -> None:
+    """Verify every consumer of a conditional gate is guarded by the gate's own condition.
+
+    For a consumer, the effective guard is the conjunction of its own ``when:`` and every
+    enclosing container's ``when:`` (a loop/parallel body step inherits its container's guard).
+    A consumer with *no* effective guard that touches a conditional gate is a hard error; one
+    whose guard cannot be shown to contain the gate's condition is a warning.
+
+    The conjunct test is normalized-string CONTAINMENT (whitespace-stripped) — a documented
+    approximation. It can be fooled by a re-parenthesized/reordered condition or a coincidental
+    substring inside a string literal, but it only ever *under*-reports (downgrading an error to
+    a warning, or a warning to silence) — it never raises a false error on a truly-guarded
+    consumer, because an exact same-string guard always contains itself.
+    """
+    gate_whens = _conditional_gate_whens(raw_nodes)
+    if not gate_whens:
+        return
+
+    def visit(rn: Any, ancestors: tuple[str, ...]) -> None:
+        if not isinstance(rn, dict):
+            return
+        own = rn.get("when")
+        guards = ancestors + ((own,) if isinstance(own, str) and own.strip() else ())
+        label = _node_label(rn, _classify(rn))
+        for gate in sorted(_gates_consumed(rn)):
+            cond = gate_whens.get(gate)
+            if cond is None:
+                continue  # consuming an unconditional gate is always safe
+            if not guards:
+                _err(
+                    f"{label} consumes conditional gate {gate!r} (active only while its "
+                    f"when: {cond!r} holds) but is itself unconditional — it will break at "
+                    f"runtime whenever the gate is inactive. Guard it with the same when:.",
+                    ctx.file,
+                )
+            elif not any(_normalize_cond(cond) in _normalize_cond(g) for g in guards):
+                ctx.warnings.append(
+                    Finding(
+                        "warning",
+                        f"{label} consumes conditional gate {gate!r} (when: {cond}) but its "
+                        f"guard does not contain that condition as a conjunct — cairn can't prove "
+                        f"the consumer is inactive whenever the gate is; guard it with the gate's "
+                        f"condition to be safe.",
+                    )
+                )
+        if "parallel" in rn:
+            for c in rn.get("steps", []) or []:
+                visit(c, guards)
+        elif "loop" in rn:
+            for c in rn.get("body", []) or []:
+                visit(c, guards)
+
+    for rn in raw_nodes:
+        visit(rn, ())
+
+
+# --------------------------------------------------------------------------- #
 # Step 5 (part) — guards.
 # --------------------------------------------------------------------------- #
 
@@ -1284,6 +1407,7 @@ def plan(
 
     active, skips = _build(raw_steps, ctx, in_loop=False)
     _verify_dataflow(active, producers, ctx)
+    _lint_conditional_gates(raw_steps, ctx)
 
     for name in artifact_decls:
         if name not in producers:

@@ -115,7 +115,7 @@ version: 1
 params:                          # the CLI surface: --param k=v
   url:   { type: string, required: true }
   mode:  { type: enum, values: [rebuild, redesign, reimagine], default: rebuild }
-  pages: { type: string, default: gate }          # <n> | all | gate
+  pages: { type: string, default: all }           # <n> | all — the scope gate always asks (headless → default)
   brease:{ type: enum, values: ["on", "off"], default: "off" }   # quote — see the note below
 
 dims:                            # derived config: preset table over one param
@@ -188,7 +188,6 @@ same timeout/log/trail treatment.
 
 ```yaml
 - gate: scope
-  when: params.pages == 'gate'
   reads: [discovery]             # summarized to the operator by the gate UI
   ask: "Which pages should we capture?"
   options:
@@ -199,6 +198,13 @@ same timeout/log/trail treatment.
 ```
 Decision lands at `gates/scope.json` `{ "choice": "...", "by": "tty|default|flag", "at": ... }` and
 is referenced in `needs:` by gate name.
+
+A gate *may* carry a `when:`, but then it is inactive whenever that condition is false — so every
+consumer of `{gate:X}`/`gates.X` must be guarded by the **same** condition, or it breaks at runtime.
+The planner enforces this: an unguarded consumer of a conditional gate is a plan error, and a
+consumer whose guard can't be shown to include the gate's condition is a plan warning. Prefer an
+**unconditional** gate with a `default:` (as above) — it always resolves (headless → the default),
+so consumers need no guard at all.
 
 ### 2.5 Parallel node
 
