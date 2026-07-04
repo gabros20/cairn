@@ -437,15 +437,26 @@ def _check_allowlist_fragment(bash: str, agent_name: str, ctx: _Ctx, file: str) 
         _err(f"agent {agent_name!r}: allowlist fragment #{frag} not found in {file_part}", file)
 
 
-def _apply_escalate(doc: dict, name: str, base_tier: str, ctx: _Ctx, file: str) -> str:
+def _apply_escalate(
+    doc: dict, name: str, base_tier: str, base_effort: str | None, ctx: _Ctx, file: str
+) -> tuple[str, str | None]:
+    """Resolve escalation to the effective ``(tier, effort)``. When the escalation FIRES it
+    bumps the tier and — if ``escalate.effort`` is given — overrides the effort (escalate.effort
+    beats the agent's own effort, which beats the tier's; see :func:`_resolve_exec`). When it does
+    not fire, or ``escalate`` is absent, the base ``(tier, effort)`` pass through unchanged.
+    ``escalate.tier`` and ``escalate.effort`` are validated unconditionally, so a typo is caught
+    even in a param set where the escalation is dormant."""
     esc = doc.get("escalate")
     if not esc:
-        return base_tier
+        return base_tier, base_effort
     if not isinstance(esc, dict):
         _err(f"agent {name!r}: escalate must be a mapping", file)
     esc_tier = esc.get("tier")
     if esc_tier not in TIERS:
         _err(f"agent {name!r}: escalate.tier {esc_tier!r} invalid (valid: {list(TIERS)})", file)
+    esc_effort = esc.get("effort")
+    if esc_effort is not None and esc_effort not in EFFORTS:
+        _err(f"agent {name!r}: escalate.effort {esc_effort!r} invalid (valid: {list(EFFORTS)})", file)
     when_src = esc.get("when")
     if not when_src:
         _err(f"agent {name!r}: escalate needs a 'when' expression", file)
@@ -456,7 +467,9 @@ def _apply_escalate(doc: dict, name: str, base_tier: str, ctx: _Ctx, file: str) 
         fires = bool(expr.evaluate(ctx.resolver))
     except EvalError as exc:
         _err(f"agent {name!r}: escalate.when: {exc}", file)
-    return esc_tier if fires else base_tier
+    if not fires:
+        return base_tier, base_effort
+    return esc_tier, (esc_effort if esc_effort is not None else base_effort)
 
 
 # The keys `_load_agent` actually reads, plus `description` (human-facing, used by the scaffold's
@@ -496,7 +509,7 @@ def _load_agent(name: str, ctx: _Ctx) -> AgentSpec:
     effort = doc.get("effort")
     if effort is not None and effort not in EFFORTS:
         _err(f"agent {name!r}: unknown effort {effort!r} (valid: {list(EFFORTS)})", str(path))
-    tier = _apply_escalate(doc, name, tier, ctx, str(path))
+    tier, effort = _apply_escalate(doc, name, tier, effort, ctx, str(path))
 
     skills = tuple(doc.get("skills", []) or [])
     for skill in skills:

@@ -239,6 +239,56 @@ def test_no_effort_anywhere_resolves_to_none(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# escalate may carry its own effort: when the escalation FIRES, escalate.effort
+# beats the agent's effort (which beats the tier). Omitted / not-firing → today's
+# post-flip resolution, untouched.
+# --------------------------------------------------------------------------- #
+
+_ESCALATE_STEP = "  - { id: one, agent: worker, produces: [a] }\n"
+
+
+def test_escalate_effort_wins_when_escalation_fires(tmp_path):
+    agent = (
+        "tier: balanced\neffort: medium\n"
+        "escalate: { when: \"params.x == 'hi'\", tier: reasoning, effort: xhigh }\n"
+        "tools: { allow: [read] }\n"
+    )
+    p = _plan_p(tmp_path, _ESCALATE_STEP, agents={"worker": agent})  # x defaults 'hi' → fires
+    assert p.resolved_models["one"] == ("claude", "opus", "xhigh")
+
+
+def test_escalation_without_effort_field_keeps_agent_pin(tmp_path):
+    agent = (
+        "tier: balanced\neffort: medium\n"
+        "escalate: { when: \"params.x == 'hi'\", tier: reasoning }\n"
+        "tools: { allow: [read] }\n"
+    )
+    p = _plan_p(tmp_path, _ESCALATE_STEP, agents={"worker": agent})  # fires, no escalate.effort
+    assert p.resolved_models["one"] == ("claude", "opus", "medium")  # agent pin, unchanged
+
+
+def test_escalate_effort_ignored_when_escalation_does_not_fire(tmp_path):
+    agent = (
+        "tier: balanced\neffort: medium\n"
+        "escalate: { when: \"params.x == 'nope'\", tier: reasoning, effort: xhigh }\n"
+        "tools: { allow: [read] }\n"
+    )
+    p = _plan_p(tmp_path, _ESCALATE_STEP, agents={"worker": agent})  # x != nope → does not fire
+    assert p.resolved_models["one"] == ("claude", "sonnet", "medium")  # base resolution untouched
+
+
+def test_invalid_escalate_effort_is_a_config_error(tmp_path):
+    agent = (
+        "tier: balanced\neffort: medium\n"
+        "escalate: { when: \"params.x == 'hi'\", tier: reasoning, effort: bogus }\n"
+        "tools: { allow: [read] }\n"
+    )
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, _ESCALATE_STEP, agents={"worker": agent})
+    assert "effort" in str(exc.value) and "bogus" in str(exc.value)
+
+
+# --------------------------------------------------------------------------- #
 # --from / --to slicing.
 # --------------------------------------------------------------------------- #
 

@@ -98,11 +98,11 @@ cheap     = { model = "grok-composer-2.5-fast", effort = "low" }
 ```
 
 Effort values are the shared enum `low | medium | high | xhigh`. Precedence is specific-over-general:
-an agent's own `effort:` wins; a tier entry's `effort` is the fallback used when the agent pins none;
-if neither sets it, effort is `None` and the executor applies its own default. So a tier may supply a
-default effort for the agents that omit one, but it never overrides an agent that pinned its own. All
-three vendor executors take effort as a flag (Claude/Codex natively; Grok since 0.2.82's headless
-`--effort`, which takes exactly this enum).
+a fired `escalate.effort` (§3) wins, then an agent's own `effort:`, then a tier entry's `effort` as
+the fallback used when the agent pins none; if none of them set it, effort is `None` and the executor
+applies its own default. So a tier may supply a default effort for the agents that omit one, but it
+never overrides an agent that pinned its own. All three vendor executors take effort as a flag
+(Claude/Codex natively; Grok since 0.2.82's headless `--effort`, which takes exactly this enum).
 
 ## 2. Pipeline file — `pipelines/<name>.yaml`
 
@@ -303,6 +303,8 @@ effort: medium                   # low | medium | high | xhigh — wins over the
 escalate:                        # optional conditional tier bump
   when: "dims.design != 'reproduce'"
   tier: reasoning
+  effort: xhigh                  # optional; when the escalation fires this beats the agent's
+                                 # effort (and the tier's). Omitted → the agent's effort stands.
 skills: [brease-capture-site, crawl4ai]
 tools:
   allow: [read, write, edit, bash]
