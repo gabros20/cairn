@@ -548,8 +548,9 @@ def test_requires_pin_unsatisfied_refuses_at_plan_time(hello_ws):
 
 
 def test_requires_pin_satisfied_plans_green(hello_ws):
-    # the DISTRIBUTION §3 canonical pin, satisfied by the installed 0.1.x cairn
-    _pin_requires(hello_ws, ">=0.1,<0.2")
+    # a representative pin satisfied by the installed cairn — kept 0.x-wide so it
+    # does not rot each minor release (the <0.2 form broke on the 0.2.0 bump).
+    _pin_requires(hello_ws, ">=0.1,<1")
     p = plan(hello_ws, "hello", {}, now=NOW)
     assert _ids(p.nodes) == ["greet", "tone", "compose"]
 

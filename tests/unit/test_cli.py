@@ -741,11 +741,12 @@ def test_doctor_reports_requires_satisfied(hello_ws, monkeypatch, capsys):
     monkeypatch.setenv("PATH", f"{FAKEBIN}{os.pathsep}{os.environ['PATH']}")
     toml = hello_ws / "cairn.toml"
     # A top-level bare key must precede any table header in TOML — prepend it.
-    toml.write_text('requires = ">=0.1,<0.2"\n' + toml.read_text(), encoding="utf-8")
+    # 0.x-wide so the pin stays satisfied across minor bumps (was <0.2, broke on 0.2.0).
+    toml.write_text('requires = ">=0.1,<1"\n' + toml.read_text(), encoding="utf-8")
     rc = main(["doctor"])
     out = capsys.readouterr().out
     assert rc == int(ExitCode.OK)
-    assert 'requires ">=0.1,<0.2"' in out
+    assert 'requires ">=0.1,<1"' in out
     assert f"satisfied by {cairn.__version__}" in out
 
 
