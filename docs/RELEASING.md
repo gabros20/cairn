@@ -70,16 +70,12 @@ fails or publishes nowhere.
    - Owner: `gabros20` · Repository: `cairn`
    - Workflow name: `release.yml`
    - Environment name: `pypi`
-- [ ] **Create the `pypi` environment** in the GitHub repo (**Settings → Environments → New
-      environment → `pypi`**). It must match the environment named in the `publish` job. Add
-      protection rules (e.g. required reviewers) here if you want a manual approval gate before
-      anything reaches PyPI.
-- [ ] **Confirm Actions can write** — **Settings → Actions → General → Workflow permissions** must
-      allow read/write (PSR pushes the version commit and tag with the built-in `GITHUB_TOKEN`).
-- [ ] **Allow the release job past branch protection** — if `main` is protected, the built-in
-      `GITHUB_TOKEN` push of the version commit + tag is rejected. Either exempt the repo's
-      GitHub Actions bot in the branch/tag protection rules (bypass list), or run releases from an
-      unprotected release branch. Without this the `release` job fails at the push step.
+- [x] **Create the `pypi` environment** in the GitHub repo — done (no protection rules yet; add
+      required reviewers later if you want a manual approval gate before anything reaches PyPI).
+- [x] **Confirm Actions can write** — done: default workflow permissions set to read/write.
+- [x] **Allow the release job past branch protection** — N/A: `main` is not protected. If
+      protection is added later, exempt the repo's GitHub Actions bot in the bypass list (or run
+      releases from an unprotected release branch), else the `release` job fails at the push step.
 - [ ] **Dispatch the workflow** (see [Cutting a release](#cutting-a-release)). The first run
       releases whatever the commits since `v0.1.0` warrant; if that's nothing yet, make a
       `feat:`/`fix:` commit first.
