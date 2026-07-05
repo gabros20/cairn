@@ -149,8 +149,14 @@ def run_process(
             except BrokenPipeError:
                 pass
 
-    reader.join(timeout_s)
-    if reader.is_alive() or proc.poll() is None:
+    # Wait on the PROCESS for the budget — never on the pipe. Clocking the pipe misreads
+    # both directions: a fast step can hit stdout EOF microseconds before the OS reaps it
+    # (``poll()`` → ``None`` → a 0.8s step reported as "exceeded timeout of 1800s"), and a
+    # step that backgrounds a child leaves the pipe open long after the step itself exited
+    # (reader alive → budget burned, then a false timeout that group-kills the survivor).
+    try:
+        proc.wait(timeout=timeout_s)
+    except subprocess.TimeoutExpired:
         _kill_process_group(proc)
         reader.join(2)
         # Reap the killed process (and re-kill best-effort if it lingers) so a long-lived
@@ -168,5 +174,8 @@ def run_process(
             f"{time.monotonic() - start:.1f}s"
         )
 
-    proc.wait()
+    # Exited within budget. Give the pump a short, bounded grace to drain what's already
+    # buffered; a backgrounded grandchild may hold the pipe open indefinitely, in which case
+    # the daemon thread keeps teeing its output to the log while the step result returns now.
+    reader.join(2)
     return proc.returncode, "".join(captured), time.monotonic() - start

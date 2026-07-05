@@ -223,6 +223,41 @@ def test_run_process_timeout_reaps_the_child(tmp_path, monkeypatch):
     assert proc.returncode is not None  # waited on → reaped, not left a zombie
 
 
+def test_run_process_eof_before_exit_is_not_a_timeout(tmp_path):
+    # The reap race that halted a live run: a step closes stdout/stderr (pump hits EOF
+    # immediately) but exits a beat later. Clocking the pipe + a non-blocking poll()
+    # misclassified this as "exceeded timeout of 1800s after 0.8s". The wait must be on
+    # the process, for the full budget.
+    code, _, dur = run_process(
+        ["/bin/sh", "-c", "exec 1>&- 2>&-; sleep 0.5; exit 0"],
+        stdin_text=None,
+        env={"PATH": "/usr/bin:/bin"},
+        cwd=tmp_path,
+        timeout_s=10,
+        log_path=tmp_path / "l.log",
+    )
+    assert code == 0
+    assert dur >= 0.4  # actually waited for the exit, not the EOF
+
+
+def test_run_process_grandchild_holding_pipe_does_not_stall_or_false_timeout(tmp_path):
+    # The inverse misread: the step exits instantly but a backgrounded grandchild inherits
+    # the stdout pipe and holds it open. Clocking the pipe burned the whole budget and then
+    # raised a false timeout that group-killed the survivor. The step's own exit must win.
+    start = time.monotonic()
+    code, out, _ = run_process(
+        ["/bin/sh", "-c", "sleep 30 & echo started"],
+        stdin_text=None,
+        env={"PATH": "/usr/bin:/bin"},
+        cwd=tmp_path,
+        timeout_s=15,
+        log_path=tmp_path / "l.log",
+    )
+    assert code == 0
+    assert "started" in out
+    assert time.monotonic() - start < 10  # returned on exit + drain grace, not the pipe
+
+
 def test_run_process_tolerates_non_utf8_output(tmp_path):
     # A lone 0xFF byte would blow up strict utf-8 decoding and silently kill the pump thread.
     code, out, _ = run_process(
