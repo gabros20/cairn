@@ -221,11 +221,14 @@ class GuardedExecutor:
         return getattr(self._inner, name)
 
     def invoke(self, inv):
+        # CAIRN_SHIM_MANIFEST points at the SIGNED manifest OUTSIDE the run dir (build_shims puts
+        # it there and returns the path in the delta); the shim also bakes this absolute path, so
+        # both agree at shim-fire time.
         env = {
             **inv.env,
             "PATH": f"{self._delta['PATH']}:{inv.env.get('PATH', '')}",
             "CAIRN_SHIM_DIR": self._delta["CAIRN_SHIM_DIR"],
-            "CAIRN_SHIM_MANIFEST": str(self._shim_dir / "manifest.json"),
+            "CAIRN_SHIM_MANIFEST": self._delta["CAIRN_SHIM_MANIFEST"],
         }
         return self._inner.invoke(dataclasses.replace(inv, env=env))
 
@@ -238,7 +241,9 @@ def _wrap_guards(plan: Plan, executors: dict[str, Any], run_dir: Path, workspace
         return executors
     shim_dir = Path(run_dir) / ".cairn" / "shims"
     shutil.rmtree(shim_dir, ignore_errors=True)  # fresh per run (contract; engine also sweeps)
-    delta = build_shims(shim_guards, shim_dir=shim_dir, workspace_dir=Path(workspace_dir))
+    delta = build_shims(
+        shim_guards, shim_dir=shim_dir, workspace_dir=Path(workspace_dir), run_dir=Path(run_dir)
+    )
     if not delta:
         return executors
     return {name: GuardedExecutor(ex, delta, shim_dir) for name, ex in executors.items()}

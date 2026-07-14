@@ -995,8 +995,9 @@ def test_system_env_passthrough_is_exactly_the_pinned_set(ws: Path, tmp_path: Pa
     run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
     assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
     assert set(captured["env"]) == {
-        # the allowed system passthrough — identity + locale + tmp, nothing more
-        "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME",
+        # the allowed system passthrough — identity + locale + tmp, plus XDG_STATE_HOME so a
+        # guard-check subprocess resolves the same gatekeys/manifest dir the parent signed under
+        "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "XDG_STATE_HOME",
         # the cairn mechanics the walker always injects
         "CAIRN_RUN_DIR", "CAIRN_STEP", "CAIRN_WORKSPACE", "CLAUDE_PROJECT_DIR",
     }
@@ -1023,7 +1024,7 @@ def test_absent_baseline_vars_are_omitted_not_none(ws: Path, tmp_path: Path, mon
     assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
     env = captured["env"]
     assert set(env) == {
-        "PATH", "HOME",
+        "PATH", "HOME", "XDG_STATE_HOME",  # XDG threaded for guard-check key-dir resolution
         "CAIRN_RUN_DIR", "CAIRN_STEP", "CAIRN_WORKSPACE", "CLAUDE_PROJECT_DIR",
     }
     assert None not in env.values()

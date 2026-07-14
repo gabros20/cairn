@@ -95,7 +95,7 @@ _GROK_COMPAT_OFF_TOML = (
 # baseline every real agent step gets). Kept in lockstep so the probe measures the same reality a
 # run experiences: USER/LOGNAME are load-bearing (macOS Keychain OAuth lookup), TMPDIR/HOME/LANG
 # shape tool behaviour, PATH resolves the vendor CLI. If walk.py's set changes, change this too.
-_ENV_PASSTHROUGH = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME")
+_ENV_PASSTHROUGH = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "XDG_STATE_HOME")
 
 # Substrings that mark a CLI's own auth/login failure → inconclusive, not a hook verdict.
 _AUTH_SIGNS = (

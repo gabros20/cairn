@@ -9,7 +9,8 @@ from pathlib import Path
 
 from cairn.executors._cli import CliExecutor
 from cairn.executors.base import Capabilities, Invocation
-from cairn.kernel.guards import build_manifest
+from cairn.kernel.gatekeys import guard_manifest_path
+from cairn.kernel.guards import write_manifest
 
 # cairn guard tool → claude PreToolUse matcher. cairn's guards are command guards; the real case
 # is bash → the claude ``Bash`` tool (the shim layer covers the same command surface). A guard
@@ -53,9 +54,20 @@ class ClaudeExecutor(CliExecutor):
         MERGES into any existing settings.json without clobbering unrelated keys. No hook-enforced
         guards → writes nothing.
 
+        The guard manifest is written to a gatekeys-protected location OUTSIDE the run dir
+        (``guard_manifest_path``) and SIGNED (per-run MAC + per-check-script hash), so the
+        sandboxed agent cannot rewrite the policy its own commands are checked against; its
+        absolute path is baked into the hook command and ``--hook-check`` authenticates it.
+
         NOTE (W4 config isolation): claude also loads the user's ``~/.claude/settings.json``;
         until W4 adds ``--setting-sources project``, this run-dir hook is ADDITIVE to the user's
         hooks. That is safe — our hook only ADDS a deny, never removes one.
+
+        NOTE (W3c): ``settings.json`` itself lives in the run dir, so under ``bypassPermissions``
+        (whole-FS write) the agent can still rewrite/remove it or the per-run secret. That residual
+        — an OS FS-sandbox or tool-scoping so claude cannot write/read outside the run dir — is
+        tracked as future work W3c; the signed manifest here DETECTS tamper (fail closed) short of
+        the agent stealing the secret, and ``post`` remains the hard gate.
         """
         hook_guards = [g for g in guards if "hook" in g.enforce]
         if not hook_guards:
@@ -64,13 +76,13 @@ class ClaudeExecutor(CliExecutor):
         run_dir = Path(run_dir)
         workspace_dir = Path(workspace_dir)
 
-        # The hook manifest — the SAME compact shape the shim manifest uses (build_manifest), so
-        # --hook-check and --shim-check re-load guards identically.
-        manifest_path = run_dir / ".cairn" / "hook-manifest.json"
-        manifest_body = json.dumps(
-            build_manifest(hook_guards, workspace_dir=workspace_dir), indent=2, sort_keys=True
-        ) + "\n"
-        _write_if_changed(manifest_path, manifest_body)
+        # The hook manifest — SIGNED, and written OUTSIDE the run dir (agent-unwritable under a
+        # workspace-write sandbox). The SAME builder (write_manifest) the shim layer uses, so
+        # --hook-check and --shim-check authenticate + re-load guards identically.
+        manifest_path = guard_manifest_path(run_dir, "hook")
+        write_manifest(
+            hook_guards, workspace_dir=workspace_dir, run_dir=run_dir, path=manifest_path
+        )
 
         # Merge our PreToolUse entries into settings.json, preserving unrelated keys and any
         # foreign (non-cairn) hook entries. Read-modify-write; a fresh run dir has no file yet.

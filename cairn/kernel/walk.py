@@ -788,7 +788,13 @@ class _Walk:
         # USER/LOGNAME are identity, not secrets: a macOS Keychain lookup (how `claude`/`codex`
         # find their stored OAuth credential) needs USER, so stripping it makes every executor
         # report "Not logged in". Kept in the deny-by-default baseline for that reason.
-        for key in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME"):
+        # XDG_STATE_HOME must pass through so a guard-check subprocess (the shim or the claude
+        # PreToolUse hook) resolves the SAME gatekeys/guard-manifest dir the parent minted+signed
+        # under — without it, a run with XDG_STATE_HOME set can't load the per-run secret and every
+        # guarded command fails closed (an availability break). It points at the state dir, not at
+        # a secret; the key stays 0600 outside the run dir (SECURITY §6 — the sandbox is the guard,
+        # not path secrecy).
+        for key in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "XDG_STATE_HOME"):
             if key in os.environ:
                 env[key] = os.environ[key]
         env["CAIRN_RUN_DIR"] = str(self.run_dir)

@@ -7,6 +7,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from cairn.kernel.gatekeys import guard_manifest_path
+
 from cairn.executors.claude import ClaudeExecutor
 from cairn.kernel.config import ExecutorConfig, TierSpec
 from cairn.kernel.errors import ConfigError
@@ -162,7 +164,7 @@ def test_install_guards_no_hook_guards_writes_nothing(tmp_path):
     guards = [_hook_guard(enforce=("shim", "post"))]
     assert ClaudeExecutor(CFG).install_guards(guards, ws, run_dir) is None
     assert not (run_dir / ".claude" / "settings.json").exists()
-    assert not (run_dir / ".cairn" / "hook-manifest.json").exists()
+    assert not guard_manifest_path(run_dir, "hook").exists()
 
 
 def test_install_guards_writes_settings_and_manifest(tmp_path):
@@ -171,9 +173,13 @@ def test_install_guards_writes_settings_and_manifest(tmp_path):
     guards = [_hook_guard(name="no-media", command="brease* createMedia*")]
     ClaudeExecutor(CFG).install_guards(guards, ws, run_dir)
 
-    manifest = json.loads((run_dir / ".cairn" / "hook-manifest.json").read_text())
+    # The manifest lives OUTSIDE the run dir (protected, agent-unwritable) and is signed.
+    manifest_path = guard_manifest_path(run_dir, "hook")
+    assert str(run_dir) not in str(manifest_path)
+    manifest = json.loads(manifest_path.read_text())
     assert "no-media" in manifest["guards"]
     assert manifest["workspace_dir"] == str(tmp_path / "ws")
+    assert isinstance(manifest["mac"], str) and manifest["mac"]  # authenticated
 
     settings = json.loads((run_dir / ".claude" / "settings.json").read_text())
     entries = settings["hooks"]["PreToolUse"]
@@ -182,8 +188,8 @@ def test_install_guards_writes_settings_and_manifest(tmp_path):
     command = entries[0]["hooks"][0]["command"]
     assert "cairn.kernel.guards --hook-check" in command
     assert "no-media" in command
-    # The manifest path is baked absolute into the hook command so it resolves at fire time.
-    assert str(run_dir / ".cairn" / "hook-manifest.json") in command
+    # The protected manifest path is baked absolute into the hook command → resolves at fire time.
+    assert str(manifest_path) in command
 
 
 def test_install_guards_is_idempotent(tmp_path):

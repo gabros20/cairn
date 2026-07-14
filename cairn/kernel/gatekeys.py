@@ -137,3 +137,38 @@ def compute_mac(secret: bytes, run_dir: Path, gate: str, choice, by, at) -> str:
     return hmac.new(
         secret, _canonical_payload(_run_disc(run_dir), gate, choice, by, at), hashlib.sha256
     ).hexdigest()
+
+
+# --------------------------------------------------------------------------- #
+# Guard manifests — the SAME threat model as gate decisions. A guard manifest
+# (the decls a command is checked against) sitting inside the run dir proves
+# nothing about who wrote it, so it lives here (outside the agent's cwd) and is
+# MAC-authenticated with the per-run secret. See guards.py.
+# --------------------------------------------------------------------------- #
+
+
+def guard_manifests_dir() -> Path:
+    """The directory holding per-run guard manifests — a sibling of :func:`gate_keys_dir`, and
+    like it OUTSIDE any run's cwd, so a sandboxed executor (codex ``workspace-write`` over the
+    run dir) cannot rewrite the guard decls its own commands are checked against."""
+    return gate_keys_dir().parent / "guard-manifests"
+
+
+def guard_manifest_path(run_dir: Path, layer: str) -> Path:
+    """Path to a run's ``layer`` (``"hook"`` / ``"shim"``) guard manifest in the protected dir,
+    keyed by run_id + the absolute-path discriminator exactly like the gate key file."""
+    return guard_manifests_dir() / f"{Path(run_dir).name}-{_run_disc(run_dir)}-{layer}.json"
+
+
+def compute_content_mac(secret: bytes, run_dir: Path, content: object) -> str:
+    """HMAC-SHA256 hex over a JSON-canonical ``content`` bound to this run — the run
+    discriminator is IN the signed payload, so a manifest cannot be replayed into a different run
+    that shares a run_id. Same key and primitive as the gate MACs, one canonical form pinned by
+    ``sort_keys`` + tight separators."""
+    payload = json.dumps(
+        {"run": _run_disc(run_dir), "content": content},
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    return hmac.new(secret, payload, hashlib.sha256).hexdigest()

@@ -98,7 +98,7 @@ def test_shim_build_rejects_absolute_or_traversing_binary(tmp_path: Path) -> Non
     )
 
     with pytest.raises((CairnError, ValueError)):
-        build_shims([guard], shim_dir=shim_dir, workspace_dir=tmp_path)
+        build_shims([guard], shim_dir=shim_dir, workspace_dir=tmp_path, run_dir=tmp_path)
     assert victim.read_text(encoding="utf-8") == "precious\n"  # untouched
 
 
