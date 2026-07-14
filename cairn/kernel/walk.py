@@ -62,6 +62,7 @@ from cairn.kernel.compose import render_artifact_path
 from cairn.kernel.config import Config
 from cairn.kernel.errors import CairnError
 from cairn.kernel.expr import EvalError, Expr
+from cairn.kernel.gatekeys import ensure_run_key
 from cairn.kernel.gatekit import GateNeedsHuman, gate_path, resolve_gate
 from cairn.kernel.hookprobe import _looks_like_auth_failure
 from cairn.kernel.plan import (
@@ -183,7 +184,9 @@ def bootstrap_run(
 
     if run_dir is not None:
         run_dir = Path(run_dir)
-        return create_run(run_dir.parent, run_dir.name, payload(run_dir.name))
+        created = create_run(run_dir.parent, run_dir.name, payload(run_dir.name))
+        ensure_run_key(created.name)  # mint the gate-decision secret before any gate commits
+        return created
 
     root = Path(runs_root) if runs_root is not None else workspace_dir / "runs"
     base = render_run_id(plan, now)
@@ -191,10 +194,13 @@ def bootstrap_run(
     suffix = 1
     while True:
         try:
-            return create_run(root, run_id, payload(run_id))
+            created = create_run(root, run_id, payload(run_id))
         except RunExistsError:
             suffix += 1
             run_id = f"{base}-v{suffix}"
+            continue
+        ensure_run_key(created.name)  # mint the gate-decision secret before any gate commits
+        return created
 
 
 # --------------------------------------------------------------------------- #
