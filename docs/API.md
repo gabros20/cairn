@@ -350,9 +350,13 @@ misspellings must not silently disable steps.
 ```python
 @dataclass
 class Capabilities:
-    blocking_hooks: bool | None     # None = unknown → doctor probes empirically
+    blocking_hooks: bool | None     # CLI-capability/probe question: None = unknown → doctor probes
     output_schema: bool             # native typed-return support (used as bonus only)
     session_capture: str | None     # glob of session files to copy into logs/, if any
+    installs_hooks: bool            # IMPLEMENTATION fact: does cairn's install_guards for this
+                                     # executor actually wire a pre-execution blocking hook (True
+                                     # only for claude today; W3b, ARCHITECTURE §4) — distinct from
+                                     # blocking_hooks (whether the vendor CLI *can*, at all)
 
 @dataclass
 class Invocation:

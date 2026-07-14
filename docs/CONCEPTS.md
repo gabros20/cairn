@@ -164,8 +164,9 @@ operations (spec: `API.md §6`): `doctor` (preflight), `resolve_model` (tier+eff
 CLI wants them). Built-ins: `claude`, `codex`, `grok`, `shell` (which is how `run:` steps execute —
 even determinism goes through the same interface).
 
-**Capabilities are declared, not assumed** (`blocking_hooks`, `output_schema`, `session_capture`),
-and the guard engine adapts enforcement to them.
+**Capabilities are declared, not assumed** (`blocking_hooks`, `output_schema`, `session_capture`,
+`installs_hooks`), and the guard engine adapts enforcement to them — and warns at plan time when a
+guard's declared layer isn't actually backed by any resolved executor (ARCHITECTURE §4).
 
 **Why:** this is the `CliAdapter` seam from cairn's originating port design verbatim — the boundary
 both the Codex and Grok mappings independently demanded. **Without it:** N pipelines × M CLIs = N×M

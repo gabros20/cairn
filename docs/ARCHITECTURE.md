@@ -169,7 +169,11 @@ operator"), then validate `produces` like any step.
 ## 4. Guard enforcement matrix
 
 Guards declare `enforce:` layers; the engine wires what each executor supports and *always* keeps
-`post` on:
+`post` on. `enforce:` is **validated at plan time** (codex-F13/claude-F10, W3b): every member must be
+one of `plan.GUARD_LAYERS = ("hook", "shim", "post")` and the list must be non-empty — an unknown
+member (a typo like `shimm`) or an empty `enforce: []` is a `ConfigError` naming the guard and the bad
+value, not a silent no-op. This catches the *spelling* class of "declared but not actually enforced";
+see below for the *no executor actually enforces it* class, which is a warning, not an error.
 
 | Layer | Claude | Codex | Grok | shell |
 |---|---|---|---|---|
@@ -191,6 +195,22 @@ install remain no-ops** — their `install_guards` does not yet wire native hook
 guarded command is still caught by the shim and the post validator, not by a native hook. (The
 `--hook-check` install path is unit-tested; the live "claude actually blocks" fact is confirmed
 per-machine by `cairn doctor --probe-hooks`, not by the unit suite.)*
+
+*`Capabilities` now separates two facts that used to be conflated in one field (grok-F3 / W3b):
+`blocking_hooks` is the CLI-capability/probe question — "can this vendor's CLI block a tool call via a
+native hook at all" (`claude`=`True`, an asserted claim the C4 probe checks; `codex`/`grok`=`None`,
+unverified-by-cairn → the doctor probe decides); `installs_hooks` is the IMPLEMENTATION fact — "does
+cairn's own `install_guards` for this executor actually wire that hook for a run" (`claude`=`True`,
+`codex`/`grok`/`shell`/`stub`=`False`). Grok's CLI genuinely ships blocking PreToolUse hooks (see the
+probe note below) but cairn doesn't install one for it, so asserting `blocking_hooks=True` there was
+dishonest about what THIS FRAMEWORK does — it now reads `None`, same as codex. **`plan()` warns** (never
+errors — an under-enforced guard is a legitimate, if risky, authoring choice) when a guard's `enforce`
+yields no EFFECTIVE pre-execution layer for the plan's resolved executor(s): effective iff
+`"shim" in enforce` (always wired) OR (`"hook" in enforce` AND some resolved executor has
+`installs_hooks=True`). A `hook`-only guard run under codex/grok, or a `post`-only guard under any
+executor, gets a plan `Finding("warning", …)` naming the guard and why; the same guard under `claude`
+(hook) or carrying `shim` never warns. Separately, a plan with agent steps and **zero** guards at all
+gets one informational warning that agent tool use is unrestricted pre-execution.*
 
 *Both the shim and hook manifests (the guard decls a command is checked against) live OUTSIDE the run
 dir in the gatekeys-protected state dir and are **authenticated**: a per-run HMAC over the manifest
@@ -215,8 +235,11 @@ dev machine it does: `claude` PreToolUse **fires+blocks** under `bypassPermissio
 is falsified where probed. `bypassPermissions` bypasses the interactive prompt but does **not** disable
 hooks. This is a per-machine, per-CLI-version fact, not a universal guarantee: treat
 `blocking_hooks=True` as the design's assumption and the probe as the standing per-machine check that
-confirms it. (Codex's `blocking_hooks` stays `None` in code by design — the probe, not the capability
-field, carries codex's per-machine truth.)
+confirms it. (Codex's and, since W3b, grok's `blocking_hooks` both stay `None` in code by design — the
+probe, not the capability field, carries their per-machine truth. Grok's CLI probes hook-primary just
+like claude's — see below — but cairn's `install_guards` doesn't wire it, so `blocking_hooks=True`
+would have overstated what *this framework* enforces; `installs_hooks=False` says that honestly and
+`None` leaves the CLI-capability question to the probe, exactly as codex already did.)
 
 `cairn doctor --probe-hooks` empirically probes hook firing per executor — it spawns a throwaway canary
 project carrying a native deny-hook, invokes the vendor CLI headlessly under the executor's real argv
