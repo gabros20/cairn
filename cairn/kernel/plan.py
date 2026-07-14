@@ -887,7 +887,18 @@ def _check_needs(node: StepNode, available: set[str], producers: dict[str, list[
             )
 
 
-def _verify_dataflow(nodes: list[Node], producers: dict[str, list[str]], ctx: _Ctx) -> None:
+def _produce_path_has_cycle(path: str) -> bool:
+    """Whether an artifact path template's placeholders reference ``{cycle}`` (the SAME
+    scanner ``_scan_check``/``_check_value_body`` use to recognise the placeholder)."""
+    return any(ph.kind == "value" and ph.raw == "cycle" for ph in scan(path))
+
+
+def _verify_dataflow(
+    nodes: list[Node],
+    producers: dict[str, list[str]],
+    ctx: _Ctx,
+    artifact_decls: dict[str, ArtifactDecl],
+) -> None:
     produced: set[str] = set()
     for node in nodes:
         if isinstance(node, StepNode):
@@ -940,6 +951,25 @@ def _verify_dataflow(nodes: list[Node], producers: dict[str, list[str]], ctx: _C
                     else:
                         loop_new[name] = cid
                         produced.add(name)
+                        # codex-F3 (critical): a NEW artifact first produced inside a loop body
+                        # is what _completed_cycles (walk.py) re-renders per cycle to discover
+                        # how many cycles already completed. If its path never varies by
+                        # {cycle}, every cycle renders the identical file — once it validates,
+                        # nothing can ever tell cycle N from cycle N+1 apart, so cycle discovery
+                        # cannot terminate on its own (walk.py's `while True`). A re-produced
+                        # BEFORE-loop artifact (the branch above) is exempt on purpose: it is
+                        # the same ArtifactDecl used outside the loop too, where no cycle exists
+                        # to substitute — forcing {cycle} into its path would break rendering
+                        # there, not just here.
+                        decl = artifact_decls.get(name)
+                        if decl is not None and not _produce_path_has_cycle(decl.path):
+                            _err(
+                                f"loop {node.name!r}: step {cid!r} produces {name!r} whose path "
+                                f"{decl.path!r} does not reference {{cycle}} — every cycle would "
+                                "render the same artifact and the loop could never detect how "
+                                "many cycles have completed",
+                                ctx.file,
+                            )
 
 
 # --------------------------------------------------------------------------- #
@@ -1452,7 +1482,7 @@ def plan(
     )
 
     active, skips = _build(raw_steps, ctx, in_loop=False)
-    _verify_dataflow(active, producers, ctx)
+    _verify_dataflow(active, producers, ctx, artifact_decls)
     _lint_conditional_gates(raw_steps, ctx)
 
     for name in artifact_decls:

@@ -668,7 +668,15 @@ class _Walk:
         self._set_status(node.name, "done", cycles=completed)
 
     def _completed_cycles(self, node: LoopNode) -> int:
-        """Largest N with cycles 1..N ALL having every body ``produces`` valid (re-validated)."""
+        """Largest N with cycles 1..N ALL having every body ``produces`` valid (re-validated).
+
+        Bounded by the loop's own cap (codex-F3 runtime backstop): a cycle-invariant produce
+        (one whose path template omits ``{cycle}``) renders byte-identically every cycle, so
+        it would otherwise never fail validation and this loop would spawn validators forever.
+        cairn.kernel.plan rejects that shape at plan time (a new loop-body produce must
+        reference ``{cycle}``); this cap is the backstop for a plan that reaches the walker
+        without going through that check (e.g. hand-built, or an older/bypassed plan).
+        """
         decls = [
             (name, self.plan.artifacts[name])
             for child in node.body
@@ -678,8 +686,9 @@ class _Walk:
         ]
         if not decls:
             return 0
+        cap = node.max_interactive if self.interactive else node.max_headless
         n = 0
-        while True:
+        while n < cap:
             k = n + 1
             for name, decl in decls:
                 rendered = render_artifact_path(
@@ -690,6 +699,7 @@ class _Walk:
                 if not validate(resolved, decl, self.run_dir, self.workspace_dir, self.timeout).ok:
                     return n
             n = k
+        return n
 
     # -- artifact predicates ------------------------------------------------ #
 

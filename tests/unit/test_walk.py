@@ -38,7 +38,7 @@ from cairn.kernel.plan import (
 from cairn.kernel.runstate import load_run, node_status
 from cairn.kernel.trail import read_trail
 from cairn.kernel.types import ExitCode, Result
-from cairn.kernel.walk import bootstrap_run, walk
+from cairn.kernel.walk import _Walk, bootstrap_run, walk
 
 NOW = datetime(2026, 7, 3, 11, 4)
 REPO = Path(__file__).resolve().parents[2]
@@ -796,6 +796,36 @@ def test_loop_cap_continue_proceeds(ws: Path, tmp_path: Path) -> None:
     assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.OK
     assert len(ex.invocations) == 2  # ran to the cap
     assert any(e["event"] == "loop-capped" for e in read_trail(run_dir))
+
+
+def test_completed_cycles_is_bounded_by_the_loop_cap(ws: Path, tmp_path: Path) -> None:
+    """codex-F3 runtime backstop: _completed_cycles' cycle-discovery loop must not spin
+    forever on a cycle-INVARIANT produce (one whose path template omits {cycle}, so it
+    renders byte-identically — and validates identically — for cycle 1, 2, 3, ...).
+
+    cairn.kernel.plan rejects this shape at plan time for a new loop-body produce; this
+    test reaches _completed_cycles directly (bypassing that check, as a hand-built or
+    otherwise-bypassed Plan would) to prove the walker itself cannot hang on it either.
+    """
+    art = ArtifactDecl("review", "review.json", schema=_verdict_schema(ws))  # no {cycle}
+    body = agent_step("review", produces=["review"])
+    node = LoopNode(
+        name="art-review", min=1, max_interactive=3, max_headless=2,
+        until=parse_expr("artifacts.review.verdict == 'approve'"),
+        on_cap="continue", body=(body,), when_runtime=None,
+    )
+    plan_obj = make_plan([node], {"review": art}, resolved_models=models_for("review"))
+    run_dir = bootstrap_run(ws, plan_obj, now=NOW, runs_root=tmp_path / "runs")
+    # One file, at the fixed (cycle-invariant) path — it validates for every k, so nothing
+    # would ever stop a `while True` cycle-discovery loop.
+    (run_dir / "review.json").write_text(json.dumps({"verdict": "revise"}))
+
+    w = _Walk(
+        plan=plan_obj, run_dir=run_dir, workspace_dir=ws, config=load_config(ws),
+        executors={}, composer=lambda **kw: "PROMPT", interactive=False,
+        gate_presets={}, now=NOW, timeout=30,
+    )
+    assert w._completed_cycles(node) == 2  # returns at max_headless, not unbounded
 
 
 def test_loop_cap_halt_fails_gate(ws: Path, tmp_path: Path) -> None:

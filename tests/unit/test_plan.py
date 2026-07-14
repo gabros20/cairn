@@ -642,6 +642,48 @@ def test_loop_body_may_reproduce_an_artifact_produced_before_the_loop(tmp_path):
     assert isinstance(_node(p, "lp"), LoopNode)
 
 
+# --------------------------------------------------------------------------- #
+# (D) A NEW loop-body produce must vary by {cycle} (codex-F3).
+# --------------------------------------------------------------------------- #
+
+_LOOP_HEAD_INVARIANT = """pipeline: p
+version: 1
+run_id: "p-{date}"
+artifacts:
+  seed:   { path: seed.json, schema: schemas/s.json }
+  review: { path: review.json, schema: schemas/s.json }
+steps:
+  - { id: seed, run: 'echo', produces: [seed] }
+  - loop: lp
+    min: 1
+    max: { interactive: 2, headless: 1 }
+    until: "artifacts.review.ok == true"
+    body:
+"""
+
+
+def test_loop_body_produce_without_cycle_in_path_is_an_error(tmp_path):
+    # 'review' is a NEW name introduced inside the loop body (not a before-loop
+    # reproduction like 'seed'/'rev' in _LOOP_HEAD) whose path lacks {cycle} — every cycle
+    # would render the identical file, so cycle-discovery (_completed_cycles) could never
+    # tell cycle N from cycle N+1 apart.
+    body = "      - { id: review, run: 'echo', needs: [seed], produces: [review] }\n"
+    ws = _write_ws(tmp_path, _LOOP_HEAD_INVARIANT + body)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    msg = str(exc.value)
+    assert "lp" in msg and "review" in msg and "cycle" in msg.lower()
+
+
+def test_loop_body_produce_with_cycle_in_path_plans_green(tmp_path):
+    # 'rev' (from _LOOP_HEAD) is a NEW loop-body produce whose path is "rev-r{cycle}.json"
+    # — it varies by cycle, so the new check must let it through.
+    body = "      - { id: review, run: 'echo', needs: [seed], produces: [rev] }\n"
+    ws = _write_ws(tmp_path, _LOOP_HEAD + body)
+    p = plan(ws, "p", {}, now=NOW)
+    assert isinstance(_node(p, "lp"), LoopNode)
+
+
 def test_to_node_into_a_loop_body_is_an_error():
     # slicing is over top-level nodes; a loop-body step id ('review') is not sliceable.
     with pytest.raises(ConfigError) as exc:
