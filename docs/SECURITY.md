@@ -159,6 +159,31 @@ separate machinery.
 - **Run locking:** the walker takes an exclusive advisory lock (`.cairn.lock` in the run dir,
   flock) — two concurrent `cairn resume`s on the same run cannot interleave; the loser exits 4
   with "run is held by PID …". Batch's parallelism is across run dirs, so it never contends.
+- **Gate-decision authentication:** a gate is a human decision point; its answer lands at
+  `runs/<id>/gates/<name>.json` and, once written, is never re-asked. But the run dir is the
+  agent's own write scope (codex, e.g., gets `--sandbox workspace-write` over it), so a bare
+  decision file there proves nothing about *who* wrote it — an injected or compromised step could
+  drop `{"choice":"yes"}` and skip a production gate. So each decision is **authenticated**: the
+  kernel's writers sign a `mac` = HMAC-SHA256 over a canonical `{gate,choice,by,at}` payload,
+  keyed by a **per-run 32-byte secret minted at run creation and stored outside any run dir**
+  (`$XDG_STATE_HOME/cairn/gate-keys/<run_id>.key`, mode 0600, dir 0700 — never under the
+  agent-writable cwd). On resume, `resolve_gate` recomputes the MAC (constant-time compare) and
+  honors the file only if it verifies *and* the choice is one of the gate's declared options; the
+  gate name is inside the signed payload, so a valid decision for gate A cannot be replayed at gate
+  B. **Any** failure — missing/mismatched MAC, an off-menu choice, or a missing/unreadable secret —
+  is treated as **unanswered** and fails safe: it emits a `gate-tamper` trail event and the gate
+  re-asks (interactive) or halts needs-human (headless, exit 6). A missing secret is never read as
+  "trust the file" and never as "auto-pass". **The guarantee, stated honestly:** an attacker who
+  cannot read the per-run secret cannot forge a decision. That holds against every injected-file
+  forge, and against any executor whose sandbox denies out-of-cwd reads (the secret lives outside
+  the run dir). It does **not**, on its own, stop an *unsandboxed* executor that can read arbitrary
+  host paths — such a step could read the key and mint a valid MAC; closing that residual is W3's
+  job (real sandbox/hook enforcement of the out-of-cwd boundary). Two known residuals: the key
+  file's own lifecycle is not yet wired into `cairn gc` (it outlives the run dir until GC learns to
+  reap it — a documented TODO, not a leak of anything sensitive on its own), and `is_answered` is a
+  pure file-existence check, so a forged file still *blocks* the `cairn gate` overwrite path (an
+  operator must delete it to answer) — a denial-of-convenience, never a forged pass. *Status: LIVE
+  — built and tested (`gatekeys.py`, `gatekit.py`).*
 - **Retention:** capture-heavy runs are multi-GB. `cairn gc [--keep-days N] [--keep-last M]
   [--artifacts-only] [--include-needs-human] [--apply]` deletes or slims old runs
   (`--artifacts-only` keeps `run.json` + trail + `.cairn.lock` — the audit skeleton — while dropping
