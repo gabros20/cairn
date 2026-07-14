@@ -231,6 +231,38 @@ mismatch is refused at plan time (**done** — `cairn plan` via `config.check_re
 
 ---
 
+## C8 — claude filesystem containment (W3c)  *(future — deferred)*
+
+*Surfaced by the 2026-07-14 hardening review (see `HARDENING-PLAN.md` and the panel synthesis). The
+guard engine now authenticates its manifest and pins each check-script's hash with the per-run secret
+(`gatekeys`), and the claude `PreToolUse` hook actually installs and blocks (C2/W3a). That makes guard
+inputs **tamper-proof under a write-sandboxed executor** (codex `--sandbox workspace-write` cannot write
+outside its cwd). It does **not** contain a fully-adversarial `claude`.*
+
+**The residual (documented, SECURITY §2.2).** The `claude` executor must run headless under
+`--permission-mode bypassPermissions` (the default mode refuses every tool use). Under that mode the
+agent has **unrestricted local filesystem read/write** — no OS sandbox. So a determined in-sandbox
+claude agent can defeat the guard layer by (a) reading the per-run secret from the `gatekeys` state dir
+and forging a validly-signed empty manifest, or (b) rewriting `<run_dir>/.claude/settings.json` to drop
+the hook. Tamper by an *injected* (non-secret-stealing) agent is detected and fails closed; a *fully
+adversarial* one is not stopped by file-based guards. **The post artifact-validator remains the honest
+hard gate for claude.** Guards must not be described as unconditional containment for the claude executor.
+
+**Build (when prioritized):** give `claude` real filesystem confinement so the agent cannot read the
+secret or write outside the run dir — an OS sandbox wrapper (`sandbox-exec` on macOS, `bwrap`/bubblewrap
+on Linux) around the claude invocation, and/or tool-scoping (`--disallowedTools`/`--allowedTools`,
+`--add-dir` confinement) that still lets legitimate steps write their declared artifacts. A subprocess
+wrapper stays within the two-dependency kernel floor (it adds no Python dependency). Platform-specific,
+so gate it behind a capability/doctor probe and degrade honestly where unavailable.
+
+**Verify:** with W3c active, the C1-style empirical probe (the same shape as `cairn doctor
+--probe-hooks`) must show a claude agent CANNOT (a) read the per-run gate/guard secret, nor (b) write
+outside the run dir — i.e. the guard-tamper exploits confirmed in the W3a security review now fail. Until
+then, `blocking_hooks`/`installs_hooks` describe the mechanism honestly and the post-validator is the
+documented backstop.
+
+---
+
 ## Decision gates along the way
 
 | At | Decision | Default |
