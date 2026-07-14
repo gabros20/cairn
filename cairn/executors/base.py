@@ -132,9 +132,8 @@ def run_process(
         # to a run-halt at exit 4 instead of an uncaught traceback that leaves run.json
         # stuck "running" forever (codex-F14/claude-F4). Never log the full argv/env — either
         # can carry secrets (SECURITY §1.3) — the executable name + errno is enough to act on.
-        raise ExecutorSpawnError(
-            f"{argv[0]!r} failed to start: {exc.strerror or exc}", executable=argv[0] if argv else None
-        ) from exc
+        exe = argv[0] if argv else "<empty>"
+        raise ExecutorSpawnError(f"{exe!r} failed to start: {exc.strerror or exc}", executable=exe) from exc
 
     def _pump() -> None:
         assert proc.stdout is not None

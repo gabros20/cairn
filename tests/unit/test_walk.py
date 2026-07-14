@@ -1075,6 +1075,31 @@ def test_agent_nonzero_exit_without_auth_signature_still_retries(ws: Path, tmp_p
     assert len(ex.invocations) == 2  # original + one retry — content path preserved
 
 
+def test_agent_nonzero_exit_auth_signature_mid_transcript_does_not_halt(ws: Path, tmp_path: Path) -> None:
+    """M1/L1: classification reads only the log TAIL (walk.py's ``_tail_text``), not the whole
+    transcript. An auth-looking substring buried early — a legitimate (possibly long) coding
+    step's output, or one whose task is literally about auth — must not short-circuit
+    retries; only a signature in the CLOSING lines (where a real vendor CLI auth failure
+    actually prints, right before it exits) does."""
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"], retry=(1, True))], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        inv.log_path.parent.mkdir(parents=True, exist_ok=True)
+        early_auth_sign = "Error: not logged in. Please run `claude /login`.\n"
+        # Pad well past the 8 KiB tail window so the early sign falls outside it.
+        padding = "benign log line filling space\n" * 400
+        clean_tail = "some generic tool crash, nothing auth-related at the tail\n"
+        inv.log_path.write_text(early_auth_sign + padding + clean_tail, encoding="utf-8")
+        (inv.cwd / "a.txt").write_text("", encoding="utf-8")  # always empty → always invalid
+        return Result(step={"status": "done", "summary": "ok", "artifacts": []}, exit_code=1, duration_s=1.0)
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    ex = FakeExecutor(on_invoke)
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.GATE_FAILED
+    assert len(ex.invocations) == 2  # original + one retry — mid-transcript sign is ignored
+
+
 def test_unexpected_exception_does_not_leave_run_running(ws: Path, tmp_path: Path) -> None:
     """claude-F4 belt: any non-_Halt exception escaping the walk still marks the run halted
     (never "running") and records a run-halt, then re-raises so the CLI exits non-zero."""

@@ -94,6 +94,24 @@ _PLACEHOLDER = re.compile(r"\{([^{}]*)\}")
 _HELPER_CALL = re.compile(r"(\w+)\((.*)\)")
 _VALUE_KEYWORDS = frozenset({"pipeline", "date", "datetime", "cycle"})
 
+# A real auth/executor failure is terminal: the vendor CLI prints the error and exits, so the
+# signal sits in the last handful of lines, not mid-transcript. Classifying from the whole log
+# would false-positive on a legitimate (possibly long) coding step whose output happens to
+# contain a broad sign ("please run", "authentication", "/login", "log in to") — or whose task
+# IS auth/login work — and costs an unbounded read on a large agent log. 8 KiB comfortably
+# covers a vendor CLI's closing error block.
+_AUTH_TAIL_BYTES = 8192
+
+
+def _tail_text(path: Path, max_bytes: int) -> str:
+    """The last ``max_bytes`` of ``path``, decoded leniently. Empty string if absent."""
+    if not path.exists():
+        return ""
+    with open(path, "rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        f.seek(max(0, size - max_bytes))
+        return f.read().decode("utf-8", errors="replace")
+
 
 # --------------------------------------------------------------------------- #
 # Internal control flow.
@@ -470,12 +488,12 @@ class _Walk:
                 # A non-zero exit is checked for every step kind now (codex-F7/grok-F11/
                 # claude-F3) — an agent CLI that fails auth/API but happens to leave a
                 # valid-looking artifact must not be recorded step-done. Split by shape:
-                # an auth/executor signature in the output is exit 4, not a content
+                # an auth/executor signature in the output TAIL is exit 4, not a content
                 # problem — retrying it just re-invokes a CLI that cannot succeed, so halt
                 # immediately and skip whatever retry budget remains. Everything else is a
                 # genuine content failure and keeps the existing retry-with-feedback path.
-                log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
-                if _looks_like_auth_failure(log_text, result.exit_code):
+                tail_text = _tail_text(log_path, _AUTH_TAIL_BYTES)
+                if _looks_like_auth_failure(tail_text, result.exit_code):
                     self._emit(
                         "step-fail",
                         node=step.id,
