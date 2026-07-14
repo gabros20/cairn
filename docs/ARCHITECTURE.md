@@ -182,11 +182,15 @@ walker's hard artifact gate, always on. `shim` is live too: for any plan carryin
 guards, `cairn run`/`resume` builds a fresh per-run shim dir (`.cairn/shims`, via
 `guards.build_shims`) and wraps every executor in a `GuardedExecutor` that prepends that dir to each
 invocation's PATH (`cli.py:_wrap_guards`), so a guarded, PATH-resolved binary is intercepted before it
-runs — independent of the hook layer. The `hook` layer is **built** (the capability flags, `guards.py`'s
-check chain + `--shim-check` entry shared with the shims, and the empirical `cairn doctor --probe-hooks`,
-C4 — see IMPLEMENTATION-PLAN) but its per-executor **install is still a documented no-op**: the inner
-executors' `install_guards` does not yet wire the native pre-tool hooks. So today a guarded command is
-caught by the shim and the post validator, not by a native hook.*
+runs — independent of the hook layer. The `hook` layer now **installs for `claude`**:
+`ClaudeExecutor.install_guards` writes `<run_dir>/.claude/settings.json` with a `PreToolUse` array whose
+hook command runs `guards.py`'s `--hook-check` entry — the SAME guard chain (`_run_chain`) the shims run,
+so a `hook`-enforced guard blocks a guarded `Bash` command before it executes (deny-JSON on stdout;
+fail-closed on any error). A plan with no `hook`-enforced guards installs nothing. **`codex` and `grok`
+install remain no-ops** — their `install_guards` does not yet wire native hooks, so for those two a
+guarded command is still caught by the shim and the post validator, not by a native hook. (The
+`--hook-check` install path is unit-tested; the live "claude actually blocks" fact is confirmed
+per-machine by `cairn doctor --probe-hooks`, not by the unit suite.)*
 
 **The C4 probe settles a specific burden.** The `claude` executor runs headless with
 `--permission-mode bypassPermissions` (it must — see API §7 / SECURITY §1.2: the default mode refuses

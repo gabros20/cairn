@@ -97,8 +97,12 @@ An injected instruction that a model obeys still cannot exceed the step's cage:
   wall is still pending (the CLI executors currently run headless under `bypassPermissions`), so
   meanwhile the **guards** layer below is the *enforced* backstop, not this one (TOOLING §3);
 - **guards** — mutating verbs are checked by code (F18, wrong-CMS) regardless of why the model
-  tried them (one per-executor caveat: grok's native hook layer fails open on hook crash/timeout/
-  malformed output — ARCHITECTURE §4 — so its shim and post layers carry the backstop);
+  tried them. Enforced today by the **shim** (any executor) and the **post** validator (always on);
+  for `claude` the native **hook** layer also installs now (`install_guards` writes a `PreToolUse`
+  hook running the same guard chain, fail-closed — ARCHITECTURE §4), while `codex`/`grok` hook
+  install is still a no-op there (shim + post carry them). One per-executor caveat: grok's native
+  hook layer fails open on hook crash/timeout/malformed output, so its shim and post layers carry the
+  backstop even once its hook install lands;
 - **gates** — the two irreversible crossings (CMS populate, deploy) sit behind human gates, with
   headless defaults of *no*, and the deploy allowlist pins the org;
 - **isolation** — cwd is the run dir; a compromised step cannot reach sibling runs;
