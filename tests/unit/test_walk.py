@@ -146,7 +146,7 @@ class FakeExecutor:
     def resolve_model(self, tier, effort):
         return ("fake-model", effort)
 
-    def install_guards(self, guards, workspace):
+    def install_guards(self, guards, workspace, run_dir):
         return None
 
     def render_workspace(self, workspace):
@@ -1226,7 +1226,7 @@ def test_install_guards_exception_does_not_leave_run_running(ws: Path, tmp_path:
         raise AssertionError("unreachable — install_guards must raise before any node dispatches")
 
     class GuardBoomExecutor(FakeExecutor):
-        def install_guards(self, guards, workspace):
+        def install_guards(self, guards, workspace, run_dir):
             raise RuntimeError("guard plugin exploded")
 
     run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")

@@ -383,7 +383,7 @@ class _Walk:
             if id(ex) in seen:
                 continue
             seen.add(id(ex))
-            ex.install_guards(self.plan.guards, self.workspace_dir)
+            ex.install_guards(self.plan.guards, self.workspace_dir, self.run_dir)
 
     def _dispatch(self, node: Any, cycle: int | None) -> None:
         if isinstance(node, StepNode):

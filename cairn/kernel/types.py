@@ -111,8 +111,12 @@ class Executor(Protocol):
         """Run ONE subprocess, blocking, and return its Result."""
         ...
 
-    def install_guards(self, guards, workspace) -> None:
-        """Wire native pre-tool hooks / PATH shims for this executor. Idempotent."""
+    def install_guards(self, guards, workspace, run_dir) -> None:
+        """Wire native pre-tool hooks / PATH shims for this executor. Idempotent.
+
+        ``run_dir`` is the per-run directory (the executor's cwd) — claude reads project hook
+        settings from ``<run_dir>/.claude/settings.json``, so a hook-installing executor needs
+        it to know where to write."""
         ...
 
     def render_workspace(self, workspace) -> None:

@@ -113,8 +113,8 @@ class CliExecutor:
             return  # idempotent: only write when missing or changed
         target.write_text(content, encoding="utf-8")
 
-    def install_guards(self, guards, ws) -> None:
-        return None  # guard wiring lands with the guards engine
+    def install_guards(self, guards, ws, run_dir) -> None:
+        return None  # base no-op; ClaudeExecutor overrides to install the PreToolUse hook
 
     # -- doctor ------------------------------------------------------------- #
 

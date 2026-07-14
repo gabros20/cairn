@@ -54,8 +54,8 @@ class ShellExecutor:
             duration_s=duration_s,
         )
 
-    def install_guards(self, guards, ws) -> None:
-        return None  # guard wiring lands with the guards engine
+    def install_guards(self, guards, ws, run_dir) -> None:
+        return None  # shell has no native hook; the shim layer covers it
 
     def render_workspace(self, ws) -> None:
         return None

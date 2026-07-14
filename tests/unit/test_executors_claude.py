@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -138,5 +139,89 @@ def test_render_workspace_rewrites_on_content_change(tmp_path):
     assert "v2 changed" in (tmp_path / "CLAUDE.md").read_text()
 
 
-def test_install_guards_is_a_noop(tmp_path):
-    assert ClaudeExecutor(CFG).install_guards([], SimpleNamespace(root=tmp_path)) is None
+def _hook_guard(name="no-media", *, tool="bash", command="brease*", enforce=("hook", "post")):
+    from pathlib import Path as _Path
+
+    from cairn.kernel.plan import GuardDecl
+
+    return GuardDecl(
+        name=name,
+        match_tool=tool,
+        match_command=command,
+        check=_Path("/nonexistent/check.py"),
+        enforce=enforce,
+        on_error="deny",
+        when=None,
+    )
+
+
+def test_install_guards_no_hook_guards_writes_nothing(tmp_path):
+    # A guard enforced only at shim/post — NOT hook — installs no claude hook.
+    ws = tmp_path / "ws"  # install_guards receives workspace_dir as a Path (as the walker passes)
+    run_dir = tmp_path / "run"
+    guards = [_hook_guard(enforce=("shim", "post"))]
+    assert ClaudeExecutor(CFG).install_guards(guards, ws, run_dir) is None
+    assert not (run_dir / ".claude" / "settings.json").exists()
+    assert not (run_dir / ".cairn" / "hook-manifest.json").exists()
+
+
+def test_install_guards_writes_settings_and_manifest(tmp_path):
+    ws = tmp_path / "ws"  # install_guards receives workspace_dir as a Path (as the walker passes)
+    run_dir = tmp_path / "run"
+    guards = [_hook_guard(name="no-media", command="brease* createMedia*")]
+    ClaudeExecutor(CFG).install_guards(guards, ws, run_dir)
+
+    manifest = json.loads((run_dir / ".cairn" / "hook-manifest.json").read_text())
+    assert "no-media" in manifest["guards"]
+    assert manifest["workspace_dir"] == str(tmp_path / "ws")
+
+    settings = json.loads((run_dir / ".claude" / "settings.json").read_text())
+    entries = settings["hooks"]["PreToolUse"]
+    assert len(entries) == 1
+    assert entries[0]["matcher"] == "Bash"
+    command = entries[0]["hooks"][0]["command"]
+    assert "cairn.kernel.guards --hook-check" in command
+    assert "no-media" in command
+    # The manifest path is baked absolute into the hook command so it resolves at fire time.
+    assert str(run_dir / ".cairn" / "hook-manifest.json") in command
+
+
+def test_install_guards_is_idempotent(tmp_path):
+    ws = tmp_path / "ws"  # install_guards receives workspace_dir as a Path (as the walker passes)
+    run_dir = tmp_path / "run"
+    guards = [_hook_guard()]
+    ex = ClaudeExecutor(CFG)
+    ex.install_guards(guards, ws, run_dir)
+    settings_path = run_dir / ".claude" / "settings.json"
+    first = settings_path.read_text()
+    mtime = settings_path.stat().st_mtime_ns
+    ex.install_guards(guards, ws, run_dir)  # second call: byte-identical, no rewrite
+    assert settings_path.read_text() == first
+    assert settings_path.stat().st_mtime_ns == mtime
+
+
+def test_install_guards_merges_into_existing_settings(tmp_path):
+    # A pre-existing settings.json with an unrelated key + a foreign PreToolUse hook must survive.
+    run_dir = tmp_path / "run"
+    (run_dir / ".claude").mkdir(parents=True)
+    (run_dir / ".claude" / "settings.json").write_text(
+        json.dumps(
+            {
+                "model": "opus",
+                "hooks": {
+                    "PreToolUse": [
+                        {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo keep"}]}
+                    ]
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    ws = tmp_path / "ws"  # install_guards receives workspace_dir as a Path (as the walker passes)
+    ClaudeExecutor(CFG).install_guards([_hook_guard()], ws, run_dir)
+
+    settings = json.loads((run_dir / ".claude" / "settings.json").read_text())
+    assert settings["model"] == "opus"  # unrelated key preserved
+    commands = [h["command"] for e in settings["hooks"]["PreToolUse"] for h in e["hooks"]]
+    assert "echo keep" in commands  # foreign hook preserved
+    assert any("--hook-check" in c for c in commands)  # our hook added

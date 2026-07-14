@@ -50,7 +50,7 @@ def test_doctor_is_trivially_healthy():
 
 def test_guards_and_workspace_are_noops(tmp_path):
     ex = ShellExecutor()
-    assert ex.install_guards([], object()) is None
+    assert ex.install_guards([], object(), object()) is None
     assert ex.render_workspace(object()) is None
 
 

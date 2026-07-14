@@ -82,7 +82,7 @@ class StubExecutor:
         step_block = self._step_block(stub_dir, step, copied)
         return Result(step=step_block, exit_code=0, duration_s=0.0)
 
-    def install_guards(self, guards, ws) -> None:
+    def install_guards(self, guards, ws, run_dir) -> None:
         return None
 
     def render_workspace(self, ws) -> None:

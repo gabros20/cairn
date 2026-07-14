@@ -8,7 +8,9 @@ thin binding over its kernel module (batchkit/learnkit/gckit/schedkit).
 Guard wiring (the pinned contract): in run/resume, a plan's ``shim``-enforced guards get a
 fresh PATH-shim dir per run (:func:`~cairn.kernel.guards.build_shims`), and every executor is
 wrapped in a :class:`GuardedExecutor` that PREPENDS the shim dir to each invocation's PATH.
-Hook-layer wiring is C4 (executors' ``install_guards`` is still a documented no-op).
+Hook-layer wiring: the walker calls each executor's ``install_guards`` once before the node
+loop; ``ClaudeExecutor`` installs a ``PreToolUse`` hook (``codex``/``grok`` install is still a
+no-op).
 """
 
 from __future__ import annotations
@@ -206,8 +208,8 @@ class GuardedExecutor:
 
     Delegates the whole Executor protocol to ``inner`` except :meth:`invoke`, which PREPENDS
     the shim dir to ``inv.env['PATH']`` (append would be a total bypass) and exports the
-    shim-dir/manifest env the shims read. Hook-layer wiring is C4 — ``install_guards`` is
-    still a documented no-op on the inner executors.
+    shim-dir/manifest env the shims read. The native hook layer is installed separately by the
+    walker via ``install_guards`` (``claude`` writes a ``PreToolUse`` hook), not by this wrapper.
     """
 
     def __init__(self, inner: Any, delta: dict[str, str], shim_dir: Path) -> None:
