@@ -684,6 +684,54 @@ def test_loop_body_produce_with_cycle_in_path_plans_green(tmp_path):
     assert isinstance(_node(p, "lp"), LoopNode)
 
 
+def test_loop_body_producing_only_a_before_loop_reproduction_is_an_error(tmp_path):
+    # The body introduces NO new produce at all — it only re-produces 'seed' (declared and
+    # produced before the loop, so it's exempt from the {cycle} check above). walk.py's
+    # _completed_cycles would then have nothing cycle-varying to key on: the reproduced
+    # artifact's cycle-invariant render validates on the very first call, and the loop would
+    # be reported done having run zero real cycles. Must fail at plan time instead.
+    body = "      - { id: fix, run: 'echo', needs: [seed], produces: [seed] }\n"
+    ws = _write_ws(tmp_path, _LOOP_HEAD + body)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    msg = str(exc.value)
+    assert "lp" in msg and "cycle" in msg.lower()
+
+
+def test_brease_art_review_loop_has_a_new_cycle_varying_produce(tmp_path):
+    # Guard against a regression where the shipped brease-rebuild loop's ONLY new produce
+    # stopped varying by cycle — it must keep planning green under the new "at least one new
+    # {cycle}-varying artifact" requirement too.
+    p = _brease("reimagine")
+    assert isinstance(_node(p, "art-review"), LoopNode)
+
+
+_LOOP_HEAD_HELPER_CYCLE = """pipeline: p
+version: 1
+run_id: "p-{date}"
+artifacts:
+  seed:   { path: seed.json, schema: schemas/s.json }
+  review: { path: "review-{slug(cycle)}.json", schema: schemas/s.json }
+steps:
+  - { id: seed, run: 'echo', produces: [seed] }
+  - loop: lp
+    min: 1
+    max: { interactive: 2, headless: 1 }
+    until: "artifacts.review.ok == true"
+    body:
+"""
+
+
+def test_loop_body_produce_with_helper_wrapped_cycle_in_path_plans_green(tmp_path):
+    # {slug(cycle)} is a helper call whose argument is cycle — it varies by cycle exactly
+    # like a bare {cycle} placeholder (and artifact paths already allow {cycle} as a helper
+    # arg); must NOT be rejected as cycle-invariant.
+    body = "      - { id: review, run: 'echo', needs: [seed], produces: [review] }\n"
+    ws = _write_ws(tmp_path, _LOOP_HEAD_HELPER_CYCLE + body)
+    p = plan(ws, "p", {}, now=NOW)
+    assert isinstance(_node(p, "lp"), LoopNode)
+
+
 def test_to_node_into_a_loop_body_is_an_error():
     # slicing is over top-level nodes; a loop-body step id ('review') is not sliceable.
     with pytest.raises(ConfigError) as exc:

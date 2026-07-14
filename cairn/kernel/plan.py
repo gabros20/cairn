@@ -888,9 +888,19 @@ def _check_needs(node: StepNode, available: set[str], producers: dict[str, list[
 
 
 def _produce_path_has_cycle(path: str) -> bool:
-    """Whether an artifact path template's placeholders reference ``{cycle}`` (the SAME
-    scanner ``_scan_check``/``_check_value_body`` use to recognise the placeholder)."""
-    return any(ph.kind == "value" and ph.raw == "cycle" for ph in scan(path))
+    """Whether an artifact path template varies by ``{cycle}``: a bare ``{cycle}`` value
+    placeholder (the SAME scanner ``_scan_check``/``_check_value_body`` use), OR a helper
+    whose first argument is ``cycle`` (e.g. ``{slug(cycle)}`` — mirrors how ``_check_helper``
+    inspects a helper's first argument; artifact paths allow ``{cycle}`` as a helper arg same
+    as bare, and it renders distinctly per cycle there too)."""
+    for ph in scan(path):
+        if ph.kind == "value" and ph.raw == "cycle":
+            return True
+        if ph.kind == "helper":
+            match = _HELPER_RE.fullmatch(ph.raw)
+            if match and match.group(2).split(",")[0].strip() == "cycle":
+                return True
+    return False
 
 
 def _verify_dataflow(
@@ -928,11 +938,20 @@ def _verify_dataflow(
                 for name in child.produces:
                     _add_produce(name, produced, in_loop=False, node_id=child.id, ctx=ctx)
         elif isinstance(node, LoopNode):
+            # NOTE: a nested ParallelNode/LoopNode inside this body is invisible to both this
+            # check and _completed_cycles (walk.py) — both only look at direct StepNode
+            # children. Pre-existing, identical blind spot in both places, so not a hazard by
+            # itself; out of scope here.
+            #
             # The sanctioned re-production (§2.6) is a body step re-writing an artifact that
             # existed BEFORE the loop. A brand-new name introduced twice inside the body is a
             # real duplicate — so exempt only names present at loop entry.
             before_loop = set(produced)
             loop_new: dict[str, str] = {}
+            # Counts loop_new entries that are declared ARTIFACTS (as opposed to e.g. a new
+            # gate name) — i.e. exactly the set _completed_cycles (walk.py) keys on. A gate
+            # doesn't help it discover the cycle count, so it must not count here either.
+            new_artifact_produces = 0
             for child in node.body:
                 names = child.produces if isinstance(child, StepNode) else (child.name,)
                 cid = child.id if isinstance(child, StepNode) else child.name
@@ -962,14 +981,33 @@ def _verify_dataflow(
                         # to substitute — forcing {cycle} into its path would break rendering
                         # there, not just here.
                         decl = artifact_decls.get(name)
-                        if decl is not None and not _produce_path_has_cycle(decl.path):
-                            _err(
-                                f"loop {node.name!r}: step {cid!r} produces {name!r} whose path "
-                                f"{decl.path!r} does not reference {{cycle}} — every cycle would "
-                                "render the same artifact and the loop could never detect how "
-                                "many cycles have completed",
-                                ctx.file,
-                            )
+                        if decl is not None:
+                            new_artifact_produces += 1
+                            if not _produce_path_has_cycle(decl.path):
+                                _err(
+                                    f"loop {node.name!r}: step {cid!r} produces {name!r} whose "
+                                    f"path {decl.path!r} does not reference {{cycle}} — every "
+                                    "cycle would render the same artifact and the loop could "
+                                    "never detect how many cycles have completed",
+                                    ctx.file,
+                                )
+            if not new_artifact_produces:
+                # codex-F3 follow-up (medium): _completed_cycles (walk.py) collects EVERY body
+                # StepNode's produces that are declared artifacts, with no new/reproduction
+                # distinction. If the body ONLY re-produces before-loop artifacts (all exempt
+                # from the {cycle} check above, and all cycle-invariant by construction — see
+                # the note there), _completed_cycles has nothing cycle-varying to key on: every
+                # decl renders identically for every cycle, so it validates on the very first
+                # call and returns the cap immediately — the loop is reported DONE having run
+                # zero real cycles. A NEW artifact is what breaks that tie (its {cycle}-varying
+                # path is guaranteed above), so at least one must exist.
+                _err(
+                    f"loop {node.name!r}: its body must produce at least one new {{cycle}}-"
+                    "varying artifact; a body that only re-produces before-loop artifacts (or "
+                    "produces no artifact at all) cannot discover its own cycle count and would "
+                    "report done having run zero cycles",
+                    ctx.file,
+                )
 
 
 # --------------------------------------------------------------------------- #
