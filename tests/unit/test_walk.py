@@ -1094,6 +1094,32 @@ def test_unexpected_exception_does_not_leave_run_running(ws: Path, tmp_path: Pat
     assert "internal-error" in halt["data"]["reason"]
 
 
+def test_install_guards_exception_does_not_leave_run_running(ws: Path, tmp_path: Path) -> None:
+    """The belt covers the whole run body, not just the node loop: an exception raised
+    BEFORE the first node ever dispatches (e.g. a plugin's install_guards, run-start/plan
+    emit) must still halt the run and record run-halt — a belt scoped only around the
+    `for node in self.plan.nodes` loop misses this call site entirely and reproduces the
+    exact "stuck running" bug sub-change 3 exists to close."""
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    def unreachable(inv, _n):
+        raise AssertionError("unreachable — install_guards must raise before any node dispatches")
+
+    class GuardBoomExecutor(FakeExecutor):
+        def install_guards(self, guards, workspace):
+            raise RuntimeError("guard plugin exploded")
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    with pytest.raises(RuntimeError, match="guard plugin exploded"):
+        _walk(ws, plan, run_dir, {"fake": GuardBoomExecutor(unreachable)})
+
+    assert load_run(run_dir)["status"] != "running"
+    assert load_run(run_dir)["status"] == "halted"
+    halt = next(e for e in read_trail(run_dir) if e["event"] == "run-halt")
+    assert "internal-error" in halt["data"]["reason"]
+
+
 # --------------------------------------------------------------------------- #
 # 13b. Redaction — declared secrets scrubbed from the log AND the trail (SECURITY §1.3).
 # --------------------------------------------------------------------------- #

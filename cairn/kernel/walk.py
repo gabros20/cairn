@@ -276,29 +276,38 @@ class _Walk:
 
         with trail_writer as trail:
             self._trail = trail
-            self._emit(
-                "run-start",
-                data={
-                    "params": self.plan.params,
-                    "dims": self.plan.dims,
-                    "executors": {"default": self.plan.executor_default or ""},
-                },
-            )
-            self._install_guards()
-            self._emit(
-                "plan",
-                data={
-                    "pipeline_hash": run_doc.get("pipeline_hash"),
-                    "nodes": [self._node_id(n) for n in self.plan.nodes],
-                    "models": {
-                        sid: (f"{m}/{e}" if e else m)
-                        for sid, (_x, m, e) in self.plan.resolved_models.items()
-                    },
-                },
-            )
+            # The whole run body — run-start, guard install, the plan emit, the node loop,
+            # AND the success tail — lives inside this one try. Anything that can raise
+            # before the first node even dispatches (e.g. a plugin's install_guards) must
+            # hit the same belt as a mid-walk failure: a bare `except BaseException` scoped
+            # only around the node loop would let those escape with run.json stuck
+            # "running" — the exact corpse the belt exists to prevent (claude-F4).
             try:
+                self._emit(
+                    "run-start",
+                    data={
+                        "params": self.plan.params,
+                        "dims": self.plan.dims,
+                        "executors": {"default": self.plan.executor_default or ""},
+                    },
+                )
+                self._install_guards()
+                self._emit(
+                    "plan",
+                    data={
+                        "pipeline_hash": run_doc.get("pipeline_hash"),
+                        "nodes": [self._node_id(n) for n in self.plan.nodes],
+                        "models": {
+                            sid: (f"{m}/{e}" if e else m)
+                            for sid, (_x, m, e) in self.plan.resolved_models.items()
+                        },
+                    },
+                )
                 for node in self.plan.nodes:
                     self._dispatch(node, None)
+                self._emit("run-done", data={"nodes": len(self.plan.nodes)})
+                self._mark_run("done")
+                return ExitCode.OK
             except _Halt as halt:
                 if halt.node is not None:
                     # A needs-human halt (manual/gate awaiting an operator) is not a node
@@ -335,10 +344,6 @@ class _Walk:
                 )
                 self._mark_run("halted")
                 raise
-
-            self._emit("run-done", data={"nodes": len(self.plan.nodes)})
-            self._mark_run("done")
-            return ExitCode.OK
 
     def _install_guards(self) -> None:
         seen: set[int] = set()
