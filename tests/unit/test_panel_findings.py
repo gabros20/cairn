@@ -33,16 +33,17 @@ from test_executors_base import fake_env, make_inv
 # --------------------------------------------------------------------------- #
 
 
-def test_gate_decision_file_is_trusted_without_provenance(tmp_path: Path) -> None:
-    """codex-F1 (critical): any writer of ``gates/<name>.json`` forges a human gate.
+def test_gate_decision_file_is_rejected_without_provenance(tmp_path: Path) -> None:
+    """codex-F1 (critical, FIXED): an unauthenticated ``gates/<name>.json`` no longer forges a gate.
 
     The run dir is agent-writable (codex gets ``--sandbox workspace-write`` over it). A
-    compromised/ injected step can drop its own decision file; ``resolve_gate`` accepts the
-    ``choice`` with no check on provenance, options membership, or operator authorization —
-    the gate is skipped and the pipeline proceeds. This is a *characterization* test: it is
-    green today, documenting the hole. gatekit.py:68.
+    compromised/injected step can still *drop* a decision file, but ``resolve_gate`` now trusts
+    only a file carrying a valid HMAC over its ``{gate,choice,by,at}`` keyed by the run's secret
+    (stored outside the run dir). A forged/unsigned file is treated as UNANSWERED: it emits a
+    ``gate-tamper`` event and, headless with no default, halts needs-human rather than skipping
+    the gate. This test was the inverted characterization anchor for the fix. gatekit.py.
     """
-    from cairn.kernel.gatekit import gate_path, resolve_gate
+    from cairn.kernel.gatekit import GateNeedsHuman, gate_path, resolve_gate
     from cairn.kernel.plan import GateNode
 
     gate = GateNode(
@@ -50,7 +51,7 @@ def test_gate_decision_file_is_trusted_without_provenance(tmp_path: Path) -> Non
         reads=("plan",),
         ask="Deploy to production?",
         options=(("yes", "ship it"), ("no", "hold")),
-        default="no",  # a defaultless deploy gate would still be bypassed identically
+        default="",  # defaultless: a forged file must NOT substitute for the missing operator
         when_runtime=None,
     )
     gp = gate_path(tmp_path, "deploy")
@@ -59,12 +60,17 @@ def test_gate_decision_file_is_trusted_without_provenance(tmp_path: Path) -> Non
     gp.write_text(json.dumps({"choice": "yes", "by": "tty"}), encoding="utf-8")
 
     events: list = []
-    choice = resolve_gate(
-        gate, tmp_path, interactive=True, presets={}, emit=lambda *a, **k: events.append(a),
-        now=None,
-    )
-    assert choice == "yes"          # forged decision honoured
-    assert events == []             # no operator was ever asked; nothing emitted
+
+    def emit(event, *, node=None, data=None):
+        events.append((event, data))
+
+    with pytest.raises(GateNeedsHuman):  # forge rejected → fail safe, never honoured
+        resolve_gate(gate, tmp_path, interactive=False, presets={}, emit=emit, now=None)
+
+    kinds = [e for e, _ in events]
+    assert "gate-tamper" in kinds          # the forgery was flagged
+    assert kinds[0] == "gate-tamper"
+    assert events[0][1] == {"gate": "deploy", "reason": "missing-mac"}
 
 
 @pytest.mark.xfail(strict=True, reason="codex-F4: absolute guard binary escapes the shim dir")

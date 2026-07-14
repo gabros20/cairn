@@ -199,6 +199,7 @@ def test_hello_pipeline_runs_end_to_end_headless(tmp_path: Path) -> None:
     assert (run_dir / "message.txt").read_text().strip() == "Friendly hello, world!"
 
     tone = json.loads((run_dir / "gates/tone.json").read_text())
+    assert tone.pop("mac")  # HMAC-authenticated (gatekeys); asserted end-to-end in test_gatekit
     # gate `at` is trail.format_at's canonical shape (UTC, ms, Z; naive NOW read as UTC).
     assert tone == {"choice": "friendly", "by": "flag", "at": "2026-07-03T11:04:00.000Z"}
 
@@ -605,7 +606,9 @@ def test_gate_tty_reprompts_then_records(ws: Path, tmp_path: Path, monkeypatch) 
     answers = iter(["nope", "b"])
     monkeypatch.setattr("builtins.input", lambda *_: next(answers))
     assert _walk(ws, plan, run_dir, {}, interactive=True) == ExitCode.OK
-    assert json.loads(gate_path(run_dir, "tone").read_text()) == {"choice": "b", "by": "tty", "at": "2026-07-03T11:04:00.000Z"}
+    tone = json.loads(gate_path(run_dir, "tone").read_text())
+    assert tone.pop("mac")  # HMAC-authenticated decision (gatekeys)
+    assert tone == {"choice": "b", "by": "tty", "at": "2026-07-03T11:04:00.000Z"}
 
 
 def test_externally_answered_gate_is_honored_on_walk(ws: Path, tmp_path: Path) -> None:
@@ -616,6 +619,21 @@ def test_externally_answered_gate_is_honored_on_walk(ws: Path, tmp_path: Path) -
 
     assert _walk(ws, plan, run_dir, {}) == ExitCode.OK  # no halt — already answered
     assert node_status(load_run(run_dir), "tone") == "done"
+
+
+def test_forged_gate_file_halts_needs_human_and_emits_gate_tamper(ws: Path, tmp_path: Path) -> None:
+    # End-to-end through the real walker + trail: an agent-forged (unsigned) decision file must
+    # NOT skip a defaultless gate — it halts needs-human and lands a gate-tamper trail event.
+    gate = GateNode(name="tone", reads=(), ask="?", options=(("a", "A"),), default="", when_runtime=None)
+    plan = make_plan([gate], {})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    gp = gate_path(run_dir, "tone")
+    gp.parent.mkdir(parents=True, exist_ok=True)
+    gp.write_text(json.dumps({"choice": "a", "by": "tty"}), encoding="utf-8")  # forged, no MAC
+
+    assert _walk(ws, plan, run_dir, {}) == ExitCode.NEEDS_HUMAN  # forge rejected, fail safe
+    events = [e["event"] for e in read_trail(run_dir)]
+    assert "gate-tamper" in events and events[-1] == "run-halt"
 
 
 # --------------------------------------------------------------------------- #
@@ -890,7 +908,9 @@ def test_system_env_passthrough_is_exactly_the_pinned_set(ws: Path, tmp_path: Pa
     # env here "contains" every key, so the invocation env must equal EXACTLY the allowed
     # system set + the CAIRN_* mechanics — widening the passthrough (e.g. a secret-bearing
     # var slipping in) fails this test loudly and forces a deliberate decision.
-    monkeypatch.setattr(os, "environ", _UniversalEnv())
+    env = _UniversalEnv()
+    env["XDG_STATE_HOME"] = str(tmp_path / "xdg")  # keep the bootstrap key-mint hermetic
+    monkeypatch.setattr(os, "environ", env)
     arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
     plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
 
@@ -914,7 +934,10 @@ def test_system_env_passthrough_is_exactly_the_pinned_set(ws: Path, tmp_path: Pa
 def test_absent_baseline_vars_are_omitted_not_none(ws: Path, tmp_path: Path, monkeypatch) -> None:
     # Absence tolerance: a parent env lacking USER/LOGNAME/TMPDIR/… simply omits those keys
     # from the child env — never a None value, never a crash.
-    monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin:/bin", "HOME": "/tmp/h"})
+    monkeypatch.setattr(
+        os, "environ",
+        {"PATH": "/usr/bin:/bin", "HOME": "/tmp/h", "XDG_STATE_HOME": str(tmp_path / "xdg")},
+    )
     arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
     plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
 
