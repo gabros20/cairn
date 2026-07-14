@@ -102,7 +102,6 @@ def test_shim_build_rejects_absolute_or_traversing_binary(tmp_path: Path) -> Non
 # --------------------------------------------------------------------------- #
 
 
-@pytest.mark.xfail(strict=True, reason="codex-F14/claude-F4: spawn OSError is untyped, escapes walker")
 def test_spawn_failure_raises_typed_cairn_error(tmp_path: Path) -> None:
     """codex-F14 / claude-F4 (major, consensus): a missing binary must be a typed failure.
 
@@ -207,7 +206,6 @@ def test_effort_enum_includes_max() -> None:
     assert "max" in EFFORTS
 
 
-@pytest.mark.xfail(strict=True, reason="codex-F7/grok-F11/claude-F3: agent exit code ignored")
 def test_agent_step_nonzero_exit_is_a_failure() -> None:
     """codex-F7 / grok-F11 / claude-F3 (major, consensus): only ``kind=='run'`` checks exit code.
 

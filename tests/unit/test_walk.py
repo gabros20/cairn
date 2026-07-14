@@ -996,6 +996,105 @@ def test_run_command_nonzero_exit_fails_even_when_produces_validate(ws: Path, tm
 
 
 # --------------------------------------------------------------------------- #
+# 13a2. Failure taxonomy — typed spawn errors, agent exit codes, no run left "running".
+# --------------------------------------------------------------------------- #
+
+
+def test_agent_step_absent_binary_halts_executor_not_traceback(ws: Path, tmp_path: Path) -> None:
+    """codex-F14/claude-F4: a missing executable is a typed run-halt at exit 4, not a
+    traceback that leaves run.json stuck "running"."""
+    from cairn.executors.base import run_process
+
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    class SpawnFailExecutor(FakeExecutor):
+        def __init__(self) -> None:
+            super().__init__(on_invoke=None)
+
+        def invoke(self, inv):
+            self.invocations.append(inv)
+            # Exercise the real spawn path (base.run_process), not a canned Result — this
+            # is the same OSError→ExecutorSpawnError conversion base.py:115 performs.
+            run_process(
+                ["cairn-definitely-not-a-real-binary-xyz"],
+                stdin_text=None,
+                env=inv.env,
+                cwd=inv.cwd,
+                timeout_s=inv.timeout_s,
+                log_path=inv.log_path,
+            )
+            raise AssertionError("unreachable — run_process must raise on a missing binary")
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": SpawnFailExecutor()}) == ExitCode.EXECUTOR
+    assert load_run(run_dir)["status"] == "halted"
+    halt = next(e for e in read_trail(run_dir) if e["event"] == "run-halt")
+    assert halt["data"]["exit_code"] == int(ExitCode.EXECUTOR)
+
+
+def test_agent_nonzero_exit_with_auth_signature_halts_executor_and_skips_retries(
+    ws: Path, tmp_path: Path
+) -> None:
+    """codex-F7/grok-F11/claude-F3: an agent CLI that exits non-zero with an auth/executor
+    signature in its output is a step-fail → run-halt at exit 4 — even with a would-be-valid
+    artifact — and burns none of the retry budget (retrying auth failure is pure waste)."""
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"], retry=(2, True))], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        inv.log_path.parent.mkdir(parents=True, exist_ok=True)
+        inv.log_path.write_text("Error: not logged in. Please run `claude /login`.\n", encoding="utf-8")
+        (inv.cwd / "a.txt").write_text("would-be-valid", encoding="utf-8")  # a valid artifact
+        return Result(step={"status": "done", "summary": "ok", "artifacts": []}, exit_code=1, duration_s=1.0)
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    ex = FakeExecutor(on_invoke)
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.EXECUTOR
+    assert len(ex.invocations) == 1  # retry budget (2) untouched — auth failure isn't retried
+    events = [e["event"] for e in read_trail(run_dir)]
+    assert "step-fail" in events
+    assert events[-1] == "run-halt"
+
+
+def test_agent_nonzero_exit_without_auth_signature_still_retries(ws: Path, tmp_path: Path) -> None:
+    """The content-invalid retry path (walk.py ~469) stays intact: a non-zero exit with no
+    auth/executor signature in the output is a content failure, not an executor failure."""
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"], retry=(1, True))], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        inv.log_path.parent.mkdir(parents=True, exist_ok=True)
+        inv.log_path.write_text("some generic tool crash, nothing auth-related\n", encoding="utf-8")
+        (inv.cwd / "a.txt").write_text("", encoding="utf-8")  # always empty → always invalid
+        return Result(step={"status": "done", "summary": "ok", "artifacts": []}, exit_code=1, duration_s=1.0)
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    ex = FakeExecutor(on_invoke)
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.GATE_FAILED
+    assert len(ex.invocations) == 2  # original + one retry — content path preserved
+
+
+def test_unexpected_exception_does_not_leave_run_running(ws: Path, tmp_path: Path) -> None:
+    """claude-F4 belt: any non-_Halt exception escaping the walk still marks the run halted
+    (never "running") and records a run-halt, then re-raises so the CLI exits non-zero."""
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        raise RuntimeError("kaboom — not a CairnError, not an ExecTimeout")
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    with pytest.raises(RuntimeError, match="kaboom"):
+        _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)})
+
+    assert load_run(run_dir)["status"] != "running"
+    assert load_run(run_dir)["status"] == "halted"
+    halt = next(e for e in read_trail(run_dir) if e["event"] == "run-halt")
+    assert "internal-error" in halt["data"]["reason"]
+
+
+# --------------------------------------------------------------------------- #
 # 13b. Redaction — declared secrets scrubbed from the log AND the trail (SECURITY §1.3).
 # --------------------------------------------------------------------------- #
 
