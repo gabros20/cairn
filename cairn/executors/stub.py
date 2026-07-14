@@ -51,6 +51,7 @@ class StubExecutor:
         blocking_hooks=False,
         output_schema=False,
         session_capture=None,
+        installs_hooks=False,  # stub never installs a hook
     )
 
     def __init__(self, config=None, *, stubs_root: Path | None = None) -> None:

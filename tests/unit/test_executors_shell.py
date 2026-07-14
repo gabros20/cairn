@@ -41,7 +41,9 @@ def test_resolve_model_is_trivial(tmp_path):
 
 def test_capabilities():
     caps = ShellExecutor().capabilities
-    assert caps == Capabilities(blocking_hooks=False, output_schema=False, session_capture=None)
+    assert caps == Capabilities(
+        blocking_hooks=False, output_schema=False, session_capture=None, installs_hooks=False,
+    )
 
 
 def test_doctor_is_trivially_healthy():

@@ -285,6 +285,7 @@ def test_protocol_surface(tmp_path: Path) -> None:
     assert ex.capabilities.blocking_hooks is False
     assert ex.capabilities.output_schema is False
     assert ex.capabilities.session_capture is None
+    assert ex.capabilities.installs_hooks is False
     assert ex.resolve_model("reasoning", "high") == ("stub", None)
     assert ex.install_guards([], tmp_path, tmp_path) is None
     assert ex.render_workspace(tmp_path) is None

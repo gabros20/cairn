@@ -19,13 +19,16 @@ class GrokExecutor(CliExecutor):
         # 10-hooks.md): JSON files in ~/.grok/hooks/*.json (global, always trusted) or
         # <project>/.grok/hooks/*.json (requires folder trust — `--trust` / /hooks-trust).
         # A hook denies a tool call via stdout {"decision":"deny","reason":...} (honored
-        # regardless of exit code) or exit 2; every other failure is fail-open. The doctor
-        # hook-probe still validates the mechanism end to end before guards rely on it.
-        blocking_hooks=True,
+        # regardless of exit code) or exit 2; every other failure is fail-open. BUT this is a
+        # CLI-capability fact only — cairn's own install_guards below does not wire it (see
+        # installs_hooks), so leave None: unknown/unasserted → the doctor hook-probe decides,
+        # rather than assert True for a mechanism cairn never installs (grok-F3).
+        blocking_hooks=None,
         # grok has native --json-schema (implies --output-format json), but it is NOT
         # wired: native schema is a later bonus; the STEP sentinel is the contract.
         output_schema=True,
         session_capture=None,
+        installs_hooks=False,  # install_guards is a no-op — cairn does not wire a grok hook yet
     )
 
     def _build_command(self, inv: Invocation, prompt_text: str) -> tuple[list[str], str | None]:

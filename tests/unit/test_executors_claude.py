@@ -88,7 +88,8 @@ def test_exit_code_propagated(tmp_path, monkeypatch):
 def test_capabilities():
     caps = ClaudeExecutor(CFG).capabilities
     assert caps == Capabilities(
-        blocking_hooks=True, output_schema=False, session_capture="~/.claude/projects/**"
+        blocking_hooks=True, output_schema=False, session_capture="~/.claude/projects/**",
+        installs_hooks=True,
     )
 
 

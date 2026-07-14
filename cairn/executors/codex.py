@@ -15,6 +15,7 @@ class CodexExecutor(CliExecutor):
         blocking_hooks=None,
         output_schema=True,  # codex has native --output-schema (see _build_command note)
         session_capture="~/.codex/sessions/**",
+        installs_hooks=False,  # install_guards is a no-op — cairn does not wire a codex hook yet
     )
 
     def _build_command(self, inv: Invocation, prompt_text: str) -> tuple[list[str], str | None]:

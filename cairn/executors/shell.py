@@ -24,6 +24,7 @@ class ShellExecutor:
         blocking_hooks=False,  # n/a for a shell step
         output_schema=False,
         session_capture=None,
+        installs_hooks=False,  # n/a — no hook mechanism, install_guards below is a no-op
     )
 
     def __init__(self, config=None) -> None:

@@ -83,7 +83,8 @@ def test_capabilities():
     caps = CodexExecutor(CFG).capabilities
     # blocking_hooks UNVERIFIED headless → None (doctor probes later); output_schema native.
     assert caps == Capabilities(
-        blocking_hooks=None, output_schema=True, session_capture="~/.codex/sessions/**"
+        blocking_hooks=None, output_schema=True, session_capture="~/.codex/sessions/**",
+        installs_hooks=False,
     )
 
 

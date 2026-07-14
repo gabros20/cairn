@@ -240,8 +240,11 @@ def test_grok_auth_failure_is_inconclusive(fakebin, tmp_path):
 
 
 def test_grok_exit_policy_true_falsified_is_error():
-    # GrokExecutor.capabilities.blocking_hooks is True, so a live no_fire/fires_no_block verdict
-    # is a FALSIFICATION → doctor error (falsified design claim). This must not be softened.
+    # render()'s policy math for an asserted blocking_hooks=True claim (grok used here only as
+    # a realistic ProbeResult.executor label — GrokExecutor.capabilities.blocking_hooks itself
+    # is None as of W3b, since cairn does not install a grok hook; see test_capabilities in
+    # test_executors_grok.py). A live no_fire/fires_no_block verdict against an asserted True
+    # is a FALSIFICATION → doctor error. This must not be softened.
     for outcome in ("no_fire", "fires_no_block"):
         lvl, _ = render(
             ProbeResult("grok", outcome, "d", "v", "under bypassPermissions", "m"), True

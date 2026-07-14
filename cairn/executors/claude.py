@@ -27,6 +27,7 @@ class ClaudeExecutor(CliExecutor):
         blocking_hooks=True,  # PreToolUse hooks can block (deny-JSON) — installed by install_guards
         output_schema=False,
         session_capture="~/.claude/projects/**",
+        installs_hooks=True,  # install_guards below actually wires the PreToolUse hook (W3a)
     )
 
     def _build_command(self, inv: Invocation, prompt_text: str) -> tuple[list[str], str | None]:

@@ -102,10 +102,13 @@ def test_resolve_model_passes_effort_through():
 def test_capabilities():
     caps = GrokExecutor(CFG).capabilities
     # blocking_hooks: 0.2.82 ships documented blocking PreToolUse hooks (deny via stdout
-    # JSON or exit 2). output_schema: native --json-schema exists (not wired; STEP sentinel
-    # is the contract).
+    # JSON or exit 2) as a CLI capability — but cairn's own install_guards does NOT wire it
+    # (installs_hooks=False), so blocking_hooks correctly stays None (unknown/unasserted; the
+    # doctor probe decides) rather than overstating True for a mechanism cairn never installs
+    # (grok-F3, W3b). output_schema: native --json-schema exists (not wired; STEP sentinel is
+    # the contract).
     assert caps == Capabilities(
-        blocking_hooks=True, output_schema=True, session_capture=None
+        blocking_hooks=None, output_schema=True, session_capture=None, installs_hooks=False,
     )
 
 

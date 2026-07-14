@@ -45,11 +45,28 @@ class Finding:
 
 @dataclass(frozen=True)
 class Capabilities:
-    """What an executor can actually enforce — declared, never assumed (docs/CONCEPTS.md §6)."""
+    """What an executor can actually enforce — declared, never assumed (docs/CONCEPTS.md §6).
+
+    ``blocking_hooks`` and ``installs_hooks`` answer two DIFFERENT questions and must not be
+    conflated: ``blocking_hooks`` is the CLI-capability/probe question — "can this vendor's CLI
+    block a tool call via a native pre-execution hook, at all" — an asserted design claim
+    (``True``) or an open question the doctor hook-probe settles empirically (``None``/``False``).
+    ``installs_hooks`` is an IMPLEMENTATION fact — "does cairn's own ``install_guards`` for this
+    executor actually wire that hook for a run" — independent of whether the CLI *could*. An
+    executor can have ``blocking_hooks=True`` (the CLI supports it) while ``installs_hooks=False``
+    (cairn hasn't wired it yet, e.g. codex/grok today) — asserting ``blocking_hooks=True`` there
+    is fine; it is `installs_hooks` that must not overstate what cairn itself does.
+    """
 
     blocking_hooks: bool | None  # None = unknown → doctor probes empirically
     output_schema: bool          # native typed-return support (used as a bonus only)
     session_capture: str | None  # glob of session files to copy into logs/, if any
+    # cairn's install_guards wires a real pre-execution blocking hook for this executor (True
+    # only for claude, post-W3a) — no default: every executor must state this explicitly, the
+    # honesty flag plan.py's effective-layer warning (§4) keys off. codex/grok may assert
+    # blocking_hooks independently of this but do NOT install, so a hook-only guard under them
+    # is not pre-execution-enforced.
+    installs_hooks: bool
 
 
 @dataclass(frozen=True)
