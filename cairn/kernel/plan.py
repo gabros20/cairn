@@ -1069,6 +1069,22 @@ def _lint_conditional_gates(raw_nodes: list, ctx: _Ctx) -> None:
 # Step 5 (part) — guards.
 # --------------------------------------------------------------------------- #
 
+# Kept here (not in guards.py) so this plan-time check and guards.py's build_shims share
+# ONE implementation — guards.py already imports GuardDecl from this module, so importing
+# _binary_name the other way round (plan.py → guards.py) would be circular.
+_GLOB_STOP = set(" \t*?[")
+
+
+def _binary_name(pattern: str) -> str:
+    """The real binary a ``match_command`` guards: its literal prefix up to the first
+    glob metachar or space. ``"brease* createMedia*"`` → ``"brease"``."""
+    out: list[str] = []
+    for ch in pattern:
+        if ch in _GLOB_STOP:
+            break
+        out.append(ch)
+    return "".join(out)
+
 
 def _parse_guards(raw_guards: Any, ctx: _Ctx) -> list[GuardDecl]:
     if not raw_guards:
@@ -1081,6 +1097,7 @@ def _parse_guards(raw_guards: Any, ctx: _Ctx) -> list[GuardDecl]:
         if not name:
             _err("a guard needs a 'name'", ctx.file)
         match = g.get("match", {}) or {}
+        match_command = str(match.get("command", ""))
         check_rel = g.get("check")
         if not check_rel:
             _err(f"guard {name!r} needs a 'check' script", ctx.file)
@@ -1090,6 +1107,22 @@ def _parse_guards(raw_guards: Any, ctx: _Ctx) -> list[GuardDecl]:
         on_error = g.get("on_error", "deny")
         if on_error not in ("allow", "deny"):
             _err(f"guard {name!r}: on_error must be 'allow' or 'deny', got {on_error!r}", ctx.file)
+
+        enforce = tuple(g.get("enforce", []) or [])
+        if "shim" in enforce:
+            # codex-F4 (critical): build_shims derives the shimmed binary from this same
+            # prefix (guards.py:_binary_name) and does `shim_dir / binary` — a binary with a
+            # '/' collapses that join to an absolute path (Path("/a") / "/b" == Path("/b")),
+            # landing an executable OUTSIDE the shim dir at plan/run build time. Reject here,
+            # before any file is written, rather than let build_shims discover it.
+            binary = _binary_name(match_command)
+            if not binary or "/" in binary or binary in (".", ".."):
+                _err(
+                    f"guard {name!r}: match_command {match_command!r} has binary {binary!r}, "
+                    "not a bare command name (no path separators, no '.'/'..' segments, not "
+                    "empty) — a shim can only be built for a plain command on PATH",
+                    ctx.file,
+                )
 
         when_runtime = None
         src = g.get("when")
@@ -1106,9 +1139,9 @@ def _parse_guards(raw_guards: Any, ctx: _Ctx) -> list[GuardDecl]:
             GuardDecl(
                 name=name,
                 match_tool=str(match.get("tool", "")),
-                match_command=str(match.get("command", "")),
+                match_command=match_command,
                 check=check_path,
-                enforce=tuple(g.get("enforce", []) or []),
+                enforce=enforce,
                 on_error=on_error,
                 when=when_runtime,
             )

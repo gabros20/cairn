@@ -73,7 +73,6 @@ def test_gate_decision_file_is_rejected_without_provenance(tmp_path: Path) -> No
     assert events[0][1] == {"gate": "deploy", "reason": "missing-mac"}
 
 
-@pytest.mark.xfail(strict=True, reason="codex-F4: absolute guard binary escapes the shim dir")
 def test_shim_build_rejects_absolute_or_traversing_binary(tmp_path: Path) -> None:
     """codex-F4 (critical): an absolute/traversing guard binary escapes the shim dir.
 

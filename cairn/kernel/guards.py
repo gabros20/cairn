@@ -50,7 +50,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from cairn.kernel.errors import ConfigError
-from cairn.kernel.plan import GuardDecl
+from cairn.kernel.plan import GuardDecl, _binary_name
 
 _SHIM_MARKER = "# cairn guard shim for"
 
@@ -181,18 +181,9 @@ def _resolve_error(guard: GuardDecl, what: str) -> CheckResult:
 # The shim layer — PATH wrappers that work on any executor (ARCHITECTURE §4).
 # --------------------------------------------------------------------------- #
 
-_GLOB_STOP = set(" \t*?[")
-
-
-def _binary_name(pattern: str) -> str:
-    """The real binary a ``match_command`` guards: its literal prefix up to the first
-    glob metachar or space. ``"brease* createMedia*"`` → ``"brease"``."""
-    out: list[str] = []
-    for ch in pattern:
-        if ch in _GLOB_STOP:
-            break
-        out.append(ch)
-    return "".join(out)
+# _binary_name lives in plan.py (this module already imports GuardDecl from there, and
+# plan.py's guard-parse pass shares this exact derivation for its plan-time basename check
+# — codex-F4).
 
 
 # One /bin/sh shim per guarded binary. It reconstructs the command line, defers the
@@ -312,6 +303,16 @@ def build_shims(
             binary=binary, shim_dir=shim_dir, python=sys.executable, names=names
         )
         shim = shim_dir / binary
+        # Defense-in-depth backstop (codex-F4): plan.py's guard-parse pass already rejects a
+        # slashed/traversing binary before any plan reaches here, but a caller that builds
+        # GuardDecls directly (bypassing plan validation) must not be able to smuggle one
+        # through — a binary containing '/' collapses `shim_dir / binary` to an absolute path
+        # (Path("/a") / "/b" == Path("/b")), landing write_text+chmod OUTSIDE the shim dir.
+        if shim.resolve().parent != shim_dir.resolve():
+            raise ConfigError(
+                f"guard binary {binary!r} resolves outside the shim dir {shim_dir} — "
+                "refusing to write it (a bare command name is required)"
+            )
         shim.write_text(body, encoding="utf-8")
         shim.chmod(0o755)
 

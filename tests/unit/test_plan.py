@@ -470,6 +470,43 @@ def test_missing_allowlist_fragment_is_an_error(tmp_path):
     assert "nope" in str(exc.value)
 
 
+_GUARD_CHECK = {"guards/check.sh": "#!/bin/sh\nexit 0\n"}
+
+
+def _guard_steps(match_command: str) -> str:
+    return (
+        "  - { id: one, run: 'echo', produces: [a] }\n"
+        "guards:\n"
+        "  - name: evil\n"
+        f"    match: {{ tool: bash, command: {match_command!r} }}\n"
+        "    check: guards/check.sh\n"
+        "    enforce: [shim]\n"
+    )
+
+
+def test_guard_with_absolute_match_command_binary_is_a_config_error(tmp_path):
+    # codex-F4: _binary_name stops only on glob metachars/space, not '/' — an absolute
+    # match_command's derived "binary" would collapse build_shims' shim_dir/binary join to
+    # an absolute path, writing an executable outside the shim dir. Must fail at plan time.
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps("/tmp/x *"), extra=_GUARD_CHECK)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    assert "evil" in str(exc.value) and "/tmp/x" in str(exc.value)
+
+
+def test_guard_with_traversing_match_command_binary_is_a_config_error(tmp_path):
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps("../x *"), extra=_GUARD_CHECK)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    assert "evil" in str(exc.value)
+
+
+def test_guard_with_bare_binary_match_command_plans_green(tmp_path):
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps("brease *"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW)
+    assert [g.name for g in p.guards] == ["evil"]
+
+
 def test_artifact_ref_inside_an_artifact_path_is_an_error(tmp_path):
     yaml_text = (
         "pipeline: p\nversion: 1\nrun_id: \"p-{date}\"\n"
