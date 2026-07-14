@@ -171,9 +171,10 @@ separate machinery.
   `run_id` in different workspaces get distinct keys, and the same discriminator is folded into the
   MAC). **Every** reader verifies — not just the gate's own proceed-decision (`resolve_gate`) but
   every consumer of the recorded value: `when:` control-flow expressions (`gates.<name>.choice`),
-  the `{{ gate:<name> }}` command/prompt helper, and `needs:` gate dependencies all recompute the
-  MAC (constant-time) and honor the file only if it verifies *and* the choice is one of the gate's
-  declared options. The gate name is in the signed payload, so a decision for gate A cannot be
+  the `{{ gate:<name> }}` command/prompt helper, `needs:` gate dependencies, and the prompt
+  **composer** (the "recorded choice: …" describe line and its own `{{ gate:… }}` arg rendering)
+  all recompute the MAC (constant-time) and honor the file only if it verifies *and* the choice is
+  one of the gate's declared options. The gate name is in the signed payload, so a decision for gate A cannot be
   replayed at gate B. This closes the *post-resolution* forge: a step that overwrites a
   legitimately-signed "no" with a forged "yes" mid-walk cannot flip a downstream `when:` or inject
   the forged value into a shell command. **Any** failure — missing/mismatched MAC, an off-menu
@@ -192,8 +193,11 @@ separate machinery.
   outlives the run dir until GC learns to reap it — a documented TODO, not a leak of anything
   sensitive on its own), and `is_answered` is a pure file-existence check, so a forged file still
   *blocks* the `cairn gate` overwrite path (an operator must delete it to answer) — a
-  denial-of-convenience, never a forged pass. *Status: LIVE — built and tested (`gatekeys.py`,
-  `gatekit.py`).*
+  denial-of-convenience, never a forged pass. **Upgrade note:** the signed payload gained a `run`
+  field in this version, so a gate answered by an *earlier* cairn no longer verifies after
+  upgrading — runs with gates answered before this version must re-answer them (it fails safe to
+  needs-human, never auto-passes). *Status: LIVE — built and tested (`gatekeys.py`, `gatekit.py`,
+  `compose.py`).*
 - **Retention:** capture-heavy runs are multi-GB. `cairn gc [--keep-days N] [--keep-last M]
   [--artifacts-only] [--include-needs-human] [--apply]` deletes or slims old runs
   (`--artifacts-only` keeps `run.json` + trail + `.cairn.lock` — the audit skeleton — while dropping
