@@ -63,6 +63,7 @@ from cairn.kernel.config import Config
 from cairn.kernel.errors import CairnError
 from cairn.kernel.expr import EvalError, Expr
 from cairn.kernel.gatekit import GateNeedsHuman, gate_path, resolve_gate
+from cairn.kernel.hookprobe import _looks_like_auth_failure
 from cairn.kernel.plan import (
     GateNode,
     LoopNode,
@@ -317,6 +318,23 @@ class _Walk:
                 )
                 self._mark_run("halted")
                 return halt.exit_code
+            except BaseException as exc:
+                # Any escape that is not a clean _Halt (an unguarded stdlib exception, a
+                # kernel bug) must still leave the run in a terminal, non-"running" state —
+                # gc (SECURITY §5) never collects a run stuck "running" (claude-F4 belt).
+                # Record the halt, then re-raise unchanged so the CLI still exits non-zero;
+                # this never swallows the exception.
+                self._emit(
+                    "run-halt",
+                    node=None,
+                    data={
+                        "reason": f"internal-error: {exc}",
+                        "validator_reasons": [],
+                        "exit_code": int(ExitCode.EXECUTOR),
+                    },
+                )
+                self._mark_run("halted")
+                raise
 
             self._emit("run-done", data={"nodes": len(self.plan.nodes)})
             self._mark_run("done")
@@ -443,7 +461,28 @@ class _Walk:
                 raise _Halt(ExitCode.GATE_FAILED, step.id, "step returned blocked", blockers)
 
             ok, validator_reasons = self._validate_produces(step, cycle)
-            if step.kind == "run" and result.exit_code != 0:
+            if result.exit_code != 0:
+                # A non-zero exit is checked for every step kind now (codex-F7/grok-F11/
+                # claude-F3) — an agent CLI that fails auth/API but happens to leave a
+                # valid-looking artifact must not be recorded step-done. Split by shape:
+                # an auth/executor signature in the output is exit 4, not a content
+                # problem — retrying it just re-invokes a CLI that cannot succeed, so halt
+                # immediately and skip whatever retry budget remains. Everything else is a
+                # genuine content failure and keeps the existing retry-with-feedback path.
+                log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
+                if _looks_like_auth_failure(log_text, result.exit_code):
+                    self._emit(
+                        "step-fail",
+                        node=step.id,
+                        attempt=attempt,
+                        cycle=cycle,
+                        data={"error": f"command exited with code {result.exit_code} (executor/auth failure)"},
+                    )
+                    raise _Halt(
+                        ExitCode.EXECUTOR,
+                        step.id,
+                        f"executor failure: command exited with code {result.exit_code}",
+                    )
                 ok = False
                 validator_reasons = validator_reasons + [f"command exited with code {result.exit_code}"]
 

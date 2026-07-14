@@ -17,7 +17,7 @@ import time
 from collections.abc import Callable
 from pathlib import Path
 
-from cairn.kernel.errors import CairnError
+from cairn.kernel.errors import CairnError, ExecutorSpawnError
 from cairn.kernel.types import (
     EFFORTS,
     TIERS,
@@ -37,6 +37,7 @@ __all__ = [
     "TIERS",
     "EFFORTS",
     "ExecTimeout",
+    "ExecutorSpawnError",
     "parse_step_sentinel",
     "run_process",
 ]
@@ -112,18 +113,28 @@ def run_process(
     captured: list[str] = []
     start = time.monotonic()
 
-    proc = subprocess.Popen(
-        list(argv),
-        stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        cwd=str(cwd),
-        env=dict(env),
-        text=True,
-        errors="replace",  # one non-utf8 byte from a CLI must not kill the pump thread
-        bufsize=1,
-        start_new_session=True,  # own process group so a timeout can group-kill children
-    )
+    try:
+        proc = subprocess.Popen(
+            list(argv),
+            stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            cwd=str(cwd),
+            env=dict(env),
+            text=True,
+            errors="replace",  # one non-utf8 byte from a CLI must not kill the pump thread
+            bufsize=1,
+            start_new_session=True,  # own process group so a timeout can group-kill children
+        )
+    except OSError as exc:
+        # A missing/non-executable binary (or a bad cwd) raises here, before there is any
+        # process to wait on. Type it so the walker's `except CairnError` (walk.py) maps it
+        # to a run-halt at exit 4 instead of an uncaught traceback that leaves run.json
+        # stuck "running" forever (codex-F14/claude-F4). Never log the full argv/env — either
+        # can carry secrets (SECURITY §1.3) — the executable name + errno is enough to act on.
+        raise ExecutorSpawnError(
+            f"{argv[0]!r} failed to start: {exc.strerror or exc}", executable=argv[0] if argv else None
+        ) from exc
 
     def _pump() -> None:
         assert proc.stdout is not None
