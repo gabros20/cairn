@@ -2,11 +2,16 @@
 
 A gate's decision lands at ``runs/<id>/gates/<name>.json`` and, once written by a kernel
 writer, is never re-asked: that single file is what makes a gate resumable. The file is
-AUTHENTICATED — it carries an HMAC (``mac``) over its ``{gate,choice,by,at}`` keyed by the
+AUTHENTICATED — it carries an HMAC (``mac``) over its ``{run,gate,choice,by,at}`` keyed by the
 run's per-run secret (``gatekeys``, stored outside the agent-writable run dir). The run dir
 is the agent's write scope, so a bare decision file proves nothing; only one with a valid
 MAC is honored. A forged/tampered/unsigned file is treated as UNANSWERED — it emits a
 ``gate-tamper`` trail event and resolution falls through as if no file existed. Order:
+
+Every OTHER reader of the decision value (the walker's ``when:`` resolver, the ``gate()``
+command/prompt helper, and ``needs:`` checks) must go through ``read_verified_decision`` /
+``read_verified_choice`` — same MAC + options check — so a decision forged AFTER the gate
+legitimately resolved cannot flip downstream control flow or a rendered command.
 
     authenticated answer on disk → skip (return the recorded choice)
     preset (``--gate name=choice``) → write ``by: "flag"``
@@ -40,6 +45,14 @@ class GateNeedsHuman(CairnError):
     """A headless run reached a gate with no default — it needs an operator (exit 6)."""
 
 
+class GateUnanswered(CairnError):
+    """A gate has no decision file yet — the normal unanswered state (not an attack)."""
+
+
+class GateTampered(CairnError):
+    """A gate decision file exists but failed authentication (forged/tampered/unsigned)."""
+
+
 def gate_path(run_dir: Path, name: str) -> Path:
     return Path(run_dir) / GATE_DIR / f"{name}.json"
 
@@ -47,11 +60,6 @@ def gate_path(run_dir: Path, name: str) -> Path:
 def is_answered(run_dir: Path, name: str) -> bool:
     """Whether ``gates/<name>.json`` already exists (the resume/skip predicate)."""
     return gate_path(run_dir, name).is_file()
-
-
-def read_choice(run_dir: Path, name: str) -> str:
-    """The recorded choice for an answered gate."""
-    return json.loads(gate_path(run_dir, name).read_text(encoding="utf-8"))["choice"]
 
 
 def resolve_gate(
@@ -77,7 +85,7 @@ def resolve_gate(
     if path.is_file():
         trusted = _verify_decision(run_dir, gate, path, options, emit)
         if trusted is not None:
-            return trusted
+            return trusted["choice"]
         # Forged/tampered/unauthenticated: `_verify_decision` emitted `gate-tamper`. Fall
         # through to the normal unanswered path — an operator preset, an interactive re-ask,
         # a headless default, or GateNeedsHuman. The forged file is NEVER honored.
@@ -114,12 +122,12 @@ def answer_gate(run_dir: Path, name: str, choice: str) -> None:
     path = gate_path(run_dir, name)
     path.parent.mkdir(parents=True, exist_ok=True)
     at = format_at(datetime.now(timezone.utc))
-    secret = ensure_run_key(run_dir.name)
+    secret = ensure_run_key(run_dir)
     payload = {
         "choice": choice,
         "by": "external",
         "at": at,
-        "mac": compute_mac(secret, name, choice, "external", at),
+        "mac": compute_mac(secret, run_dir, name, choice, "external", at),
     }
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
@@ -128,11 +136,11 @@ def answer_gate(run_dir: Path, name: str, choice: str) -> None:
 
 def _verify_decision(
     run_dir: Path, gate: GateNode, path: Path, options: list[str], emit
-) -> str | None:
-    """Return the authenticated ``choice`` for an existing decision file, else None.
+) -> dict | None:
+    """Return the authenticated decision dict for an existing file, else None.
 
     A file is trusted only if it carries a ``mac`` that HMAC-verifies (with the run's secret)
-    over its own ``{gate,choice,by,at}`` AND its ``choice`` is one of the gate's options. On
+    over its own ``{run,gate,choice,by,at}`` AND its ``choice`` is one of the gate's options. On
     ANY failure — unreadable file, missing/blank ``mac``, missing/unreadable secret, MAC
     mismatch, or off-menu choice — it emits a ``gate-tamper`` trail event and returns None so
     the caller re-asks/halts. Fails SAFE: a missing secret is tamper, never "trust the file".
@@ -155,13 +163,13 @@ def _verify_decision(
         tamper("missing-mac")
         return None
 
-    secret = load_run_key(run_dir.name)
+    secret = load_run_key(run_dir)
     if secret is None:
         tamper("missing-secret")
         return None
 
     choice, by, at = doc.get("choice"), doc.get("by"), doc.get("at")
-    expected = compute_mac(secret, gate.name, choice, by, at)
+    expected = compute_mac(secret, run_dir, gate.name, choice, by, at)
     if not hmac.compare_digest(expected, mac):
         tamper("mac-mismatch")
         return None
@@ -170,15 +178,48 @@ def _verify_decision(
         tamper("choice-not-an-option")
         return None
 
-    return choice
+    return doc
+
+
+def _noop_emit(*_a, **_k) -> None:
+    return None
+
+
+def read_verified_decision(run_dir: Path, gate: GateNode, emit=_noop_emit) -> dict:
+    """The authenticated decision dict for an already-answered gate — for readers OTHER than
+    ``resolve_gate`` (the ``when:`` resolver, the ``gate()`` command helper, ``needs``).
+
+    Raises :class:`GateUnanswered` if no decision file exists, and :class:`GateTampered` (after
+    emitting ``gate-tamper``) if one exists but fails MAC/options verification. A tampered file is
+    thus treated no better than a missing one for these consumers — closing the post-resolution
+    forge window where a compromised step overwrites a legitimately-signed decision within one
+    walk. ``emit`` defaults to a no-op for callers with no live trail (the ``cairn gate`` CLI).
+    """
+    run_dir = Path(run_dir)
+    path = gate_path(run_dir, gate.name)
+    if not path.is_file():
+        raise GateUnanswered(gate.name)
+    options = [key for key, _ in gate.options]
+    doc = _verify_decision(run_dir, gate, path, options, emit)
+    if doc is None:
+        raise GateTampered(gate.name)
+    return doc
+
+
+def read_verified_choice(run_dir: Path, gate: GateNode, emit=_noop_emit) -> str:
+    """The authenticated ``choice`` for an already-answered gate (see read_verified_decision)."""
+    return read_verified_decision(run_dir, gate, emit)["choice"]
 
 
 def _commit(run_dir: Path, path: Path, gate: GateNode, choice: str, by: str, emit, now) -> str:
     """Write the (signed) decision file atomically then trail ``gate-answered``."""
     path.parent.mkdir(parents=True, exist_ok=True)
     at = format_at(now)
-    secret = ensure_run_key(Path(run_dir).name)
-    payload = {"choice": choice, "by": by, "at": at, "mac": compute_mac(secret, gate.name, choice, by, at)}
+    secret = ensure_run_key(run_dir)
+    payload = {
+        "choice": choice, "by": by, "at": at,
+        "mac": compute_mac(secret, run_dir, gate.name, choice, by, at),
+    }
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)

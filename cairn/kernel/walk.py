@@ -63,7 +63,14 @@ from cairn.kernel.config import Config
 from cairn.kernel.errors import CairnError
 from cairn.kernel.expr import EvalError, Expr
 from cairn.kernel.gatekeys import ensure_run_key
-from cairn.kernel.gatekit import GateNeedsHuman, gate_path, resolve_gate
+from cairn.kernel.gatekit import (
+    GateNeedsHuman,
+    GateTampered,
+    GateUnanswered,
+    read_verified_choice,
+    read_verified_decision,
+    resolve_gate,
+)
 from cairn.kernel.hookprobe import _looks_like_auth_failure
 from cairn.kernel.plan import (
     GateNode,
@@ -185,7 +192,7 @@ def bootstrap_run(
     if run_dir is not None:
         run_dir = Path(run_dir)
         created = create_run(run_dir.parent, run_dir.name, payload(run_dir.name))
-        ensure_run_key(created.name)  # mint the gate-decision secret before any gate commits
+        ensure_run_key(created)  # mint the gate-decision secret before any gate commits
         return created
 
     root = Path(runs_root) if runs_root is not None else workspace_dir / "runs"
@@ -199,7 +206,7 @@ def bootstrap_run(
             suffix += 1
             run_id = f"{base}-v{suffix}"
             continue
-        ensure_run_key(created.name)  # mint the gate-decision secret before any gate commits
+        ensure_run_key(created)  # mint the gate-decision secret before any gate commits
         return created
 
 
@@ -269,6 +276,7 @@ class _Walk:
         self._trail = None  # set in run()
         self._redactor: Callable[[str], str] | None = None  # built in run() from [secrets]
         self._schema_path = self.run_dir / ".cairn" / "step-return.json"
+        self._gate_nodes: dict[str, GateNode] | None = None  # name→GateNode, built lazily
 
     # -- top-level orchestration -------------------------------------------- #
 
@@ -752,8 +760,16 @@ class _Walk:
                 if not exists(resolve_path(decl, rendered, self.run_dir)):
                     raise _Halt(ExitCode.CONFIG, step.id, f"required input {name!r} is missing")
             else:  # a gate name
-                if not gate_path(self.run_dir, name).is_file():
-                    raise _Halt(ExitCode.CONFIG, step.id, f"required gate {name!r} is unanswered")
+                gate = self._gate_node(name)
+                if gate is None:
+                    raise _Halt(ExitCode.CONFIG, step.id, f"required gate {name!r} is unknown")
+                # Verify, not just exist: a forged file must not satisfy a gate dependency.
+                try:
+                    read_verified_decision(self.run_dir, gate, self._emit)
+                except (GateUnanswered, GateTampered) as exc:
+                    raise _Halt(
+                        ExitCode.CONFIG, step.id, f"required gate {name!r} is unanswered"
+                    ) from exc
 
     # -- environment (SECURITY §1.2 — deny by default) ---------------------- #
 
@@ -850,11 +866,16 @@ class _Walk:
             return str(self.run_dir / rendered)
 
         def gate(name: str) -> Any:
-            path = gate_path(self.run_dir, name)
-            if not path.is_file():
+            gate_node = self._gate_node(name)
+            if gate_node is None:
                 raise KeyError(name)
-
-            return json.loads(path.read_text(encoding="utf-8")).get("choice")
+            # A forged choice must never reach a rendered shell command. A tampered file is
+            # treated as unavailable (KeyError → command placeholder error → CONFIG halt); the
+            # accessor emits gate-tamper before we raise.
+            try:
+                return read_verified_choice(self.run_dir, gate_node, self._emit)
+            except (GateUnanswered, GateTampered) as exc:
+                raise KeyError(name) from exc
 
         return TemplateContext(
             params=self.plan.params,
@@ -948,15 +969,44 @@ class _Walk:
             raise EvalError(f"artifact {name!r} is not readable JSON: {exc}") from exc
         return self._index(doc, parts[1:], f"artifacts.{name}") if parts[1:] else doc
 
+    def _gate_node(self, name: str) -> GateNode | None:
+        """The GateNode named ``name`` anywhere in the plan (recursing parallels/loops), or None.
+
+        Needed by every gate-decision reader other than ``resolve_gate`` so it can run the SAME
+        MAC verification (the accessor needs the node's ``name`` for the MAC and ``options`` for
+        the membership check). Built once, cached.
+        """
+        if self._gate_nodes is None:
+            index: dict[str, GateNode] = {}
+
+            def collect(nodes) -> None:
+                for node in nodes:
+                    if isinstance(node, GateNode):
+                        index[node.name] = node
+                    elif isinstance(node, ParallelNode):
+                        collect(node.steps)
+                    elif isinstance(node, LoopNode):
+                        collect(node.body)
+
+            collect(self.plan.nodes)
+            self._gate_nodes = index
+        return self._gate_nodes.get(name)
+
     def _resolve_gate_ref(self, parts: tuple[str, ...]) -> Any:
         if not parts:
             raise EvalError("gates needs a name (e.g. gates.tone.choice)")
         name = parts[0]
-        path = gate_path(self.run_dir, name)
-        if not path.is_file():
-            raise EvalError(f"gate {name!r} is unanswered")
-
-        doc = json.loads(path.read_text(encoding="utf-8"))
+        gate = self._gate_node(name)
+        if gate is None:
+            raise EvalError(f"unknown gate {name!r} in expression")
+        # Verify the MAC here too: a compromised step can overwrite a legitimately-resolved
+        # decision file within the same walk, and `when:` control flow must not trust a forge.
+        try:
+            doc = read_verified_decision(self.run_dir, gate, self._emit)
+        except GateUnanswered as exc:
+            raise EvalError(f"gate {name!r} is unanswered") from exc
+        except GateTampered as exc:
+            raise EvalError(f"gate {name!r} decision failed authentication") from exc
         return self._index(doc, parts[1:], f"gates.{name}") if parts[1:] else doc
 
     # -- trail / run.json bookkeeping (locked, single-writer) --------------- #

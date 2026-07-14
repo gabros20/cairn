@@ -33,7 +33,13 @@ from cairn.kernel.batchkit import run_batch
 from cairn.kernel.compose import make_composer, render_artifact_path
 from cairn.kernel.config import Config, ExecutorConfig, installed_version, load_config, version_compat
 from cairn.kernel.errors import CairnError, ConfigError
-from cairn.kernel.gatekit import answer_gate, is_answered, read_choice
+from cairn.kernel.gatekit import (
+    GateTampered,
+    GateUnanswered,
+    answer_gate,
+    is_answered,
+    read_verified_choice,
+)
 from cairn.kernel.gckit import apply_gc, plan_gc
 from cairn.kernel.guards import build_shims
 from cairn.kernel.learnkit import collect_learnings, render_learnings
@@ -754,7 +760,15 @@ def _cmd_gate(args: argparse.Namespace) -> int:
 
     # (b) refuse to overwrite an already-recorded decision — explicit beats silent clobber.
     if is_answered(run_dir, name):
-        print(f"cairn: gate {name!r} is already answered ({read_choice(run_dir, name)!r}); refusing to overwrite", file=sys.stderr)
+        # Quote the recorded choice only if it AUTHENTICATES — never echo an unverified
+        # attacker-controlled value back to the operator as if it were the real decision.
+        try:
+            recorded = repr(read_verified_choice(run_dir, gate))
+        except GateTampered:
+            recorded = "unverifiable — decision file failed authentication"
+        except GateUnanswered:
+            recorded = "unreadable"
+        print(f"cairn: gate {name!r} is already answered ({recorded}); refusing to overwrite", file=sys.stderr)
         return int(ExitCode.CONFIG)
 
     # (c) the choice must be one of the gate's declared options.

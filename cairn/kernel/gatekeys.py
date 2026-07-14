@@ -10,10 +10,13 @@ The key path is derived from the run id alone (``run_dir.name``), so the writer 
 ``_commit`` / ``answer_gate``), the verifier (``resolve_gate``), and the mint site
 (``bootstrap_run``) all agree on it without plumbing the secret through call signatures.
 
+The key file name is ``<run_id>-<disc>.key`` where ``disc`` is a hash of the run dir's
+absolute path — so two runs that share a run_id in different workspaces get distinct keys.
+
 Location ladder (first that applies):
-    ``$XDG_STATE_HOME/cairn/gate-keys/<run_id>.key``
-    ``~/.local/state/cairn/gate-keys/<run_id>.key``   (HOME set, XDG_STATE_HOME not)
-    ``~/.cairn/gate-keys/<run_id>.key``               (neither set)
+    ``$XDG_STATE_HOME/cairn/gate-keys/<run_id>-<disc>.key``
+    ``~/.local/state/cairn/gate-keys/<run_id>-<disc>.key``   (HOME set, XDG_STATE_HOME not)
+    ``~/.cairn/gate-keys/<run_id>-<disc>.key``               (neither set)
 
 The dir is created 0700 and each key file 0600. Stdlib only (secrets/hmac/hashlib/json).
 """
@@ -41,18 +44,32 @@ def gate_keys_dir() -> Path:
     return Path.home() / ".cairn" / "gate-keys"
 
 
-def _key_path(run_id: str) -> Path:
-    return gate_keys_dir() / f"{run_id}.key"
+def _run_disc(run_dir: Path) -> str:
+    """A stable per-run discriminator: 12 hex of sha256 over the run dir's ABSOLUTE path.
+
+    ``run_id`` (``run_dir.name``) is timestamp-derived and collision-suffixed only WITHIN one
+    ``runs_root`` — two runs in different workspaces can share a run_id. Binding the absolute
+    dir path distinguishes them, so their keys and MACs never collide. ``Path.resolve()`` is
+    CWD-independent for an existing dir, so it is stable across ``run`` and ``resume``.
+    """
+    abspath = os.fspath(Path(run_dir).resolve())
+    return hashlib.sha256(abspath.encode("utf-8")).hexdigest()[:12]
 
 
-def ensure_run_key(run_id: str) -> bytes:
+def _key_path(run_dir: Path) -> Path:
+    # The discriminator is in the filename too, so a shared run_id across workspaces mints two
+    # distinct key files rather than the second run silently reusing the first's secret.
+    return gate_keys_dir() / f"{Path(run_dir).name}-{_run_disc(run_dir)}.key"
+
+
+def ensure_run_key(run_dir: Path) -> bytes:
     """Return the run's secret, minting + persisting a fresh 0600 key file if absent.
 
     Idempotent: an existing key file is REUSED (regenerating would invalidate every gate MAC
     the run has already committed). Called at run mint (``bootstrap_run``) and, as a safety
     net, by the writers — never by the verifier, which must fail safe on a missing key.
     """
-    path = _key_path(run_id)
+    path = _key_path(run_dir)
     existing = _read_key(path)
     if existing is not None:
         return existing
@@ -66,7 +83,14 @@ def ensure_run_key(run_id: str) -> bytes:
 
     secret = secrets.token_bytes(_KEY_BYTES)
     tmp = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # O_EXCL (not O_TRUNC) so the mint won't follow/truncate a pre-planted symlink in the key
+    # dir — defense in depth even though that dir lives outside the agent's write scope. A stale
+    # tmp from a crashed mint is unlinked and retried once.
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        os.unlink(tmp)
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         os.write(fd, secret)
     finally:
@@ -75,13 +99,13 @@ def ensure_run_key(run_id: str) -> bytes:
     return secret
 
 
-def load_run_key(run_id: str) -> bytes | None:
+def load_run_key(run_dir: Path) -> bytes | None:
     """Return the run's secret, or None if the key file is missing/unreadable/empty.
 
     Read-only: it NEVER mints. A None here means "cannot authenticate" — the verifier treats
     that as tamper (unresolved), never as "trust the file".
     """
-    return _read_key(_key_path(run_id))
+    return _read_key(_key_path(run_dir))
 
 
 def _read_key(path: Path) -> bytes | None:
@@ -92,20 +116,24 @@ def _read_key(path: Path) -> bytes | None:
     return data or None
 
 
-def _canonical_payload(gate: str, choice, by, at) -> bytes:
+def _canonical_payload(run_disc: str, gate: str, choice, by, at) -> bytes:
     """The exact byte serialization both writer and verifier sign — they must never drift.
 
     ``gate`` (the name) is IN the payload so a valid decision for gate A cannot be replayed at
-    gate B's path. Sorted keys + tight separators pin one canonical form across Python builds.
+    gate B's path; ``run`` (the per-run discriminator) is in it so a decision cannot be replayed
+    into a different run that happens to share a run_id. Sorted keys + tight separators pin one
+    canonical form across Python builds.
     """
     return json.dumps(
-        {"gate": gate, "choice": choice, "by": by, "at": at},
+        {"run": run_disc, "gate": gate, "choice": choice, "by": by, "at": at},
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
     ).encode("utf-8")
 
 
-def compute_mac(secret: bytes, gate: str, choice, by, at) -> str:
-    """HMAC-SHA256 hex digest over the canonical ``{gate,choice,by,at}`` payload."""
-    return hmac.new(secret, _canonical_payload(gate, choice, by, at), hashlib.sha256).hexdigest()
+def compute_mac(secret: bytes, run_dir: Path, gate: str, choice, by, at) -> str:
+    """HMAC-SHA256 hex digest over the canonical ``{run,gate,choice,by,at}`` payload."""
+    return hmac.new(
+        secret, _canonical_payload(_run_disc(run_dir), gate, choice, by, at), hashlib.sha256
+    ).hexdigest()
