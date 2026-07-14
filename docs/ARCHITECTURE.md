@@ -192,6 +192,19 @@ guarded command is still caught by the shim and the post validator, not by a nat
 `--hook-check` install path is unit-tested; the live "claude actually blocks" fact is confirmed
 per-machine by `cairn doctor --probe-hooks`, not by the unit suite.)*
 
+*Both the shim and hook manifests (the guard decls a command is checked against) live OUTSIDE the run
+dir in the gatekeys-protected state dir and are **authenticated**: a per-run HMAC over the manifest
+content plus a sha256 of each check script, keyed by the run secret held outside the agent's write
+scope (`gatekeys`). A sandboxed executor (codex `--sandbox workspace-write`) therefore cannot rewrite
+the policy — the manifest is not in its cwd; and even under claude `bypassPermissions` (whole-FS write)
+a rewritten manifest or a swapped check script **fails verification and denies** (fail-closed) unless
+the agent also steals the run secret. What the `hook` does NOT do is widen the matcher: it uses the
+SAME `fnmatch` glob as the shim, so an absolute-path / `sh -c` / `env`-prefixed / leading-space
+invocation of a guarded binary MISSES the glob and is caught only by `post` — the hook does **not**
+backstop the shim's absolute-path gap (corrected: earlier text claimed it did). Closing the claude
+`bypassPermissions` residual outright (an OS FS-sandbox or tool-scoping so claude cannot read the run
+secret or write outside the run dir) is tracked as **W3c**.*
+
 **The C4 probe settles a specific burden.** The `claude` executor runs headless with
 `--permission-mode bypassPermissions` (it must — see API §7 / SECURITY §1.2: the default mode refuses
 every tool use and the guards are the enforcement layer instead of an interactive prompt). That made

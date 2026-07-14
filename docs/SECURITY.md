@@ -100,9 +100,19 @@ An injected instruction that a model obeys still cannot exceed the step's cage:
   tried them. Enforced today by the **shim** (any executor) and the **post** validator (always on);
   for `claude` the native **hook** layer also installs now (`install_guards` writes a `PreToolUse`
   hook running the same guard chain, fail-closed — ARCHITECTURE §4), while `codex`/`grok` hook
-  install is still a no-op there (shim + post carry them). One per-executor caveat: grok's native
-  hook layer fails open on hook crash/timeout/malformed output, so its shim and post layers carry the
-  backstop even once its hook install lands;
+  install is still a no-op there (shim + post carry them). The guard manifests (shim AND hook) and
+  the check scripts they name are **integrity-protected**: each manifest lives OUTSIDE the run dir
+  (gatekeys-protected state dir) and is HMAC-signed with the per-run secret, and each check script's
+  sha256 is signed in; the shim/hook re-verify both at decision time and **fail closed** on any
+  mismatch. So under a **write-sandboxed** executor (codex `workspace-write`) the guard inputs are
+  tamper-proof — the agent cannot write outside its cwd. Under **claude `bypassPermissions`** the
+  agent has whole-FS access, so file-based guards are defense-in-depth: tamper (rewritten manifest or
+  swapped check) is **DETECTED and denied** unless the agent steals the per-run secret, and `post`
+  remains the hard gate. The definitive claude fix — an OS FS-sandbox / tool-scoping so claude cannot
+  read the secret or write outside the run dir — is tracked as **W3c**. Two per-executor caveats: the
+  hook uses the same glob as the shim, so it does NOT catch absolute-path / `sh -c` / `env`-prefixed
+  invocations (only `post` does); and grok's native hook fails open on hook crash/timeout/malformed
+  output, so its shim and post layers carry the backstop even once its hook install lands;
 - **gates** — the two irreversible crossings (CMS populate, deploy) sit behind human gates, with
   headless defaults of *no*, and the deploy allowlist pins the org;
 - **isolation** — cwd is the run dir; a compromised step cannot reach sibling runs;
