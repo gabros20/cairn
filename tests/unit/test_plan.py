@@ -507,6 +507,163 @@ def test_guard_with_bare_binary_match_command_plans_green(tmp_path):
     assert [g.name for g in p.guards] == ["evil"]
 
 
+# --------------------------------------------------------------------------- #
+# W3b — enforce enum validation (codex-F13 / claude-F10) + effective-layer warnings.
+# --------------------------------------------------------------------------- #
+
+
+def _guard_steps_enforce(match_command: str, enforce: str) -> str:
+    return (
+        "  - { id: one, run: 'echo', produces: [a] }\n"
+        "guards:\n"
+        "  - name: evil\n"
+        f"    match: {{ tool: bash, command: {match_command!r} }}\n"
+        "    check: guards/check.sh\n"
+        f"    enforce: [{enforce}]\n"
+    )
+
+
+def test_enforce_typo_layer_is_a_config_error(tmp_path):
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps_enforce("brease *", "shimm"), extra=_GUARD_CHECK)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    assert "evil" in str(exc.value) and "shimm" in str(exc.value)
+
+
+def test_enforce_bogus_layer_is_a_config_error(tmp_path):
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps_enforce("brease *", "bogus"), extra=_GUARD_CHECK)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    assert "evil" in str(exc.value) and "bogus" in str(exc.value)
+
+
+def test_enforce_empty_is_a_config_error(tmp_path):
+    steps = (
+        "  - { id: one, run: 'echo', produces: [a] }\n"
+        "guards:\n"
+        "  - name: evil\n"
+        "    match: { tool: bash, command: 'brease *' }\n"
+        "    check: guards/check.sh\n"
+        "    enforce: []\n"
+    )
+    ws = _write_ws(tmp_path, _HEADER + steps, extra=_GUARD_CHECK)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    assert "evil" in str(exc.value) and "empty" in str(exc.value)
+
+
+def test_enforce_hook_and_post_plans_green(tmp_path):
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps_enforce("brease *", "hook, post"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW)
+    assert [g.enforce for g in p.guards] == [("hook", "post")]
+
+
+def test_enforce_shim_alone_plans_green(tmp_path):
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps_enforce("brease *", "shim"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW)
+    assert [g.enforce for g in p.guards] == [("shim",)]
+
+
+def _write_multi_exec_ws(tmp_path: Path, pipeline_yaml: str, *, extra=None) -> Path:
+    """Like ``_write_ws`` but claude/codex/grok are all configured with matching tiers, and
+    an agent named ``worker`` exists — for the effective-pre-execution-layer warning tests,
+    which need a real resolved-executor set to check ``installs_hooks`` against."""
+    ws = tmp_path / "ws"
+    (ws / "pipelines").mkdir(parents=True)
+    (ws / "schemas").mkdir()
+    (ws / "validators").mkdir()
+    (ws / "agents").mkdir()
+    tiers = (
+        "[executors.{ex}]\nenabled = true\n[executors.{ex}.tiers]\n"
+        'reasoning = {{ model = "m1", effort = "high" }}\n'
+        'balanced = {{ model = "m2", effort = "medium" }}\n'
+        'cheap = {{ model = "m3", effort = "low" }}\n'
+    )
+    (ws / "cairn.toml").write_text(
+        '[workspace]\nname = "t"\ndefault_executor = "claude"\n'
+        + tiers.format(ex="claude")
+        + tiers.format(ex="codex")
+        + tiers.format(ex="grok")
+        + "[secrets]\nOK_TOKEN = {}\n",
+        encoding="utf-8",
+    )
+    (ws / "schemas" / "s.json").write_text('{"type":"object"}', encoding="utf-8")
+    (ws / "validators" / "v.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    (ws / "pipelines" / "p.yaml").write_text(pipeline_yaml, encoding="utf-8")
+    (ws / "agents" / "worker.yaml").write_text(
+        "tier: balanced\ntools: { allow: [read] }\n", encoding="utf-8"
+    )
+    for rel, body in (extra or {}).items():
+        target = ws / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+    return ws
+
+
+def _guarded_agent_steps(enforce: str) -> str:
+    return (
+        "  - { id: one, agent: worker, produces: [a] }\n"
+        "guards:\n"
+        "  - name: no-deploy\n"
+        "    match: { tool: bash, command: 'deploy *' }\n"
+        "    check: guards/check.sh\n"
+        f"    enforce: [{enforce}]\n"
+    )
+
+
+def test_hook_only_guard_warns_when_no_resolved_executor_installs_hooks(tmp_path):
+    ws = _write_multi_exec_ws(tmp_path, _HEADER + _guarded_agent_steps("hook"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW, executor="codex")
+    warns = [w.message for w in p.warnings if w.level == "warning"]
+    assert any(
+        "no-deploy" in w and "no configured executor installs hooks" in w and "NOT blocked" in w
+        for w in warns
+    )
+
+
+def test_hook_only_guard_under_grok_also_warns(tmp_path):
+    ws = _write_multi_exec_ws(tmp_path, _HEADER + _guarded_agent_steps("hook"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW, executor="grok")
+    assert any("no-deploy" in w.message for w in p.warnings if w.level == "warning")
+
+
+def test_hook_only_guard_under_claude_does_not_warn(tmp_path):
+    ws = _write_multi_exec_ws(tmp_path, _HEADER + _guarded_agent_steps("hook"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW, executor="claude")
+    assert not [w for w in p.warnings if "no-deploy" in w.message]
+
+
+def test_shim_guard_never_warns_regardless_of_executor(tmp_path):
+    ws = _write_multi_exec_ws(tmp_path, _HEADER + _guarded_agent_steps("shim"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW, executor="codex")
+    assert not [w for w in p.warnings if "no-deploy" in w.message]
+
+
+def test_post_only_guard_always_warns(tmp_path):
+    ws = _write_multi_exec_ws(tmp_path, _HEADER + _guarded_agent_steps("post"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW, executor="claude")
+    warns = [w.message for w in p.warnings if w.level == "warning"]
+    assert any("no-deploy" in w and "backstop only" in w for w in warns)
+
+
+def test_zero_guards_with_agent_steps_gets_one_info_warning(tmp_path):
+    steps = "  - { id: one, agent: worker, produces: [a] }\n"
+    ws = _write_ws(
+        tmp_path, _HEADER + steps, agents={"worker": "tier: balanced\ntools: { allow: [read] }\n"}
+    )
+    p = plan(ws, "p", {}, now=NOW)
+    infos = [w for w in p.warnings if w.level == "info" and "no guards declared" in w.message]
+    assert len(infos) == 1
+
+
+def test_zero_guards_with_no_agent_steps_is_silent(tmp_path):
+    # A pure run:/shell pipeline has no agent tool use to warn about.
+    steps = "  - { id: one, run: 'echo', produces: [a] }\n"
+    ws = _write_ws(tmp_path, _HEADER + steps)
+    p = plan(ws, "p", {}, now=NOW)
+    assert not [w for w in p.warnings if "no guards declared" in w.message]
+
+
 def test_artifact_ref_inside_an_artifact_path_is_an_error(tmp_path):
     yaml_text = (
         "pipeline: p\nversion: 1\nrun_id: \"p-{date}\"\n"

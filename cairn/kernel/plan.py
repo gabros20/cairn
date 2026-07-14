@@ -1142,6 +1142,12 @@ def _lint_conditional_gates(raw_nodes: list, ctx: _Ctx) -> None:
 # _binary_name the other way round (plan.py → guards.py) would be circular.
 _GLOB_STOP = set(" \t*?[")
 
+# The supported `enforce:` layers (docs/ARCHITECTURE.md §4). Defined once, referenced by
+# _parse_guards' validation below AND by the effective-layer predicate near plan()'s emit —
+# codex-F13 / claude-F10: an unknown or empty `enforce` used to plan clean and silently
+# enforce nothing (or only the layer whose name happened to match).
+GUARD_LAYERS = ("hook", "shim", "post")
+
 
 def _binary_name(pattern: str) -> str:
     """The real binary a ``match_command`` guards: its literal prefix up to the first
@@ -1177,6 +1183,22 @@ def _parse_guards(raw_guards: Any, ctx: _Ctx) -> list[GuardDecl]:
             _err(f"guard {name!r}: on_error must be 'allow' or 'deny', got {on_error!r}", ctx.file)
 
         enforce = tuple(g.get("enforce", []) or [])
+        # codex-F13 / claude-F10: an unknown or empty `enforce` used to plan clean and
+        # silently enforce nothing (or only whichever layer happened to spell right) — that's
+        # a config bug, not a silent no-op, so reject it here rather than let it plan quiet.
+        unknown = [e for e in enforce if e not in GUARD_LAYERS]
+        if unknown:
+            _err(
+                f"guard {name!r}: enforce has unknown layer(s) {unknown!r} — must be one or "
+                f"more of {GUARD_LAYERS!r}",
+                ctx.file,
+            )
+        if not enforce:
+            _err(
+                f"guard {name!r}: enforce is empty — a guard that declares no layer enforces "
+                f"nothing; declare at least one of {GUARD_LAYERS!r}",
+                ctx.file,
+            )
         if "shim" in enforce:
             # codex-F4 (critical): build_shims derives the shimmed binary from this same
             # prefix (guards.py:_binary_name) and does `shim_dir / binary` — a binary with a
@@ -1215,6 +1237,87 @@ def _parse_guards(raw_guards: Any, ctx: _Ctx) -> list[GuardDecl]:
             )
         )
     return out
+
+
+# --------------------------------------------------------------------------- #
+# claude-F10 — warn when a guard has no EFFECTIVE pre-execution layer for THIS plan's
+# resolved executor(s). `_parse_guards` above already rejects a garbage `enforce`; this is
+# the honesty check one level up — a *valid* `enforce` can still enforce nothing in practice
+# (e.g. `hook`-only under codex/grok, which don't install one). Never an error: an
+# under-enforced guard is a legitimate (if risky) authoring choice — the point is to stop it
+# being a SILENT one.
+# --------------------------------------------------------------------------- #
+
+
+def _installs_hooks(exec_name: str) -> bool:
+    """Whether cairn's own ``install_guards`` for ``exec_name`` wires a real pre-execution
+    blocking hook — read from the executor plugin's own ``Capabilities.installs_hooks`` (the
+    single source of truth, ``cairn/executors/*.py``), never hardcoded here, so a third-party
+    plugin's honest claim is respected exactly like the four built-ins. Loaded lazily via
+    ``cairn.cli``'s entry-point registry (a function-local import, matching
+    ``doctor.py:_doctor_probe_hooks`` — importing ``cairn.cli`` at module scope would cycle,
+    since ``cli.py`` imports ``plan`` at module scope). A plugin that fails to load, or isn't
+    registered, can't be credited with installing a hook — conservative default False; this is
+    a warning enrichment, never a reason to fail planning."""
+    from cairn.cli import load_executor_class
+
+    try:
+        return bool(load_executor_class(exec_name).capabilities.installs_hooks)
+    except Exception:
+        return False
+
+
+def _warn_ineffective_guards(
+    guards: list[GuardDecl],
+    resolved_models: dict[str, tuple[str, str, str | None]],
+    warnings: list[Finding],
+) -> None:
+    """Append one warning per guard whose ``enforce`` yields no effective pre-execution layer
+    (see the section note above). Effective iff: ``"shim" in enforce`` (always wired for shim
+    guards) OR (``"hook" in enforce`` AND some executor this plan resolves has
+    ``installs_hooks``). ``post``-only is never pre-execution — it's the artifact-validator
+    backstop, which cannot stop a side-effecting command before it runs.
+
+    Also: if the plan has agent steps (``resolved_models`` non-empty) and declares ZERO guards
+    at all, one informational warning — agent tool use is otherwise wholly unrestricted before
+    execution."""
+    if not guards:
+        if resolved_models:
+            warnings.append(
+                Finding(
+                    "info",
+                    "no guards declared — agent tool use is unrestricted before execution; "
+                    "only the post artifact-validator applies",
+                )
+            )
+        return
+
+    exec_names = {exec_name for exec_name, _model, _effort in resolved_models.values()}
+    any_installs_hooks = any(_installs_hooks(name) for name in exec_names)
+
+    for guard in guards:
+        if "shim" in guard.enforce:
+            continue
+        if "hook" in guard.enforce and any_installs_hooks:
+            continue
+        if "hook" in guard.enforce:
+            warnings.append(
+                Finding(
+                    "warning",
+                    f"guard {guard.name!r}: enforce={guard.enforce!r} but no configured "
+                    "executor installs hooks (claude installs; codex/grok do not) — only the "
+                    "post validator applies; the command is NOT blocked before it runs",
+                )
+            )
+        else:  # enforce == ("post",) — the only remaining valid, non-empty combination
+            warnings.append(
+                Finding(
+                    "warning",
+                    f"guard {guard.name!r}: enforce={guard.enforce!r} — post is a backstop "
+                    "only (the artifact validator; it cannot stop a side-effecting command "
+                    "before it runs) — no pre-execution layer is configured",
+                )
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -1542,6 +1645,11 @@ def plan(
     guards = _parse_guards(doc.get("guards", []), ctx)
 
     emitted, resolved_models = _emit(active, executor, step_executors, config, from_node, to_node, str(pfile))
+
+    # claude-F10: honest enforcement — warn (never error) when a guard's declared enforce
+    # layers yield no effective pre-execution block for THIS plan's resolved executor(s), or
+    # when agent steps run wholly unguarded. Only in range guards + resolved_models are used.
+    _warn_ineffective_guards(guards, resolved_models, warnings)
 
     # Range-scoped tool preflight — offline; the workspace-wide scan is a lazy fallback
     # that only runs for a needed_by target the current pipeline can't account for. The
