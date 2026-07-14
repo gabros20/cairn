@@ -19,7 +19,16 @@ from pathlib import Path
 
 import pytest
 
-from cairn.kernel.guards import CheckResult, build_shims, matches, run_check
+import io
+
+from cairn.kernel.guards import (
+    CheckResult,
+    build_manifest,
+    build_shims,
+    main,
+    matches,
+    run_check,
+)
 from cairn.kernel.plan import GuardDecl
 
 CHECKS = Path(__file__).parent / "fixtures" / "guard-checks"
@@ -436,3 +445,143 @@ def test_shim_no_recursion_when_shim_dir_appears_twice_on_path(
     )
     assert result.returncode == 7, result.stderr  # resolved to the real binary, no recursion
     assert record.read_text().strip() == "status"
+
+
+# --------------------------------------------------------------------------- #
+# The --hook-check entry: stdin PreToolUse event → deny-JSON on stdout / silent allow.
+# --------------------------------------------------------------------------- #
+
+
+def _write_hook_manifest(path: Path, guards, workspace_dir: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(build_manifest(guards, workspace_dir=workspace_dir)), encoding="utf-8"
+    )
+
+
+def _run_hook_check(
+    names, event, *, manifest_path, run_dir, monkeypatch, capsys
+) -> tuple[int, str]:
+    """Drive ``main(["--hook-check", …])`` in-process: patch stdin to the PreToolUse event JSON,
+    point CAIRN_HOOK_MANIFEST/CAIRN_RUN_DIR, capture stdout."""
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(event) if event is not None else "x"))
+    if manifest_path is None:
+        monkeypatch.delenv("CAIRN_HOOK_MANIFEST", raising=False)
+    else:
+        monkeypatch.setenv("CAIRN_HOOK_MANIFEST", str(manifest_path))
+    monkeypatch.setenv("CAIRN_RUN_DIR", str(run_dir))
+    code = main(["--hook-check", *names])
+    return code, capsys.readouterr().out
+
+
+def _bash_event(command: str) -> dict:
+    return {"tool_name": "Bash", "tool_input": {"command": command}}
+
+
+def test_hook_check_denies_with_deny_json_on_stdout(tmp_path, monkeypatch, capsys) -> None:
+    manifest = tmp_path / ".cairn" / "hook-manifest.json"
+    _write_hook_manifest(
+        manifest, [guard("deny_all.py", name="no-media", command="brease*")], tmp_path
+    )
+    code, out = _run_hook_check(
+        ["no-media"], _bash_event("brease media createMedia x.png"),
+        manifest_path=manifest, run_dir=tmp_path, monkeypatch=monkeypatch, capsys=capsys,
+    )
+    assert code == 0  # the deny is carried by the stdout JSON, not the exit code
+    payload = json.loads(out)
+    assert payload["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "screenshot may not become media" in (
+        payload["hookSpecificOutput"]["permissionDecisionReason"]
+    )
+
+
+def test_hook_check_allows_silently(tmp_path, monkeypatch, capsys) -> None:
+    manifest = tmp_path / ".cairn" / "hook-manifest.json"
+    _write_hook_manifest(
+        manifest, [guard("allow_all.py", name="ok", command="brease*")], tmp_path
+    )
+    code, out = _run_hook_check(
+        ["ok"], _bash_event("brease status"),
+        manifest_path=manifest, run_dir=tmp_path, monkeypatch=monkeypatch, capsys=capsys,
+    )
+    assert code == 0
+    assert out == ""  # allow → no output at all
+
+
+def test_hook_check_allows_when_glob_does_not_match(tmp_path, monkeypatch, capsys) -> None:
+    manifest = tmp_path / ".cairn" / "hook-manifest.json"
+    # deny_all would deny IF it matched — but the command isn't a brease* command, so the guard
+    # simply doesn't apply → allow.
+    _write_hook_manifest(
+        manifest, [guard("deny_all.py", name="no-media", command="brease*")], tmp_path
+    )
+    code, out = _run_hook_check(
+        ["no-media"], _bash_event("ls -la"),
+        manifest_path=manifest, run_dir=tmp_path, monkeypatch=monkeypatch, capsys=capsys,
+    )
+    assert code == 0
+    assert out == ""
+
+
+def test_hook_check_allows_when_no_command_in_event(tmp_path, monkeypatch, capsys) -> None:
+    manifest = tmp_path / ".cairn" / "hook-manifest.json"
+    _write_hook_manifest(
+        manifest, [guard("deny_all.py", name="no-media", command="brease*")], tmp_path
+    )
+    # A non-command tool (Read) carries no command string → no command guard can apply → allow.
+    code, out = _run_hook_check(
+        ["no-media"], {"tool_name": "Read", "tool_input": {"file_path": "x"}},
+        manifest_path=manifest, run_dir=tmp_path, monkeypatch=monkeypatch, capsys=capsys,
+    )
+    assert code == 0
+    assert out == ""
+
+
+def test_hook_check_fails_closed_on_missing_manifest(tmp_path, monkeypatch, capsys) -> None:
+    # Manifest path unset AND the run-dir fallback has no manifest → cannot decide → BLOCK.
+    code, out = _run_hook_check(
+        ["no-media"], _bash_event("brease media createMedia x.png"),
+        manifest_path=None, run_dir=tmp_path, monkeypatch=monkeypatch, capsys=capsys,
+    )
+    assert code != 0  # fail-closed: non-zero exit
+    assert json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_hook_check_fails_closed_on_malformed_stdin(tmp_path, monkeypatch, capsys) -> None:
+    manifest = tmp_path / ".cairn" / "hook-manifest.json"
+    _write_hook_manifest(
+        manifest, [guard("deny_all.py", name="no-media", command="brease*")], tmp_path
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO("this is not json"))
+    monkeypatch.setenv("CAIRN_HOOK_MANIFEST", str(manifest))
+    monkeypatch.setenv("CAIRN_RUN_DIR", str(tmp_path))
+    code = main(["--hook-check", "no-media"])
+    out = capsys.readouterr().out
+    assert code != 0  # fail-closed
+    assert json.loads(out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_hook_and_shim_agree_on_a_matched_deny(tmp_path, monkeypatch, capsys) -> None:
+    """The shared chain (_run_chain) means both entries reach the SAME verdict on the same
+    guard+command: the shim exits 2 (deny), the hook prints deny-JSON."""
+    g = guard("deny_all.py", name="no-media", command="brease*")
+    command = "brease media createMedia x.png"
+
+    # --hook-check
+    hook_manifest = tmp_path / ".cairn" / "hook-manifest.json"
+    _write_hook_manifest(hook_manifest, [g], tmp_path)
+    hook_code, hook_out = _run_hook_check(
+        ["no-media"], _bash_event(command),
+        manifest_path=hook_manifest, run_dir=tmp_path, monkeypatch=monkeypatch, capsys=capsys,
+    )
+    assert hook_code == 0
+    assert json.loads(hook_out)["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    # --shim-check on the SAME guard+command
+    shim_manifest = tmp_path / "shims" / "manifest.json"
+    _write_hook_manifest(shim_manifest, [g], tmp_path)
+    monkeypatch.setenv("CAIRN_SHIM_MANIFEST", str(shim_manifest))
+    monkeypatch.setenv("CAIRN_SHIM_COMMAND", command)
+    monkeypatch.setenv("CAIRN_SHIM_TOOL", "bash")
+    monkeypatch.setenv("CAIRN_RUN_DIR", str(tmp_path))
+    assert main(["--shim-check", "no-media"]) == 2  # shim's deny contract, unchanged

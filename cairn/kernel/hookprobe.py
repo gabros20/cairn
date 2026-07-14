@@ -50,6 +50,7 @@ from typing import Literal
 # reuses them so a canary invocation runs through exactly the same subprocess machinery a real
 # step does (streamed log, group-kill on timeout, EXACT env — never os.environ).
 from cairn.executors.base import ExecTimeout, run_process
+from cairn.kernel.guards import deny_json
 
 Outcome = Literal["fires_blocks", "fires_no_block", "no_fire", "no_mechanism", "inconclusive"]
 
@@ -64,15 +65,9 @@ _SIDECAR_REL = f"{_PROBE_SUBDIR}/sidecar"
 # INSTALLED binaries (claude 2.1.199, codex-cli 0.142.5): both honor a `hookSpecificOutput`
 # object with `permissionDecision: "deny"` for PreToolUse (grep of each binary's embedded hook
 # schema — PreToolUsePermissionDecisionWire = {allow, deny, ask}; deny needs a non-empty reason).
-_DENY_JSON = json.dumps(
-    {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": "cairn hook probe: blocked by design",
-        }
-    }
-)
+# ONE builder (kernel.guards.deny_json) shared with the production `--hook-check` entry so the
+# probe canary and the real hook can never drift.
+_DENY_JSON = deny_json("cairn hook probe: blocked by design")
 
 # grok's PreToolUse deny shape is DIFFERENT from claude/codex: a top-level
 # ``{"decision": "deny", "reason": ...}`` on stdout, honored REGARDLESS of exit code (grok

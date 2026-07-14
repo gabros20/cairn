@@ -9,7 +9,10 @@ wires them to executors.
 Layers (ARCHITECTURE §4 matrix):
 
 * ``hook`` — the executor's native pre-tool hook (Claude deny-JSON, Grok exit-2, Codex if it
-  fires). Executor-specific; not built here.
+  fires). The install is executor-specific (``ClaudeExecutor.install_guards`` writes the
+  ``PreToolUse`` settings), but the DECISION runs here: the ``--hook-check`` entry reads the
+  PreToolUse event from stdin and runs the SAME guard chain as ``--shim-check`` (``_run_chain``),
+  blocking via deny-JSON on stdout and failing CLOSED on any error.
 * ``shim`` — a PATH wrapper this module installs (``build_shims``) that works on *any* executor,
   even a bare shell. It reconstructs the command line, runs the guard chain via
   ``python -m cairn.kernel.guards --shim-check``, and — on allow — execs the real binary found on
@@ -244,6 +247,38 @@ def _guard_json(guard: GuardDecl) -> dict[str, object]:
     }
 
 
+def build_manifest(
+    guards: Sequence[GuardDecl], *, workspace_dir: Path
+) -> dict[str, object]:
+    """The compact ``{workspace_dir, guards:{name:decl}}`` a guard-check entry re-loads.
+
+    ONE shape shared by the shim manifest (``build_shims``) and the hook manifest
+    (``ClaudeExecutor.install_guards``) so ``--shim-check`` and ``--hook-check`` read the same
+    thing — a drift between the two would be a security bug."""
+    return {
+        "workspace_dir": str(workspace_dir),
+        "guards": {g.name: _guard_json(g) for g in guards},
+    }
+
+
+def deny_json(reason: str) -> str:
+    """The claude/codex ``PreToolUse`` deny payload (printed to STDOUT to BLOCK a tool).
+
+    claude/codex honor ``hookSpecificOutput.permissionDecision == "deny"`` for ``PreToolUse``
+    (verified against claude 2.1.199 / codex-cli 0.142.5 — see hookprobe). The single builder
+    both the production ``--hook-check`` entry and the ``hookprobe`` canary use, so the two can
+    never drift. ``reason`` becomes ``permissionDecisionReason`` (must be non-empty)."""
+    return json.dumps(
+        {
+            "hookSpecificOutput": {
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "deny",
+                "permissionDecisionReason": reason,
+            }
+        }
+    )
+
+
 def build_shims(
     guards: Sequence[GuardDecl], *, shim_dir: Path, workspace_dir: Path
 ) -> dict[str, str]:
@@ -289,10 +324,7 @@ def build_shims(
         if _SHIM_MARKER in head:  # only sweep files we generated; leave foreign files alone
             entry.unlink()
 
-    manifest = {
-        "workspace_dir": str(workspace_dir),
-        "guards": {g.name: _guard_json(g) for g in guards},
-    }
+    manifest = build_manifest(guards, workspace_dir=workspace_dir)
     (shim_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )
@@ -336,19 +368,44 @@ def _load_manifest_guard(name: str, raw: dict[str, object]) -> GuardDecl:
     )
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """The ``python -m cairn.kernel.guards --shim-check NAME...`` entry a shim calls.
+def _run_chain(
+    names: Sequence[str],
+    guards_raw: dict,
+    *,
+    tool: str,
+    command: str,
+    workspace_dir: Path,
+    run_dir: Path,
+    env: dict[str, str],
+) -> CheckResult:
+    """Run the guard chain for ``names`` against ``(tool, command)`` — the ONE enforcement loop
+    both ``--shim-check`` and ``--hook-check`` call, so the two layers can never diverge (a
+    divergence between shim and hook enforcement is a security bug). Each named guard is loaded
+    from the manifest, ``matches``-filtered, then ``run_check``-ed; the FIRST deny wins and is
+    returned. No matching deny → an allow. Callers own how a deny is COMMUNICATED (shim: exit 2 +
+    stderr; hook: deny-JSON on stdout)."""
+    for name in names:
+        raw = guards_raw.get(name)
+        if raw is None:
+            continue
+        g = _load_manifest_guard(name, raw)
+        if not matches(g, tool=tool, command=command):
+            continue
+        result = run_check(
+            g,
+            command=command,
+            env=env,
+            run_dir=run_dir,
+            workspace_dir=workspace_dir,
+        )
+        if not result.allowed:
+            return result
+    return CheckResult(allowed=True, reason=None)
 
-    Reads the invoked command / run dir / manifest from the ``CAIRN_*`` env the shim exports,
-    re-loads the named guards from the manifest, and runs the chain (matches → run_check). Exit
-    0 → allow (the shim then execs the real binary); exit 2 → deny with the reason on stderr.
-    """
-    args = list(sys.argv[1:] if argv is None else argv)
-    if not args or args[0] != "--shim-check":
-        print("usage: python -m cairn.kernel.guards --shim-check NAME...", file=sys.stderr)
-        return 2  # fail-closed: a malformed invocation must not wave a command through
-    names = args[1:]
 
+def _shim_check(names: Sequence[str]) -> int:
+    """The ``--shim-check`` body: reads the command / run dir / manifest from the ``CAIRN_*`` env
+    the shim exports, runs the chain, and returns exit 0 (allow) / 2 (deny, reason on stderr)."""
     manifest_path = os.environ.get("CAIRN_SHIM_MANIFEST")
     if not manifest_path:
         shim_dir = os.environ.get("CAIRN_SHIM_DIR")
@@ -364,24 +421,114 @@ def main(argv: Sequence[str] | None = None) -> int:
     tool = os.environ.get("CAIRN_SHIM_TOOL", "bash")
     run_dir = Path(os.environ.get("CAIRN_RUN_DIR", os.getcwd()))
 
-    for name in names:
-        raw = guards_raw.get(name)
-        if raw is None:
-            continue
-        g = _load_manifest_guard(name, raw)
-        if not matches(g, tool=tool, command=command):
-            continue
-        result = run_check(
-            g,
-            command=command,
-            env=dict(os.environ),
-            run_dir=run_dir,
-            workspace_dir=workspace_dir,
-        )
-        if not result.allowed:
-            print(result.reason or "denied", file=sys.stderr)
-            return 2
+    result = _run_chain(
+        names, guards_raw, tool=tool, command=command,
+        workspace_dir=workspace_dir, run_dir=run_dir, env=dict(os.environ),
+    )
+    if not result.allowed:
+        print(result.reason or "denied", file=sys.stderr)
+        return 2
     return 0
+
+
+# Map a claude/codex PreToolUse ``tool_name`` to a cairn guard tool. cairn's guards are command
+# guards; ``Bash`` → ``bash`` is the real case (the shim layer covers the same). Any other tool
+# lowercases through — a guard with a matching ``match_tool`` still applies, and a Bash-only guard
+# simply won't ``match``.
+def _hook_command(event: dict) -> tuple[str, str | None]:
+    """From a PreToolUse event ``{"tool_name", "tool_input"}`` derive ``(tool, command)``. The
+    command is ``tool_input.command`` (Bash and other command-carrying tools). A tool with no
+    command string yields ``None`` — no command-glob guard can apply, so the caller allows."""
+    tool = str(event.get("tool_name", "")).lower()
+    tool_input = event.get("tool_input")
+    command = tool_input.get("command") if isinstance(tool_input, dict) else None
+    return tool, command if isinstance(command, str) and command else None
+
+
+def _hook_fail_closed(reason: str) -> int:
+    """A claude ``PreToolUse`` hook that cannot reach a decision must BLOCK, never wave the tool
+    through. Emit the deny-JSON (stdout is HOW a PreToolUse hook denies) AND exit non-zero — the
+    fail-closed contract. Contrast ``--shim-check``'s exit-2-on-error."""
+    sys.stdout.write(deny_json(reason))  # no trailing newline — mirrors the probe-verified form
+    return 1
+
+
+def _hook_check(names: Sequence[str]) -> int:
+    """The ``--hook-check`` body a claude ``PreToolUse`` hook invokes. Reads the event JSON from
+    STDIN, runs the SAME guard chain as ``--shim-check`` (``_run_chain``), and blocks by printing
+    the deny-JSON to STDOUT. ALLOW → no output, exit 0. Any error (unreadable stdin, missing
+    manifest, malformed guard) FAILS CLOSED via ``_hook_fail_closed`` — a hook that cannot decide
+    must never silently allow.
+
+    The manifest path comes from ``CAIRN_HOOK_MANIFEST`` (baked absolute into the hook command by
+    install_guards), falling back to ``<CAIRN_RUN_DIR>/.cairn/hook-manifest.json``; both resolve
+    at hook-fire time because the hook inherits the executor's env."""
+    try:
+        raw_event = sys.stdin.read()
+        event = json.loads(raw_event) if raw_event.strip() else None
+        if not isinstance(event, dict):
+            raise ValueError("PreToolUse event is not a JSON object")
+    except (ValueError, OSError) as exc:
+        return _hook_fail_closed(f"cairn hook: unreadable PreToolUse event ({exc})")
+
+    tool, command = _hook_command(event)
+    if command is None:
+        return 0  # no command string → no command guard applies → allow
+
+    manifest_path = os.environ.get("CAIRN_HOOK_MANIFEST")
+    if not manifest_path:
+        run_dir_env = os.environ.get("CAIRN_RUN_DIR")
+        manifest_path = (
+            str(Path(run_dir_env) / ".cairn" / "hook-manifest.json") if run_dir_env else None
+        )
+    if not manifest_path or not Path(manifest_path).is_file():
+        return _hook_fail_closed("cairn hook: guard manifest not found")
+
+    try:
+        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        guards_raw = manifest.get("guards", {})
+        workspace_dir = Path(manifest.get("workspace_dir", os.getcwd()))
+    except (ValueError, OSError) as exc:
+        return _hook_fail_closed(f"cairn hook: guard manifest unreadable ({exc})")
+
+    run_dir = Path(os.environ.get("CAIRN_RUN_DIR", os.getcwd()))
+    try:
+        result = _run_chain(
+            names, guards_raw, tool=tool, command=command,
+            workspace_dir=workspace_dir, run_dir=run_dir, env=dict(os.environ),
+        )
+    except Exception as exc:  # a malformed guard decl etc. must BLOCK, not wave the tool through
+        return _hook_fail_closed(f"cairn hook: guard check failed ({exc})")
+
+    if not result.allowed:
+        # A deny is carried by the deny-JSON on STDOUT (proven-blocking; mirrors hookprobe's
+        # ClaudeHookRecipe, which exits 0 and blocks via stdout). Exit 0: the verdict is the JSON.
+        # No trailing newline — byte-for-byte the probe-verified deny output.
+        sys.stdout.write(deny_json(result.reason or "denied"))
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """The ``python -m cairn.kernel.guards`` guard-check entry, in two modes:
+
+    * ``--shim-check NAME...`` — a PATH shim's body: reads the command from ``CAIRN_SHIM_*`` env,
+      exits 0 (allow → shim execs the real binary) / 2 (deny, reason on stderr).
+    * ``--hook-check NAME...`` — a claude ``PreToolUse`` hook's body: reads the event from stdin,
+      allows silently (exit 0) or blocks by printing the deny-JSON to stdout; FAILS CLOSED on any
+      error (deny-JSON + non-zero). Both modes run the SAME chain (``_run_chain``).
+    """
+    args = list(sys.argv[1:] if argv is None else argv)
+    mode = args[0] if args else None
+    names = args[1:]
+    if mode == "--shim-check":
+        return _shim_check(names)
+    if mode == "--hook-check":
+        return _hook_check(names)
+    print(
+        "usage: python -m cairn.kernel.guards (--shim-check|--hook-check) NAME...",
+        file=sys.stderr,
+    )
+    return 2  # fail-closed: a malformed invocation must not wave a command through
 
 
 if __name__ == "__main__":
