@@ -221,14 +221,14 @@ def test_valid_mac_but_choice_off_menu_is_rejected(tmp_path: Path) -> None:
     """Defense in depth: a properly-signed decision whose choice isn't an option is rejected."""
     from cairn.kernel.gatekeys import compute_mac, ensure_run_key
 
-    secret = ensure_run_key(tmp_path.name)
+    secret = ensure_run_key(tmp_path)
     at = "2026-07-03T11:04:00.000Z"
     gp = gate_path(tmp_path, "tone")
     gp.parent.mkdir(parents=True, exist_ok=True)
     gp.write_text(
         json.dumps(
             {"choice": "sneaky", "by": "external", "at": at,
-             "mac": compute_mac(secret, "tone", "sneaky", "external", at)}
+             "mac": compute_mac(secret, tmp_path, "tone", "sneaky", "external", at)}
         ),
         encoding="utf-8",
     )
@@ -246,7 +246,8 @@ def test_missing_secret_is_tamper_never_auto_passed(tmp_path: Path) -> None:
     from cairn.kernel.gatekeys import gate_keys_dir
 
     answer_gate(tmp_path, "tone", "formal")  # writes a genuinely valid MAC
-    (gate_keys_dir() / f"{tmp_path.name}.key").unlink()  # ...then the secret is gone
+    for key in gate_keys_dir().glob("*.key"):  # ...then the secret is gone
+        key.unlink()
     rec = _Recorder()
 
     with pytest.raises(GateNeedsHuman):  # fail SAFE — no secret means cannot authenticate
@@ -254,3 +255,29 @@ def test_missing_secret_is_tamper_never_auto_passed(tmp_path: Path) -> None:
 
     reasons = [d["data"].get("reason") for e, d in rec.events if e == "gate-tamper"]
     assert reasons == ["missing-secret"]
+
+
+def test_same_run_id_in_different_dirs_get_distinct_keys_and_dont_cross_verify(tmp_path: Path) -> None:
+    """F-SEC-2: two runs sharing a run_id in different workspaces must not share a key, and a
+    decision signed in one must not verify in the other (run identity is bound into key + MAC)."""
+    from cairn.kernel.gatekeys import ensure_run_key
+
+    a = tmp_path / "wsA" / "t-20260703"
+    b = tmp_path / "wsB" / "t-20260703"
+    a.mkdir(parents=True)
+    b.mkdir(parents=True)
+    assert a.name == b.name  # identical run_id, different absolute dirs
+
+    assert ensure_run_key(a) != ensure_run_key(b)  # distinct per-run secrets
+
+    answer_gate(a, "tone", "formal")  # a legitimately-signed decision in run A
+    bp = gate_path(b, "tone")
+    bp.parent.mkdir(parents=True, exist_ok=True)
+    bp.write_text(gate_path(a, "tone").read_text(encoding="utf-8"), encoding="utf-8")  # replay at B
+    rec = _Recorder()
+
+    with pytest.raises(GateNeedsHuman):  # B verifies with B's secret + B's run-disc → rejected
+        resolve_gate(_gate(default=""), b, interactive=False, presets={}, emit=rec, now=NOW)
+
+    reasons = [d["data"].get("reason") for e, d in rec.events if e == "gate-tamper"]
+    assert reasons == ["mac-mismatch"]

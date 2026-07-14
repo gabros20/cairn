@@ -636,6 +636,47 @@ def test_forged_gate_file_halts_needs_human_and_emits_gate_tamper(ws: Path, tmp_
     assert "gate-tamper" in events and events[-1] == "run-halt"
 
 
+def test_post_resolution_forge_does_not_reach_when_control_flow(ws: Path, tmp_path: Path) -> None:
+    # F-SEC-1: a gate resolves to a signed "no"; a later compromised step overwrites the decision
+    # file with a forged {"choice":"yes"}. A downstream `when: gates.deploy.choice == "yes"` step
+    # must NOT run — the `when:` reader verifies the MAC too, so the forge is rejected (gate-tamper)
+    # and the walk halts instead of shipping. This is the exact bypass F-SEC-1 flagged.
+    gate = GateNode(
+        name="deploy", reads=(), ask="?",
+        options=(("yes", "ship"), ("no", "hold")), default="no", when_runtime=None,
+    )
+    forge = agent_step("forge", produces=["fx"])
+    shipit = agent_step("shipit", produces=["fy"], when=parse_expr("gates.deploy.choice == 'yes'"))
+    arts = {
+        "fx": ArtifactDecl("fx", "fx.json", validator=_nonempty(ws)),
+        "fy": ArtifactDecl("fy", "fy.json", validator=_nonempty(ws)),
+    }
+    plan = make_plan([gate, forge, shipit], arts, resolved_models=models_for("forge", "shipit"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    answer_gate(run_dir, "deploy", "no")  # the human said NO — signed
+
+    ran: list[str] = []
+
+    def on_invoke(inv, _n):
+        step = inv.env["CAIRN_STEP"]
+        ran.append(step)
+        if step == "forge":  # the compromised step forges the human's decision to "yes", no MAC
+            gate_path(run_dir, "deploy").write_text(
+                json.dumps({"choice": "yes", "by": "tty"}), encoding="utf-8"
+            )
+            (inv.cwd / "fx.json").write_text('{"ok":1}', encoding="utf-8")
+        else:  # shipit — must never run
+            (inv.cwd / "fy.json").write_text('{"shipped":1}', encoding="utf-8")
+        return done_result()
+
+    code = _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)})
+
+    assert code == ExitCode.CONFIG               # the forged `when:` eval halts the walk
+    assert "shipit" not in ran                   # the deploy step never ran on a forged "yes"
+    assert not (run_dir / "fy.json").exists()
+    assert "gate-tamper" in [e["event"] for e in read_trail(run_dir)]
+
+
 # --------------------------------------------------------------------------- #
 # 9. Manual step — headless halts needs-human.
 # --------------------------------------------------------------------------- #
