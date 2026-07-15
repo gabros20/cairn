@@ -16,7 +16,7 @@ import shutil
 import threading
 import time
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -361,6 +361,42 @@ def test_created_at_and_node_at_are_z_terminated_utc(ws: Path, tmp_path: Path) -
     assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
     node_at = load_run(run_dir)["nodes"]["s"]["at"]
     assert node_at.endswith("Z") and datetime.fromisoformat(node_at).tzinfo is not None
+
+
+def test_two_step_run_records_differing_real_at_timestamps(ws: Path, tmp_path: Path) -> None:
+    # claude-F12: `_set_status` must stamp the REAL transition time, not the walk's frozen
+    # construction-time clock (NOW, fixed at 2026-07-03T11:04:00). Under the old bug every
+    # node's `at` was literally format_at(NOW) — identical across the whole run regardless of
+    # how long it actually took. A real sleep between two run: steps proves the fix: the
+    # trail is correct — the two records now agree.
+    arts = {
+        "a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws)),
+        "b": ArtifactDecl("b", "b.txt", validator=_nonempty(ws)),
+    }
+    plan = make_plan(
+        [
+            run_step("first", "sleep 0.3 && echo hi > {artifact:a}", produces=["a"]),
+            run_step("second", "sleep 0.1 && echo hi > {artifact:b}", needs=["a"], produces=["b"]),
+        ],
+        arts,
+    )
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    start = datetime.now(timezone.utc)
+    assert _walk(ws, plan, run_dir, {"shell": ShellExecutor()}) == ExitCode.OK
+
+    nodes = load_run(run_dir)["nodes"]
+    frozen = "2026-07-03T11:04:00.000Z"  # format_at(NOW) — the old (buggy) stamp every node got
+    assert nodes["first"]["at"] != frozen
+    assert nodes["second"]["at"] != frozen
+    assert nodes["first"]["at"] != nodes["second"]["at"]
+
+    at_first = datetime.fromisoformat(nodes["first"]["at"])
+    at_second = datetime.fromisoformat(nodes["second"]["at"])
+    # Each stamp reflects real elapsed wall-clock time since the walk started (not the
+    # frozen construction-time NOW), and they're strictly ordered by when each step's sleep
+    # actually finished — proof the trail and run.json now agree.
+    assert (at_first - start).total_seconds() >= 0.2
+    assert (at_second - at_first).total_seconds() >= 0.05
 
 
 def test_legacy_naive_created_at_still_loads(ws: Path, tmp_path: Path) -> None:

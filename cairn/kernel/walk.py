@@ -45,7 +45,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -1038,7 +1038,11 @@ class _Walk:
             return self._trail.emit(event, node=node, attempt=attempt, cycle=cycle, data=data)
 
     def _set_status(self, node_id: str, status: str, cycles: int | None = None) -> None:
-        at = format_at(self.now)
+        # The REAL transition time, not self.now (the walk's construction-time clock — kept
+        # for path/template rendering determinism elsewhere, see the `now=self.now` call
+        # sites above). A node's `at` is an event, not a rendered value: a 3-hour run must
+        # not record every node finishing at second zero (claude-F12).
+        at = format_at(datetime.now(timezone.utc))
         with self._lock:
             update_run(
                 self.run_dir,
