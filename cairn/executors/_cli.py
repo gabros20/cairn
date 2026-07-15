@@ -9,6 +9,7 @@ here. Shell is deliberately NOT built on this (no model, no config, its own invo
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -22,7 +23,7 @@ from cairn.executors.base import (
     run_process,
 )
 from cairn.kernel.config import ExecutorConfig
-from cairn.kernel.errors import ConfigError
+from cairn.kernel.errors import CairnError, ConfigError
 
 
 def _render_doctrine(doctrine: Path) -> str:
@@ -31,22 +32,45 @@ def _render_doctrine(doctrine: Path) -> str:
     return f"{header}\n\n{doctrine.read_text(encoding='utf-8')}"
 
 
-def _probe_version(name: str, timeout_s: float = 15.0) -> tuple[int | None, str]:
-    """Run ``<name> --version`` for doctor. Uses the ambient env (a machine preflight, not an
-    agent invocation) so PATH/HOME are available. Returns (exit_code|None-on-timeout, output)."""
+def _probe(argv: list[str], timeout_s: float = 15.0) -> tuple[int | None, str]:
+    """Run ``argv`` for doctor (a ``--version`` or ``--help`` probe). Uses the ambient env (a
+    machine preflight, not an agent invocation) so PATH/HOME are available. Returns
+    (exit_code|None-on-timeout, output). A Popen spawn failure (``ExecutorSpawnError``, a
+    ``CairnError`` per W1/W5a) is NOT caught here — it propagates so callers can tell "the binary
+    ran and said no" from "the binary couldn't even start" and report each precisely."""
     with tempfile.TemporaryDirectory() as td:
         try:
             code, out, _ = run_process(
-                [name, "--version"],
+                argv,
                 stdin_text=None,
                 env=os.environ.copy(),
                 cwd=Path.cwd(),
                 timeout_s=timeout_s,
-                log_path=Path(td) / "version.log",
+                log_path=Path(td) / "probe.log",
             )
         except ExecTimeout:
             return None, ""
         return code, out.strip()
+
+
+def _probe_version(name: str, timeout_s: float = 15.0) -> tuple[int | None, str]:
+    """Run ``<name> --version`` for doctor. See :func:`_probe`."""
+    return _probe([name, "--version"], timeout_s)
+
+
+_flag_re_cache: dict[str, re.Pattern[str]] = {}
+
+
+def _flag_present(flag: str, help_text: str) -> bool:
+    """Is ``flag`` present as a whole TOKEN in ``help_text`` (tolerant of column-wrapped ``--help``
+    output, e.g. ``argparse``/``clap`` two-column layouts)? Bounded on both sides by "not a word
+    char or hyphen" so ``-p`` doesn't false-match inside ``--print`` and ``--model`` doesn't
+    false-match inside a longer ``--model-foo`` some future flag might add."""
+    pattern = _flag_re_cache.get(flag)
+    if pattern is None:
+        pattern = re.compile(rf"(?<![\w-]){re.escape(flag)}(?![\w-])")
+        _flag_re_cache[flag] = pattern
+    return pattern.search(help_text) is not None
 
 
 class CliExecutor:
@@ -56,9 +80,27 @@ class CliExecutor:
     name: str = ""
     _workspace_file: str | None = None  # CLAUDE.md / AGENTS.md / None
     _install_hint: str = ""
+    # The flags/tokens `_build_command` can emit — doctor asserts each is still advertised by
+    # the installed CLI's `--help` (W5b sub-change A.1). A small declared const per subclass
+    # (cleaner and less brittle than scraping `_build_command`'s argv construction). Empty here
+    # ⇒ no check — the base class itself is never instantiated directly.
+    _emitted_flags: tuple[str, ...] = ()
 
     def __init__(self, config: ExecutorConfig) -> None:
         self.config = config
+
+    def _help_argv(self) -> list[str]:
+        """argv that prints the help text covering the flags `_build_command` emits. Override
+        when that help lives under a subcommand (codex: `codex exec --help`, not the top-level
+        `codex --help` — `exec`'s flags are a different set)."""
+        return [self.name, "--help"]
+
+    def _model_findings(self) -> list[Finding]:
+        """Best-effort: do the workspace's configured tier models look like ones the installed
+        CLI actually knows about (W5b sub-change A.2)? Override per-executor; the default here
+        is a documented no-op, not a silent gap — see the executor that relies on it (codex: no
+        CLI command enumerates a model roster to check against)."""
+        return []
 
     # -- model resolution --------------------------------------------------- #
 
@@ -121,7 +163,18 @@ class CliExecutor:
     def doctor(self) -> list[Finding]:
         if shutil.which(self.name) is None:
             return [Finding("error", f"executor {self.name!r} not found", fix=self._install_hint)]
-        code, out = _probe_version(self.name)
+        try:
+            code, out = _probe_version(self.name)
+        except (OSError, CairnError) as exc:
+            # which() is a TOCTOU check, not a guarantee: the binary can vanish between the
+            # check and the spawn, or resolve to a broken shim (asdf/mise/nvm-managed CLIs are
+            # a realistic case) that fails to exec. Either raises here as OSError or
+            # ExecutorSpawnError (a CairnError, post-W1) — a doctor probe is best-effort, so
+            # report it as a clean Finding, never an uncaught traceback (mirrors cli.py's
+            # _probe_executor_versions fix, W5a).
+            return [
+                Finding("error", f"{self.name} --version failed to run: {exc}", fix=self._install_hint)
+            ]
         if code is None:
             return [Finding("error", f"{self.name} --version timed out", fix=self._install_hint)]
         if code != 0:
@@ -138,4 +191,25 @@ class CliExecutor:
                     fix=f"install {self.name}@{pin}",
                 )
             )
+        findings += self._flag_findings()
+        findings += self._model_findings()
         return findings
+
+    def _flag_findings(self) -> list[Finding]:
+        """Re-verify `_emitted_flags` against the installed CLI's `--help` (W5b sub-change A.1).
+        Cheap, offline, per-machine. A help-fetch failure (spawn error, timeout, non-zero exit,
+        or empty output) is ONE warning, never a crash and never a per-flag false positive."""
+        if not self._emitted_flags:
+            return []
+        argv = self._help_argv()
+        try:
+            code, out = _probe(argv)
+        except (OSError, CairnError):
+            code, out = None, ""
+        if code is None or code != 0 or not out:
+            return [Finding("warning", f"could not run {' '.join(argv)} — skipping flag drift check")]
+        return [
+            Finding("warning", f"{self.name} {flag} not advertised by installed {self.name}")
+            for flag in self._emitted_flags
+            if not _flag_present(flag, out)
+        ]

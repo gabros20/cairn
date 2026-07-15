@@ -147,6 +147,67 @@ def test_doctor_reports_missing_binary(monkeypatch):
     assert any(f.level == "error" and f.fix for f in findings)
 
 
+# --------------------------------------------------------------------------- #
+# W5b — doctor drift checks (sub-change A).
+# --------------------------------------------------------------------------- #
+
+
+def test_doctor_warns_when_emitted_flag_missing_from_help(tmp_path, monkeypatch):
+    use_fakebin(monkeypatch)
+    monkeypatch.setenv("CAIRN_TEST_HELP_OMIT", "--setting-sources")
+    findings = ClaudeExecutor(CFG).doctor()
+    assert any(
+        f.level == "warning" and "--setting-sources" in f.message and "not advertised" in f.message
+        for f in findings
+    )
+
+
+def test_doctor_no_flag_warning_on_healthy_help(tmp_path, monkeypatch):
+    use_fakebin(monkeypatch)
+    findings = ClaudeExecutor(CFG).doctor()
+    assert not any("not advertised" in f.message for f in findings)
+
+
+def test_doctor_aliases_and_dated_ids_pass_model_check(tmp_path, monkeypatch):
+    # CFG uses "opus" (alias) and "haiku" (alias) — both recognized, no warning.
+    use_fakebin(monkeypatch)
+    findings = ClaudeExecutor(CFG).doctor()
+    assert not any("not a recognized claude alias" in f.message for f in findings)
+
+
+def test_doctor_warns_on_unrecognized_model_string(tmp_path, monkeypatch):
+    use_fakebin(monkeypatch)
+    cfg = ExecutorConfig(name="claude", tiers={"cheap": TierSpec(model="gpt-4o")})
+    findings = ClaudeExecutor(cfg).doctor()
+    assert any(
+        f.level == "warning" and "gpt-4o" in f.message and "not a recognized claude alias" in f.message
+        for f in findings
+    )
+
+
+def test_doctor_accepts_dated_model_ids(tmp_path, monkeypatch):
+    use_fakebin(monkeypatch)
+    cfg = ExecutorConfig(
+        name="claude",
+        tiers={
+            "reasoning": TierSpec(model="claude-opus-4-8"),
+            "balanced": TierSpec(model="claude-sonnet-5"),
+            "cheap": TierSpec(model="claude-haiku-4-5-20251001"),
+        },
+    )
+    findings = ClaudeExecutor(cfg).doctor()
+    assert not any("not a recognized claude alias" in f.message for f in findings)
+
+
+def test_doctor_never_hard_fails_on_drift(tmp_path, monkeypatch):
+    use_fakebin(monkeypatch)
+    monkeypatch.setenv("CAIRN_TEST_HELP_OMIT", "--setting-sources,--model")
+    cfg = ExecutorConfig(name="claude", tiers={"cheap": TierSpec(model="not-a-claude-model")})
+    findings = ClaudeExecutor(cfg).doctor()
+    assert findings  # something warned
+    assert not any(f.level == "error" for f in findings)
+
+
 def test_render_workspace_writes_and_is_idempotent(tmp_path):
     doctrine = tmp_path / "DOCTRINE.md"
     doctrine.write_text("BE EXCELLENT.", encoding="utf-8")

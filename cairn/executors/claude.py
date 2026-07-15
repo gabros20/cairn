@@ -3,14 +3,24 @@
 from __future__ import annotations
 
 import json
+import re
 import shlex
 import sys
 from pathlib import Path
 
 from cairn.executors._cli import CliExecutor
-from cairn.executors.base import Capabilities, Invocation
+from cairn.executors.base import Capabilities, Finding, Invocation
 from cairn.kernel.gatekeys import guard_manifest_path
 from cairn.kernel.guards import write_manifest
+
+# claude's `--model` accepts either a bare alias for the latest model in a family, or a full
+# dated model id (captured help: "Provide an alias for the latest model (e.g. 'fable', 'opus',
+# or 'sonnet') or a model's full name (e.g. 'claude-fable-5')"). Every full id observed so far —
+# `claude-fable-5`, `claude-opus-4-8`, `claude-sonnet-5`, `claude-haiku-4-5-20251001` — is
+# `claude-<family>` optionally followed by more segments, so one prefix regex covers dated ids
+# too without hardcoding version numbers that will drift.
+_MODEL_ALIASES = frozenset({"opus", "sonnet", "haiku", "fable"})
+_MODEL_ID_RE = re.compile(r"^claude-(?:opus|sonnet|haiku|fable)(?:-|$)")
 
 # cairn guard tool → claude PreToolUse matcher. cairn's guards are command guards; the real case
 # is bash → the claude ``Bash`` tool (the shim layer covers the same command surface). A guard
@@ -31,6 +41,30 @@ class ClaudeExecutor(CliExecutor):
         session_capture=None,
         installs_hooks=True,  # install_guards below actually wires the PreToolUse hook (W3a)
     )
+    # The flags `_build_command` emits — doctor re-verifies these against the installed CLI's
+    # `claude --help` (W5b sub-change A.1).
+    _emitted_flags: tuple[str, ...] = (
+        "-p", "--model", "--effort", "--output-format", "--permission-mode",
+        "--setting-sources", "--strict-mcp-config", "--no-session-persistence",
+    )
+
+    def _model_findings(self) -> list[Finding]:
+        # W5b sub-change A.2: claude has no CLI command enumerating its model roster — best
+        # effort against the alias set + the dated-id shape (see _MODEL_ALIASES/_MODEL_ID_RE
+        # above). Model lists drift; this is a WARN, never a hard-fail.
+        findings = []
+        for tier in sorted(self.config.tiers):
+            model = self.config.tiers[tier].model
+            if model in _MODEL_ALIASES or _MODEL_ID_RE.match(model):
+                continue
+            findings.append(
+                Finding(
+                    "warning",
+                    f"claude tier {tier!r} model {model!r} is not a recognized claude alias "
+                    f"({'/'.join(sorted(_MODEL_ALIASES))}) or dated model id",
+                )
+            )
+        return findings
 
     def _build_command(self, inv: Invocation, prompt_text: str) -> tuple[list[str], str | None]:
         # re-verify against `claude --help` at doctor time; vendors drift.

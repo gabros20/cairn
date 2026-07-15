@@ -1,5 +1,13 @@
 #!/usr/bin/env python3
-"""Fake `grok` CLI for executor tests. See fakebin/claude for the env-var contract."""
+"""Fake `grok` CLI for executor tests. See fakebin/claude for the env-var contract.
+
+  CAIRN_TEST_HELP_OMIT   comma-separated flag tokens to DROP from `--help` output (W5b doctor
+                       flag-drift tests)
+  CAIRN_TEST_HELP_FAIL   if set, `--help` fails (exit 1, no output)
+  CAIRN_TEST_MODELS      comma-separated model slugs `grok models` reports (default below
+                       covers this fixture dir's own test CFGs; override for drift tests)
+  CAIRN_TEST_MODELS_FAIL if set, `grok models` fails (exit 1, no output)
+"""
 import json
 import os
 import sys
@@ -9,8 +17,45 @@ from pathlib import Path
 _NAME = "grok"
 _DEFAULT_VERSION = "grok 1.4.0 (fake)"
 
+# Superset covering GrokExecutor._emitted_flags (cairn/executors/grok.py) — W5b doctor
+# flag-presence check.
+_HELP_FLAGS = [
+    "--prompt-file", "--cwd", "-m", "--output-format", "--permission-mode",
+    "--no-alt-screen", "--no-memory", "--sandbox", "--effort",
+]
+
+# Default `grok models` roster — includes every model slug the executor test CFGs in this repo
+# configure (test_executors_grok.py: grok-build, grok-composer-2.5-fast), so the existing
+# doctor-healthy tests stay green without needing CAIRN_TEST_MODELS.
+_DEFAULT_MODELS = ["grok-build", "grok-composer-2.5-fast"]
+
 if "--version" in sys.argv:
     print(os.environ.get("CAIRN_TEST_VERSION", _DEFAULT_VERSION))
+    sys.exit(0)
+
+if "--help" in sys.argv:
+    if os.environ.get("CAIRN_TEST_HELP_FAIL"):
+        sys.exit(1)
+    omit = set(os.environ.get("CAIRN_TEST_HELP_OMIT", "").split(","))
+    for flag in _HELP_FLAGS:
+        if flag not in omit:
+            print(f"  {flag}  fake help text")
+    sys.exit(0)
+
+if sys.argv[1:2] == ["models"]:
+    if os.environ.get("CAIRN_TEST_MODELS_FAIL"):
+        sys.exit(1)
+    raw = os.environ.get("CAIRN_TEST_MODELS")
+    roster = raw.split(",") if raw is not None else _DEFAULT_MODELS
+    print("You are logged in with grok.com.")
+    print()
+    print(f"Default model: {roster[0] if roster else ''}")
+    print()
+    print("Available models:")
+    for i, m in enumerate(roster):
+        marker = "*" if i == 0 else "-"
+        suffix = " (default)" if i == 0 else ""
+        print(f"  {marker} {m}{suffix}")
     sys.exit(0)
 
 scratch = Path(os.environ["CAIRN_TEST_SCRATCH"])

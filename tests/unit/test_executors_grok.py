@@ -130,10 +130,11 @@ def test_capabilities():
     # JSON or exit 2) as a CLI capability — but cairn's own install_guards does NOT wire it
     # (installs_hooks=False), so blocking_hooks correctly stays None (unknown/unasserted; the
     # doctor probe decides) rather than overstating True for a mechanism cairn never installs
-    # (grok-F3, W3b). output_schema: native --json-schema exists (not wired; STEP sentinel is
-    # the contract).
+    # (grok-F3, W3b). output_schema=False (W5b sub-change B, grok-F2): native --json-schema
+    # exists but is NOT wired — the STEP sentinel is the contract; this previously asserted
+    # True, overstating what cairn actually uses.
     assert caps == Capabilities(
-        blocking_hooks=None, output_schema=True, session_capture=None, installs_hooks=False,
+        blocking_hooks=None, output_schema=False, session_capture=None, installs_hooks=False,
     )
 
 
@@ -148,3 +149,60 @@ def test_render_workspace_is_a_noop(tmp_path):
 def test_doctor_healthy_with_fake_version(monkeypatch):
     use_fakebin(monkeypatch)
     assert GrokExecutor(CFG).doctor() == []
+
+
+# --------------------------------------------------------------------------- #
+# W5b — doctor drift checks (sub-change A).
+# --------------------------------------------------------------------------- #
+
+
+def test_doctor_warns_when_emitted_flag_missing_from_help(monkeypatch):
+    use_fakebin(monkeypatch)
+    monkeypatch.setenv("CAIRN_TEST_HELP_OMIT", "--sandbox")
+    findings = GrokExecutor(CFG).doctor()
+    assert any(
+        f.level == "warning" and "--sandbox" in f.message and "not advertised" in f.message
+        for f in findings
+    )
+
+
+def test_doctor_no_auto_update_never_warns(monkeypatch):
+    # --no-auto-update is deliberately excluded from _emitted_flags — grok 0.2.82 hides it
+    # from --help while still accepting it, so it must never trigger a flag-drift warning.
+    use_fakebin(monkeypatch)
+    findings = GrokExecutor(CFG).doctor()
+    assert not any("--no-auto-update" in f.message for f in findings)
+
+
+def test_doctor_warns_on_unknown_model_slug(monkeypatch):
+    use_fakebin(monkeypatch)
+    monkeypatch.setenv("CAIRN_TEST_MODELS", "grok-build,grok-composer-2.5-fast")
+    cfg = ExecutorConfig(
+        name="grok", tiers={"cheap": TierSpec(model="grok-this-slug-does-not-exist")}
+    )
+    findings = GrokExecutor(cfg).doctor()
+    assert any(
+        f.level == "warning" and "grok-this-slug-does-not-exist" in f.message for f in findings
+    )
+
+
+def test_doctor_no_model_warning_when_all_tiers_known(monkeypatch):
+    use_fakebin(monkeypatch)
+    findings = GrokExecutor(CFG).doctor()  # CFG models: grok-build, grok-composer-2.5-fast
+    assert not any("not in `grok models`" in f.message for f in findings)
+
+
+def test_doctor_warns_when_models_fetch_fails(monkeypatch):
+    use_fakebin(monkeypatch)
+    monkeypatch.setenv("CAIRN_TEST_MODELS_FAIL", "1")
+    findings = GrokExecutor(CFG).doctor()
+    assert any(f.level == "warning" and "could not run" in f.message and "grok models" in f.message for f in findings)
+
+
+def test_doctor_never_hard_fails_on_drift(monkeypatch):
+    use_fakebin(monkeypatch)
+    monkeypatch.setenv("CAIRN_TEST_HELP_OMIT", "--sandbox,-m")
+    monkeypatch.setenv("CAIRN_TEST_MODELS", "some-other-model")
+    findings = GrokExecutor(CFG).doctor()
+    assert findings  # something warned
+    assert not any(f.level == "error" for f in findings)

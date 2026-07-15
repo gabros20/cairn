@@ -6,8 +6,26 @@ cairn's EFFORTS exactly, so tier-resolved effort flows through like the other ex
 
 from __future__ import annotations
 
-from cairn.executors._cli import CliExecutor
-from cairn.executors.base import Capabilities, Invocation
+import re
+
+from cairn.executors._cli import CliExecutor, _probe
+from cairn.executors.base import Capabilities, Finding, Invocation
+from cairn.kernel.errors import CairnError
+
+
+# `grok models` prints e.g.:
+#   Default model: grok-4.5
+#
+#   Available models:
+#     * grok-4.5 (default)
+#     - grok-composer-2.5-fast
+# One model slug per "  * " / "  - " bulleted line; strip the leading marker and any trailing
+# "(default)" annotation (the `\S+` capture already stops before the space that precedes it).
+_GROK_MODEL_LINE_RE = re.compile(r"^\s*[-*]\s+(\S+)", re.MULTILINE)
+
+
+def _parse_grok_models(help_text: str) -> set[str]:
+    return {m.group(1) for m in _GROK_MODEL_LINE_RE.finditer(help_text)}
 
 
 class GrokExecutor(CliExecutor):
@@ -25,11 +43,50 @@ class GrokExecutor(CliExecutor):
         # rather than assert True for a mechanism cairn never installs (grok-F3).
         blocking_hooks=None,
         # grok has native --json-schema (implies --output-format json), but it is NOT
-        # wired: native schema is a later bonus; the STEP sentinel is the contract.
-        output_schema=True,
+        # wired: native schema is a later bonus; the STEP sentinel is the contract. W5b
+        # sub-change B: this previously asserted True, overstating what cairn actually uses
+        # (grok-F2).
+        output_schema=False,
         session_capture=None,
         installs_hooks=False,  # install_guards is a no-op — cairn does not wire a grok hook yet
     )
+    # The flags `_build_command` emits — doctor re-verifies these against the installed CLI's
+    # `grok --help` (W5b sub-change A.1). `--no-auto-update` is DELIBERATELY excluded: the
+    # captured help (and grok 0.2.82 live) hides it from `--help` while still accepting it (see
+    # the comment on the flag below) — asserting it here would WARN on every healthy install.
+    _emitted_flags: tuple[str, ...] = (
+        "--prompt-file", "--cwd", "-m", "--output-format", "--permission-mode",
+        "--no-alt-screen", "--no-memory", "--sandbox", "--effort",
+    )
+
+    def _model_findings(self) -> list[Finding]:
+        # W5b sub-change A.2: grok is the one executor with a queryable model roster —
+        # `grok models` (captured help: "List available models and exit"). Best-effort: a
+        # fetch failure or an unparseable roster is one warning, never a crash; the goal is
+        # catching model-slug drift before the first paid run, not gatekeeping.
+        try:
+            code, out = _probe(["grok", "models"])
+        except (OSError, CairnError):
+            code, out = None, ""
+        if code is None or code != 0 or not out:
+            return [Finding("warning", "could not run `grok models` — skipping model drift check")]
+        known = _parse_grok_models(out)
+        if not known:
+            return [
+                Finding("warning", "`grok models` returned no parseable model list — skipping model drift check")
+            ]
+        findings = []
+        for tier in sorted(self.config.tiers):
+            model = self.config.tiers[tier].model
+            if model not in known:
+                findings.append(
+                    Finding(
+                        "warning",
+                        f"grok tier {tier!r} model {model!r} not in `grok models` "
+                        f"(known: {', '.join(sorted(known))})",
+                    )
+                )
+        return findings
 
     def _build_command(self, inv: Invocation, prompt_text: str) -> tuple[list[str], str | None]:
         # re-verify against `grok --help` at doctor time; vendors drift.
