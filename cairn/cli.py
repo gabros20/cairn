@@ -33,6 +33,7 @@ from cairn.kernel import newkit
 from cairn.kernel.artifacts import resolve_path, validate
 from cairn.kernel.batchkit import run_batch
 from cairn.kernel.compose import make_composer, render_artifact_path
+from cairn.executors._cli import _probe_version
 from cairn.kernel.config import Config, ExecutorConfig, installed_version, load_config, version_compat
 from cairn.kernel.errors import CairnError, ConfigError
 from cairn.kernel.gatekit import (
@@ -507,7 +508,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             # sequence as every other resume entrance: guards (drift → version), then the tool
             # hard-stop. `cairn run` has no --force; the refusals name
             # `cairn resume <run-dir> --force` as the escape hatch.
-            fail = _resume_guards(run_dir, phash, p.pipeline, force=False)
+            fail = _resume_guards(run_dir, phash, p.pipeline, ws, force=False)
             if fail is not None:
                 return fail
             fail = _preflight_tools(p)
@@ -532,7 +533,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
             # edit or a cross-major cairn upgrade must fail loud, not silently resume), then
             # the tool hard-stop. `cairn run` has no --force flag; only
             # `cairn resume … --force` can override.
-            fail = _resume_guards(match.run_dir, phash, p.pipeline, force=False)
+            fail = _resume_guards(match.run_dir, phash, p.pipeline, ws, force=False)
             if fail is not None:
                 return fail
             fail = _preflight_tools(p)
@@ -551,7 +552,7 @@ def _cmd_run(args: argparse.Namespace) -> int:
         # Record the actual executor routing so `cairn resume` reconstructs the same fleet
         # (mixed --executor / --step-executor) instead of silently falling back to defaults.
         global_default = (None if stub_mode else args.executor) or config.workspace.default_executor or ""
-        _record_executor_routing(run_dir, now, global_default, _kv(args.step_executor))
+        _record_executor_routing(run_dir, now, global_default, _kv(args.step_executor), p.resolved_models, ws)
 
     interactive = (not args.headless) and sys.stdin.isatty()
     try:
@@ -564,16 +565,70 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return int(ExitCode.EXECUTOR)
 
 
-def _record_executor_routing(run_dir: Path, now: datetime, default: str, overrides: dict[str, str]) -> None:
+def _probe_executor_versions(resolved_models: dict[str, tuple[str, str, str | None]]) -> dict[str, str | None]:
+    """``<cli> --version`` for each DISTINCT executor the plan actually resolves (ARCHITECTURE
+    §10) — never ``shell``/``stub``, which aren't CLI-backed and don't understand the flag.
+
+    A probe failure (binary not on PATH, non-zero exit, timeout) records ``None`` for that
+    executor and moves on — mint must never crash on a bad probe (docs/TOOLING-AND-GROWTH's
+    "record null, continue" rule, same as a missing tool check)."""
+    names = sorted({exec_name for exec_name, _model, _effort in resolved_models.values()})
+    out: dict[str, str | None] = {}
+    for name in names:
+        if shutil.which(name) is None:
+            out[name] = None
+            continue
+        try:
+            code, text = _probe_version(name)
+        except OSError:
+            out[name] = None
+            continue
+        out[name] = text if (code == 0 and text) else None
+    return out
+
+
+def _workspace_git_rev(ws: Path) -> dict[str, Any] | None:
+    """The workspace's git ``HEAD`` + dirty flag for run.json's reproducibility record
+    (ARCHITECTURE §10), or ``None`` when ``ws`` isn't inside a git repo (or ``git`` itself is
+    unavailable). Never raises — a missing binary/non-repo workspace is absent, not a mint
+    failure, mirroring ``_probe_executor_versions``'s probe-failure handling."""
+    runner = _SubprocessRunner()
+    try:
+        head = runner.run(["git", "-C", str(ws), "rev-parse", "HEAD"])
+    except OSError:
+        return None
+    if head.returncode != 0 or not head.stdout.strip():
+        return None
+    try:
+        status = runner.run(["git", "-C", str(ws), "status", "--porcelain"])
+    except OSError:
+        status = None
+    dirty = bool(status.stdout.strip()) if status is not None and status.returncode == 0 else False
+    return {"rev": head.stdout.strip(), "dirty": dirty}
+
+
+def _record_executor_routing(
+    run_dir: Path,
+    now: datetime,
+    default: str,
+    overrides: dict[str, str],
+    resolved_models: dict[str, tuple[str, str, str | None]],
+    ws: Path,
+) -> None:
     """Persist the run's executor fleet into run.json (schema §8.1 ``executors``) so resume is
-    faithful. ``default`` is the effective global executor; ``overrides`` the ``--step-executor``
-    map. Versions stay empty (recording them is a cheap future add)."""
+    faithful, AND the reproducibility record ARCHITECTURE §10 promises: each resolved
+    executor's probed ``--version`` and the workspace's git rev + dirty flag at mint (``None``
+    for either on probe failure / a non-git workspace — never a mint crash)."""
+    versions = _probe_executor_versions(resolved_models)
+    git = _workspace_git_rev(ws)
 
     def mutate(doc: dict) -> None:
         ex = doc.setdefault("executors", {})
         ex["default"] = default
         ex["overrides"] = dict(overrides)
-        ex.setdefault("versions", {})
+        ex["versions"] = versions
+        doc["git_rev"] = git["rev"] if git is not None else None
+        doc["git_dirty"] = git["dirty"] if git is not None else None
 
     update_run(run_dir, mutate)
 
@@ -654,14 +709,50 @@ def _version_compat_guard(recorded: str | None, run_dir: Path, *, force: bool) -
     return None
 
 
-def _resume_guards(run_dir: Path, phash: str, pipeline: str, *, force: bool) -> int | None:
+def _reproducibility_drift_guard(recorded: dict, ws: Path) -> None:
+    """Warn — never refuse — when an executor version or the workspace git rev recorded at
+    mint (ARCHITECTURE §10) has drifted by resume time. Unlike ``_pipeline_drift_guard``
+    (the pipeline itself changed under the run — potentially unsafe to resume against) or
+    ``_version_compat_guard``'s cross-major case (run-dir semantics may not carry across a
+    cairn major), a newer CLI or a workspace commit since mint doesn't invalidate what's on
+    disk — so this never blocks and takes no ``--force``. A probe failure here is silent (not
+    a second, redundant warning): the tool hard-stop / doctor already own "can this run at
+    all"; this guard only speaks up when a probe SUCCEEDS with a value that disagrees."""
+    recorded_versions = (recorded.get("executors") or {}).get("versions") or {}
+    for name, old in sorted(recorded_versions.items()):
+        if not old or shutil.which(name) is None:
+            continue
+        try:
+            code, current = _probe_version(name)
+        except OSError:
+            continue
+        if code == 0 and current and current != old:
+            print(
+                f"cairn: warning — executor {name!r} reports {current!r} at resume, "
+                f"recorded {old!r} at mint (version drift)",
+                file=sys.stderr,
+            )
+
+    recorded_git = recorded.get("git_rev")
+    if recorded_git:
+        current = _workspace_git_rev(ws)
+        if current is not None and current["rev"] != recorded_git:
+            print(
+                f"cairn: warning — workspace is at git {current['rev']} at resume, "
+                f"recorded {recorded_git} at mint (workspace drift)",
+                file=sys.stderr,
+            )
+
+
+def _resume_guards(run_dir: Path, phash: str, pipeline: str, ws: Path, *, force: bool) -> int | None:
     """The shared gate for ``cairn run``'s two resume entrances (``--run-dir <existing>``
-    and ``--idempotent``'s auto-match): read the manifest fail-loud, then drift → version —
-    the same order ``cairn resume`` applies them. A dir chosen for resume whose run.json
-    can't be read (or fails the cairn:run schema) is a config error: degrading to ``{}``
-    would print a misleading "records no cairn version" warning and then crash later inside
-    the walk. Returns the exit code to fail with, or None to proceed. (``_cmd_resume`` stays
-    separate — its force comes from argv and it needs the run doc for params/executors.)"""
+    and ``--idempotent``'s auto-match): read the manifest fail-loud, then drift → version →
+    reproducibility (advisory) — the same order ``cairn resume`` applies them. A dir chosen
+    for resume whose run.json can't be read (or fails the cairn:run schema) is a config
+    error: degrading to ``{}`` would print a misleading "records no cairn version" warning
+    and then crash later inside the walk. Returns the exit code to fail with, or None to
+    proceed. (``_cmd_resume`` stays separate — its force comes from argv and it needs the run
+    doc for params/executors.)"""
     try:
         recorded = load_run(run_dir)
     except (OSError, ValueError, ConfigError) as exc:
@@ -670,7 +761,11 @@ def _resume_guards(run_dir: Path, phash: str, pipeline: str, *, force: bool) -> 
     fail = _pipeline_drift_guard(recorded.get("pipeline_hash"), phash, pipeline, run_dir, force=force)
     if fail is not None:
         return fail
-    return _version_compat_guard(recorded.get("cairn_version"), run_dir, force=force)
+    fail = _version_compat_guard(recorded.get("cairn_version"), run_dir, force=force)
+    if fail is not None:
+        return fail
+    _reproducibility_drift_guard(recorded, ws)
+    return None
 
 
 def _cmd_resume(args: argparse.Namespace) -> int:
@@ -697,6 +792,7 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     fail = _version_compat_guard(run_doc.get("cairn_version"), run_dir, force=args.force)
     if fail is not None:
         return fail
+    _reproducibility_drift_guard(run_doc, ws)
 
     # Reconstruct the recorded fleet (§8.1 executors) so a mixed-executor run resumes on the
     # same models, not the workspace defaults.
