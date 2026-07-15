@@ -16,7 +16,7 @@ import shutil
 import threading
 import time
 from dataclasses import replace
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -200,8 +200,12 @@ def test_hello_pipeline_runs_end_to_end_headless(tmp_path: Path) -> None:
 
     tone = json.loads((run_dir / "gates/tone.json").read_text())
     assert tone.pop("mac")  # HMAC-authenticated (gatekeys); asserted end-to-end in test_gatekit
-    # gate `at` is trail.format_at's canonical shape (UTC, ms, Z; naive NOW read as UTC).
-    assert tone == {"choice": "friendly", "by": "flag", "at": "2026-07-03T11:04:00.000Z"}
+    # gate `at` is the REAL transition time (claude-F12's fix, extended to gate decisions —
+    # see test_gate_answer_records_real_time_not_frozen_now below), not the walk's frozen
+    # construction-time NOW; still trail.format_at's canonical shape (UTC, ms, Z).
+    at = tone.pop("at")
+    assert at.endswith("Z") and datetime.fromisoformat(at).tzinfo is not None
+    assert tone == {"choice": "friendly", "by": "flag"}
 
     events = [e["event"] for e in read_trail(run_dir)]
     assert events[0] == "run-start"
@@ -653,6 +657,33 @@ def test_gate_preset_records_by_flag_and_marks_node_done(ws: Path, tmp_path: Pat
     assert node_status(load_run(run_dir), "tone") == "done"
 
 
+def test_in_walk_gate_decision_records_real_time_not_frozen_now(ws: Path, tmp_path: Path) -> None:
+    # claude-F12's fix extends to gate decisions (found while auditing walk.py's self.now uses):
+    # resolve_gate's `now` only ever feeds gatekit._commit's `at` stamp on gates/<name>.json — an
+    # event time signed into the W2 HMAC as-written and verified as-written, with no
+    # path/render/determinism use — so it must track wall time exactly like _set_status, and
+    # exactly like `answer_gate`'s external-answer path already does (gatekit.py's own
+    # `datetime.now(timezone.utc)`, which never went through self.now in the first place).
+    gate = GateNode(name="tone", reads=(), ask="?", options=(("a", "A"),), default="a", when_runtime=None)
+    plan = make_plan([gate], {})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    start = datetime.now(timezone.utc)
+    assert _walk(ws, plan, run_dir, {}, presets={"tone": "a"}) == ExitCode.OK
+    decision = json.loads(gate_path(run_dir, "tone").read_text())
+    at = datetime.fromisoformat(decision["at"])
+
+    assert decision["at"] != "2026-07-03T11:04:00.000Z"  # not format_at(NOW), the frozen stamp
+    # format_at TRUNCATES to milliseconds (doesn't round), so `at` can read up to ~1ms before
+    # `start` even though both are real, live clock reads a few microseconds apart.
+    assert at >= start - timedelta(milliseconds=1)
+    # The MAC still verifies with the live `at` — resolve_gate re-reads and trusts the file on
+    # the very next call (a second walk() on the same run dir, i.e. resume), proving the W2
+    # gate-auth invariant holds for a live-clock `at` exactly as it did for the frozen one.
+    assert _walk(ws, plan, run_dir, {}, presets={"tone": "a"}) == ExitCode.OK
+    assert json.loads(gate_path(run_dir, "tone").read_text()) == decision  # untouched — trusted
+
+
 def test_gate_headless_without_default_halts_needs_human(ws: Path, tmp_path: Path) -> None:
     gate = GateNode(name="tone", reads=(), ask="?", options=(("a", "A"),), default="", when_runtime=None)
     plan = make_plan([gate], {})
@@ -673,7 +704,9 @@ def test_gate_tty_reprompts_then_records(ws: Path, tmp_path: Path, monkeypatch) 
     assert _walk(ws, plan, run_dir, {}, interactive=True) == ExitCode.OK
     tone = json.loads(gate_path(run_dir, "tone").read_text())
     assert tone.pop("mac")  # HMAC-authenticated decision (gatekeys)
-    assert tone == {"choice": "b", "by": "tty", "at": "2026-07-03T11:04:00.000Z"}
+    at = tone.pop("at")  # real transition time now, not the frozen NOW — see hello test above
+    assert at.endswith("Z") and datetime.fromisoformat(at).tzinfo is not None
+    assert tone == {"choice": "b", "by": "tty"}
 
 
 def test_externally_answered_gate_is_honored_on_walk(ws: Path, tmp_path: Path) -> None:

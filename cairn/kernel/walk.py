@@ -595,13 +595,18 @@ class _Walk:
             self._set_status(gate.name, "skipped")
             return
         try:
+            # The REAL transition time (like _set_status, claude-F12's fix), not self.now: the
+            # `now` passed here only ever feeds gatekit._commit's `at` stamp on the decision
+            # file (gates/<name>.json, signed into the W2 HMAC as-written and verified
+            # as-written — no path/render/determinism use), so there's no determinism
+            # requirement pulling it back to the frozen construction-time clock.
             resolve_gate(
                 gate,
                 self.run_dir,
                 interactive=self.interactive,
                 presets=self.gate_presets,
                 emit=self._emit,
-                now=self.now,
+                now=datetime.now(timezone.utc),
             )
         except GateNeedsHuman as exc:
             raise _Halt(ExitCode.NEEDS_HUMAN, gate.name, "gate needs a human decision") from exc
