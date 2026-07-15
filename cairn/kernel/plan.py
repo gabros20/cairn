@@ -1263,7 +1263,7 @@ def _installs_hooks(exec_name: str) -> bool:
 
     try:
         return bool(load_executor_class(exec_name).capabilities.installs_hooks)
-    except Exception:
+    except (KeyError, AttributeError):
         return False
 
 
@@ -1274,9 +1274,18 @@ def _warn_ineffective_guards(
 ) -> None:
     """Append one warning per guard whose ``enforce`` yields no effective pre-execution layer
     (see the section note above). Effective iff: ``"shim" in enforce`` (always wired for shim
-    guards) OR (``"hook" in enforce`` AND some executor this plan resolves has
-    ``installs_hooks``). ``post``-only is never pre-execution — it's the artifact-validator
-    backstop, which cannot stop a side-effecting command before it runs.
+    guards, for EVERY executor — `cli.py`'s ``_wrap_guards`` prepends the shim dir to every
+    invocation's PATH regardless of which executor(s) the plan resolves) OR (``"hook" in
+    enforce`` AND EVERY executor this plan resolves has ``installs_hooks``). ``post``-only is
+    never pre-execution — it's the artifact-validator backstop, which cannot stop a
+    side-effecting command before it runs.
+
+    The ``hook`` check is deliberately per-executor, not "any resolved executor installs
+    hooks": a plan mixing e.g. ``claude`` and ``codex`` steps has hook coverage for the claude
+    steps only — a matching command under the codex step is NOT blocked pre-execution, and a
+    plan-wide "some executor installs hooks" verdict would silently hide that gap. When
+    coverage is partial, the warning names exactly which resolved executor(s) don't install
+    hooks, so the guard author knows which steps are actually unprotected.
 
     Also: if the plan has agent steps (``resolved_models`` non-empty) and declares ZERO guards
     at all, one informational warning — agent tool use is otherwise wholly unrestricted before
@@ -1293,31 +1302,45 @@ def _warn_ineffective_guards(
         return
 
     exec_names = {exec_name for exec_name, _model, _effort in resolved_models.values()}
-    any_installs_hooks = any(_installs_hooks(name) for name in exec_names)
+    uncovered = sorted(name for name in exec_names if not _installs_hooks(name))
 
     for guard in guards:
         if "shim" in guard.enforce:
             continue
-        if "hook" in guard.enforce and any_installs_hooks:
-            continue
         if "hook" in guard.enforce:
-            warnings.append(
-                Finding(
-                    "warning",
-                    f"guard {guard.name!r}: enforce={guard.enforce!r} but no configured "
-                    "executor installs hooks (claude installs; codex/grok do not) — only the "
-                    "post validator applies; the command is NOT blocked before it runs",
+            if exec_names and not uncovered:
+                continue  # every resolved executor installs hooks — fully effective
+            if uncovered:
+                uncovered_repr = "{" + ", ".join(repr(n) for n in uncovered) + "}"
+                warnings.append(
+                    Finding(
+                        "warning",
+                        f"guard {guard.name!r}: enforce={guard.enforce!r} but executor(s) "
+                        f"{uncovered_repr} do not install hooks — the command is NOT blocked "
+                        "before it runs under them; only the post validator applies",
+                    )
                 )
-            )
-        else:  # enforce == ("post",) — the only remaining valid, non-empty combination
-            warnings.append(
-                Finding(
-                    "warning",
-                    f"guard {guard.name!r}: enforce={guard.enforce!r} — post is a backstop "
-                    "only (the artifact validator; it cannot stop a side-effecting command "
-                    "before it runs) — no pre-execution layer is configured",
+            else:
+                # No agent step in the sliced range resolves ANY executor — there is no
+                # PreToolUse to intercept at all, so a hook-enforced guard is unreachable.
+                warnings.append(
+                    Finding(
+                        "warning",
+                        f"guard {guard.name!r}: enforce={guard.enforce!r} but no agent step "
+                        "in this plan resolves an executor that installs hooks — only the "
+                        "post validator applies; the command is NOT blocked before it runs",
+                    )
                 )
+            continue
+        # enforce == ("post",) — the only remaining valid, non-empty combination
+        warnings.append(
+            Finding(
+                "warning",
+                f"guard {guard.name!r}: enforce={guard.enforce!r} — post is a backstop "
+                "only (the artifact validator; it cannot stop a side-effecting command "
+                "before it runs) — no pre-execution layer is configured",
             )
+        )
 
 
 # --------------------------------------------------------------------------- #

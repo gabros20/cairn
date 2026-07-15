@@ -206,11 +206,17 @@ probe note below) but cairn doesn't install one for it, so asserting `blocking_h
 dishonest about what THIS FRAMEWORK does — it now reads `None`, same as codex. **`plan()` warns** (never
 errors — an under-enforced guard is a legitimate, if risky, authoring choice) when a guard's `enforce`
 yields no EFFECTIVE pre-execution layer for the plan's resolved executor(s): effective iff
-`"shim" in enforce` (always wired) OR (`"hook" in enforce` AND some resolved executor has
-`installs_hooks=True`). A `hook`-only guard run under codex/grok, or a `post`-only guard under any
-executor, gets a plan `Finding("warning", …)` naming the guard and why; the same guard under `claude`
-(hook) or carrying `shim` never warns. Separately, a plan with agent steps and **zero** guards at all
-gets one informational warning that agent tool use is unrestricted pre-execution.*
+`"shim" in enforce` (always wired, for EVERY executor — the shim dir is prepended to PATH regardless of
+which executor(s) the plan resolves) OR (`"hook" in enforce` AND **every** executor the plan resolves has
+`installs_hooks=True`). The `hook` check is deliberately per-executor, not "some resolved executor
+installs hooks": a plan mixing `claude` and `codex` steps has hook coverage for the claude steps only, so
+a plan-wide "some executor installs hooks" verdict would silently hide a codex step's guarded command
+going unblocked. When coverage is partial, the warning names exactly which resolved executor(s) lack it
+— `guard 'no-deploy': enforce=('hook',) but executor(s) {'codex'} do not install hooks — the command is
+NOT blocked before it runs under them; only the post validator applies` — so `claude`+`codex`+`hook`-only
+warns naming `codex` even though `claude` IS covered, and `claude`-only never warns. A `post`-only guard
+warns under any executor set. Separately, a plan with agent steps and **zero** guards at all gets one
+informational warning that agent tool use is unrestricted pre-execution.*
 
 *Both the shim and hook manifests (the guard decls a command is checked against) live OUTSIDE the run
 dir in the gatekeys-protected state dir and are **authenticated**: a per-run HMAC over the manifest

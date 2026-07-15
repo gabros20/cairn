@@ -537,6 +537,16 @@ def test_enforce_bogus_layer_is_a_config_error(tmp_path):
     assert "evil" in str(exc.value) and "bogus" in str(exc.value)
 
 
+def test_enforce_mixed_valid_and_unknown_layer_is_a_config_error(tmp_path):
+    # enforce: [hook, bogus] — one valid member alongside one bad one. Must still reject, and
+    # must name ONLY the bad member (not falsely flag 'hook' as unknown too).
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps_enforce("brease *", "hook, bogus"), extra=_GUARD_CHECK)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    assert "evil" in str(exc.value)
+    assert "['bogus']" in str(exc.value)  # only the unknown member is named, not 'hook'
+
+
 def test_enforce_empty_is_a_config_error(tmp_path):
     steps = (
         "  - { id: one, run: 'echo', produces: [a] }\n"
@@ -616,7 +626,7 @@ def test_hook_only_guard_warns_when_no_resolved_executor_installs_hooks(tmp_path
     p = plan(ws, "p", {}, now=NOW, executor="codex")
     warns = [w.message for w in p.warnings if w.level == "warning"]
     assert any(
-        "no-deploy" in w and "no configured executor installs hooks" in w and "NOT blocked" in w
+        "no-deploy" in w and "{'codex'}" in w and "do not install hooks" in w and "NOT blocked" in w
         for w in warns
     )
 
@@ -624,7 +634,8 @@ def test_hook_only_guard_warns_when_no_resolved_executor_installs_hooks(tmp_path
 def test_hook_only_guard_under_grok_also_warns(tmp_path):
     ws = _write_multi_exec_ws(tmp_path, _HEADER + _guarded_agent_steps("hook"), extra=_GUARD_CHECK)
     p = plan(ws, "p", {}, now=NOW, executor="grok")
-    assert any("no-deploy" in w.message for w in p.warnings if w.level == "warning")
+    warns = [w.message for w in p.warnings if w.level == "warning"]
+    assert any("no-deploy" in w and "{'grok'}" in w for w in warns)
 
 
 def test_hook_only_guard_under_claude_does_not_warn(tmp_path):
@@ -644,6 +655,43 @@ def test_post_only_guard_always_warns(tmp_path):
     p = plan(ws, "p", {}, now=NOW, executor="claude")
     warns = [w.message for w in p.warnings if w.level == "warning"]
     assert any("no-deploy" in w and "backstop only" in w for w in warns)
+
+
+def _mixed_exec_guarded_steps(enforce: str) -> str:
+    # Two agent steps, both usable by the same `worker` agent — one left on the workspace
+    # default (claude), one overridable per-step via `step_executors`, so a single plan can
+    # resolve a MIXED executor set (the exact case the per-executor-coverage predicate exists
+    # to catch — see Finding 1 in .orchestrate/review-taskW3b-quality-r1.md).
+    return (
+        "  - { id: one, agent: worker, produces: [a] }\n"
+        "  - { id: two, agent: worker, produces: [b] }\n"
+        "guards:\n"
+        "  - name: no-deploy\n"
+        "    match: { tool: bash, command: 'deploy *' }\n"
+        "    check: guards/check.sh\n"
+        f"    enforce: [{enforce}]\n"
+    )
+
+
+def test_mixed_executor_plan_warns_naming_only_the_uncovered_executor(tmp_path):
+    # step 'one' resolves the default (claude, installs hooks); step 'two' is pinned to codex
+    # (does not) — partial coverage. The old "ANY resolved executor installs hooks" predicate
+    # would have missed this entirely (claude's presence made the whole plan look covered).
+    ws = _write_multi_exec_ws(tmp_path, _HEADER + _mixed_exec_guarded_steps("hook"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW, step_executors={"two": "codex"})
+    warns = [w.message for w in p.warnings if w.level == "warning"]
+    assert any(
+        "no-deploy" in w and "{'codex'}" in w and "'claude'" not in w and "NOT blocked" in w
+        for w in warns
+    )
+
+
+def test_mixed_executor_plan_all_claude_does_not_warn(tmp_path):
+    # Same two-step shape, but both resolve the workspace default (claude) — full coverage,
+    # no warning, confirming the tightened predicate isn't just always-warn on multi-step plans.
+    ws = _write_multi_exec_ws(tmp_path, _HEADER + _mixed_exec_guarded_steps("hook"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW)
+    assert not [w for w in p.warnings if "no-deploy" in w.message]
 
 
 def test_zero_guards_with_agent_steps_gets_one_info_warning(tmp_path):
