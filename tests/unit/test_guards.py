@@ -685,11 +685,16 @@ def test_hook_check_fail_closed_still_denies_with_deny_json(tmp_path, monkeypatc
     _write_hook_manifest(
         manifest, [guard("crash.py", name="flaky", command="brease*", on_error="deny")], tmp_path
     )
-    code, out = _run_hook_check(
-        ["flaky"], _bash_event("brease status"),
-        manifest_path=manifest, run_dir=tmp_path, monkeypatch=monkeypatch, capsys=capsys,
-    )
-    assert code == 0 and _hook_denied(out)  # allow/deny outcome unchanged
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_bash_event("brease status"))))
+    monkeypatch.setenv("CAIRN_HOOK_MANIFEST", str(manifest))
+    monkeypatch.setenv("CAIRN_RUN_DIR", str(tmp_path))
+    code = main(["--hook-check", "flaky"])
+    captured = capsys.readouterr()
+    assert code == 0 and _hook_denied(captured.out)  # allow/deny outcome unchanged
+    # Symmetry with the fail-open warning test: a fail-CLOSED deny is carried entirely by
+    # the deny-JSON on stdout — the reason is already in the JSON, so no stderr line is
+    # needed (and none is emitted; only the fail-open-ALLOW case gets the extra warning).
+    assert captured.err == ""
 
 
 # --------------------------------------------------------------------------- #

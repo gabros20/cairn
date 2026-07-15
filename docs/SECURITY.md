@@ -78,6 +78,28 @@ log gets only the per-line pass for whatever that grandchild still emits; the re
 rather than risk a second concurrent writer on the file. The captured text handed to the walker is
 unaffected either way — it's an in-memory snapshot, not a second writer.*
 
+### 1.4 Artifact path containment — symlink resolution, and a disclosed TOCTOU residual
+
+`artifacts.py:resolve_path` rejects an absolute or `..`-containing rendered path by string before
+touching disk, then additionally resolves every concrete candidate (the plain path, and each glob
+match) and requires it to stay under the run dir (codex-F11) — a run-local path like
+`run/report.json` can pass the string checks while a symlink somewhere in its chain points at
+`/etc/passwd` or any other host file, which would otherwise let an external file falsely satisfy
+an artifact's done predicate and let reads escape the run dir. `resolve()` is strict, so a
+not-yet-existing artifact leaf (the normal case) still resolves fine as long as no symlink in its
+parent chain escapes.
+
+*Disclosed residual (not closed): `ResolvedArtifact.paths` stores the UNRESOLVED candidate, not
+the resolved path the containment check verified — downstream readers (`validate()`, the walker's
+artifact JSON reads) re-touch the filesystem through that unresolved path. In the narrow
+same-process window between the check and that later read, the sandboxed agent (who holds write
+access to the run dir) could swap the symlink to redirect the read. Storing the resolved path
+would close most of that window, but would also change what downstream code sees — a resolved
+leaf compared against an unresolved `run_dir` in `validate()`'s relative-path formatting could
+fall back to printing an absolute path in artifact-missing/schema-violation reasons. Given the
+brief for this containment fix (W6), that downstream contract change was out of scope; this is a
+known, accepted gap for a follow-up if it needs closing.*
+
 ## 2. Untrusted content — the prompt-injection posture
 
 The pipeline's raw material is **scraped third-party web content**, read by agents that hold
