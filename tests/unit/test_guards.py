@@ -97,6 +97,21 @@ def test_run_check_crash_fails_open_with_warning(tmp_path: Path) -> None:
     assert result.allowed is True
     assert result.reason is not None
     assert "failing open" in result.reason
+    assert result.failed_open is True  # W6-B: the explicit flag, not just the reason string
+
+
+def test_run_check_allow_and_fail_closed_do_not_set_failed_open(tmp_path: Path) -> None:
+    clean = run_check(
+        guard("allow_all.py"), command="brease status", env={},
+        run_dir=tmp_path, workspace_dir=tmp_path,
+    )
+    assert clean.allowed is True and clean.failed_open is False
+
+    closed = run_check(
+        guard("crash.py", on_error="deny"), command="brease status", env={},
+        run_dir=tmp_path, workspace_dir=tmp_path,
+    )
+    assert closed.allowed is False and closed.failed_open is False
 
 
 def test_run_check_crash_fails_closed_naming_error(tmp_path: Path) -> None:
@@ -594,6 +609,87 @@ def test_hook_and_shim_agree_on_a_matched_deny(tmp_path, monkeypatch, capsys) ->
     monkeypatch.setenv("CAIRN_SHIM_TOOL", "bash")
     monkeypatch.setenv("CAIRN_RUN_DIR", str(tmp_path))
     assert main(["--shim-check", "no-media"]) == 2  # shim's deny contract, unchanged
+
+
+# --------------------------------------------------------------------------- #
+# Fail-open visibility (W6-B, codex-F18) — purely additive: a stderr warning on the
+# fail-open-allow case, never a changed allow/deny outcome.
+# --------------------------------------------------------------------------- #
+
+
+def test_shim_check_fail_open_still_allows_and_warns_on_stderr(tmp_path, monkeypatch, capsys) -> None:
+    manifest = tmp_path / "shims" / "manifest.json"
+    _write_hook_manifest(
+        manifest, [guard("crash.py", name="flaky", command="brease*", on_error="allow")], tmp_path
+    )
+    code = _run_shim_check(
+        ["flaky"], manifest_path=manifest, command="brease status",
+        run_dir=tmp_path, monkeypatch=monkeypatch,
+    )
+    assert code == 0  # allow/deny outcome unchanged — on_error: allow still allows
+    assert "failing open" in capsys.readouterr().err
+
+
+def test_shim_check_clean_allow_emits_no_fail_open_warning(tmp_path, monkeypatch, capsys) -> None:
+    manifest = tmp_path / "shims" / "manifest.json"
+    _write_hook_manifest(manifest, [guard("allow_all.py", name="ok", command="brease*")], tmp_path)
+    code = _run_shim_check(
+        ["ok"], manifest_path=manifest, command="brease status",
+        run_dir=tmp_path, monkeypatch=monkeypatch,
+    )
+    assert code == 0
+    assert capsys.readouterr().err == ""
+
+
+def test_shim_check_fail_closed_still_denies(tmp_path, monkeypatch, capsys) -> None:
+    manifest = tmp_path / "shims" / "manifest.json"
+    _write_hook_manifest(
+        manifest, [guard("crash.py", name="flaky", command="brease*", on_error="deny")], tmp_path
+    )
+    code = _run_shim_check(
+        ["flaky"], manifest_path=manifest, command="brease status",
+        run_dir=tmp_path, monkeypatch=monkeypatch,
+    )
+    assert code == 2  # allow/deny outcome unchanged — on_error: deny still denies
+
+
+def test_hook_check_fail_open_still_allows_and_warns_on_stderr(tmp_path, monkeypatch, capsys) -> None:
+    manifest = tmp_path / ".cairn" / "hook-manifest.json"
+    _write_hook_manifest(
+        manifest, [guard("crash.py", name="flaky", command="brease*", on_error="allow")], tmp_path
+    )
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_bash_event("brease status"))))
+    monkeypatch.setenv("CAIRN_HOOK_MANIFEST", str(manifest))
+    monkeypatch.setenv("CAIRN_RUN_DIR", str(tmp_path))
+    code = main(["--hook-check", "flaky"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.out == ""  # allowed → no deny-JSON on stdout, outcome unchanged
+    assert "failing open" in captured.err  # but the fail-open is now visible
+
+
+def test_hook_check_clean_allow_emits_no_fail_open_warning(tmp_path, monkeypatch, capsys) -> None:
+    manifest = tmp_path / ".cairn" / "hook-manifest.json"
+    _write_hook_manifest(manifest, [guard("allow_all.py", name="ok", command="brease*")], tmp_path)
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(_bash_event("brease status"))))
+    monkeypatch.setenv("CAIRN_HOOK_MANIFEST", str(manifest))
+    monkeypatch.setenv("CAIRN_RUN_DIR", str(tmp_path))
+    code = main(["--hook-check", "ok"])
+    captured = capsys.readouterr()
+    assert code == 0
+    assert captured.out == "" and captured.err == ""
+
+
+def test_hook_check_fail_closed_still_denies_with_deny_json(tmp_path, monkeypatch, capsys) -> None:
+    manifest = tmp_path / ".cairn" / "hook-manifest.json"
+    _write_hook_manifest(
+        manifest, [guard("crash.py", name="flaky", command="brease*", on_error="deny")], tmp_path
+    )
+    code, out = _run_hook_check(
+        ["flaky"], _bash_event("brease status"),
+        manifest_path=manifest, run_dir=tmp_path, monkeypatch=monkeypatch, capsys=capsys,
+    )
+    assert code == 0 and _hook_denied(out)  # allow/deny outcome unchanged
 
 
 # --------------------------------------------------------------------------- #

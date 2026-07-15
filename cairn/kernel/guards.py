@@ -70,10 +70,17 @@ _SHIM_MARKER = "# cairn guard shim for"
 
 @dataclass(frozen=True)
 class CheckResult:
-    """The verdict of one guard check on one command."""
+    """The verdict of one guard check on one command.
+
+    ``failed_open`` is True only for the ``on_error == "allow"`` branch of ``_resolve_error``
+    — an ALLOW that happened because the check crashed/timed out/errored, not because it ran
+    and said yes (codex-F18). It never affects the allow/deny decision itself; it exists so a
+    consumer can surface the degraded-check case (W6-B) without string-matching ``reason``.
+    """
 
     allowed: bool
     reason: str | None = None
+    failed_open: bool = False
 
 
 def matches(guard: GuardDecl, *, tool: str, command: str) -> bool:
@@ -183,7 +190,9 @@ def _resolve_error(guard: GuardDecl, what: str) -> CheckResult:
     """Apply ``on_error`` to an ERROR outcome (not a clean 0/2)."""
     if guard.on_error == "allow":
         return CheckResult(
-            allowed=True, reason=f"guard {guard.name!r} check {what}; failing open"
+            allowed=True,
+            reason=f"guard {guard.name!r} check {what}; failing open",
+            failed_open=True,
         )
     return CheckResult(
         allowed=False, reason=f"guard {guard.name!r} check {what}; failing closed"
@@ -513,6 +522,12 @@ def _run_chain(
             run_dir=run_dir,
             workspace_dir=workspace_dir,
         )
+        if result.failed_open:
+            # Purely additive (W6-B, codex-F18): the check errored and this guard fails OPEN,
+            # so the command runs with no diagnostic anywhere unless we surface it here.
+            # Never changes the outcome — result.allowed is already True in this branch;
+            # this is only visibility for a broken guard that waved a command through.
+            print(result.reason or f"guard {g.name!r}: failed open", file=sys.stderr)
         if not result.allowed:
             return result
     return CheckResult(allowed=True, reason=None)
