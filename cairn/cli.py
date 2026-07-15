@@ -28,12 +28,12 @@ from pathlib import Path
 from typing import Any
 
 import cairn
+from cairn.executors._cli import _probe_version
 from cairn.kernel import doctor as doctor_mod
 from cairn.kernel import newkit
 from cairn.kernel.artifacts import resolve_path, validate
 from cairn.kernel.batchkit import run_batch
 from cairn.kernel.compose import make_composer, render_artifact_path
-from cairn.executors._cli import _probe_version
 from cairn.kernel.config import Config, ExecutorConfig, installed_version, load_config, version_compat
 from cairn.kernel.errors import CairnError, ConfigError
 from cairn.kernel.gatekit import (
@@ -569,9 +569,14 @@ def _probe_executor_versions(resolved_models: dict[str, tuple[str, str, str | No
     """``<cli> --version`` for each DISTINCT executor the plan actually resolves (ARCHITECTURE
     §10) — never ``shell``/``stub``, which aren't CLI-backed and don't understand the flag.
 
-    A probe failure (binary not on PATH, non-zero exit, timeout) records ``None`` for that
-    executor and moves on — mint must never crash on a bad probe (docs/TOOLING-AND-GROWTH's
-    "record null, continue" rule, same as a missing tool check)."""
+    A probe failure (binary not on PATH, non-zero exit, timeout, or a spawn failure) records
+    ``None`` for that executor and moves on — a version probe is best-effort telemetry, never
+    a reason to crash the mint. ``shutil.which`` only rules out the common case; it's a TOCTOU
+    check (the binary can vanish between the check and the spawn) and doesn't catch a
+    resolvable-but-broken shim (asdf/mise/nvm-managed CLIs are a realistic case on dev
+    machines), so the probe itself is still wrapped: ``run_process`` (via ``_probe_version``)
+    raises :class:`~cairn.kernel.errors.ExecutorSpawnError` — a :class:`CairnError`, NOT an
+    ``OSError`` — on a Popen spawn failure, not just a bare ``OSError``."""
     names = sorted({exec_name for exec_name, _model, _effort in resolved_models.values()})
     out: dict[str, str | None] = {}
     for name in names:
@@ -580,7 +585,7 @@ def _probe_executor_versions(resolved_models: dict[str, tuple[str, str, str | No
             continue
         try:
             code, text = _probe_version(name)
-        except OSError:
+        except (OSError, CairnError):
             out[name] = None
             continue
         out[name] = text if (code == 0 and text) else None
@@ -717,14 +722,18 @@ def _reproducibility_drift_guard(recorded: dict, ws: Path) -> None:
     cairn major), a newer CLI or a workspace commit since mint doesn't invalidate what's on
     disk — so this never blocks and takes no ``--force``. A probe failure here is silent (not
     a second, redundant warning): the tool hard-stop / doctor already own "can this run at
-    all"; this guard only speaks up when a probe SUCCEEDS with a value that disagrees."""
+    all"; this guard only speaks up when a probe SUCCEEDS with a value that disagrees. Catches
+    both ``OSError`` and :class:`CairnError` — a Popen spawn failure surfaces as
+    ``ExecutorSpawnError`` (a ``CairnError``), not a bare ``OSError`` (see
+    ``_probe_executor_versions``). NOTE: only ``git_rev`` is drift-compared here — ``git_dirty``
+    is recorded at mint but a clean↔dirty change alone (same rev) is never itself warned on."""
     recorded_versions = (recorded.get("executors") or {}).get("versions") or {}
     for name, old in sorted(recorded_versions.items()):
         if not old or shutil.which(name) is None:
             continue
         try:
             code, current = _probe_version(name)
-        except OSError:
+        except (OSError, CairnError):
             continue
         if code == 0 and current and current != old:
             print(

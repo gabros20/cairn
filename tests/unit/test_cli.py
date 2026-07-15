@@ -19,6 +19,7 @@ import pytest
 import cairn
 from cairn.cli import SUBCOMMANDS, main
 from cairn.kernel import newkit
+from cairn.kernel.errors import ExecutorSpawnError
 from cairn.kernel.types import ExitCode
 
 REPO = Path(__file__).resolve().parents[2]
@@ -389,8 +390,8 @@ def test_run_mint_records_executor_versions(tmp_path, monkeypatch):
 
 def test_run_mint_records_null_versions_when_executor_missing(tmp_path, monkeypatch):
     # An empty PATH — `claude` unresolvable (this dev machine's own `claude` CLI would
-    # otherwise shadow the fixture). Mint must record null, never crash
-    # (docs/TOOLING-AND-GROWTH's "record null, continue" rule).
+    # otherwise shadow the fixture). Mint must record null, never crash (ARCHITECTURE §10:
+    # a probe failure records null and continues, same as a missing tool check).
     ws = _twofleet_ws(tmp_path)
     monkeypatch.chdir(ws)
     monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
@@ -398,6 +399,42 @@ def test_run_mint_records_null_versions_when_executor_missing(tmp_path, monkeypa
     assert rc == int(ExitCode.OK)
     ex = json.loads((_run_dir(ws, "twofleet") / "run.json").read_text())["executors"]
     assert ex["versions"] == {"claude": None}
+
+
+def test_run_mint_records_null_on_executor_spawn_error(tmp_path, monkeypatch):
+    # W1's run_process wraps a Popen spawn failure into ExecutorSpawnError — a CairnError,
+    # NOT an OSError — so `shutil.which` finding the binary is not enough to guarantee a
+    # clean probe: a TOCTOU removal, or a resolvable-but-broken shim (asdf/mise/nvm-managed
+    # CLIs are a realistic case), can still raise past a which()-only guard. This asserts the
+    # handler catches CairnError too — it must FAIL against a bare `except OSError`.
+    ws = _twofleet_ws(tmp_path)
+    monkeypatch.chdir(ws)  # real PATH — `claude` resolves via shutil.which on this machine
+
+    def _boom(name: str, timeout_s: float = 15.0):
+        raise ExecutorSpawnError(f"{name!r} failed to start", executable=name)
+
+    monkeypatch.setattr("cairn.cli._probe_version", _boom)
+    rc = main(["run", "twofleet", "--executor", "stub", "--headless"])
+    assert rc == int(ExitCode.OK)  # never crashes the mint
+    ex = json.loads((_run_dir(ws, "twofleet") / "run.json").read_text())["executors"]
+    assert ex["versions"] == {"claude": None}
+
+
+def test_resume_survives_executor_spawn_error_during_drift_probe(tmp_path, monkeypatch):
+    # Same fix, the resume-side call site (_reproducibility_drift_guard): a probe raising
+    # ExecutorSpawnError during the drift check must not crash the resume either.
+    ws = _twofleet_ws(tmp_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PATH", f"{FAKEBIN}{os.pathsep}{os.environ['PATH']}")
+    assert main(["run", "twofleet", "--executor", "stub", "--headless"]) == 0
+    rd = _run_dir(ws, "twofleet")
+
+    def _boom(name: str, timeout_s: float = 15.0):
+        raise ExecutorSpawnError(f"{name!r} failed to start", executable=name)
+
+    monkeypatch.setattr("cairn.cli._probe_version", _boom)
+    rc = main(["resume", str(rd)])
+    assert rc == int(ExitCode.OK)  # drift-probe failure is silent, never a crash
 
 
 def test_run_mint_records_git_rev_and_dirty_flag(hello_ws, monkeypatch):
@@ -477,11 +514,18 @@ def test_resume_warns_on_workspace_git_rev_drift(hello_ws, monkeypatch, capsys):
 
 
 def test_resume_same_versions_and_git_rev_is_silent(tmp_path, monkeypatch, capsys):
+    # A git-initialized workspace, so `git_rev` is a real recorded value (not None) — the
+    # no-drift path for BOTH executor versions and git rev is actually exercised here, not
+    # just the versions half (a bare, non-git ws would leave git_rev None and never touch
+    # the git-rev comparison branch of _reproducibility_drift_guard at all).
     ws = _twofleet_ws(tmp_path)
     monkeypatch.chdir(ws)
+    _git_init(ws)
     monkeypatch.setenv("PATH", f"{FAKEBIN}{os.pathsep}{os.environ['PATH']}")
     assert main(["run", "twofleet", "--executor", "stub", "--headless"]) == 0
     rd = _run_dir(ws, "twofleet")
+    doc = json.loads((rd / "run.json").read_text())
+    assert doc["git_rev"] is not None  # confirm this run actually has a git_rev to compare
     capsys.readouterr()
     rc = main(["resume", str(rd)])
     err = capsys.readouterr().err
