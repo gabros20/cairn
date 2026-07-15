@@ -65,14 +65,18 @@ the actual control.
 
 *Status: built. The declaration + deny-by-default pass-through (§1.1–1.2) landed in C1, and the
 literal scrubber is now live: declared `[secrets]` values are scrubbed from step logs (line by
-line as they stream, then a whole-content rewrite pass over the bounded log once the process
-exits), captured output (the whole-content pass over the complete captured text, run before the
-walker parses it for the STEP block), and every trail event — applied structurally *before*
-serialization, so a secret containing quotes, backslashes, or JSON syntax cannot escape the scrub.
-Envelopes never contain resolved secret values (verified). A secret split across two log lines
-(W6-C, grok-F10) is caught by the whole-content pass in both the captured text and the rewritten
-log — the streaming per-line pass alone would miss it, but nothing downstream (parse input or
-on-disk log) still sees it raw.*
+line as they stream), captured output (a whole-content pass over the complete captured text, run
+before the walker parses it for the STEP block), and every trail event — applied structurally
+*before* serialization, so a secret containing quotes, backslashes, or JSON syntax cannot escape
+the scrub. Envelopes never contain resolved secret values (verified). A secret split across two
+log lines (W6-C, grok-F10) is caught by the whole-content pass in the captured text always, and in
+the on-disk log in the NORMAL case (the streaming per-line pass alone would miss it in both).
+Disclosed residual: the log's whole-content rewrite only runs once the pump thread has fully
+drained (its sole writer has finished) — a backgrounded grandchild holding the log's pipe open
+past the drain grace (the same pre-existing case that already limits timeout accounting) means the
+log gets only the per-line pass for whatever that grandchild still emits; the rewrite is skipped
+rather than risk a second concurrent writer on the file. The captured text handed to the walker is
+unaffected either way — it's an in-memory snapshot, not a second writer.*
 
 ## 2. Untrusted content — the prompt-injection posture
 

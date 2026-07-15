@@ -126,6 +126,33 @@ def _kill_process_group(proc: subprocess.Popen) -> None:
             pass
 
 
+def _rewrite_log_if_drained(
+    log_path: Path, redactor: Callable[[str], str] | None, reader: threading.Thread
+) -> None:
+    """Whole-content redaction rewrite of the on-disk log (W6-C option (a)) — but ONLY once
+    the pump thread has fully drained (``reader`` is no longer alive).
+
+    The pump thread is the log's sole writer, and it only returns (closing the file) after
+    its ``for line in proc.stdout`` loop hits EOF. A backgrounded grandchild can hold the
+    write end of the pipe open long past the process exiting or being killed (the same
+    pre-existing case the ``reader.join(2)`` grace period above already documents) — in that
+    case the pump is STILL the log's writer when we'd otherwise reopen and rewrite it here,
+    and a second concurrent writer on one file is a corruption risk. So: reader still alive
+    ⇒ skip the rewrite entirely, no second writer is ever opened. That leaves a documented
+    residual — a secret split across a newline in output written by a still-running
+    grandchild keeps only the per-line streamed redaction, not the whole-content pass — in
+    the same family as the pre-existing pipe-hold limitation (SECURITY.md §1.3).
+    """
+    if redactor is None or reader.is_alive():
+        return
+    try:
+        log_path.write_text(
+            redactor(log_path.read_text(encoding="utf-8", errors="replace")), encoding="utf-8"
+        )
+    except OSError:
+        pass  # best-effort — a log rewrite failure must not fail an otherwise-good step
+
+
 def run_process(
     argv: list[str],
     *,
@@ -143,13 +170,17 @@ def run_process(
     killed and :class:`ExecTimeout` is raised. Never uses ``shell=True``.
 
     ``redactor`` (SECURITY.md §1.3), when given, scrubs each line *before* it is written to the
-    log or captured, AND is re-applied once, whole-content, on both the log and the returned
-    text after the process exits (W6-C, grok-F10). The per-line pass alone cannot catch a
+    log or captured, AND is re-applied once, whole-content, on both the returned text and the
+    log after the process exits (W6-C, grok-F10). The per-line pass alone cannot catch a
     secret whose value is SPLIT across a newline (tokens are single-line) — it would land raw
-    on disk and in the captured text the walker parses for the STEP block. The final
-    whole-content pass closes that gap: the log is one bounded step's output, so re-reading and
-    rewriting it once here is cheap, and the captured string is complete by then. ``None`` ⇒ the
-    stream is teed verbatim, byte-for-byte as before (no whole-content pass either).
+    on disk and in the captured text the walker parses for the STEP block. The whole-content
+    pass on the RETURNED text always runs (``captured`` is an in-memory snapshot, not a second
+    writer). The log rewrite is gated on the pump thread having fully drained
+    (``_rewrite_log_if_drained``): a backgrounded grandchild holding the pipe open past the
+    drain grace is still the log's writer, so rewriting then would race a second writer onto
+    the same file — in that rare case the rewrite is skipped and only the per-line redaction
+    covers the log (a documented residual, SECURITY.md §1.3). ``None`` ⇒ the stream is teed
+    verbatim, byte-for-byte as before (no whole-content pass either).
     """
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -222,6 +253,9 @@ def run_process(
                 proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 pass
+        # Same reader-gated whole-content pass as the normal-exit path below (W6-C) — a
+        # timeout must not skip it just because it raises instead of returning.
+        _rewrite_log_if_drained(log_path, redactor, reader)
         raise ExecTimeout(
             f"{argv[0]} exceeded timeout of {timeout_s}s after "
             f"{time.monotonic() - start:.1f}s"
@@ -237,9 +271,8 @@ def run_process(
         # was split across a newline in the streamed output — and so survived the per-line
         # pass above — is still caught here, before the walker parses this text for the STEP
         # block. Redacting an already-redacted marker is a no-op, so this is safe to layer on.
+        # (This part never needs the reader-alive gate: `captured` is a snapshot already read
+        # into memory, not a second writer on the log file.)
         captured_text = redactor(captured_text)
-        try:
-            log_path.write_text(redactor(log_path.read_text(encoding="utf-8", errors="replace")), encoding="utf-8")
-        except OSError:
-            pass  # best-effort — a log rewrite failure must not fail an otherwise-good step
+    _rewrite_log_if_drained(log_path, redactor, reader)
     return proc.returncode, captured_text, time.monotonic() - start

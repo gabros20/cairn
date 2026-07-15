@@ -350,6 +350,66 @@ def test_run_process_redacts_a_multiline_secret_from_captured_and_log(tmp_path):
     assert "∎REDACTED:TOKEN∎" in on_disk
 
 
+def test_run_process_skips_log_rewrite_when_reader_still_alive(tmp_path):
+    # Same shape as test_run_process_grandchild_holding_pipe_does_not_stall_or_false_timeout:
+    # a backgrounded grandchild inherits the stdout pipe and holds it open past the drain
+    # grace, so the pump thread is still the log's writer when run_process would otherwise
+    # rewrite it. The reader-gated rewrite (W6-C) must SKIP in that case (no second writer,
+    # no corruption) — proven here by a MULTILINE secret that survives on disk (residual)
+    # while still being caught in the RETURNED text (never gated on the reader).
+    secret = "SEC\nRET"
+
+    def redact(text: str) -> str:
+        return text.replace(secret, "∎REDACTED:TOKEN∎")
+
+    log = tmp_path / "l.log"
+    code, out, _ = run_process(
+        ["/bin/sh", "-c", "printf 'a=SEC\\nRET-b\\n'; sleep 30 & echo started"],
+        stdin_text=None,
+        env={"PATH": "/usr/bin:/bin"},
+        cwd=tmp_path,
+        timeout_s=15,
+        log_path=log,
+        redactor=redact,
+    )
+    assert code == 0
+    # The whole-content pass on the returned/parsed text always runs — it's an in-memory
+    # snapshot, not a second writer, so it never needs the reader-drained gate.
+    assert secret not in out
+    assert "∎REDACTED:TOKEN∎" in out
+    # The on-disk log, by contrast, only gets the per-line pass here (documented residual):
+    # the reader was still alive, so the whole-content rewrite was skipped, not raced.
+    on_disk = log.read_text()
+    assert secret in on_disk
+    assert "started" in on_disk  # log is intact, not corrupted or truncated by a race
+
+
+def test_run_process_timeout_path_rewrites_log_when_reader_drains(tmp_path):
+    # On a timeout, the whole process GROUP is SIGKILLed (no surviving backgrounded
+    # grandchild in this case) — the pipe closes, the pump drains, and the reader-gated
+    # rewrite (W6-C) must still run on this path even though it raises instead of
+    # returning: a multiline secret is caught in the log here too.
+    secret = "TOK\nEN99"
+
+    def redact(text: str) -> str:
+        return text.replace(secret, "∎REDACTED:TOKEN∎")
+
+    log = tmp_path / "l.log"
+    with pytest.raises(ExecTimeout):
+        run_process(
+            ["/bin/sh", "-c", "printf 'x=TOK\\nEN99-y\\n'; sleep 30"],
+            stdin_text=None,
+            env={"PATH": "/usr/bin:/bin"},
+            cwd=tmp_path,
+            timeout_s=0.5,
+            log_path=log,
+            redactor=redact,
+        )
+    on_disk = log.read_text()
+    assert secret not in on_disk
+    assert "∎REDACTED:TOKEN∎" in on_disk
+
+
 def test_run_process_without_redactor_is_byte_identical(tmp_path):
     # No redactor ⇒ the stream is teed verbatim (the default path stays unchanged).
     log = tmp_path / "out.log"
