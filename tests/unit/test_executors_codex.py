@@ -33,9 +33,17 @@ def test_argv_shape_and_prompt_on_stdin(tmp_path, monkeypatch):
     assert argv[1:] == [
         "exec", "-C", str(inv.cwd), "-m", "gpt-5.5",
         "--sandbox", "workspace-write", "--skip-git-repo-check",
+        "--ignore-user-config", "--ignore-rules",
         "-c", "model_reasoning_effort=high",
     ]
     assert stdin == "the codex prompt"  # prompt is delivered on stdin, not argv
+
+
+def test_config_isolation_flags_present(tmp_path, monkeypatch):
+    # W4 (codex-F6): seal the process from ambient user config for deterministic runs.
+    _, _, argv, _, _ = _invoke(tmp_path, monkeypatch, effort=None)
+    assert "--ignore-user-config" in argv
+    assert "--ignore-rules" in argv
 
 
 def test_no_approval_flag(tmp_path, monkeypatch):
@@ -59,6 +67,7 @@ def test_effort_override_omitted_when_none(tmp_path, monkeypatch):
     assert argv[1:] == [
         "exec", "-C", str(inv.cwd), "-m", "gpt-5.5",
         "--sandbox", "workspace-write", "--skip-git-repo-check",
+        "--ignore-user-config", "--ignore-rules",
     ]
     assert not any(a.startswith("model_reasoning_effort=") for a in argv)
     assert "-c" not in argv

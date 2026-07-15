@@ -32,6 +32,13 @@ class CodexExecutor(CliExecutor):
             "-m", inv.model,
             "--sandbox", "workspace-write",
             "--skip-git-repo-check",
+            # W4 config isolation (codex-F6): seal the process from ambient user config so
+            # identical pipeline runs are deterministic. `--ignore-user-config` skips
+            # `$CODEX_HOME/config.toml` (auth still uses CODEX_HOME); `--ignore-rules` skips user
+            # or project execpolicy `.rules` files. Both confirmed in the captured
+            # `codex exec --help`.
+            "--ignore-user-config",
+            "--ignore-rules",
         ]
         if inv.effort is not None:
             argv += ["-c", f"model_reasoning_effort={inv.effort}"]
