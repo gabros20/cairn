@@ -135,6 +135,50 @@ def test_resolve_rejects_parent_escape(tmp_path):
         resolve_path(_decl(), "../../secrets.json", tmp_path)
 
 
+# --------------------------------------------------------------------------- #
+# Symlink containment (codex-F11) — the string checks above can't catch a symlink.
+# --------------------------------------------------------------------------- #
+
+
+def test_resolve_rejects_plain_path_symlinked_outside_run_dir(tmp_path):
+    outside = tmp_path.parent / "outside_target.json"
+    outside.write_text("{}")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "report.json").symlink_to(outside)
+    with pytest.raises(ConfigError, match="escapes"):
+        resolve_path(_decl(path="report.json"), "report.json", run_dir)
+
+
+def test_resolve_rejects_glob_match_symlinked_outside_run_dir(tmp_path):
+    outside = tmp_path.parent / "outside_target.json"
+    outside.write_text("{}")
+    run_dir = tmp_path / "run"
+    (run_dir / "blueprints").mkdir(parents=True)
+    (run_dir / "blueprints" / "escape.json").symlink_to(outside)
+    with pytest.raises(ConfigError, match="escapes"):
+        resolve_path(_decl(path="blueprints/**"), "blueprints/*.json", run_dir)
+
+
+def test_resolve_allows_symlink_whose_target_stays_inside_run_dir(tmp_path):
+    (tmp_path / "real").mkdir()
+    real_file = tmp_path / "real" / "report.json"
+    real_file.write_text("{}")
+    link = tmp_path / "report.json"
+    link.symlink_to(real_file)
+    resolved = resolve_path(_decl(path="report.json"), "report.json", tmp_path)
+    assert resolved.paths == [link]
+    assert exists(resolved) is True
+
+
+def test_resolve_normal_not_yet_existing_artifact_path_still_resolves(tmp_path):
+    # The common case: the artifact file doesn't exist yet (the step will write it). No
+    # symlink is involved, so the resolve-containment check must not reject it.
+    resolved = resolve_path(_decl(path="out.json"), "out.json", tmp_path)
+    assert resolved.paths == [tmp_path / "out.json"]
+    assert exists(resolved) is False
+
+
 def test_exists_true_only_when_plain_file_present(tmp_path):
     resolved = resolve_path(_decl(), "out.json", tmp_path)
     assert exists(resolved) is False
