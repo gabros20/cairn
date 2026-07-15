@@ -121,6 +121,14 @@ class GrokExecutor(CliExecutor):
         #   * `--no-auto-update` is hidden from --help on 0.2.82 but still accepted
         #     (unknown flags are rejected at parse time, this one is not) and remains
         #     documented for headless use — keep it so runs never trigger update checks.
+        #     Drift risk flagged by the panel (grok-F1: a hidden flag can be silently
+        #     removed with no --help diff to catch it). Re-verified LIVE on grok 0.2.101
+        #     (W6): `grok --no-auto-update models` exits 0 (accepted), while a fake flag
+        #     (`grok --this-flag-does-not-exist models`) exits 2 ("unexpected argument") —
+        #     so the flag is hidden-but-accepted and works today. The W5b doctor
+        #     emitted-flags drift check can't verify a flag --help doesn't list, so this
+        #     comment IS the verification record; re-check it by hand on the next grok
+        #     version bump.
         argv = [
             "grok",
             "--prompt-file", str(inv.prompt_file),
