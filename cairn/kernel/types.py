@@ -19,7 +19,7 @@ from typing import Literal, Protocol, runtime_checkable
 # Abstract model tiers (never vendor names — cairn.toml maps tier → concrete model per executor)
 # and the shared effort enum. Both are ordered, lowest-cost last where it matters.
 TIERS: tuple[str, ...] = ("reasoning", "balanced", "cheap")
-EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh")
+EFFORTS: tuple[str, ...] = ("low", "medium", "high", "xhigh", "max")
 
 
 class ExitCode(IntEnum):
