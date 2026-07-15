@@ -58,11 +58,24 @@ class GrokExecutor(CliExecutor):
             "--permission-mode", "bypassPermissions",
             "--no-alt-screen",
             "--no-auto-update",
+            # W4 config isolation (grok-F6): disable cross-session memory so identical pipeline
+            # runs are deterministic (captured help: "Disable cross-session memory for this
+            # session").
+            "--no-memory",
+            # W4 (grok-F5): `--sandbox <PROFILE>` — the CLI help does not enumerate profile names,
+            # but the installed CLI ships ~/.grok/docs/user-guide/18-sandbox.md documenting the
+            # built-in profiles, and `workspace` is live-verified on grok 0.2.101: `grok --sandbox
+            # workspace inspect` applies cleanly (no warning), while a bogus profile name is
+            # refused ("could not apply … sandbox profile; refusing to start"). `workspace` reads
+            # everywhere and writes only CWD + ~/.grok/ + temp dirs — the workspace-write
+            # equivalent to codex's `--sandbox workspace-write`, and cwd here is always the run
+            # dir.
+            "--sandbox", "workspace",
         ]
         if inv.effort is not None:
-            # Native effort: the headless-only `--effort` flag takes low|medium|high|xhigh
-            # (+max) — a superset of cairn's EFFORTS. NOT `--reasoning-effort`: that is a
-            # separate per-model reasoning knob, and both models shipped on 0.2.82 report
+            # Native effort: the headless-only `--effort` flag takes low|medium|high|xhigh|max —
+            # matches cairn's EFFORTS exactly (W4 added "max"). NOT `--reasoning-effort`: that is
+            # a separate per-model reasoning knob, and both models shipped on 0.2.82 report
             # supports_reasoning_effort=false in models_cache.json (it would be a no-op).
             argv += ["--effort", inv.effort]
         return argv, None  # prompt delivered via --prompt-file; stdin is not read headlessly

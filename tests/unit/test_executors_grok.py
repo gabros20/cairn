@@ -44,6 +44,8 @@ def test_argv_shape_prompt_via_prompt_file_with_effort(tmp_path, monkeypatch):
         "--permission-mode", "bypassPermissions",
         "--no-alt-screen",
         "--no-auto-update",
+        "--no-memory",
+        "--sandbox", "workspace",
         "--effort", "low",
     ]
     # grok 0.2.82 headless does NOT read the prompt from stdin (bare `-p` is an argv
@@ -62,8 +64,21 @@ def test_effort_flag_omitted_when_none(tmp_path, monkeypatch):
         "--permission-mode", "bypassPermissions",
         "--no-alt-screen",
         "--no-auto-update",
+        "--no-memory",
+        "--sandbox", "workspace",
     ]
     assert "--effort" not in argv
+
+
+def test_config_isolation_flags_present(tmp_path, monkeypatch):
+    # W4 (grok-F6/F5): cross-session memory disabled and the workspace sandbox profile applied
+    # so identical pipeline runs are deterministic. `workspace` is live-verified against the
+    # installed grok CLI (see grok.py's comment) — reads everywhere, writes only CWD + ~/.grok/
+    # + temp dirs, matching codex's workspace-write equivalent.
+    _, _, argv, _, _ = _invoke(tmp_path, monkeypatch, effort=None)
+    assert "--no-memory" in argv
+    i = argv.index("--sandbox")
+    assert argv[i + 1] == "workspace"
 
 
 def test_dead_and_wrong_flags_absent(tmp_path, monkeypatch):
