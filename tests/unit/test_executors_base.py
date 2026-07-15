@@ -321,6 +321,35 @@ def test_run_process_redacts_the_log_and_captured_output(tmp_path):
     assert "sk-live-DEADBEEF" not in out and "∎REDACTED:TOKEN∎" in out
 
 
+def test_run_process_redacts_a_multiline_secret_from_captured_and_log(tmp_path):
+    # A secret VALUE containing an embedded newline isn't caught by the per-line pass alone
+    # (each streamed line only holds half of it) — the whole-content pass run after the
+    # process exits (W6-C, grok-F10) must still catch it, both in the text the walker parses
+    # for the STEP block and in the on-disk log (this repo's choice (a): a final rewrite pass
+    # over the bounded step log).
+    secret = "sk-live-DEAD\nBEEF"
+
+    def redact(text: str) -> str:
+        return text.replace(secret, "∎REDACTED:TOKEN∎")
+
+    log = tmp_path / "out.log"
+    code, out, _ = run_process(
+        ["/bin/sh", "-c", "printf 'token=sk-live-DEAD\\nBEEF-tail\\n'"],
+        stdin_text=None,
+        env={"PATH": "/usr/bin:/bin"},
+        cwd=tmp_path,
+        timeout_s=10,
+        log_path=log,
+        redactor=redact,
+    )
+    assert code == 0
+    assert secret not in out
+    assert "∎REDACTED:TOKEN∎" in out
+    on_disk = log.read_text()
+    assert secret not in on_disk
+    assert "∎REDACTED:TOKEN∎" in on_disk
+
+
 def test_run_process_without_redactor_is_byte_identical(tmp_path):
     # No redactor ⇒ the stream is teed verbatim (the default path stays unchanged).
     log = tmp_path / "out.log"

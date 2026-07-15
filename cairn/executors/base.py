@@ -143,11 +143,13 @@ def run_process(
     killed and :class:`ExecTimeout` is raised. Never uses ``shell=True``.
 
     ``redactor`` (SECURITY.md §1.3), when given, scrubs each line *before* it is written to the
-    log or captured — so declared secret values never land on disk in ``logs/<step>.log`` (and
-    never in the returned output the walker parses for the STEP block). It runs per line in the
-    pump thread; a secret split across two lines is not caught (tokens are single-line), and the
-    trail's own redactor is the belt-and-suspenders scrub for any event payload. ``None`` ⇒ the
-    stream is teed verbatim, byte-for-byte as before.
+    log or captured, AND is re-applied once, whole-content, on both the log and the returned
+    text after the process exits (W6-C, grok-F10). The per-line pass alone cannot catch a
+    secret whose value is SPLIT across a newline (tokens are single-line) — it would land raw
+    on disk and in the captured text the walker parses for the STEP block. The final
+    whole-content pass closes that gap: the log is one bounded step's output, so re-reading and
+    rewriting it once here is cheap, and the captured string is complete by then. ``None`` ⇒ the
+    stream is teed verbatim, byte-for-byte as before (no whole-content pass either).
     """
     log_path = Path(log_path)
     log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -229,4 +231,15 @@ def run_process(
     # buffered; a backgrounded grandchild may hold the pipe open indefinitely, in which case
     # the daemon thread keeps teeing its output to the log while the step result returns now.
     reader.join(2)
-    return proc.returncode, "".join(captured), time.monotonic() - start
+    captured_text = "".join(captured)
+    if redactor is not None:
+        # Whole-content pass (W6-C): the captured string is complete now, so a secret that
+        # was split across a newline in the streamed output — and so survived the per-line
+        # pass above — is still caught here, before the walker parses this text for the STEP
+        # block. Redacting an already-redacted marker is a no-op, so this is safe to layer on.
+        captured_text = redactor(captured_text)
+        try:
+            log_path.write_text(redactor(log_path.read_text(encoding="utf-8", errors="replace")), encoding="utf-8")
+        except OSError:
+            pass  # best-effort — a log rewrite failure must not fail an otherwise-good step
+    return proc.returncode, captured_text, time.monotonic() - start
