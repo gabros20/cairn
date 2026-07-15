@@ -282,8 +282,11 @@ def test_install_guards_writes_settings_and_manifest(tmp_path):
     command = entries[0]["hooks"][0]["command"]
     assert "cairn.kernel.guards --hook-check" in command
     assert "no-media" in command
-    # The protected manifest path is baked absolute into the hook command → resolves at fire time.
-    assert str(manifest_path) in command
+    # C9: the manifest path is no longer baked into the hook command — the hook subprocess
+    # INHERITS CAIRN_HOOK_MANIFEST from claude's env (walker-set per invocation), falling back to
+    # guard_manifest_path(CAIRN_RUN_DIR, "hook") — exactly manifest_path above — when unset.
+    assert str(manifest_path) not in command
+    assert "CAIRN_HOOK_MANIFEST" not in command
 
 
 def test_install_guards_is_idempotent(tmp_path):

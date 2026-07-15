@@ -263,7 +263,19 @@ documented backstop.
 
 ---
 
-## C9 — runtime `when` on guards (codex-F12 / W6-guard-when)  *(future — deferred)*
+## C9 — runtime `when` on guards (codex-F12 / W6-guard-when)  *(done — 2026-07-15)*
+
+**Landed 2026-07-15.** Full design in `docs/GUARD-WHEN-PLAN.md` (status: done). Built as **Option
+B**, NOT the Option A sketched in "Build (when prioritized)" below (that paragraph is left
+as-written, a superseded record): the `when` is evaluated in the trusted **walker**
+(`walk.py::_guard_active`/`_active_guard_manifest`), which writes a fresh, SIGNED,
+**per-invocation** manifest containing only the currently-active guards; the subprocess
+enforcement path (`_run_chain`/`_shim_check`/`_hook_check`/`_load_verified_manifest`, the MAC +
+check-hash pinning) is byte-for-byte unchanged — an inactive guard is simply absent from the
+manifest. A guard whose `when` can't evaluate (missing gate/artifact) is treated ACTIVE
+(fail-safe) with a `guard-when-error` warning, never dropped and never a run halt. A plan with no
+runtime-`when` guards takes a mandatory fast path (`{}` override, zero per-invocation writes) —
+byte-identical to pre-C9 behavior, proven by a dedicated regression test.
 
 *Surfaced by the same 2026-07-14 hardening review. A guard whose `when:` is decidable at plan time
 (params/dims only) is already handled: the planner drops an inactive guard entirely. The gap is a guard

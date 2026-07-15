@@ -62,7 +62,7 @@ from cairn.kernel.compose import render_artifact_path
 from cairn.kernel.config import Config
 from cairn.kernel.errors import CairnError
 from cairn.kernel.expr import EvalError, Expr
-from cairn.kernel.gatekeys import ensure_run_key
+from cairn.kernel.gatekeys import ensure_run_key, guard_manifest_path
 from cairn.kernel.gatekit import (
     GateNeedsHuman,
     GateTampered,
@@ -71,9 +71,11 @@ from cairn.kernel.gatekit import (
     read_verified_decision,
     resolve_gate,
 )
+from cairn.kernel.guards import write_manifest
 from cairn.kernel.hookprobe import _looks_like_auth_failure
 from cairn.kernel.plan import (
     GateNode,
+    GuardDecl,
     LoopNode,
     ParallelNode,
     Plan,
@@ -443,6 +445,7 @@ class _Walk:
                 )
 
         env = self._build_env(step)
+        env.update(self._active_guard_manifest(step, cycle))
         retry_attempts, feedback = step.retry
         model_str = f"{model}/{effort}" if effort else model
         reasons: list[str] = []
@@ -941,6 +944,64 @@ class _Walk:
             return bool(expr.evaluate(self._resolver(cycle)))
         except EvalError as exc:
             raise _Halt(ExitCode.CONFIG, node_id, f"expression error: {exc}") from exc
+
+    def _guard_active(self, guard: GuardDecl, cycle: int | None) -> bool:
+        """Is ``guard`` currently enforced (GUARD-WHEN-PLAN.md §7)? A static guard (``when is
+        None``) is always active. A runtime ``when`` is evaluated against the SAME trusted
+        resolver steps/gates use (``_resolver``) — ``params``/``dims`` from ``self.plan`` in
+        memory, ``gates`` via the W2-verified reader, ``artifacts`` via the contained resolver —
+        never re-parsed from the agent-writable run dir.
+
+        Unlike ``_eval`` (steps/gates: an unevaluable ``when`` halts the whole run), a guard whose
+        ``when`` raises ``EvalError`` is treated as ACTIVE and a warning is emitted, never halted
+        and never silently dropped: over-enforcing on ambiguity is fail-safe, dropping the guard
+        would be fail-OPEN (unsafe), and halting the run over one guard's `when` is too aggressive
+        for what is, at worst, an over-block."""
+        if guard.when is None:
+            return True
+        try:
+            return bool(guard.when.evaluate(self._resolver(cycle)))
+        except EvalError as exc:
+            self._emit(
+                "guard-when-error", node=guard.name, cycle=cycle, data={"error": str(exc)}
+            )
+            return True
+
+    def _active_guard_manifest(self, step: StepNode, cycle: int | None) -> dict[str, str]:
+        """Env overrides pointing this invocation at its per-invocation guard manifest(s), or
+        ``{}`` (GUARD-WHEN-PLAN.md §3, §8).
+
+        MANDATORY fast path: if no guard in the plan carries a runtime ``when``, every
+        invocation's active set is identical to the once-per-run static install — return ``{}``
+        and let the static shim manifest / baked hook fallback stand, byte-identical to pre-C9
+        behavior, with zero per-invocation overhead. This is the regression guard for "existing
+        (no-runtime-`when`) pipelines are unaffected".
+
+        Otherwise, for each layer the plan actually enforces guards at, evaluate the active
+        subset (``_guard_active``) and write a freshly SIGNED manifest (same ``write_manifest``
+        builder, same MAC — the subprocess enforcement path is untouched) containing ONLY the
+        active guards, at a path keyed by ``step.id`` + ``cycle`` (``gatekeys.guard_manifest_path``
+        ``key=``) so concurrent ``parallel:`` children never share a manifest file (§6; retries are
+        sequential and a guard's ``when`` doesn't change across attempts of the same step, so
+        attempt is not part of the key). The manifest never carries the `when` expression itself
+        (`_load_manifest_guard` still sets `when=None` on reload) — inactive guards are simply
+        absent, and absence is what `_run_chain` already treats as "skip"."""
+        if not any(g.when is not None for g in self.plan.guards):
+            return {}
+
+        key = f"{step.id}-c{cycle}"
+        overrides: dict[str, str] = {}
+        for layer, env_var in (("shim", "CAIRN_SHIM_MANIFEST"), ("hook", "CAIRN_HOOK_MANIFEST")):
+            if not any(layer in g.enforce for g in self.plan.guards):
+                continue
+            active = [
+                g for g in self.plan.guards
+                if layer in g.enforce and self._guard_active(g, cycle)
+            ]
+            path = guard_manifest_path(self.run_dir, layer, key=key)
+            write_manifest(active, workspace_dir=self.workspace_dir, run_dir=self.run_dir, path=path)
+            overrides[env_var] = str(path)
+        return overrides
 
     def _resolver(self, cycle: int | None) -> Callable[[str, tuple[str, ...]], Any]:
         def resolve(root: str, parts: tuple[str, ...]) -> Any:

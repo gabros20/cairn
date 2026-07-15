@@ -259,6 +259,21 @@ other hook failure (crash, timeout, malformed output) fails OPEN**, so for grok 
 layers are the backstop against a broken hook, not just a bypassed one. The check script contract is
 one file, one convention (exit 0/2), reused across all three layers.
 
+**Guard activation — runtime `when` (C9).** A `guards:` entry may carry a `when:`. A plan-time `when`
+(references only `params`/`dims`) is settled by the planner: an inactive guard is dropped entirely,
+before it ever reaches a run. A **runtime** `when` (references `gates`/`artifacts`/`run`/`cycle`) can't
+be settled until mid-run, so it is evaluated by the **walker**, per invocation, against trusted
+in-memory state (`self.plan.params/dims`, the W2-verified gate reader, the W6-contained artifact
+resolver) — never by the subprocess, and never re-read from the agent-writable `run.json`. The walker
+writes a fresh, per-invocation SIGNED manifest (same `write_manifest`/MAC machinery as the static
+install, keyed by step+cycle so `parallel:` children never share a path) containing only the
+CURRENTLY-active guards, and points that invocation's `CAIRN_SHIM_MANIFEST`/`CAIRN_HOOK_MANIFEST` at it
+(env-first: the static once-per-run manifest is the fallback when no guard has a runtime `when`, which
+is the common case and costs nothing extra). The shim/hook decision path (`_run_chain`) is completely
+unaware of any of this — an inactive guard is simply absent from the manifest it loads, which it
+already treats as "skip". A guard whose `when` can't evaluate (e.g. a referenced gate/artifact is
+missing) is treated ACTIVE, never dropped — full design and rationale in `GUARD-WHEN-PLAN.md`.
+
 ## 5. Isolation & environment
 
 Each invocation gets: `cwd = run dir`; env `CAIRN_RUN_DIR`, `CAIRN_STEP`, `CAIRN_WORKSPACE`

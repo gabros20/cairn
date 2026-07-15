@@ -27,10 +27,17 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import secrets
 from pathlib import Path
 
 _KEY_BYTES = 32
+
+# A per-invocation manifest key (C9: step.id + cycle) can contain characters a filename
+# can't (step ids may hold '/' or '.'; cycle renders as a bare int or "None") — collapse
+# anything outside this safe set to '-'. The MAC binds run-disc + content, not the filename,
+# so a sanitized-but-collided key is not a security issue, only a (harmless) path reuse.
+_SAFE_KEY_RE = re.compile(r"[^A-Za-z0-9._-]")
 
 
 def gate_keys_dir() -> Path:
@@ -154,10 +161,20 @@ def guard_manifests_dir() -> Path:
     return gate_keys_dir().parent / "guard-manifests"
 
 
-def guard_manifest_path(run_dir: Path, layer: str) -> Path:
+def guard_manifest_path(run_dir: Path, layer: str, *, key: str | None = None) -> Path:
     """Path to a run's ``layer`` (``"hook"`` / ``"shim"``) guard manifest in the protected dir,
-    keyed by run_id + the absolute-path discriminator exactly like the gate key file."""
-    return guard_manifests_dir() / f"{Path(run_dir).name}-{_run_disc(run_dir)}-{layer}.json"
+    keyed by run_id + the absolute-path discriminator exactly like the gate key file.
+
+    ``key``, when given, is an OPTIONAL per-invocation token (C9: ``walk.py``'s
+    ``_active_guard_manifest`` passes ``f"{step.id}-c{cycle}"``) appended to the filename, so a
+    runtime-``when`` guard's active set — which can differ per step/cycle — gets its own manifest
+    rather than racing a shared one under ``parallel:`` (GUARD-WHEN-PLAN.md §6). Sanitized to a
+    filesystem-safe token; the MAC binds run-disc + content, not the filename, so a per-invocation
+    filename is safe. No ``key`` → the original static/once-per-run path, unchanged."""
+    base = f"{Path(run_dir).name}-{_run_disc(run_dir)}-{layer}"
+    if key is not None:
+        base = f"{base}-{_SAFE_KEY_RE.sub('-', key)}"
+    return guard_manifests_dir() / f"{base}.json"
 
 
 def compute_content_mac(secret: bytes, run_dir: Path, content: object) -> str:

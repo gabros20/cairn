@@ -110,10 +110,15 @@ class ClaudeExecutor(CliExecutor):
         MERGES into any existing settings.json without clobbering unrelated keys. No hook-enforced
         guards → writes nothing.
 
-        The guard manifest is written to a gatekeys-protected location OUTSIDE the run dir
-        (``guard_manifest_path``) and SIGNED (per-run MAC + per-check-script hash), so the
-        sandboxed agent cannot rewrite the policy its own commands are checked against; its
-        absolute path is baked into the hook command and ``--hook-check`` authenticates it.
+        The guard manifest written here is the STATIC, once-per-run manifest — the FALLBACK
+        ``--hook-check`` resolves via ``CAIRN_RUN_DIR`` when no per-invocation manifest is set (the
+        common, no-runtime-`when`-guard case; ``guards.py::_hook_check``). It lives in a
+        gatekeys-protected location OUTSIDE the run dir (``guard_manifest_path``) and is SIGNED
+        (per-run MAC + per-check-script hash), so the sandboxed agent cannot rewrite the policy its
+        own commands are checked against. Its path is no longer baked into the hook command (C9):
+        a runtime-`when` guard's per-invocation manifest, when the walker sets one, is what
+        ``--hook-check`` actually reads, via the inherited ``CAIRN_HOOK_MANIFEST`` env — see
+        ``_hook_command``.
 
         NOTE (W3c): ``settings.json`` itself lives in the run dir, so under ``bypassPermissions``
         (whole-FS write) the agent can still rewrite/remove it or the per-run secret. That residual
@@ -143,7 +148,7 @@ class ClaudeExecutor(CliExecutor):
         hooks = settings.setdefault("hooks", {})
         existing = hooks.get("PreToolUse", [])
         foreign = [e for e in existing if not _is_cairn_hook_entry(e)]
-        hooks["PreToolUse"] = foreign + _pretooluse_entries(hook_guards, manifest_path)
+        hooks["PreToolUse"] = foreign + _pretooluse_entries(hook_guards)
         _write_if_changed(settings_path, json.dumps(settings, indent=2) + "\n")
         return None
 
@@ -153,7 +158,7 @@ class ClaudeExecutor(CliExecutor):
 _HOOK_CHECK_MARKER = "cairn.kernel.guards --hook-check"
 
 
-def _pretooluse_entries(guards, manifest_path: Path) -> list[dict]:
+def _pretooluse_entries(guards) -> list[dict]:
     """Group ``guards`` by claude matcher and build one ``PreToolUse`` entry per matcher, each
     running ``--hook-check`` over that matcher's guard names."""
     by_matcher: dict[str, list] = {}
@@ -166,21 +171,28 @@ def _pretooluse_entries(guards, manifest_path: Path) -> list[dict]:
         entries.append(
             {
                 "matcher": matcher,
-                "hooks": [{"type": "command", "command": _hook_command(manifest_path, names)}],
+                "hooks": [{"type": "command", "command": _hook_command(names)}],
             }
         )
     return entries
 
 
-def _hook_command(manifest_path: Path, names: list[str]) -> str:
-    """The shell command string claude runs as the hook. The manifest path is baked ABSOLUTE (as
-    a ``CAIRN_HOOK_MANIFEST=`` env prefix — claude runs hook commands through a shell) so it
-    resolves at hook-fire time regardless of the env claude passes. ``sys.executable`` runs the
-    same interpreter the run uses."""
-    prefix = f"CAIRN_HOOK_MANIFEST={shlex.quote(str(manifest_path))}"
+def _hook_command(names: list[str]) -> str:
+    """The shell command string claude runs as the hook.
+
+    C9: no ``CAIRN_HOOK_MANIFEST=`` prefix is baked in here anymore — the hook subprocess
+    INHERITS it from the claude process env instead, exactly like ``CAIRN_RUN_DIR`` already does
+    (claude forwards its env to hook subprocesses; probed by ``hookprobe``/``cairn doctor
+    --probe-hooks``). This lets the walker point a per-invocation runtime-`when` manifest at a
+    step's own hook fire (``inv.env["CAIRN_HOOK_MANIFEST"]``, set per step+cycle) without
+    reinstalling settings.json. When the walker sets nothing (no runtime-`when` guards — the
+    common case), ``--hook-check`` falls back to ``guard_manifest_path(CAIRN_RUN_DIR, "hook")``
+    (``guards.py::_hook_check``), which is exactly the STATIC manifest ``install_guards`` writes
+    once per run — so this call site no longer needs the manifest path at all.
+    ``sys.executable`` runs the same interpreter the run uses."""
     argv = [shlex.quote(sys.executable), "-m", "cairn.kernel.guards", "--hook-check"]
     argv += [shlex.quote(n) for n in names]
-    return f"{prefix} {' '.join(argv)}"
+    return " ".join(argv)
 
 
 def _is_cairn_hook_entry(entry: object) -> bool:

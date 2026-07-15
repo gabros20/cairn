@@ -26,22 +26,43 @@ from cairn.kernel.artifacts import ArtifactDecl
 from cairn.kernel.compose import make_composer
 from cairn.kernel.config import load_config
 from cairn.kernel.expr import parse as parse_expr
+from cairn.kernel.gatekeys import guard_manifests_dir
 from cairn.kernel.gatekit import answer_gate, gate_path
 from cairn.kernel.plan import (
     GateNode,
+    GuardDecl,
     LoopNode,
     ParallelNode,
     Plan,
     StepNode,
     plan as build_plan,
 )
-from cairn.kernel.runstate import load_run, node_status
+from cairn.kernel.runstate import load_run, node_status, update_run
 from cairn.kernel.trail import read_trail
 from cairn.kernel.types import ExitCode, Result
 from cairn.kernel.walk import _Walk, bootstrap_run, walk
 
 NOW = datetime(2026, 7, 3, 11, 4)
 REPO = Path(__file__).resolve().parents[2]
+GUARD_CHECKS = Path(__file__).parent / "fixtures" / "guard-checks"
+
+
+def guard(
+    check_name: str = "deny_all.py",
+    *,
+    name: str = "g",
+    tool: str = "bash",
+    command: str = "brease*",
+    on_error: str = "deny",
+    enforce: tuple[str, ...] = ("shim",),
+    when=None,
+) -> GuardDecl:
+    """A GuardDecl for walker-level `when`-activation tests (mirrors test_guards.py's ``guard``
+    builder, plus the ``when`` this module's tests actually exercise)."""
+    return GuardDecl(
+        name=name, match_tool=tool, match_command=command, check=GUARD_CHECKS / check_name,
+        enforce=enforce, on_error=on_error, when=when,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -118,11 +139,11 @@ def manual_step(step_id: str, command: str, *, produces=()) -> StepNode:
     )
 
 
-def make_plan(nodes, artifacts, *, params=None, dims=None, resolved_models=None) -> Plan:
+def make_plan(nodes, artifacts, *, params=None, dims=None, resolved_models=None, guards=()) -> Plan:
     return Plan(
         pipeline="t", version=1, params=params or {}, dims=dims or {},
         run_id_template="t-{date}", nodes=tuple(nodes), artifacts=artifacts,
-        guards=(), warnings=[], executor_default="fake",
+        guards=tuple(guards), warnings=[], executor_default="fake",
         resolved_models=resolved_models or {}, skipped=(),
     )
 
@@ -1476,3 +1497,155 @@ def test_bootstrap_suffixes_v2_on_collision(ws: Path, tmp_path: Path) -> None:
     second = bootstrap_run(ws, plan, now=NOW, runs_root=root)
     assert first.name == "t-20260703"
     assert second.name == "t-20260703-v2"
+
+
+# --------------------------------------------------------------------------- #
+# 15. Guard `when` — per-invocation manifest, walker-evaluated (C9, GUARD-WHEN-PLAN.md).
+# --------------------------------------------------------------------------- #
+
+
+def test_guard_when_gate_active_then_inactive_after_answer(ws: Path, tmp_path: Path) -> None:
+    # Before the gate is answered, `gates.approve.choice` can't be read → `_guard_active` fails
+    # safe (ACTIVE), exactly like an unresolvable ref (§7); once answered "yes" the `!=` goes
+    # false and the guard is OMITTED from the manifest — an active→inactive flip driven purely by
+    # a gate answer, the doc's motivating scenario (§1.2).
+    gate = GateNode(
+        name="approve", reads=(), ask="?", options=(("yes", "Y"), ("no", "N")),
+        default="no", when_runtime=None,
+    )
+    g = guard(
+        name="no-deploy", command="deploy*", enforce=("shim",),
+        when=parse_expr("gates.approve.choice != 'yes'"),
+    )
+    step = run_step("s", "deploy prod")
+    plan = make_plan([step, gate], {}, guards=[g])
+
+    run_a = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs-a")
+    ex_a = FakeExecutor(lambda inv, n: done_result())
+    assert _walk(ws, plan, run_a, {"shell": ex_a}) == ExitCode.OK
+    manifest_a = json.loads(Path(ex_a.invocations[0].env["CAIRN_SHIM_MANIFEST"]).read_text())
+    assert "no-deploy" in manifest_a["guards"]  # unanswered → fail-safe ACTIVE, denies
+
+    run_b = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs-b")
+    answer_gate(run_b, "approve", "yes")
+    ex_b = FakeExecutor(lambda inv, n: done_result())
+    assert _walk(ws, plan, run_b, {"shell": ex_b}) == ExitCode.OK
+    manifest_b = json.loads(Path(ex_b.invocations[0].env["CAIRN_SHIM_MANIFEST"]).read_text())
+    assert "no-deploy" not in manifest_b["guards"]  # approved → deactivated, allowed
+
+
+def test_guard_when_artifact_flips_with_content(ws: Path, tmp_path: Path) -> None:
+    arts = {"qa": ArtifactDecl("qa", "qa.json", schema=_verdict_schema(ws))}
+    g = guard(
+        name="release-gate", command="release*", enforce=("shim",),
+        when=parse_expr("artifacts.qa.verdict == 'NO-GO'"),
+    )
+    step = run_step("s", "release now")
+    plan = make_plan([step], arts, guards=[g])
+
+    run_a = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs-a")
+    (run_a / "qa.json").write_text(json.dumps({"verdict": "NO-GO"}), encoding="utf-8")
+    ex_a = FakeExecutor(lambda inv, n: done_result())
+    assert _walk(ws, plan, run_a, {"shell": ex_a}) == ExitCode.OK
+    manifest_a = json.loads(Path(ex_a.invocations[0].env["CAIRN_SHIM_MANIFEST"]).read_text())
+    assert "release-gate" in manifest_a["guards"]
+
+    run_b = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs-b")
+    (run_b / "qa.json").write_text(json.dumps({"verdict": "GO"}), encoding="utf-8")
+    ex_b = FakeExecutor(lambda inv, n: done_result())
+    assert _walk(ws, plan, run_b, {"shell": ex_b}) == ExitCode.OK
+    manifest_b = json.loads(Path(ex_b.invocations[0].env["CAIRN_SHIM_MANIFEST"]).read_text())
+    assert "release-gate" not in manifest_b["guards"]
+
+
+def test_static_guards_fast_path_writes_no_per_invocation_manifest(ws: Path, tmp_path: Path) -> None:
+    # No guard in the plan carries a runtime `when` → `_active_guard_manifest` MUST be a pure
+    # no-op: `{}` back, zero manifest files written, env untouched. The regression guard for
+    # "every existing (no-runtime-`when`) pipeline is unaffected" — this fast path is MANDATORY.
+    g = guard(name="static", command="deploy*", enforce=("shim",), when=None)
+    step = run_step("s", "deploy prod")
+    plan = make_plan([step], {}, guards=[g])
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    w = _Walk(
+        plan=plan, run_dir=run_dir, workspace_dir=ws, config=load_config(ws),
+        executors={}, composer=lambda **kw: "PROMPT", interactive=False,
+        gate_presets={}, now=NOW, timeout=30,
+    )
+    assert w._active_guard_manifest(step, None) == {}
+
+    before = set(guard_manifests_dir().glob("*"))
+    ex = FakeExecutor(lambda inv, n: done_result())
+    assert _walk(ws, plan, run_dir, {"shell": ex}) == ExitCode.OK
+    assert "CAIRN_SHIM_MANIFEST" not in ex.invocations[0].env  # no per-invocation override
+    assert set(guard_manifests_dir().glob("*")) == before  # zero per-invocation writes
+
+
+def test_parallel_children_get_distinct_guard_manifests(ws: Path, tmp_path: Path) -> None:
+    g = guard(
+        name="release-gate", command="deploy*", enforce=("shim",),
+        when=parse_expr("artifacts.qa.verdict == 'NO-GO'"),
+    )
+    arts = {
+        "qa": ArtifactDecl("qa", "qa.json", schema=_verdict_schema(ws)),
+        "a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws)),
+        "b": ArtifactDecl("b", "b.txt", validator=_nonempty(ws)),
+    }
+    child_a = agent_step("deploy-a", produces=["a"])
+    child_b = agent_step("deploy-b", produces=["b"])
+    node = ParallelNode(name="pair", on_fail="wait_all", steps=(child_a, child_b), when_runtime=None)
+    plan = make_plan([node], arts, guards=[g], resolved_models=models_for("deploy-a", "deploy-b"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    (run_dir / "qa.json").write_text(json.dumps({"verdict": "NO-GO"}), encoding="utf-8")
+
+    def on_invoke(inv, _n):
+        step = inv.env["CAIRN_STEP"]
+        (inv.cwd / ("a.txt" if step == "deploy-a" else "b.txt")).write_text("ok")
+        return done_result()
+
+    ex = FakeExecutor(on_invoke)
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.OK
+    assert len(ex.invocations) == 2
+    manifests = {inv.env["CAIRN_STEP"]: inv.env["CAIRN_SHIM_MANIFEST"] for inv in ex.invocations}
+    assert manifests["deploy-a"] != manifests["deploy-b"]  # distinct paths — no shared file/race
+    for path in manifests.values():
+        content = json.loads(Path(path).read_text())
+        assert "release-gate" in content["guards"]  # each independently, correctly enforced
+
+
+def test_guard_when_eval_error_is_fail_safe_active_with_warning(ws: Path, tmp_path: Path) -> None:
+    g = guard(
+        name="missing-ref-guard", command="deploy*", enforce=("shim",),
+        when=parse_expr("artifacts.nope.verdict == 'x'"),
+    )
+    step = run_step("s", "deploy prod")
+    plan = make_plan([step], {}, guards=[g])
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    ex = FakeExecutor(lambda inv, n: done_result())
+    assert _walk(ws, plan, run_dir, {"shell": ex}) == ExitCode.OK  # NOT a run halt
+    manifest = json.loads(Path(ex.invocations[0].env["CAIRN_SHIM_MANIFEST"]).read_text())
+    assert "missing-ref-guard" in manifest["guards"]  # ACTIVE despite the eval error — fail-safe
+
+    events = [e["event"] for e in read_trail(run_dir)]
+    assert "guard-when-error" in events  # visible, never silently swallowed
+
+
+def test_guard_when_params_read_from_memory_not_forged_run_json(ws: Path, tmp_path: Path) -> None:
+    # A params-only `when` is normally SETTLED at plan time (dropped, or made static — it never
+    # reaches here as a live Expr); hand-built directly (as every node in this module is) to prove
+    # the RESOLVER's `params` root reads `self.plan.params` in memory, never `run.json` — an agent
+    # with run-dir write access cannot flip this guard by editing the (agent-writable) file.
+    g = guard(
+        name="strict-only", command="deploy*", enforce=("shim",),
+        when=parse_expr("params.mode == 'strict'"),
+    )
+    step = run_step("s", "deploy prod")
+    plan = make_plan([step], {}, params={"mode": "strict"}, guards=[g])
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    update_run(run_dir, lambda doc: doc.__setitem__("params", {"mode": "off"}))
+
+    ex = FakeExecutor(lambda inv, n: done_result())
+    assert _walk(ws, plan, run_dir, {"shell": ex}) == ExitCode.OK
+    manifest = json.loads(Path(ex.invocations[0].env["CAIRN_SHIM_MANIFEST"]).read_text())
+    assert "strict-only" in manifest["guards"]  # still ACTIVE — the forged run.json is ignored

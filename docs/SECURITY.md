@@ -143,6 +143,21 @@ An injected instruction that a model obeys still cannot exceed the step's cage:
   hook uses the same glob as the shim, so it does NOT catch absolute-path / `sh -c` / `env`-prefixed
   invocations (only `post` does); and grok's native hook fails open on hook crash/timeout/malformed
   output, so its shim and post layers carry the backstop even once its hook install lands;
+- **guard activation** — a guard's `enforce`/`check`/`on_error` decl is static, but WHETHER it is
+  currently enforced can be runtime-conditional (a `when:` referencing `gates`/`artifacts`). The
+  **authority over the active set is the trusted walker**, not the sandboxed subprocess: it
+  evaluates `when` in-process against `self.plan.params/dims` (never re-read from the
+  agent-writable run dir), the W2-verified gate reader, and the W6-contained artifact resolver, then
+  writes a per-invocation SIGNED manifest containing only the active guards — the shim/hook
+  subprocess stays exactly what it always was, a dumb fail-closed executor of a manifest it can't
+  forge (C9 / `GUARD-WHEN-PLAN.md`). Two residuals, neither new: (a) **env redirection** — under
+  claude `bypassPermissions` an agent could point `CAIRN_SHIM_MANIFEST`/`CAIRN_HOOK_MANIFEST` at an
+  *older, still-validly-signed* manifest from earlier in the same run; bounded (older manifests are
+  generally MORE restrictive — fewer gates answered → more guards active — so replay tends to
+  over-block, not under-block) and is the same **C8/W3c** whole-FS-write residual noted above, not a
+  new hole; (b) a `run.*`-rooted guard `when` inherits the ordinary `run.json` trust level (that root
+  alone re-reads the agent-writable file) — prefer `gates`/`params`/`dims`/`artifacts` in a guard
+  `when` and treat `run.*` there the same way you'd treat a `run.*`-rooted step `when`;
 - **gates** — the two irreversible crossings (CMS populate, deploy) sit behind human gates, with
   headless defaults of *no*, and the deploy allowlist pins the org;
 - **isolation** — cwd is the run dir; a compromised step cannot reach sibling runs;

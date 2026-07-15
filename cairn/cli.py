@@ -222,14 +222,16 @@ class GuardedExecutor:
         return getattr(self._inner, name)
 
     def invoke(self, inv):
-        # CAIRN_SHIM_MANIFEST points at the SIGNED manifest OUTSIDE the run dir (build_shims puts
-        # it there and returns the path in the delta); the shim also bakes this absolute path, so
-        # both agree at shim-fire time.
+        # CAIRN_SHIM_MANIFEST points at the SIGNED manifest OUTSIDE the run dir. Env-first (C9):
+        # if the walker already set a per-invocation manifest in inv.env (a runtime-`when` guard
+        # is in play), HONOR it — it must win over the static delta or the walker's `when`
+        # decision would be clobbered right back to "always enforce". No runtime-`when` guards →
+        # inv.env carries no override → falls back to the static delta, unchanged from before C9.
         env = {
             **inv.env,
             "PATH": f"{self._delta['PATH']}:{inv.env.get('PATH', '')}",
             "CAIRN_SHIM_DIR": self._delta["CAIRN_SHIM_DIR"],
-            "CAIRN_SHIM_MANIFEST": self._delta["CAIRN_SHIM_MANIFEST"],
+            "CAIRN_SHIM_MANIFEST": inv.env.get("CAIRN_SHIM_MANIFEST", self._delta["CAIRN_SHIM_MANIFEST"]),
         }
         return self._inner.invoke(dataclasses.replace(inv, env=env))
 

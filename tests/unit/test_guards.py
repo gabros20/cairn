@@ -21,7 +21,7 @@ import pytest
 
 import io
 
-from cairn.kernel.gatekeys import guard_manifest_path
+from cairn.kernel.gatekeys import guard_manifest_path, guard_manifests_dir
 from cairn.kernel.guards import (
     CheckResult,
     build_shims,
@@ -234,6 +234,23 @@ def test_matches_command_is_case_sensitive() -> None:
     g = guard("allow_all.py", command="brease* createMedia*")
     # createmedia != createMedia — the guard must not be dodged by casing.
     assert matches(g, tool="bash", command="brease media createmedia x") is False
+
+
+# --------------------------------------------------------------------------- #
+# guard_manifest_path — per-invocation `key=` (C9).
+# --------------------------------------------------------------------------- #
+
+
+def test_guard_manifest_path_key_is_sanitized_and_distinct(tmp_path: Path) -> None:
+    # step ids can contain '/' or '.' (unsafe in a filename); non-alnum/._- chars collapse to
+    # '-'. Two different keys must never collide, and omitting `key` must reproduce the exact
+    # pre-C9 static path (byte-identical — no behavior change for the no-runtime-`when` case).
+    p1 = guard_manifest_path(tmp_path, "shim", key="review/step-c1")
+    p2 = guard_manifest_path(tmp_path, "shim", key="review/step-c2")
+    static = guard_manifest_path(tmp_path, "shim")
+    assert p1 != p2 != static
+    assert "/" not in p1.name  # sanitized to a single path component
+    assert p1.parent == static.parent == guard_manifests_dir()
 
 
 # --------------------------------------------------------------------------- #
@@ -769,6 +786,22 @@ def test_manifest_missing_secret_fails_closed(tmp_path, monkeypatch, capsys) -> 
     _write_hook_manifest(manifest, [guard("deny_all.py", name="no-media", command="brease*")], tmp_path)
     for key in gate_keys_dir().glob("*.key"):  # delete the per-run secret → cannot authenticate
         key.unlink()
+    _assert_both_fail_closed(manifest, tmp_path, monkeypatch, capsys)
+
+
+def test_per_invocation_manifest_tamper_fails_closed(tmp_path, monkeypatch, capsys) -> None:
+    # C9: a runtime-`when` guard's manifest lives at a per-invocation KEYED path
+    # (walk.py::_active_guard_manifest → gatekeys.guard_manifest_path(..., key=...)) instead of
+    # the static once-per-run one — but it's signed with the SAME MAC machinery (build_manifest /
+    # write_manifest are unchanged), so tamper detection is identical: a forged per-invocation
+    # manifest fails closed exactly like W3a's static one.
+    manifest = guard_manifest_path(tmp_path, "hook", key="deploy-c1")
+    _write_hook_manifest(
+        manifest, [guard("deny_all.py", name="no-media", command="brease*")], tmp_path
+    )
+    doc = json.loads(manifest.read_text())
+    doc["guards"] = {}  # attacker drops the guard from the keyed manifest; cannot re-sign (no secret)
+    manifest.write_text(json.dumps(doc), encoding="utf-8")
     _assert_both_fail_closed(manifest, tmp_path, monkeypatch, capsys)
 
 
