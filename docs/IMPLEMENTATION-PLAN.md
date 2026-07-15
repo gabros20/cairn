@@ -263,6 +263,40 @@ documented backstop.
 
 ---
 
+## C9 — runtime `when` on guards (codex-F12 / W6-guard-when)  *(future — deferred)*
+
+*Surfaced by the same 2026-07-14 hardening review. A guard whose `when:` is decidable at plan time
+(params/dims only) is already handled: the planner drops an inactive guard entirely. The gap is a guard
+whose `when:` references **runtime** roots (gates/artifacts) — that `Expr` is stored on `GuardDecl.when`
+but set to `None` when the guard is reloaded from the (now-signed) manifest in the shim/hook decision
+path (`guards.py` `_load_manifest_guard`), so the guard's condition is lost and it runs its check on
+**every** invocation.*
+
+**The residual.** A runtime-conditional guard therefore over-applies: it runs its check even when its
+`when:` is currently false. This **fails safe** — it can only produce an incorrect *denial* / an extra
+check run (over-strict), never a missed block (it is never wrongly *deactivated*). No security
+weakening; a correctness/availability edge for the rarely-used runtime-`when`-on-a-guard shape.
+
+**Why deferred, not fixed in W6.** The correct fix requires **per-step re-evaluation** of the `when`
+expression against current on-disk state — the guard installs once per run, but a runtime `when`
+(e.g. `gates.approve.choice == 'yes'`) only becomes decidable mid-run. That means serializing the
+`when` source into the signed manifest and evaluating it inside the W3a-hardened, HMAC-authenticated
+`_run_chain` (building an expression context from `run.json` params/dims, the W2-verified gate
+decisions, and produced artifacts). Adding an expression evaluator + context-builder to the
+freshly-hardened security-critical decision path is real new surface; doing it as the tail item of the
+hardening run, without soak, is lower-reliability than deferring it — the same judgment applied to C8.
+
+**Build (when prioritized):** serialize `when` (source string) into the signed manifest; in `_run_chain`,
+before running a guard's check, re-parse and evaluate it against a context from `run.json` +
+`read_verified_choice` gate state + artifacts; `when=false` → guard inactive (skip, allow); an
+evaluation error → treat the guard as **active** (fail-safe, run the check). The earlier waves make this
+safe to add now: the `when` inputs (manifest, gates, artifacts) are all authenticated/contained
+(W3a/W2/W6), so a forged gate can't wrongly deactivate a guard. **Verify:** a guard with a runtime
+`when` that resolves false does not run its check; one that resolves true does; a forged/tampered gate
+cannot flip an active guard to inactive.
+
+---
+
 ## Decision gates along the way
 
 | At | Decision | Default |
