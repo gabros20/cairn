@@ -603,10 +603,11 @@ def _hook_check(names: Sequence[str]) -> int:
     malformed guard) FAILS CLOSED via ``_hook_fail_closed`` (deny-JSON, exit 0) — a hook that
     cannot decide must never silently allow.
 
-    The manifest path comes from ``CAIRN_HOOK_MANIFEST`` (baked absolute into the hook command by
-    install_guards — a gatekeys-protected location OUTSIDE the run dir), falling back to
-    ``guard_manifest_path(CAIRN_RUN_DIR, "hook")``; both resolve at hook-fire time because the hook
-    inherits the executor's env."""
+    The manifest path comes from ``CAIRN_HOOK_MANIFEST`` — inherited from the executor's
+    per-invocation env (the walker sets it per step so a runtime-``when`` guard's active set is
+    honored; C9), a gatekeys-protected location OUTSIDE the run dir — falling back to
+    ``guard_manifest_path(CAIRN_RUN_DIR, "hook")`` (the once-per-run static manifest) when the env
+    var is absent; both resolve at hook-fire time because the hook inherits the executor's env."""
     try:
         raw_event = sys.stdin.read()
         event = json.loads(raw_event) if raw_event.strip() else None

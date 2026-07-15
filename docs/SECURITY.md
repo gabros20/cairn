@@ -152,10 +152,15 @@ An injected instruction that a model obeys still cannot exceed the step's cage:
   subprocess stays exactly what it always was, a dumb fail-closed executor of a manifest it can't
   forge (C9 / `GUARD-WHEN-PLAN.md`). Two residuals, neither new: (a) **env redirection** — under
   claude `bypassPermissions` an agent could point `CAIRN_SHIM_MANIFEST`/`CAIRN_HOOK_MANIFEST` at an
-  *older, still-validly-signed* manifest from earlier in the same run; bounded (older manifests are
-  generally MORE restrictive — fewer gates answered → more guards active — so replay tends to
-  over-block, not under-block) and is the same **C8/W3c** whole-FS-write residual noted above, not a
-  new hole; (b) a `run.*`-rooted guard `when` inherits the ordinary `run.json` trust level (that root
+  *older, still-validly-signed* manifest from earlier in the same run; bounded to manifests already
+  signed *this run* — for a monotonic gate `when` (gate answered once, stays answered) an older
+  manifest tends to be MORE restrictive (fewer gates answered → more guards active → over-block), but
+  a *non-monotonic* artifact-content `when` (e.g. `when: artifacts.qa.verdict=='NO-GO'`) can make an
+  earlier manifest LESS restrictive — replaying an invocation whose artifact then read `GO` omits a
+  guard that a later `NO-GO` should activate (under-block). C9 introduces this first class of
+  validly-signed, less-restrictive manifests, so the bound is the **C8/W3c** whole-FS-write residual
+  (the agent can rewrite the shim script / `settings.json` / steal the secret anyway under today's
+  executors — `post` remains the hard gate), NOT manifest monotonicity; (b) a `run.*`-rooted guard `when` inherits the ordinary `run.json` trust level (that root
   alone re-reads the agent-writable file) — prefer `gates`/`params`/`dims`/`artifacts` in a guard
   `when` and treat `run.*` there the same way you'd treat a `run.*`-rooted step `when`;
 - **gates** — the two irreversible crossings (CMS populate, deploy) sit behind human gates, with
