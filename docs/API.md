@@ -368,6 +368,12 @@ class Invocation:
     timeout_s: int
     log_path: Path
     return_schema: Path
+    network: bool = False           # the step's resolved network policy (StepNode.network,
+                                    # plan.py) — default false. codex consumes it today (`-c
+                                    # sandbox_workspace_write.network_access=...`, W5b); grok's
+                                    # sandbox profile has no separate network toggle to verify
+                                    # against, claude's CLI has none at all — both leave it
+                                    # unconsumed on purpose, not a silent drop (ARCHITECTURE §5)
 
 @dataclass
 class Result:
@@ -409,15 +415,20 @@ claude:  claude -p --model {model} [--effort {effort}] --output-format text
               disables the on-disk session transcript entirely — session_capture is None, there is
               nothing to capture)
 codex:   codex exec -C {cwd} -m {model} --sandbox workspace-write --skip-git-repo-check
-             --ignore-user-config --ignore-rules
+             --ephemeral --ignore-user-config --ignore-rules
+             -c sandbox_workspace_write.network_access={true|false}
              [-c model_reasoning_effort={effort}]  < envelope
              (prompt on stdin; `-a/--ask-for-approval` is gone from `codex exec` as of codex-cli
               0.142.5 — exec hardwires approval-never; `--skip-git-repo-check` because codex refuses a
               non-git/untrusted cwd and cairn's `--sandbox` flag + guards are the enforcement layer;
-              `--ignore-user-config` skips `$CODEX_HOME/config.toml` (auth still uses CODEX_HOME),
-              `--ignore-rules` skips user/project execpolicy `.rules` files — both seal the process
-              from ambient config; --output-schema is NOT wired yet — the STEP sentinel is the
-              contract)
+              `--ephemeral` (W5b) runs without persisting session files, so session_capture is None
+              — nothing under ~/.codex/sessions/** to capture; `--ignore-user-config` skips
+              `$CODEX_HOME/config.toml` (auth still uses CODEX_HOME), `--ignore-rules` skips
+              user/project execpolicy `.rules` files — both seal the process from ambient config;
+              `-c sandbox_workspace_write.network_access=...` (W5b, codex-F5) threads
+              Invocation.network through, emitted unconditionally so `false` is stated
+              explicitly, not left to the sandbox's undeclared default; --output-schema is NOT
+              wired yet — the STEP sentinel is the contract)
 grok:    grok --prompt-file {envelope} --cwd {cwd} -m {model}
              --output-format plain --permission-mode bypassPermissions
              --no-alt-screen --no-auto-update --no-memory --sandbox workspace

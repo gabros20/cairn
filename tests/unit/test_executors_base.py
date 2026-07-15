@@ -55,6 +55,7 @@ def make_inv(
     env: dict[str, str] | None = None,
     timeout_s: int = 30,
     scratch: Path | None = None,
+    network: bool = False,
 ) -> Invocation:
     scratch = scratch or (tmp_path / "scratch")
     prompt_file = tmp_path / "prompt.md"
@@ -70,6 +71,7 @@ def make_inv(
         timeout_s=timeout_s,
         log_path=tmp_path / "logs" / "step.log",
         return_schema=tmp_path / "return.json",
+        network=network,
     )
 
 

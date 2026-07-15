@@ -130,11 +130,22 @@ class GrokExecutor(CliExecutor):
             # everywhere and writes only CWD + ~/.grok/ + temp dirs — the workspace-write
             # equivalent to codex's `--sandbox workspace-write`, and cwd here is always the run
             # dir.
-            # NOTE (W5-doctor-drift): this profile name is a hard, ungated argv literal — nothing
-            # checks it against the installed CLI's actual profile roster, so a future grok
-            # renaming/removing "workspace" would hard-fail every grok step (fails closed, but
-            # with no earlier warning). Tracked for W5: doctor should verify emitted flags/profile
-            # names against the installed CLI, not just assert the binary runs.
+            # NOTE (W5-doctor-drift): this profile name is a hard, ungated argv literal — the
+            # W5b doctor drift check (sub-change A.1) verifies the `--sandbox` FLAG is still
+            # advertised by the installed CLI (`_emitted_flags` above), but the captured help
+            # still doesn't enumerate profile NAMES, so "workspace" itself stays unverified; a
+            # future grok renaming/removing that profile would still hard-fail every grok step
+            # with no earlier warning.
+            #
+            # NOTE (W5b sub-change C, codex-F5): StepNode.network now reaches
+            # Invocation.network (see its docstring), but it is NOT consumed here. grok's
+            # `--sandbox <PROFILE>` is a SINGLE profile governing filesystem AND network
+            # together (captured help: "Sandbox profile for filesystem and network access") —
+            # there is no separate network on/off flag to verify, and the help doesn't enumerate
+            # profile names to pick an alternate "no-network" one from. Wiring `inv.network`
+            # here would mean inventing an unverified profile name, which sub-change C
+            # explicitly forbids. Left unconsumed on purpose: codex is wired today; grok mapping
+            # is future work.
             "--sandbox", "workspace",
         ]
         if inv.effort is not None:

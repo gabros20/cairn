@@ -81,6 +81,15 @@ class Invocation:
     timeout_s: int
     log_path: Path
     return_schema: Path
+    # The step's resolved network policy (AgentSpec.network / StepNode.network — plan.py). This
+    # was parsed since plan.py but never reached an executor until W5b (codex-F5) added this
+    # field. Default false matches every executor's behavior before W5b. Consumed by codex
+    # today (`-c sandbox_workspace_write.network_access=true|false`, ARCHITECTURE §5); grok's
+    # `--sandbox <PROFILE>` is a single filesystem+network profile with no separate toggle to
+    # verify against the captured help, and claude's CLI has no analogous flag — wiring either
+    # is future work, NOT a silent drop: this field still carries the resolved value for both,
+    # the executor is just not yet honoring it.
+    network: bool = False
     # Literal-value scrubber (SECURITY.md §1.3) threaded into the executor's log-write path,
     # so declared secrets are redacted from logs/<step>.log line-by-line as they stream. None
     # (no secret resolved) ⇒ the log is teed verbatim, byte-for-byte as before.

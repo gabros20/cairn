@@ -90,12 +90,13 @@ def agent_step(
     skippable=False,
     when=None,
     env=(),
+    network=False,
 ) -> StepNode:
     return StepNode(
         id=step_id, kind="agent", agent=None, command=None, args={},
         needs=tuple(needs), needs_optional=(), produces=tuple(produces),
         when_runtime=when, timeout_s=1800, retry=retry, skippable=skippable,
-        executor="fake", tier="balanced", effort=None, env=tuple(env), network=False,
+        executor="fake", tier="balanced", effort=None, env=tuple(env), network=network,
     )
 
 
@@ -269,6 +270,41 @@ def test_agent_success_emits_learnings_and_usage(ws: Path, tmp_path: Path) -> No
     assert done_ev["data"]["usage"] == {"in_tokens": 10, "out_tokens": 4}
     assert done_ev["data"]["metrics"] == {"pages": 3}
     assert node_status(load_run(run_dir), "s") == "done"
+
+
+def test_invocation_network_defaults_false(ws: Path, tmp_path: Path) -> None:
+    # W5b (codex-F5): StepNode.network was parsed since plan.py but never reached an
+    # Invocation until this field was added — assert the walker's default posture is
+    # unchanged (false) when a step doesn't opt in.
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        (inv.cwd / "a.txt").write_text("hi")
+        return done_result()
+
+    ex = FakeExecutor(on_invoke)
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.OK
+    assert ex.invocations[0].network is False
+
+
+def test_invocation_network_true_reaches_the_executor(ws: Path, tmp_path: Path) -> None:
+    # W5b (codex-F5): a step's resolved network policy now threads through to Invocation —
+    # the walker construction site, not just plan.py's parse.
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan(
+        [agent_step("s", produces=["a"], network=True)], arts, resolved_models=models_for("s")
+    )
+
+    def on_invoke(inv, _n):
+        (inv.cwd / "a.txt").write_text("hi")
+        return done_result()
+
+    ex = FakeExecutor(on_invoke)
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.OK
+    assert ex.invocations[0].network is True
 
 
 def test_walker_ignores_non_dict_learnings_member_instead_of_raising(ws: Path, tmp_path: Path) -> None:

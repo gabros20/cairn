@@ -470,6 +470,7 @@ class _Walk:
                 timeout_s=step.timeout_s,
                 log_path=log_path,
                 return_schema=self._schema_path,
+                network=step.network,
                 redactor=self._redactor,
             )
             try:

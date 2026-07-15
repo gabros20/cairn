@@ -279,10 +279,37 @@ config*, so identical pipeline runs are deterministic regardless of the operator
   `MAX_ARG_STRLEN` ceiling. `--no-session-persistence` disables the on-disk session transcript
   entirely, so `Capabilities.session_capture` is `None` (there is nothing to capture).
 - **codex**: `--ignore-user-config` skips `$CODEX_HOME/config.toml` (auth still uses
-  `CODEX_HOME`); `--ignore-rules` skips user/project execpolicy `.rules` files.
+  `CODEX_HOME`); `--ignore-rules` skips user/project execpolicy `.rules` files; `--ephemeral`
+  (W5b) runs without persisting session files to disk, so `Capabilities.session_capture` is
+  `None` — the old `~/.codex/sessions/**` glob was dead, nothing ever consumed it.
 - **grok**: `--no-memory` disables cross-session memory; `--sandbox workspace` applies the
   built-in `workspace` sandbox profile (read everywhere, write only cwd + `~/.grok/` + temp
   dirs) — the workspace-write equivalent to codex's `--sandbox workspace-write`.
+
+**Network policy (W5b, codex-F5).** An agent's `tools.network` (API.md §3) resolves through
+`StepNode.network` (plan.py) into `Invocation.network` — parsed since plan.py existed but never
+reached an executor until this field was added. **codex** consumes it: `-c
+sandbox_workspace_write.network_access=true|false`, emitted on every invocation (not only
+under `network: true`) so a step's `false` is stated explicitly rather than left to the
+sandbox's undeclared default. **grok**'s `--sandbox <PROFILE>` is a single profile governing
+filesystem AND network together, with no separate toggle to verify against the captured
+`--help` (and no enumerated profile roster to pick an alternate one from); **claude**'s CLI has
+no analogous flag. Both leave `inv.network` unconsumed on purpose rather than invent an
+unverified flag — future work, tracked in each adapter (`cairn/executors/{grok,claude}.py`).
+
+**Doctor drift checks (W5b, codex-F19/grok-F14/claude-F15).** `cairn doctor` re-verifies two
+things per in-scope executor, both WARN-level and never a reason to fail the doctor exit: (1)
+**flag presence** — each adapter declares a small `_emitted_flags` const (the flags/tokens its
+`_build_command` can emit); doctor greps the installed CLI's `--help` (`codex exec --help` for
+codex) for each as a whole token, and warns by name on a miss (e.g. "claude --setting-sources
+not advertised by installed claude"); (2) **model validation** — grok's configured tier models
+are checked against `grok models`' live roster; claude's against the alias set
+(opus/sonnet/haiku/fable) plus the dated-id shape; codex has no queryable model roster, so
+nothing is checked (documented, not silent). A help-fetch failure is one warning, never a crash
+and never a false positive per flag. The doctor version probe itself is also hardened: a
+bad-shim/ENOEXEC binary that `shutil.which` resolves but that fails to spawn raises
+`ExecutorSpawnError` (a `CairnError`, post-W1) — caught into a clean Finding, mirroring the
+`cli.py` fix from W5a.
 
 ## 6. The envelope — AX as a specification
 
@@ -387,3 +414,9 @@ Small kernel; five sanctioned plugin surfaces, each a tiny protocol + entry-poin
 Nothing else is pluggable **on purpose** — node kinds, envelope block order, the STEP protocol, and
 run-dir layout are fixed. That fixedness is what makes every cairn workspace legible to every tool
 (and every agent) that has seen one before.
+
+An Executor plugin's declared surface (`Capabilities`, the argv `_build_command` emits) is a
+claim about the vendor CLI, and claims drift out from under a plugin author as the vendor ships
+new releases. `cairn doctor` is the per-machine check on that claim (§5 above): it re-verifies a
+plugin's emitted flags and configured models against the *installed* CLI, not just that the
+binary runs — WARN-level, so a stale claim is surfaced without blocking the workspace.

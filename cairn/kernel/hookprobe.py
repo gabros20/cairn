@@ -314,23 +314,28 @@ class CodexHookRecipe(HookRecipe):
     def build_invocation(
         self, canary: Path, prompt_text: str, model: str
     ) -> tuple[list[str], str | None]:
-        # LOCKSTEP with cairn/executors/codex.py::CodexExecutor._build_command (effort=None
-        # branch) — pinned by test_codex_invocation_mirrors_real_executor_argv; change that
-        # executor and this recipe together. Live-verified on codex-cli 0.142.5:
+        # LOCKSTEP with cairn/executors/codex.py::CodexExecutor._build_command (effort=None,
+        # network=False branch) — pinned by test_codex_invocation_mirrors_real_executor_argv;
+        # change that executor and this recipe together. Live-verified on codex-cli 0.142.5:
         # `-a/--ask-for-approval` no longer exists on `codex exec` (argv error), and
         # `--skip-git-repo-check` is required (the canary tempdir is not a git repo).
+        # `--ephemeral` (W5b) matches the real executor's session-less posture.
         # `--ignore-user-config`/`--ignore-rules` (W4) skip $CODEX_HOME/config.toml + execpolicy
         # .rules — belt-over-suspenders with the empty config.toml write_canary already plants.
-        # The one probe-only addition is --dangerously-bypass-hook-trust, so the freshly-written
-        # canary hook runs without persisted hook trust. Prompt on stdin.
+        # `-c sandbox_workspace_write.network_access=false` (W5b) mirrors the real executor's
+        # default-false network policy — the probe canary never needs network. The one
+        # probe-only addition is --dangerously-bypass-hook-trust, so the freshly-written canary
+        # hook runs without persisted hook trust. Prompt on stdin.
         argv = [
             "codex", "exec",
             "-C", str(canary),
             "-m", model,
             "--sandbox", "workspace-write",
             "--skip-git-repo-check",
+            "--ephemeral",
             "--ignore-user-config",
             "--ignore-rules",
+            "-c", "sandbox_workspace_write.network_access=false",
             "--dangerously-bypass-hook-trust",
         ]
         return argv, prompt_text
