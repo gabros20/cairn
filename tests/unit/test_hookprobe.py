@@ -191,6 +191,26 @@ def test_missing_cli_is_inconclusive(tmp_path, monkeypatch):
     assert "not found" in r.detail
 
 
+def test_spawn_failure_is_inconclusive_not_a_crash(fakebin, tmp_path, monkeypatch):
+    # L1 (whole-branch review): available() (shutil.which) is a TOCTOU check, not a guarantee —
+    # a resolvable-but-broken shim (asdf/mise/nvm-managed CLIs) can still fail to spawn, raising
+    # ExecutorSpawnError (a CairnError, post-W1), NOT a bare OSError. The fake claude IS on PATH
+    # (available() sees it), but every run_process call is forced to raise as if the binary
+    # couldn't actually start. Must FAIL against a bare `except ExecTimeout` (the error would
+    # propagate uncaught through probe() and this test would error, not assert) and PASS once
+    # hookprobe catches CairnError alongside ExecTimeout.
+    from cairn.kernel.errors import ExecutorSpawnError
+
+    def _boom(*args, **kwargs):
+        raise ExecutorSpawnError("'claude' failed to start: [Errno 8] Exec format error", executable="claude")
+
+    monkeypatch.setattr(hookprobe, "run_process", _boom)
+    r = probe(ClaudeHookRecipe(), workspace_dir=tmp_path)  # must not raise
+    assert r.outcome == "inconclusive"
+    assert r.cli_version is None  # version() hit the same spawn failure, best-effort → None
+    assert "failed to start" in r.detail
+
+
 # --------------------------------------------------------------------------- #
 # Codex recipe against its fake (isolated CODEX_HOME).
 # --------------------------------------------------------------------------- #

@@ -27,9 +27,10 @@ The mechanic, per executor (a :class:`HookRecipe`):
    absent           absent          ``inconclusive``   — the agent attempted no guarded tool
    ===============  ==============  ===================================================
 
-CLI missing / timeout / auth failure is also ``inconclusive`` (a probe of a different reality,
-not a verdict). Results are **never cached** — a probe run is a fresh fact each time, and it
-only runs under the explicit ``--probe-hooks`` flag, so the token cost is opt-in.
+CLI missing / timeout / spawn failure (a resolvable-but-broken shim) / auth failure is also
+``inconclusive`` (a probe of a different reality, not a verdict). Results are **never cached**
+— a probe run is a fresh fact each time, and it only runs under the explicit ``--probe-hooks``
+flag, so the token cost is opt-in.
 
 Stdlib + pinned kernel/executor-base modules only.
 """
@@ -50,6 +51,7 @@ from typing import Literal
 # reuses them so a canary invocation runs through exactly the same subprocess machinery a real
 # step does (streamed log, group-kill on timeout, EXACT env — never os.environ).
 from cairn.executors.base import ExecTimeout, run_process
+from cairn.kernel.errors import CairnError
 from cairn.kernel.guards import deny_json
 
 Outcome = Literal["fires_blocks", "fires_no_block", "no_fire", "no_mechanism", "inconclusive"]
@@ -151,7 +153,12 @@ class HookRecipe:
         return shutil.which(self.name, path=env.get("PATH")) is not None
 
     def version(self, env: dict[str, str]) -> str | None:
-        """``<name> --version`` under the probe env; None on timeout/failure."""
+        """``<name> --version`` under the probe env; None on timeout/failure. ``available()``
+        (``shutil.which``) is a TOCTOU check, not a guarantee — a resolvable-but-broken shim
+        (asdf/mise/nvm-managed CLIs) can still fail to spawn here, raising ``ExecutorSpawnError``
+        (a ``CairnError``, post-W1) rather than a bare ``OSError``. Caught alongside
+        ``ExecTimeout``: version is best-effort telemetry for the probe report, same as a
+        timeout — an unknown version, not a probe crash."""
         with tempfile.TemporaryDirectory() as td:
             try:
                 code, out, _ = run_process(
@@ -162,7 +169,7 @@ class HookRecipe:
                     timeout_s=15.0,
                     log_path=Path(td) / "v.log",
                 )
-            except ExecTimeout:
+            except (ExecTimeout, CairnError):
                 return None
             return out.strip() if code == 0 else None
 
@@ -616,6 +623,17 @@ def _probe_in(
         return ProbeResult(
             recipe.name, "inconclusive",
             f"the canary invocation timed out after {timeout_s}s",
+            version, recipe.posture, recipe.mechanism,
+        )
+    except CairnError as exc:
+        # available() (shutil.which) is a TOCTOU check, not a guarantee — a resolvable-but-
+        # broken shim can still fail to spawn here, raising ExecutorSpawnError (a CairnError,
+        # post-W1) rather than a bare OSError. Same "different reality, not a verdict" bucket
+        # as a timeout or auth failure (module docstring) — inconclusive, never an uncaught
+        # traceback out of `cairn doctor --probe-hooks`.
+        return ProbeResult(
+            recipe.name, "inconclusive",
+            f"the canary invocation failed to start: {exc}",
             version, recipe.posture, recipe.mechanism,
         )
 
