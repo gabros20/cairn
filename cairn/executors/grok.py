@@ -8,19 +8,24 @@ from __future__ import annotations
 
 import re
 
-from cairn.executors._cli import CliExecutor, _probe
+from cairn.executors._cli import CliExecutor, probe_argv
 from cairn.executors.base import Capabilities, Finding, Invocation
 from cairn.kernel.errors import CairnError
 
 
-# `grok models` prints e.g.:
+# `grok models` prints e.g. (live-verified output, logged-in: .orchestrate/raw/
+# grok-models-live.txt):
+#   You are logged in with grok.com.
+#
 #   Default model: grok-4.5
 #
 #   Available models:
 #     * grok-4.5 (default)
 #     - grok-composer-2.5-fast
 # One model slug per "  * " / "  - " bulleted line; strip the leading marker and any trailing
-# "(default)" annotation (the `\S+` capture already stops before the space that precedes it).
+# "(default)" annotation (the `\S+` capture already stops before the space that precedes it) —
+# confirmed against the live capture above: matches both the "*" default line and the "-" line,
+# and stops each capture before " (default)".
 _GROK_MODEL_LINE_RE = re.compile(r"^\s*[-*]\s+(\S+)", re.MULTILINE)
 
 
@@ -61,19 +66,26 @@ class GrokExecutor(CliExecutor):
 
     def _model_findings(self) -> list[Finding]:
         # W5b sub-change A.2: grok is the one executor with a queryable model roster —
-        # `grok models` (captured help: "List available models and exit"). Best-effort: a
-        # fetch failure or an unparseable roster is one warning, never a crash; the goal is
-        # catching model-slug drift before the first paid run, not gatekeeping.
+        # `grok models` (captured help: "List available models and exit"). This is a LOCAL
+        # metadata listing (reads the CLI's cached model roster for the logged-in account), not
+        # a billed inference call — live-verified: returns in ~1s (.orchestrate/raw/
+        # grok-models-live.txt), so the extra doctor probe is cheap, same posture as the
+        # --version/--help probes. Best-effort: a fetch failure or an unparseable roster is one
+        # warning, never a crash; the goal is catching model-slug drift before the first paid
+        # run, not gatekeeping.
         try:
-            code, out = _probe(["grok", "models"])
+            code, out = probe_argv([self.name, "models"])
         except (OSError, CairnError):
             code, out = None, ""
         if code is None or code != 0 or not out:
-            return [Finding("warning", "could not run `grok models` — skipping model drift check")]
+            return [Finding("warning", f"could not run `{self.name} models` — skipping model drift check")]
         known = _parse_grok_models(out)
         if not known:
             return [
-                Finding("warning", "`grok models` returned no parseable model list — skipping model drift check")
+                Finding(
+                    "warning",
+                    f"`{self.name} models` returned no parseable model list — skipping model drift check",
+                )
             ]
         findings = []
         for tier in sorted(self.config.tiers):
@@ -82,7 +94,7 @@ class GrokExecutor(CliExecutor):
                 findings.append(
                     Finding(
                         "warning",
-                        f"grok tier {tier!r} model {model!r} not in `grok models` "
+                        f"{self.name} tier {tier!r} model {model!r} not in `{self.name} models` "
                         f"(known: {', '.join(sorted(known))})",
                     )
                 )

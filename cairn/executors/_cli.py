@@ -32,12 +32,14 @@ def _render_doctrine(doctrine: Path) -> str:
     return f"{header}\n\n{doctrine.read_text(encoding='utf-8')}"
 
 
-def _probe(argv: list[str], timeout_s: float = 15.0) -> tuple[int | None, str]:
-    """Run ``argv`` for doctor (a ``--version`` or ``--help`` probe). Uses the ambient env (a
-    machine preflight, not an agent invocation) so PATH/HOME are available. Returns
-    (exit_code|None-on-timeout, output). A Popen spawn failure (``ExecutorSpawnError``, a
-    ``CairnError`` per W1/W5a) is NOT caught here — it propagates so callers can tell "the binary
-    ran and said no" from "the binary couldn't even start" and report each precisely."""
+def probe_argv(argv: list[str], timeout_s: float = 15.0) -> tuple[int | None, str]:
+    """Run ``argv`` for doctor (a ``--version``, ``--help``, or vendor-subcommand probe like
+    ``grok models``). Public (no leading underscore): every adapter's doctor extension needs it,
+    not just this module. Uses the ambient env (a machine preflight, not an agent invocation) so
+    PATH/HOME are available. Returns (exit_code|None-on-timeout, output). A Popen spawn failure
+    (``ExecutorSpawnError``, a ``CairnError`` per W1/W5a) is NOT caught here — it propagates so
+    callers can tell "the binary ran and said no" from "the binary couldn't even start" and
+    report each precisely."""
     with tempfile.TemporaryDirectory() as td:
         try:
             code, out, _ = run_process(
@@ -54,22 +56,18 @@ def _probe(argv: list[str], timeout_s: float = 15.0) -> tuple[int | None, str]:
 
 
 def _probe_version(name: str, timeout_s: float = 15.0) -> tuple[int | None, str]:
-    """Run ``<name> --version`` for doctor. See :func:`_probe`."""
-    return _probe([name, "--version"], timeout_s)
-
-
-_flag_re_cache: dict[str, re.Pattern[str]] = {}
+    """Run ``<name> --version`` for doctor. See :func:`probe_argv`."""
+    return probe_argv([name, "--version"], timeout_s)
 
 
 def _flag_present(flag: str, help_text: str) -> bool:
     """Is ``flag`` present as a whole TOKEN in ``help_text`` (tolerant of column-wrapped ``--help``
     output, e.g. ``argparse``/``clap`` two-column layouts)? Bounded on both sides by "not a word
     char or hyphen" so ``-p`` doesn't false-match inside ``--print`` and ``--model`` doesn't
-    false-match inside a longer ``--model-foo`` some future flag might add."""
-    pattern = _flag_re_cache.get(flag)
-    if pattern is None:
-        pattern = re.compile(rf"(?<![\w-]){re.escape(flag)}(?![\w-])")
-        _flag_re_cache[flag] = pattern
+    false-match inside a longer ``--model-foo`` some future flag might add. No manual memoization
+    here — ``re.compile`` already caches identical pattern strings internally (stdlib
+    ``re._cache``), so a second cache layer on top would just duplicate memory for nothing."""
+    pattern = re.compile(rf"(?<![\w-]){re.escape(flag)}(?![\w-])")
     return pattern.search(help_text) is not None
 
 
@@ -84,6 +82,9 @@ class CliExecutor:
     # the installed CLI's `--help` (W5b sub-change A.1). A small declared const per subclass
     # (cleaner and less brittle than scraping `_build_command`'s argv construction). Empty here
     # ⇒ no check — the base class itself is never instantiated directly.
+    # NOTE: this is NOT derived from `_build_command` — the two must be kept in sync by hand
+    # when an adapter's argv changes (an accepted tradeoff per the W5b brief: a declared const
+    # is cleaner/less brittle than scraping argv construction, at the cost of manual upkeep).
     _emitted_flags: tuple[str, ...] = ()
 
     def __init__(self, config: ExecutorConfig) -> None:
@@ -169,9 +170,15 @@ class CliExecutor:
             # which() is a TOCTOU check, not a guarantee: the binary can vanish between the
             # check and the spawn, or resolve to a broken shim (asdf/mise/nvm-managed CLIs are
             # a realistic case) that fails to exec. Either raises here as OSError or
-            # ExecutorSpawnError (a CairnError, post-W1) — a doctor probe is best-effort, so
-            # report it as a clean Finding, never an uncaught traceback (mirrors cli.py's
-            # _probe_executor_versions fix, W5a).
+            # ExecutorSpawnError (a CairnError, post-W1). This doesn't change whether `cairn
+            # doctor` itself crashes — doctor.py's `_doctor_executor` already wraps `ex.doctor()`
+            # in a broad `except Exception`, so that CLI path was already caught. What this DOES
+            # fix: doctor() is a documented protocol (API.md §6, "return list[Finding]") any
+            # caller can invoke directly — every unit test in this file does — and an uncaught
+            # exception there breaks that contract regardless of the CLI wrapper; this gives a
+            # precise Finding (naming the executor and the underlying error) instead of either a
+            # raw traceback (direct callers) or doctor.py's generic "doctor failed: <str(exc)>"
+            # (mirrors cli.py's _probe_executor_versions fix, W5a, same precision motive there).
             return [
                 Finding("error", f"{self.name} --version failed to run: {exc}", fix=self._install_hint)
             ]
@@ -203,7 +210,7 @@ class CliExecutor:
             return []
         argv = self._help_argv()
         try:
-            code, out = _probe(argv)
+            code, out = probe_argv(argv)
         except (OSError, CairnError):
             code, out = None, ""
         if code is None or code != 0 or not out:
