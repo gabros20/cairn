@@ -176,15 +176,15 @@ def test_loop_completion_precondition_is_unbounded(tmp_path: Path) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def test_claude_prompt_is_passed_on_argv_not_stdin(tmp_path: Path) -> None:
-    """claude-F2/F6 (major/minor): the full envelope rides in a single argv arg.
+def test_claude_prompt_is_passed_on_stdin_not_argv(tmp_path: Path) -> None:
+    """claude-F2/F6 (major/minor, FIXED): the full envelope no longer rides in a single argv arg.
 
-    ``ClaudeExecutor._build_command`` returns ``["claude", "-p", prompt_text, …], None`` — the
-    whole envelope (inlined SKILL.md bodies, contract, trail slice) is one argv element. Two
-    consequences: it is world-readable via ``ps``/``/proc/*/cmdline`` for the step's duration, and
-    a skill-heavy envelope trips Linux ``MAX_ARG_STRLEN`` (128 KiB) → uncaught ``OSError(E2BIG)``.
-    The codex adapter already delivers its prompt on stdin. Characterization: green today.
-    claude.py:21.
+    ``ClaudeExecutor._build_command`` used to return ``["claude", "-p", prompt_text, …], None`` —
+    the whole envelope (inlined SKILL.md bodies, contract, trail slice) was one argv element:
+    world-readable via ``ps``/``/proc/*/cmdline`` for the step's duration, and a skill-heavy
+    envelope could trip Linux ``MAX_ARG_STRLEN`` (128 KiB) → uncaught ``OSError(E2BIG)``. W4:
+    the prompt now rides on stdin, like the codex adapter already did. This test was the
+    characterization anchor for the bug; it now asserts the fix directly. claude.py.
     """
     from cairn.executors.claude import ClaudeExecutor
     from cairn.kernel.config import ExecutorConfig
@@ -193,11 +193,10 @@ def test_claude_prompt_is_passed_on_argv_not_stdin(tmp_path: Path) -> None:
     argv, stdin = ClaudeExecutor(ExecutorConfig(name="claude", tiers={}))._build_command(
         inv, inv.prompt_file.read_text(encoding="utf-8")
     )
-    assert "ENVELOPE-BODY-MARKER" in argv       # prompt exposed on the argv/ps surface
-    assert stdin is None                         # nothing delivered on stdin
+    assert "ENVELOPE-BODY-MARKER" not in argv   # prompt no longer exposed on the argv/ps surface
+    assert stdin == "ENVELOPE-BODY-MARKER"       # delivered on stdin instead
 
 
-@pytest.mark.xfail(strict=True, reason="claude-F11: effort enum omits 'max' the CLI accepts")
 def test_effort_enum_includes_max() -> None:
     """claude-F11 (minor): ``claude --help`` lists effort ``max``; cairn's enum stops at xhigh.
 
