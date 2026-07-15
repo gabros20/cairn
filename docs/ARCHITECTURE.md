@@ -268,6 +268,22 @@ runs are safe by construction; the executor's own sandbox flags (`--sandbox work
 the isolation rule and the wrong-run tripwire (assert `run.json.params.url` matches) — belt over
 the environment's suspenders, unchanged from today.
 
+**Config isolation per CLI (W4).** Each executor also seals its process from *ambient user
+config*, so identical pipeline runs are deterministic regardless of the operator's local
+`~/.claude`, `$CODEX_HOME/config.toml`, or `~/.grok` state:
+- **claude**: `--setting-sources project` loads only the run-dir `.claude/settings.json`
+  (the "project" source) that `install_guards` writes — the cairn guard hook stays authoritative
+  while the user's `~/.claude/settings.json` is dropped; `--strict-mcp-config` drops any ambient
+  MCP servers. The prompt itself rides on stdin, not argv (`-p`/`--print` without the positional
+  `prompt` arg reads stdin) — keeps the envelope off `ps`/`/proc/*/cmdline` and off the
+  `MAX_ARG_STRLEN` ceiling. `--no-session-persistence` disables the on-disk session transcript
+  entirely, so `Capabilities.session_capture` is `None` (there is nothing to capture).
+- **codex**: `--ignore-user-config` skips `$CODEX_HOME/config.toml` (auth still uses
+  `CODEX_HOME`); `--ignore-rules` skips user/project execpolicy `.rules` files.
+- **grok**: `--no-memory` disables cross-session memory; `--sandbox workspace` applies the
+  built-in `workspace` sandbox profile (read everywhere, write only cwd + `~/.grok/` + temp
+  dirs) — the workspace-write equivalent to codex's `--sandbox workspace-write`.
+
 ## 6. The envelope — AX as a specification
 
 `compose.py` renders **the same six blocks, in the same order, for every agent step on every

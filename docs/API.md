@@ -97,7 +97,7 @@ balanced  = { model = "grok-build",             effort = "medium" }
 cheap     = { model = "grok-composer-2.5-fast", effort = "low" }
 ```
 
-Effort values are the shared enum `low | medium | high | xhigh`. Precedence is specific-over-general:
+Effort values are the shared enum `low | medium | high | xhigh | max`. Precedence is specific-over-general:
 a fired `escalate.effort` (§3) wins, then an agent's own `effort:`, then a tier entry's `effort` as
 the fallback used when the agent pins none; if none of them set it, effort is `None` and the executor
 applies its own default. So a tier may supply a default effort for the agents that omit one, but it
@@ -299,7 +299,7 @@ validators like everything else — never a config knob that quietly writes else
 ```yaml
 description: "P0 worker: crawls the source site into structured captures/"
 tier: balanced                   # reasoning | balanced | cheap
-effort: medium                   # low | medium | high | xhigh — wins over the tier's effort (§1)
+effort: medium                   # low | medium | high | xhigh | max — wins over the tier's effort (§1)
 escalate:                        # optional conditional tier bump
   when: "dims.design != 'reproduce'"
   tier: reasoning
@@ -393,28 +393,44 @@ Built-in `invoke` shapes (as actually built; flags re-verified at doctor time �
 `[--effort …]`/`[-c …]` appear only when the step resolves an effort:
 
 ```
-claude:  claude -p "<envelope text>" --model {model} [--effort {effort}] --output-format text
+claude:  claude -p --model {model} [--effort {effort}] --output-format text
              --permission-mode bypassPermissions
-             (prompt passed as the -p argument; nothing on stdin. bypassPermissions is required:
-              headless `claude -p` under the default mode refuses every tool use and exits 0
-              without producing the artifact — cairn's blocking PreToolUse guards are the
-              enforcement layer instead of an interactive prompt)
+             --setting-sources project --strict-mcp-config --no-session-persistence
+             < envelope
+             (prompt on stdin — the positional `prompt` arg is omitted, so `-p`/`--print` reads
+              stdin instead; keeps the envelope off `ps`/`/proc/*/cmdline` and off the argv
+              `MAX_ARG_STRLEN` (128 KiB) ceiling a skill-heavy envelope could trip. bypassPermissions
+              is required: headless `claude -p` under the default mode refuses every tool use and
+              exits 0 without producing the artifact — cairn's blocking PreToolUse guards are the
+              enforcement layer instead of an interactive prompt. `--setting-sources project` seals
+              the process from the user's ambient `~/.claude/settings.json` while keeping the
+              run-dir `.claude/settings.json` install_guards writes (that IS the "project" source);
+              `--strict-mcp-config` drops any ambient MCP servers; `--no-session-persistence`
+              disables the on-disk session transcript entirely — session_capture is None, there is
+              nothing to capture)
 codex:   codex exec -C {cwd} -m {model} --sandbox workspace-write --skip-git-repo-check
+             --ignore-user-config --ignore-rules
              [-c model_reasoning_effort={effort}]  < envelope
              (prompt on stdin; `-a/--ask-for-approval` is gone from `codex exec` as of codex-cli
               0.142.5 — exec hardwires approval-never; `--skip-git-repo-check` because codex refuses a
               non-git/untrusted cwd and cairn's `--sandbox` flag + guards are the enforcement layer;
-              --output-schema is NOT wired yet — the STEP sentinel is the contract)
-grok:    grok --prompt-file {envelope} --cwd {cwd} -m {model} [--effort {effort}]
+              `--ignore-user-config` skips `$CODEX_HOME/config.toml` (auth still uses CODEX_HOME),
+              `--ignore-rules` skips user/project execpolicy `.rules` files — both seal the process
+              from ambient config; --output-schema is NOT wired yet — the STEP sentinel is the
+              contract)
+grok:    grok --prompt-file {envelope} --cwd {cwd} -m {model}
              --output-format plain --permission-mode bypassPermissions
-             --no-alt-screen --no-auto-update
-             (grok 0.2.82: headless mode does NOT read stdin — the envelope is delivered via
+             --no-alt-screen --no-auto-update --no-memory --sandbox workspace
+             [--effort {effort}]
+             (grok 0.2.101: headless mode does NOT read stdin — the envelope is delivered via
               --prompt-file; `--output-format text` is gone (valid: plain|json|streaming-json);
               bypassPermissions is required — `dontAsk` silently denies file writes (exit 0,
               empty output, no artifact) and PreToolUse hooks still apply under bypass;
-              `--effort low|medium|high|xhigh` is grok's native headless effort flag — NOT
+              `--effort low|medium|high|xhigh|max` is grok's native headless effort flag — NOT
               `--reasoning-effort`, a separate per-model knob; native --json-schema exists but
-              is NOT wired — the STEP sentinel is the contract)
+              is NOT wired — the STEP sentinel is the contract; `--no-memory` disables
+              cross-session memory and `--sandbox workspace` applies the built-in workspace-write
+              equivalent sandbox profile — both seal the process from ambient config/access)
 shell:   the run: command verbatim (this executor is how deterministic steps execute)
 stub:    copies tests/stubs/<pipeline>/<step>[.c<cycle>]/ into the run dir + returns a canned
          STEP — the L1 test executor (TESTING.md §5); selectable like any other, so a full
