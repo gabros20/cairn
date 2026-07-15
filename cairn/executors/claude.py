@@ -26,13 +26,19 @@ class ClaudeExecutor(CliExecutor):
     capabilities = Capabilities(
         blocking_hooks=True,  # PreToolUse hooks can block (deny-JSON) — installed by install_guards
         output_schema=False,
-        session_capture="~/.claude/projects/**",
+        # W4: --no-session-persistence (below) makes this genuinely None, not just unconsumed —
+        # claude-F7. No code ever read this glob; the transcripts it pointed at now don't exist.
+        session_capture=None,
         installs_hooks=True,  # install_guards below actually wires the PreToolUse hook (W3a)
     )
 
     def _build_command(self, inv: Invocation, prompt_text: str) -> tuple[list[str], str | None]:
         # re-verify against `claude --help` at doctor time; vendors drift.
-        argv = ["claude", "-p", prompt_text, "--model", inv.model]
+        # W4 (claude-F2/F6): the positional `prompt` arg is dropped from argv — `-p`/`--print`
+        # reads it from stdin when absent (captured help: "-p, --print … non-interactive
+        # mode"). Keeps the envelope off `ps`/`/proc/*/cmdline` and off the argv `MAX_ARG_STRLEN`
+        # (128 KiB) ceiling that a skill-heavy envelope could trip.
+        argv = ["claude", "-p", "--model", inv.model]
         if inv.effort is not None:
             argv += ["--effort", inv.effort]
         argv += ["--output-format", "text"]
@@ -42,7 +48,19 @@ class ClaudeExecutor(CliExecutor):
         # Capabilities.blocking_hooks, installed by install_guards) are the enforcement layer, so
         # run claude fully non-interactive and let the guards, not an interactive prompt, gate tools.
         argv += ["--permission-mode", "bypassPermissions"]
-        return argv, None  # prompt is an argv arg, nothing on stdin
+        # W4 config isolation (claude's half of F5): seal the process from ambient user config so
+        # identical pipeline runs are deterministic. `--setting-sources project` drops the user's
+        # `~/.claude/settings.json` and any local override while KEEPING the run-dir
+        # `.claude/settings.json` install_guards writes (that IS the "project" source, cwd is the
+        # run dir) — the cairn guard hook stays authoritative, only the user's ambient settings
+        # go away. `--strict-mcp-config` drops any ambient MCP servers (none are passed via
+        # --mcp-config, so this yields zero MCP servers rather than the user's set).
+        argv += ["--setting-sources", "project", "--strict-mcp-config"]
+        # W4 (claude-F7): retire the dead session-capture path — full transcripts otherwise
+        # accumulate under ~/.claude/projects/, outside the run dir, and nothing ever read them
+        # back in. "Disable session persistence … only works with --print" (captured help).
+        argv += ["--no-session-persistence"]
+        return argv, prompt_text  # prompt delivered on stdin, not argv
 
     def install_guards(self, guards, workspace_dir, run_dir) -> None:
         """Install the ``hook``-enforced guards as a claude ``PreToolUse`` hook.
@@ -59,10 +77,6 @@ class ClaudeExecutor(CliExecutor):
         (``guard_manifest_path``) and SIGNED (per-run MAC + per-check-script hash), so the
         sandboxed agent cannot rewrite the policy its own commands are checked against; its
         absolute path is baked into the hook command and ``--hook-check`` authenticates it.
-
-        NOTE (W4 config isolation): claude also loads the user's ``~/.claude/settings.json``;
-        until W4 adds ``--setting-sources project``, this run-dir hook is ADDITIVE to the user's
-        hooks. That is safe — our hook only ADDS a deny, never removes one.
 
         NOTE (W3c): ``settings.json`` itself lives in the run dir, so under ``bypassPermissions``
         (whole-FS write) the agent can still rewrite/remove it or the per-run secret. That residual

@@ -1,4 +1,4 @@
-"""ClaudeExecutor — prompt as an argv arg, --effort omitted when None, blocking hooks."""
+"""ClaudeExecutor — prompt on stdin, config isolation, --effort omitted when None, blocking hooks."""
 
 from __future__ import annotations
 
@@ -34,16 +34,20 @@ def _invoke(tmp_path, monkeypatch, **kw):
     return result, inv, argv, env, stdin
 
 
-def test_argv_shape_prompt_as_arg(tmp_path, monkeypatch):
+def test_argv_shape_prompt_on_stdin(tmp_path, monkeypatch):
     _, inv, argv, _, stdin = _invoke(tmp_path, monkeypatch, prompt="hello prompt", model="opus", effort="high")
     assert argv[0].split("/")[-1] == "claude"  # argv[0] is the PATH-resolved binary
     assert argv[1:] == [
-        "-p", "hello prompt",
+        "-p",
         "--model", "opus", "--effort", "high",
         "--output-format", "text",
         "--permission-mode", "bypassPermissions",
+        "--setting-sources", "project",
+        "--strict-mcp-config",
+        "--no-session-persistence",
     ]
-    assert stdin == ""  # claude gets the prompt as an arg, not on stdin
+    assert "hello prompt" not in argv  # W4 (claude-F2): not exposed on the argv/ps surface
+    assert stdin == "hello prompt"  # claude gets the prompt on stdin, not as an arg
 
 
 def test_headless_permission_mode_is_bypass(tmp_path, monkeypatch):
@@ -51,7 +55,25 @@ def test_headless_permission_mode_is_bypass(tmp_path, monkeypatch):
     # permission…") and never writes its artifact. cairn's own guards (blocking PreToolUse
     # hooks) are the enforcement layer, so the executor runs claude fully non-interactive.
     _, _, argv, _, _ = _invoke(tmp_path, monkeypatch)
-    assert argv[-2:] == ["--permission-mode", "bypassPermissions"]
+    i = argv.index("--permission-mode")
+    assert argv[i : i + 2] == ["--permission-mode", "bypassPermissions"]
+
+
+def test_config_isolation_flags_present(tmp_path, monkeypatch):
+    # W4 (codex-F6/grok-F6/claude's half of F5): seal the process from ambient user config —
+    # keeps the run-dir hook (the "project" source) while dropping the user's settings, and
+    # ignores any ambient MCP servers.
+    _, _, argv, _, _ = _invoke(tmp_path, monkeypatch)
+    assert "--setting-sources" in argv
+    i = argv.index("--setting-sources")
+    assert argv[i + 1] == "project"
+    assert "--strict-mcp-config" in argv
+
+
+def test_no_session_persistence_present(tmp_path, monkeypatch):
+    # W4 (claude-F7): retire the dead session-capture path.
+    _, _, argv, _, _ = _invoke(tmp_path, monkeypatch)
+    assert "--no-session-persistence" in argv
 
 
 def test_effort_pair_omitted_when_none(tmp_path, monkeypatch):
@@ -87,8 +109,10 @@ def test_exit_code_propagated(tmp_path, monkeypatch):
 
 def test_capabilities():
     caps = ClaudeExecutor(CFG).capabilities
+    # W4 (claude-F7): session_capture retired to None — --no-session-persistence means there
+    # are no transcripts to capture, and nothing ever consumed the old glob.
     assert caps == Capabilities(
-        blocking_hooks=True, output_schema=False, session_capture="~/.claude/projects/**",
+        blocking_hooks=True, output_schema=False, session_capture=None,
         installs_hooks=True,
     )
 
