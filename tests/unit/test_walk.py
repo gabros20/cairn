@@ -267,6 +267,35 @@ def test_agent_success_emits_learnings_and_usage(ws: Path, tmp_path: Path) -> No
     assert node_status(load_run(run_dir), "s") == "done"
 
 
+def test_walker_ignores_non_dict_learnings_member_instead_of_raising(ws: Path, tmp_path: Path) -> None:
+    # codex-F10 defensive belt: parse_step_sentinel schema-validates learnings before returning
+    # a block, but Result.step is a plain dict any Executor can hand back directly, bypassing
+    # that gate. A non-object learnings member must be skipped, not raise AttributeError on
+    # `learn.get(...)` deep in the walker.
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        (inv.cwd / "a.txt").write_text("hi")
+        return Result(
+            step={
+                "status": "done",
+                "summary": "ok",
+                "artifacts": [],
+                "learnings": ["not-an-object", {"note": "kept", "tag": "capture"}],
+            },
+            exit_code=0,
+            duration_s=1.0,
+        )
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
+
+    learns = [e for e in read_trail(run_dir) if e["event"] == "learn"]
+    assert len(learns) == 1
+    assert learns[0]["data"]["note"] == "kept"
+
+
 def test_executor_reported_usage_on_result_wins_over_step_block(ws: Path, tmp_path: Path) -> None:
     # The future json-output path: the executor reports usage on Result (authoritative),
     # outranking a model's self-reported STEP-block usage. Today Result.usage is always None,

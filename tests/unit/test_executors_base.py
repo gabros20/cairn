@@ -123,6 +123,29 @@ def test_last_WELL_FORMED_block_wins_over_a_trailing_broken_block():
     assert parse_step_sentinel(text) == {"status": "done", "summary": "good"}
 
 
+def test_fully_valid_block_parses_with_learnings_intact():
+    text = (
+        '<<<STEP {"status": "done", "summary": "shipped", "artifacts": ["out.txt"], '
+        '"learnings": [{"note": "watch rate limits", "tag": "capture"}]} STEP>>>'
+    )
+    obj = parse_step_sentinel(text)
+    assert obj["status"] == "done"
+    assert obj["artifacts"] == ["out.txt"]
+    assert obj["learnings"] == [{"note": "watch rate limits", "tag": "capture"}]
+
+
+def test_status_outside_enum_returns_none():
+    obj = parse_step_sentinel('<<<STEP {"status": "done-ish", "summary": "ok"} STEP>>>')
+    assert obj is None
+
+
+def test_artifacts_not_a_list_of_strings_returns_none():
+    obj = parse_step_sentinel(
+        '<<<STEP {"status": "done", "summary": "ok", "artifacts": [1, 2]} STEP>>>'
+    )
+    assert obj is None
+
+
 # --------------------------------------------------------------------------- #
 # run_process
 # --------------------------------------------------------------------------- #

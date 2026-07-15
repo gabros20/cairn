@@ -443,6 +443,17 @@ mechanism for gate UIs (`cairn.gates`) and trail sinks (`cairn.sinks`).
 Emitted between `<<<STEP` / `STEP>>>` sentinels as the final message. Authority rule: artifact
 validation outranks this block in both directions (ARCHITECTURE §7).
 
+`parse_step_sentinel` (`executors/base.py`) extracts this block defensively: it locates each
+`<<<STEP` marker and reads the first complete JSON value after it with `json.JSONDecoder.raw_decode`
+(real JSON parsing, not a regex to the closing marker), so a `STEP>>>` substring quoted inside a
+`summary`/`note` string does not truncate the block. The parsed object is then validated against
+this schema with `required` dropped — so a status-only block (e.g. `{"status": "blocked",
+"summary": "…"}`, no `artifacts`) still parses, but a wrong-shaped field (e.g. `"learnings":
+["x"]`, a bare string instead of an object with `note`) does not. The last marker that yields a
+schema-valid object wins; anything that fails to parse or validate is skipped in favour of an
+earlier well-formed block, and if none validates the result is `None` — a soft signal, never a
+hard failure.
+
 ## 8. Run directory layout & schemas
 
 The skeleton (`run.json`, `trail.jsonl`, `gates/`, `logs/`, and the internal `.cairn.lock` / `.cairn/`)

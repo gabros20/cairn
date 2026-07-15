@@ -128,7 +128,6 @@ def test_spawn_failure_raises_typed_cairn_error(tmp_path: Path) -> None:
         )
 
 
-@pytest.mark.xfail(strict=True, reason="codex-F10/claude-F13: STEP block not schema-validated")
 def test_step_sentinel_rejects_wrong_shaped_object() -> None:
     """codex-F10 (major): a syntactically valid but wrong-shaped STEP object is accepted.
 
@@ -142,7 +141,6 @@ def test_step_sentinel_rejects_wrong_shaped_object() -> None:
     assert obj is None
 
 
-@pytest.mark.xfail(strict=True, reason="claude-F13: greedy STEP regex truncates on nested marker")
 def test_step_sentinel_survives_marker_in_payload() -> None:
     """claude-F13 (minor): a payload string containing ``STEP>>>`` truncates the match.
 
