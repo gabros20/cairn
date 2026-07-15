@@ -483,7 +483,13 @@ class _Walk:
                 raise _Halt(ExitCode.EXECUTOR, step.id, f"executor failure: {exc}") from exc
 
             block = result.step or {}
+            # Defensive belt: parse_step_sentinel schema-validates learnings before returning a
+            # block (executors/base.py), but Result.step is a plain dict any Executor can hand
+            # back directly (bypassing that gate) — guard so a non-object member never raises
+            # AttributeError deep in the walker (codex-F10).
             for learn in block.get("learnings") or []:
+                if not isinstance(learn, dict):
+                    continue
                 self._emit("learn", node=step.id, cycle=cycle, data={k: learn.get(k) for k in ("note", "tag")})
 
             status = block.get("status")

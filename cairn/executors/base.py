@@ -15,9 +15,13 @@ import subprocess
 import threading
 import time
 from collections.abc import Callable
+from functools import lru_cache
 from pathlib import Path
 
+import jsonschema
+
 from cairn.kernel.errors import CairnError, ExecutorSpawnError
+from cairn.kernel.schemas import get_schema
 from cairn.kernel.types import (
     EFFORTS,
     TIERS,
@@ -47,30 +51,67 @@ class ExecTimeout(CairnError):
     """An invocation exceeded its ``timeout_s``. The walker maps this to ExitCode.TIMEOUT."""
 
 
-# The STEP sentinel: a chatty model frames its final machine-readable block between these
-# markers so it survives surrounding prose (docs/API.md §7). ``\b`` after STEP keeps a bare
-# ``<<<STEP{...}`` from matching the closing marker's ``STEP``.
-_STEP_RE = re.compile(r"<<<STEP\b(.*?)STEP>>>", re.DOTALL)
+# The STEP sentinel: a chatty model frames its final machine-readable block after this opening
+# marker so it survives surrounding prose (docs/API.md §7). ``\b`` after STEP keeps a bare
+# ``<<<STEP{...}`` from matching mid-word (e.g. a stray ``<<<STEPPER``). The closing ``STEP>>>``
+# is NOT used to delimit the block — see the raw_decode note in parse_step_sentinel below.
+_STEP_START_RE = re.compile(r"<<<STEP\b")
+
+
+@lru_cache(maxsize=1)
+def _relaxed_step_schema() -> dict:
+    """The bundled step-return schema with its top-level ``required`` dropped.
+
+    Property TYPES are still enforced (e.g. a learnings item must be an object with ``note``,
+    so ``{"learnings": ["x"]}`` is rejected), but PRESENCE is not (so a status-only block like
+    ``{"status": "blocked", "summary": "…"}`` with no ``artifacts`` still validates). This is
+    what lets a well-typed-but-incomplete soft signal through while still rejecting a
+    wrong-shaped one (codex-F10).
+    """
+    schema = dict(get_schema("step-return"))
+    schema.pop("required", None)
+    return schema
 
 
 def parse_step_sentinel(text: str) -> dict | None:
-    """Extract the LAST well-formed ``<<<STEP … STEP>>>`` block and json.loads it.
+    """Extract the LAST schema-valid ``<<<STEP …`` block and return it as a dict.
 
-    Returns the parsed object, or None when absent / unparsable / not a JSON object.
-    Authority rule (docs/ARCHITECTURE.md §7): artifact validation outranks this block, so a
-    missing or malformed STEP is a soft signal (→ None), never a hard failure here.
+    For each ``<<<STEP`` marker (scanned last→first), the first complete JSON value after it is
+    read with ``json.JSONDecoder().raw_decode`` — real JSON parsing, so a ``STEP>>>`` marker
+    appearing INSIDE a string in the payload (e.g. a summary that quotes the protocol back) is
+    just string content, not a terminator (claude-F13). A trailing ``STEP>>>`` after the object
+    is harmless: raw_decode stops at the value's closing brace and the rest is ignored.
+
+    The result is validated against a relaxed copy of the step-return schema (required dropped,
+    types enforced — see ``_relaxed_step_schema``) before it is accepted, so a wrong-shaped
+    object (e.g. ``{"learnings": ["x"]}``) can never reach the walker (codex-F10).
+
+    Returns the parsed object, or None when absent / unparsable / not a schema-valid JSON
+    object. Authority rule (docs/ARCHITECTURE.md §7): artifact validation outranks this block, so
+    a missing or malformed STEP is a soft signal (→ None), never a hard failure here.
     """
     if not text:
         return None
-    # Scan matched blocks last→first; the LAST well-formed (json-object) block wins, so a
-    # trailing broken/partial block never masks a good one earlier in the output.
-    for block in reversed(_STEP_RE.findall(text)):
+    decoder = json.JSONDecoder()
+    schema = _relaxed_step_schema()
+    starts = [m.end() for m in _STEP_START_RE.finditer(text)]
+    # Scan markers last→first; the LAST schema-valid block wins, so a trailing broken/partial
+    # block never masks a good one earlier in the output.
+    for start in reversed(starts):
+        idx = start
+        while idx < len(text) and text[idx].isspace():
+            idx += 1
         try:
-            obj = json.loads(block)
+            obj, _end = decoder.raw_decode(text, idx)
         except (ValueError, TypeError):
             continue
-        if isinstance(obj, dict):
-            return obj
+        if not isinstance(obj, dict):
+            continue
+        try:
+            jsonschema.validate(obj, schema)
+        except jsonschema.ValidationError:
+            continue
+        return obj
     return None
 
 
