@@ -565,9 +565,30 @@ def test_codex_copied_auth_dies_with_the_canary(fakebin, tmp_path, monkeypatch):
 
 def test_claude_invocation_carries_bypass_permissions(tmp_path):
     argv, stdin_text = ClaudeHookRecipe().build_invocation(tmp_path, "PROMPT", "haiku")
-    assert argv[0] == "claude" and stdin_text is None
+    assert argv[0] == "claude" and stdin_text == "PROMPT"  # W4: prompt on stdin, not argv
     assert "--permission-mode" in argv and "bypassPermissions" in argv
     assert "haiku" in argv
+
+
+def test_claude_invocation_mirrors_real_executor_argv(tmp_path):
+    """The recipe argv must equal the REAL ClaudeExecutor argv (minus effort) EXACTLY.
+
+    Pinned by construction (not a copied list): drift in either direction — the executor
+    changing shape (W4: prompt to stdin, config-isolation flags) or the recipe growing stale —
+    fails this test loudly."""
+    from cairn.executors.claude import ClaudeExecutor
+    from cairn.kernel.config import ExecutorConfig
+    from cairn.kernel.types import Invocation
+
+    inv = Invocation(
+        prompt_file=tmp_path / "p.md", model="haiku", effort=None, cwd=tmp_path,
+        env={}, timeout_s=60, log_path=tmp_path / "l.log", return_schema=tmp_path / "s.json",
+    )
+    exec_argv, exec_stdin = ClaudeExecutor(ExecutorConfig(name="claude"))._build_command(inv, "PROMPT")
+    recipe_argv, recipe_stdin = ClaudeHookRecipe().build_invocation(tmp_path, "PROMPT", "haiku")
+
+    assert recipe_argv == exec_argv  # exact mirror — no probe-only extra flag for claude
+    assert recipe_stdin == exec_stdin == "PROMPT"
 
 
 # --------------------------------------------------------------------------- #

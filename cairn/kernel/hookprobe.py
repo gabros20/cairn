@@ -245,15 +245,21 @@ class ClaudeHookRecipe(HookRecipe):
     def build_invocation(
         self, canary: Path, prompt_text: str, model: str
     ) -> tuple[list[str], str | None]:
-        # Mirrors ClaudeExecutor._build_command (minus effort): prompt as an argv arg, text
-        # output, and the load-bearing bypassPermissions the probe exists to stress.
+        # LOCKSTEP with cairn/executors/claude.py::ClaudeExecutor._build_command (minus effort):
+        # prompt on stdin (W4), text output, --setting-sources project + --strict-mcp-config +
+        # --no-session-persistence (W4 isolation), and the load-bearing bypassPermissions the
+        # probe exists to stress. `--setting-sources project` also means the probe's own
+        # write_canary settings.json (the "project" source, canary is cwd) is what fires — same
+        # posture a real run gets from install_guards' run-dir settings.json.
         argv = [
-            "claude", "-p", prompt_text,
+            "claude", "-p",
             "--model", model,
             "--output-format", "text",
             "--permission-mode", "bypassPermissions",
+            "--setting-sources", "project", "--strict-mcp-config",
+            "--no-session-persistence",
         ]
-        return argv, None
+        return argv, prompt_text
 
     def build_prompt(self, sidecar: Path) -> str:
         return (
@@ -312,15 +318,19 @@ class CodexHookRecipe(HookRecipe):
         # branch) — pinned by test_codex_invocation_mirrors_real_executor_argv; change that
         # executor and this recipe together. Live-verified on codex-cli 0.142.5:
         # `-a/--ask-for-approval` no longer exists on `codex exec` (argv error), and
-        # `--skip-git-repo-check` is required (the canary tempdir is not a git repo). The one
-        # probe-only addition is --dangerously-bypass-hook-trust, so the freshly-written canary
-        # hook runs without persisted hook trust. Prompt on stdin.
+        # `--skip-git-repo-check` is required (the canary tempdir is not a git repo).
+        # `--ignore-user-config`/`--ignore-rules` (W4) skip $CODEX_HOME/config.toml + execpolicy
+        # .rules — belt-over-suspenders with the empty config.toml write_canary already plants.
+        # The one probe-only addition is --dangerously-bypass-hook-trust, so the freshly-written
+        # canary hook runs without persisted hook trust. Prompt on stdin.
         argv = [
             "codex", "exec",
             "-C", str(canary),
             "-m", model,
             "--sandbox", "workspace-write",
             "--skip-git-repo-check",
+            "--ignore-user-config",
+            "--ignore-rules",
             "--dangerously-bypass-hook-trust",
         ]
         return argv, prompt_text
@@ -418,6 +428,8 @@ class GrokHookRecipe(HookRecipe):
         # (stdin is dead headless), so write it into the canary and reference it; return stdin=None.
         # NO probe-only extra flag: the hook is GLOBAL (always trusted), so unlike codex there is
         # no folder-trust to bypass — recipe argv == executor argv exactly.
+        # W4: --no-memory + --sandbox workspace added to match the executor's config-isolation
+        # posture (cairn-F5/F6) — also tightens the probe itself, on top of the relocated GROK_HOME.
         #
         # Deliberately duplicates the engine's own prompt.md write (_probe_in materializes the
         # same path/content just before calling this): the recipe stays self-contained — the file
@@ -435,6 +447,8 @@ class GrokHookRecipe(HookRecipe):
             "--permission-mode", "bypassPermissions",
             "--no-alt-screen",
             "--no-auto-update",
+            "--no-memory",
+            "--sandbox", "workspace",
             "--effort", self.effort,
         ]
         return argv, None
