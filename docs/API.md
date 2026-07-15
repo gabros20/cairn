@@ -505,11 +505,14 @@ loop body — cycle 1 is `.c1` — and absent only for steps outside a loop.
   "params": { "url": "…", "mode": "redesign", "pages": "gate", "brease": "off" },
   "dims":   { "content": "keep", "design": "redesign", "brand": "keep", "routes": "keep" },
   "executors": { "default": "codex", "overrides": { "review": "claude" },
-                 "versions": { "codex": "0.138.0" } },
+                 "versions": { "codex": "0.138.0" } },  // probed at mint; null on a failed probe
   "models":  { "capture": "gpt-5.4/medium", "review": "opus/high" },
+  "git_rev": "…", "git_dirty": false,   // workspace HEAD + dirty flag at mint; both null outside git
   "created_at": "…", "status": "running | done | halted",
   "nodes": { "<node-id>": { "status": "running|done|skipped|halted", "at": "…", "cycles": 2 } } }
 ```
+`at` is the node's real transition time (not the run's `created_at` clock) — `cairn ps` and a
+post-mortem trail reflect when each node actually finished (ARCHITECTURE §10).
 
 ### 8.2 Trail events (one JSON per line — the Trail Protocol, full spec: OBSERVABILITY.md)
 

@@ -356,10 +356,21 @@ it as a tool. Composition happens above the pipeline, never inside a step.
 
 ## 10. Reproducibility
 
-`run.json` records: pipeline content-hash, workspace git rev (if any), cairn version, executor
-versions (`codex --version` …), resolved model IDs per step (date-pinned where the vendor allows),
-params, dims. `cairn resume` warns on any drift. Two runs with equal hashes and params differ only
-by model nondeterminism — the maximum honesty possible in this domain.
+`run.json` records: pipeline content-hash, workspace git rev + dirty flag (if any — `null` outside
+a git repo or when `git` is unavailable), cairn version, executor versions (each resolved
+executor's `--version`, probed once at mint; a probe failure records `null`, never a mint crash),
+resolved model IDs per step (date-pinned where the vendor allows), params, dims. `cairn resume`
+warns (never refuses) on drift in either the executor versions or the git rev — a newer CLI or a
+workspace commit since mint doesn't invalidate what's already on disk, unlike a changed pipeline
+(hash drift, refuses without `--force`) or a cross-major cairn version. Two runs with equal hashes
+and params differ only by model nondeterminism — the maximum honesty possible in this domain.
+
+Every node's `run.json` `at` is the REAL wall-clock transition time (`datetime.now(timezone.utc)`
+at the moment the status is written), not the walk's construction-time clock — a multi-hour run's
+`cairn ps` and post-mortems reflect when nodes actually finished, not all-at-second-zero. Path and
+`{datetime}`-placeholder rendering still uses the walk's frozen clock, deliberately: that
+determinism (the same run renders the same artifact paths on every resume) is a different
+guarantee from an event timestamp's honesty, and the two must not be conflated.
 
 ## 11. Extension points (the pi-mono discipline)
 
