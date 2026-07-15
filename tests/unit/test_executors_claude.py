@@ -81,6 +81,14 @@ def test_effort_pair_omitted_when_none(tmp_path, monkeypatch):
     assert "--effort" not in argv
 
 
+def test_effort_max_flows_through(tmp_path, monkeypatch):
+    # W4 (claude-F11 Done-when #4): "max" must actually flow through to the emitted argv, not
+    # just be accepted by the EFFORTS enum.
+    _, _, argv, _, _ = _invoke(tmp_path, monkeypatch, effort="max")
+    i = argv.index("--effort")
+    assert argv[i + 1] == "max"
+
+
 def test_env_passed_exactly(tmp_path, monkeypatch):
     _, _, _, env, _ = _invoke(tmp_path, monkeypatch)
     assert env["CAIRN_CANARY"] == "canary-value"

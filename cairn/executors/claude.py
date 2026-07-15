@@ -35,8 +35,11 @@ class ClaudeExecutor(CliExecutor):
     def _build_command(self, inv: Invocation, prompt_text: str) -> tuple[list[str], str | None]:
         # re-verify against `claude --help` at doctor time; vendors drift.
         # W4 (claude-F2/F6): the positional `prompt` arg is dropped from argv — `-p`/`--print`
-        # reads it from stdin when absent (captured help: "-p, --print … non-interactive
-        # mode"). Keeps the envelope off `ps`/`/proc/*/cmdline` and off the argv `MAX_ARG_STRLEN`
+        # reads it from stdin when absent. The captured help documents -p/--print but doesn't
+        # itself spell out the stdin-fallback, so this is LIVE-VERIFIED, not just help-inferred:
+        # `printf '<prompt>' | claude -p --model haiku --output-format text` returned the
+        # expected reply with exit 0 (.orchestrate/raw/W4-claude-stdin-smoke.err is empty).
+        # Keeps the envelope off `ps`/`/proc/*/cmdline` and off the argv `MAX_ARG_STRLEN`
         # (128 KiB) ceiling that a skill-heavy envelope could trip.
         argv = ["claude", "-p", "--model", inv.model]
         if inv.effort is not None:

@@ -33,7 +33,10 @@ class GrokExecutor(CliExecutor):
 
     def _build_command(self, inv: Invocation, prompt_text: str) -> tuple[list[str], str | None]:
         # re-verify against `grok --help` at doctor time; vendors drift.
-        # Live-verified against grok 0.2.82 (6d0b07d2de0f):
+        # Live-verified against grok 0.2.82 (6d0b07d2de0f) at the original build; the W4 additions
+        # below (--no-memory, --sandbox, and the --effort/--reasoning-effort alias) were
+        # separately live-verified against 0.2.101, the version installed when W4 landed — the
+        # two version numbers below are not a typo, just two verification passes over time:
         #   * Headless mode does NOT read the prompt from stdin — bare `-p` is an argv
         #     error ("a value is required for '--single <PROMPT>'") and the headless docs
         #     state piped stdin is never read into the prompt. The envelope can be multi-KB
@@ -70,12 +73,21 @@ class GrokExecutor(CliExecutor):
             # everywhere and writes only CWD + ~/.grok/ + temp dirs — the workspace-write
             # equivalent to codex's `--sandbox workspace-write`, and cwd here is always the run
             # dir.
+            # NOTE (W5-doctor-drift): this profile name is a hard, ungated argv literal — nothing
+            # checks it against the installed CLI's actual profile roster, so a future grok
+            # renaming/removing "workspace" would hard-fail every grok step (fails closed, but
+            # with no earlier warning). Tracked for W5: doctor should verify emitted flags/profile
+            # names against the installed CLI, not just assert the binary runs.
             "--sandbox", "workspace",
         ]
         if inv.effort is not None:
-            # Native effort: the headless-only `--effort` flag takes low|medium|high|xhigh|max —
-            # matches cairn's EFFORTS exactly (W4 added "max"). NOT `--reasoning-effort`: that is
-            # a separate per-model reasoning knob, and both models shipped on 0.2.82 report
-            # supports_reasoning_effort=false in models_cache.json (it would be a no-op).
+            # Native effort: `--effort` IS `--reasoning-effort` — the captured help lists them as
+            # the same flag ("--reasoning-effort <EFFORT> ... [aliases: --effort]"), confirmed
+            # live on the installed 0.2.101. It takes low|medium|high|xhigh|max — matches cairn's
+            # EFFORTS exactly (W4 added "max") — and IS forwarded to the model, not a dead knob.
+            # Whether it changes anything is per-model (models_cache.json's
+            # `supports_reasoning_effort`; e.g. grok-4.5 reports true, grok-composer-2.5-fast
+            # reports false today) — cairn's job is to pass the tier-resolved effort through, not
+            # to second-guess per-model support, so the flag is always emitted when effort is set.
             argv += ["--effort", inv.effort]
         return argv, None  # prompt delivered via --prompt-file; stdin is not read headlessly

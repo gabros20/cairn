@@ -81,6 +81,16 @@ def test_config_isolation_flags_present(tmp_path, monkeypatch):
     assert argv[i + 1] == "workspace"
 
 
+def test_effort_max_flows_through(tmp_path, monkeypatch):
+    # W4 (claude-F11 Done-when #4): "max" must actually flow through to the emitted argv, not
+    # just be accepted by the EFFORTS enum. grok emits it via --effort, which the captured help
+    # confirms is an alias for --reasoning-effort (both accept low|medium|high|xhigh|max) — a
+    # form the installed grok CLI accepts.
+    _, _, argv, _, _ = _invoke(tmp_path, monkeypatch, effort="max")
+    i = argv.index("--effort")
+    assert argv[i + 1] == "max"
+
+
 def test_dead_and_wrong_flags_absent(tmp_path, monkeypatch):
     _, _, argv, _, _ = _invoke(tmp_path, monkeypatch, effort="low")
     # `-p/--single` requires the prompt as an ARGUMENT on 0.2.82 and stdin is never read
