@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Fake `hermes` CLI for executor tests. See fakebin/claude for the env-var contract.
+
+  CAIRN_TEST_HELP_OMIT  comma-separated flag tokens to DROP from `--help` output (W5b doctor
+                      flag-drift tests — simulates a vendor removing a flag)
+  CAIRN_TEST_HELP_FAIL  if set, `--help` fails (exit 1, no output)
+
+The hermes prompt rides ARGV (`-z <prompt>`), not stdin, so stdin.txt is empty on a normal run.
+"""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+_NAME = "hermes"
+_DEFAULT_VERSION = "hermes 0.18.2 (fake)"
+
+# Superset covering HermesExecutor._emitted_flags (cairn/executors/hermes.py) — W5b doctor
+# flag-presence check.
+_HELP_FLAGS = [
+    "-z", "-m", "--ignore-user-config", "--ignore-rules",
+    "--accept-hooks", "--yolo", "--usage-file",
+]
+
+if "--version" in sys.argv:
+    print(os.environ.get("CAIRN_TEST_VERSION", _DEFAULT_VERSION))
+    sys.exit(0)
+
+if "--help" in sys.argv:
+    if os.environ.get("CAIRN_TEST_HELP_FAIL"):
+        sys.exit(1)
+    omit = set(os.environ.get("CAIRN_TEST_HELP_OMIT", "").split(","))
+    for flag in _HELP_FLAGS:
+        if flag not in omit:
+            print(f"  {flag}  fake help text")
+    sys.exit(0)
+
+scratch = Path(os.environ["CAIRN_TEST_SCRATCH"])
+scratch.mkdir(parents=True, exist_ok=True)
+(scratch / "argv.json").write_text(json.dumps(sys.argv), encoding="utf-8")
+(scratch / "env.json").write_text(json.dumps(dict(os.environ)), encoding="utf-8")
+(scratch / "cwd.txt").write_text(os.getcwd(), encoding="utf-8")
+(scratch / "stdin.txt").write_text(sys.stdin.read(), encoding="utf-8")
+
+sleep_s = os.environ.get("CAIRN_TEST_SLEEP")
+if sleep_s:
+    time.sleep(float(sleep_s))
+
+print(f"chatty {_NAME} preamble the sentinel must survive")
+print('<<<STEP {"status": "done", "summary": "fake ok", "artifacts": []} STEP>>>')
+sys.exit(int(os.environ.get("CAIRN_TEST_EXIT", "0")))
