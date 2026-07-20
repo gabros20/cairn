@@ -50,6 +50,11 @@ stub = "cairn.executors.stub:StubExecutor"
 claude = "cairn.executors.claude:ClaudeExecutor"
 codex = "cairn.executors.codex:CodexExecutor"
 grok = "cairn.executors.grok:GrokExecutor"
+cursor = "cairn.executors.cursor:CursorExecutor"
+opencode = "cairn.executors.opencode:OpencodeExecutor"
+hermes = "cairn.executors.hermes:HermesExecutor"
+kimi = "cairn.executors.kimi:KimiExecutor"
+agy = "cairn.executors.agy:AgyExecutor"
 
 [dependency-groups]
 dev = ["pytest"]
