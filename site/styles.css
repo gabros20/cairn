@@ -440,6 +440,9 @@ html.js .reveal.is-visible { opacity: 1; transform: translateY(0); }
 }
 
 .terminal-panel {
+  position: relative;
+  display: flex;
+  flex-direction: column;
   background: var(--basalt);
   color: var(--chalk-dim);
   font-family: var(--font-mono);
@@ -448,7 +451,26 @@ html.js .reveal.is-visible { opacity: 1; transform: translateY(0); }
   box-shadow: var(--shadow-panel);
   overflow: hidden;
 }
+/* Right-edge fade lives on the non-scrolling shell (a child of the scroll
+   container would ride along with the content); hidden once scrolled to end. */
+.terminal-panel::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 28px;
+  background: linear-gradient(to right, transparent, var(--basalt));
+  border-radius: 0 var(--r-lg) var(--r-lg) 0;
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity var(--t-micro) var(--ease-calm);
+  z-index: 1;
+}
+.terminal-panel.has-fade::after { opacity: 1; }
 .terminal-panel__bar {
+  position: relative;
+  z-index: 2; /* keeps the edge fade from washing over the file-label bar */
   display: flex;
   align-items: center;
   gap: 0.5rem;
@@ -461,6 +483,7 @@ html.js .reveal.is-visible { opacity: 1; transform: translateY(0); }
 .terminal-panel__dot { width: 8px; height: 8px; border-radius: 50%; background: var(--granite-dim); opacity: 0.5; }
 .terminal-panel__body {
   position: relative;
+  flex: 1; /* fill the (grid-stretched) panel so the h-scrollbar sits at the panel's bottom edge */
   padding: 1.25rem 1.5rem;
   overflow-x: auto;
   scrollbar-width: thin;
@@ -469,19 +492,6 @@ html.js .reveal.is-visible { opacity: 1; transform: translateY(0); }
 .terminal-panel__body::-webkit-scrollbar { height: 6px; }
 .terminal-panel__body::-webkit-scrollbar-track { background: transparent; }
 .terminal-panel__body::-webkit-scrollbar-thumb { background: var(--granite-dim); border-radius: 3px; }
-.terminal-panel__body::after {
-  content: "";
-  position: absolute;
-  top: 0;
-  right: 0;
-  bottom: 0;
-  width: 28px;
-  background: linear-gradient(to right, transparent, var(--basalt));
-  pointer-events: none;
-  opacity: 0;
-  transition: opacity var(--t-micro) var(--ease-calm);
-}
-.terminal-panel__body.is-scrollable::after { opacity: 1; }
 .terminal-panel pre { margin: 0; white-space: pre; }
 
 .status-pill {

@@ -163,11 +163,17 @@
      genuinely need horizontal scroll (long sourced lines) get a visible
      right-edge fade + styled scrollbar instead of clipping quietly. */
   var panelBodies = Array.prototype.slice.call(document.querySelectorAll(".terminal-panel__body"));
-  function updateScrollAffordance() {
-    panelBodies.forEach(function (el) {
-      el.classList.toggle("is-scrollable", el.scrollWidth > el.clientWidth + 1);
-    });
+  function updatePanel(el) {
+    var scrollable = el.scrollWidth > el.clientWidth + 1;
+    var atEnd = el.scrollLeft + el.clientWidth >= el.scrollWidth - 2;
+    el.classList.toggle("is-scrollable", scrollable);
+    var panel = el.closest(".terminal-panel");
+    if (panel) panel.classList.toggle("has-fade", scrollable && !atEnd);
   }
+  function updateScrollAffordance() { panelBodies.forEach(updatePanel); }
+  panelBodies.forEach(function (el) {
+    el.addEventListener("scroll", function () { updatePanel(el); }, { passive: true });
+  });
   updateScrollAffordance();
   window.addEventListener("resize", updateScrollAffordance);
   window.addEventListener("load", updateScrollAffordance);
