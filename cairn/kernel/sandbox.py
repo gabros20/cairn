@@ -102,6 +102,15 @@ class SandboxPolicy:
     paths are realpath-resolved and de-duplicated at :meth:`build` time. ``network`` gates whether
     the wrapped process may open sockets (kept True for the ``fs`` posture — invariant 1).
     ``deny_default`` is the containment stance: everything not explicitly allowed is denied.
+
+    ``protect_paths`` (F1 fix) are read-allowed but write-**hard-denied even under overlap** with an
+    ``rw_path`` — the gatekeys dir lives here. SBPL is last-match-wins and bwrap applies binds in
+    order, so a gatekeys dir nested under ``run_dir``/``workspace``/``TMPDIR`` (e.g. CI sets
+    ``XDG_STATE_HOME=$PWD/.state``) would otherwise be silently upgraded to WRITABLE by the rw rule,
+    reverting the W3c close. A backend re-asserts the read-only protection for these paths *last*
+    (macOS: a trailing ``(deny file-write* …)``; Linux: the gatekeys ``--ro-bind`` after the rw
+    ``--bind``). Distinct from ``ro_paths`` (interpreter/source), which MAY legitimately equal the
+    workspace and stay writable when overlapped — only ``protect_paths`` are security boundaries.
     """
 
     rw_paths: tuple[Path, ...]
@@ -109,6 +118,7 @@ class SandboxPolicy:
     tmp_paths: tuple[Path, ...]
     network: bool
     deny_default: bool = True
+    protect_paths: tuple[Path, ...] = ()
 
     @classmethod
     def build(
@@ -119,6 +129,7 @@ class SandboxPolicy:
         tmp_paths: list[Path],
         network: bool,
         deny_default: bool = True,
+        protect_paths: list[Path] | None = None,
     ) -> SandboxPolicy:
         return cls(
             rw_paths=_dedup(rw_paths),
@@ -126,7 +137,17 @@ class SandboxPolicy:
             tmp_paths=_dedup(tmp_paths),
             network=network,
             deny_default=deny_default,
+            protect_paths=_dedup(protect_paths or []),
         )
+
+    def overlaps_rw(self, path: Path) -> bool:
+        """Does ``path`` resolve at or under any ``rw_path``/``tmp_path``? Used to reason about the
+        F1 overlap (a protected path here needs the backend's last-word re-protection to win)."""
+        target = _resolve(path)
+        for base in (*self.rw_paths, *self.tmp_paths):
+            if target == base or base in target.parents:
+                return True
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -288,10 +309,19 @@ class NativeBackend(SandboxBackend):
         ]
         ro = [Path(p) for p in self._MAC_SYSTEM_RO if Path(p).exists()]
         ro += list(policy.ro_paths)
+        ro += list(policy.protect_paths)  # gatekeys must be READABLE (the hook reads the secret)
         for p in _dedup(ro):
             lines.append(f"(allow file-read* (subpath {_sbpl_string(p)}))")
         for p in _dedup(list(policy.rw_paths) + list(policy.tmp_paths)):
             lines.append(f"(allow file-read* file-write* (subpath {_sbpl_string(p)}))")
+        # F1: re-assert write-DENY on the protected (gatekeys) paths AFTER the rw allows. SBPL is
+        # last-match-wins, so this trailing deny wins even when a protected path is nested under an
+        # rw path (the overlap that would otherwise silently re-grant write and let the agent forge
+        # a manifest — reverting the W3c close). Read stays allowed (granted above); only write is
+        # denied. Emitted unconditionally (harmless when there is no overlap — deny-default already
+        # covers it) so the protection is safe-by-construction, not contingent on overlap detection.
+        for p in policy.protect_paths:
+            lines.append(f"(deny file-write* (subpath {_sbpl_string(p)}))")
         lines.append("(allow network*)" if policy.network else "(deny network*)")
         return "\n".join(lines) + "\n"
 
@@ -302,8 +332,19 @@ class NativeBackend(SandboxBackend):
         (``--clearenv`` would drop cairn's curated PATH-with-shim-dir / XDG_STATE_HOME / CAIRN_*;
         run_process already passes exactly ``inv.env``). ``/lib`` and ``/lib64`` are bound only
         where they are real dirs (merged-usr symlinks would be redundant with ``/usr``).
+
+        F2(a): ``--unshare-pid`` + ``--unshare-ipc`` put the process in fresh PID and IPC
+        namespaces so it cannot ``ptrace()``/signal or SysV-IPC a same-UID host process OUTSIDE the
+        cage (on a host with ``kernel.yama.ptrace_scope=0`` that would be an FS-containment escape).
+        Net is deliberately left shared (invariant 1).
+
+        NOTE (F2c — honest gating): this argv is UNIT-tested (string shape) but has NOT been run
+        against a real ``bwrap`` on this build host (macOS). Before the Linux leg is relied on in
+        CI it needs a one-box real-Linux smoke: a write/read confinement check, the F1 nested-
+        gatekeys forge-denial, and the F2(a) cross-namespace ptrace check. See
+        docs/IMPLEMENTATION-PLAN.md (C8) / the C8 report.
         """
-        out = [launcher, "--die-with-parent", "--new-session"]
+        out = [launcher, "--die-with-parent", "--new-session", "--unshare-pid", "--unshare-ipc"]
         for d in self._LINUX_SYSTEM_RO:
             p = Path(d)
             if not p.exists() or p.is_symlink():
@@ -311,19 +352,50 @@ class NativeBackend(SandboxBackend):
             out += ["--ro-bind", d, d]
         for p in policy.ro_paths:
             out += ["--ro-bind-try", str(p), str(p)]
-        out += ["--proc", "/proc", "--dev", "/dev", "--tmpfs", "/tmp"]
+        out += ["--proc", "/proc", "--dev", "/dev"]
+        # F2(b): only lay a fresh tmpfs over /tmp when NOTHING we then rw-bind is /tmp or under it.
+        # With TMPDIR=/tmp (common on Linux/CI) the later `--bind /tmp /tmp` would remount host /tmp
+        # over the tmpfs, negating it — so in that case skip the tmpfs and let the explicit bind of
+        # the resolved TMPDIR provide scratch instead.
+        if not self._binds_touch_tmp(policy):
+            out += ["--tmpfs", "/tmp"]
         for p in list(policy.rw_paths) + list(policy.tmp_paths):
             out += ["--bind", str(p), str(p)]
+        # F1: re-protect the gatekeys paths with a read-only bind AFTER the rw binds. bwrap applies
+        # binds in order, so a later `--ro-bind` over a path nested in an earlier rw `--bind`
+        # re-mounts it read-only — the gatekeys dir cannot be written even when it lives under
+        # run_dir/workspace/TMPDIR (the F1 overlap). Read still works (it's a read-only bind).
+        for p in policy.protect_paths:
+            out += ["--ro-bind-try", str(p), str(p)]
         if policy.rw_paths:
             out += ["--chdir", str(policy.rw_paths[0])]  # run_dir is passed first
         out += ["--", *argv]
         return out
 
+    @staticmethod
+    def _binds_touch_tmp(policy: SandboxPolicy) -> bool:
+        """Does any rw/tmp bind resolve to ``/tmp`` or under it? (F2(b) tmpfs-clobber guard.)"""
+        tmp = Path("/tmp")
+        for p in (*policy.rw_paths, *policy.tmp_paths):
+            if p == tmp or tmp in p.parents:
+                return True
+        return False
+
     def linux_landrun_argv(self, launcher: str, argv: list[str], policy: SandboxPolicy) -> list[str]:
         """Construct the ``landrun`` (Landlock) fallback argv. Pure — unit-testable on any OS.
         Landlock needs no user namespace, so it survives the AppArmor-userns block. ``--rox`` =
         read+execute, ``--ro`` = read-only, ``--rwx`` = read-write-execute. Network is left alone
-        (Landlock is filesystem-only; it does not touch the net namespace — invariant 1)."""
+        (Landlock is filesystem-only; it does not touch the net namespace — invariant 1).
+
+        NOTE (F2c / F1 residual — honest gating): NOT run against a real ``landrun`` on this build
+        host (macOS). The gatekeys ``--ro`` is emitted LAST (mirroring the bwrap ordering), but
+        Landlock composes the rights of ALL matching rules by UNION per file hierarchy — order does
+        not by itself guarantee a nested ``--ro`` overrides an enclosing ``--rwx`` the way bwrap's
+        in-order binds or SBPL's last-match-wins do. So on the landrun path the F1 nested-gatekeys
+        protection is UNCONFIRMED and must be validated on a real Linux box (or the gatekeys dir kept
+        out of any rw subtree) before landrun is relied on. bwrap (the primary Linux backend) does
+        re-protect correctly; landrun is only the AppArmor-userns fallback.
+        """
         out = [launcher]
         for d in self._LINUX_SYSTEM_RO:
             p = Path(d)
@@ -333,6 +405,8 @@ class NativeBackend(SandboxBackend):
             out += ["--ro", str(p)]
         for p in list(policy.rw_paths) + list(policy.tmp_paths):
             out += ["--rwx", str(p)]
+        for p in policy.protect_paths:  # gatekeys — emitted last (see NOTE above)
+            out += ["--ro", str(p)]
         out += ["--", *argv]
         return out
 
@@ -413,15 +487,22 @@ class SandboxWrapper:
 
             tmpdir = tempfile.gettempdir()
         tmp = [Path(tmpdir)]
-        # ro: the gatekeys state dir (read the secret+manifest, but deny-default blocks WRITES there
-        # — the W3c close), the interpreter + cairn source (so the hook/shim child runs), and a
-        # distinct XDG_STATE_HOME/cairn if the env points elsewhere than the default ladder.
-        ro = [_state_cairn_dir(env)]
-        ro += _interpreter_ro_paths()
+        # protect: the gatekeys state dir — READ the secret+manifest, but write HARD-denied even if
+        # it resolves under run_dir/workspace/TMPDIR (F1: CI may set XDG_STATE_HOME under the run
+        # dir). This is the W3c close, now safe-by-construction against path overlap (the backend
+        # re-asserts the deny LAST — mac trailing (deny file-write*), linux ro-bind after rw bind).
+        protect = [_state_cairn_dir(env)]
+        # ro: the interpreter + cairn source so the hook/shim child can exec python + import cairn.
+        # These are NOT security boundaries — one may legitimately equal the workspace (e.g. an
+        # editable install whose repo IS the workspace), so they stay plain read-only and are
+        # allowed to remain writable where overlapped by an rw path (unlike `protect`).
+        ro = _interpreter_ro_paths()
         # Network stays ON for fs (invariant 1): the CLI's own model API needs it; egress control is
         # the deferred strict/srt tier. inv.network governs codex today and is intentionally NOT
         # mapped onto the FS posture yet.
-        return SandboxPolicy.build(rw_paths=rw, ro_paths=ro, tmp_paths=tmp, network=True)
+        return SandboxPolicy.build(
+            rw_paths=rw, ro_paths=ro, tmp_paths=tmp, network=True, protect_paths=protect
+        )
 
     def _degrade(self, reason: str) -> None:
         self._pending_warning = reason

@@ -47,9 +47,10 @@ requires_sandbox = pytest.mark.skipif(
 CHECKS = Path(__file__).parent / "fixtures" / "guard-checks"
 
 
-def _policy(rw=(), ro=(), tmp=(), network=True) -> SandboxPolicy:
+def _policy(rw=(), ro=(), tmp=(), network=True, protect=()) -> SandboxPolicy:
     return SandboxPolicy.build(
-        rw_paths=list(rw), ro_paths=list(ro), tmp_paths=list(tmp), network=network
+        rw_paths=list(rw), ro_paths=list(ro), tmp_paths=list(tmp), network=network,
+        protect_paths=list(protect),
     )
 
 
@@ -140,11 +141,17 @@ def test_linux_bwrap_argv_shape_and_network_shared(tmp_path):
     gk = tmp_path / "state"
     for p in (run, ws, gk):
         p.mkdir()
-    argv = _BACKEND.linux_bwrap_argv("/usr/bin/bwrap", ["claude", "-p"], _policy(rw=[run, ws], ro=[gk], tmp=[tmp_path / "t"]))
+    argv = _BACKEND.linux_bwrap_argv(
+        "/usr/bin/bwrap", ["claude", "-p"],
+        _policy(rw=[run, ws], protect=[gk], tmp=[tmp_path / "t"]),
+    )
     assert argv[0] == "/usr/bin/bwrap"
     # Invariant 1: network stays shared — NO --unshare-net / --unshare-all anywhere in the argv.
     assert "--unshare-net" not in argv
     assert "--unshare-all" not in argv
+    # F2(a): PID + IPC namespaces are unshared (no cross-namespace ptrace/IPC escape); net is not.
+    assert "--unshare-pid" in argv
+    assert "--unshare-ipc" in argv
     # Env is NOT cleared (would drop cairn's PATH-with-shim-dir / XDG_STATE_HOME / CAIRN_*).
     assert "--clearenv" not in argv
     # rw binds are read-write; the gatekeys dir is ro-bind (read the secret, cannot forge — W3c).
@@ -157,15 +164,64 @@ def test_linux_bwrap_argv_shape_and_network_shared(tmp_path):
     assert "--chdir" in argv  # cwd set to run_dir inside the namespace
 
 
+def test_bwrap_reprotects_gatekeys_nested_under_rw(tmp_path):
+    # F1: gatekeys nested UNDER an rw path (CI: XDG_STATE_HOME=$run_dir/.state). bwrap applies binds
+    # in order, so the gatekeys --ro-bind-try must come AFTER the rw --bind that contains it, to
+    # re-mount it read-only and defeat the overlap that would otherwise leave it writable.
+    run = tmp_path / "run"
+    gk = run / ".state" / "cairn"
+    gk.mkdir(parents=True)
+    argv = _BACKEND.linux_bwrap_argv("/usr/bin/bwrap", ["c"], _policy(rw=[run], protect=[gk]))
+    rw_i = argv.index(str(run.resolve()))  # first appearance = the --bind value
+    ro_i = argv.index(str(gk.resolve()))
+    assert ro_i > rw_i  # gatekeys re-protection is applied LAST (wins the overlap)
+
+
+def test_bwrap_skips_tmpfs_when_a_bind_is_tmp():
+    # F2(b): with TMPDIR=/tmp the rw bind would remount host /tmp over a fresh tmpfs, negating it.
+    # Build the policy DIRECTLY (bypassing build()'s resolve, which on macOS maps /tmp→/private/tmp)
+    # so the /tmp logic is exercised deterministically on any OS.
+    touching = SandboxPolicy(
+        rw_paths=(Path("/home/ci/run"),), ro_paths=(), tmp_paths=(Path("/tmp"),),
+        network=True, protect_paths=(),
+    )
+    argv = _BACKEND.linux_bwrap_argv("/usr/bin/bwrap", ["c"], touching)
+    assert "--tmpfs" not in argv  # would clobber the /tmp bind — skipped
+    assert _adjacent(argv, "--bind", "/tmp")  # scratch still provided by the explicit bind
+    # When no bind touches /tmp, the fresh tmpfs IS laid down.
+    distinct = SandboxPolicy(
+        rw_paths=(Path("/home/ci/run"),), ro_paths=(), tmp_paths=(Path("/home/ci/tmp"),),
+        network=True, protect_paths=(),
+    )
+    argv2 = _BACKEND.linux_bwrap_argv("/usr/bin/bwrap", ["c"], distinct)
+    assert _adjacent(argv2, "--tmpfs", "/tmp")
+
+
+def test_mac_gatekeys_write_denied_when_nested_under_rw(tmp_path):
+    # F1 (macOS, pure string): a trailing (deny file-write* …) for the gatekeys dir is emitted AFTER
+    # the rw allows, so SBPL's last-match-wins denies a forge even when gatekeys is nested under rw.
+    run = tmp_path / "run"
+    gk = run / ".state" / "cairn"
+    gk.mkdir(parents=True)
+    profile = _BACKEND.mac_profile(_policy(rw=[run], protect=[gk]))
+    lines = profile.splitlines()
+    rw_allow = f'(allow file-read* file-write* (subpath "{run.resolve()}"))'
+    gk_deny = f'(deny file-write* (subpath "{gk.resolve()}"))'
+    assert rw_allow in lines and gk_deny in lines
+    assert lines.index(gk_deny) > lines.index(rw_allow)  # deny is LAST → wins
+    # Gatekeys stays READABLE (the hook needs the secret).
+    assert f'(allow file-read* (subpath "{gk.resolve()}"))' in lines
+
+
 def test_linux_landrun_argv_shape(tmp_path):
     run = tmp_path / "run"
     gk = tmp_path / "state"
     for p in (run, gk):
         p.mkdir()
-    argv = _BACKEND.linux_landrun_argv("/usr/bin/landrun", ["claude"], _policy(rw=[run], ro=[gk]))
+    argv = _BACKEND.linux_landrun_argv("/usr/bin/landrun", ["claude"], _policy(rw=[run], protect=[gk]))
     assert argv[0] == "/usr/bin/landrun"
     assert _adjacent(argv, "--rwx", str(run.resolve()))
-    assert _adjacent(argv, "--ro", str(gk.resolve()))
+    assert _adjacent(argv, "--ro", str(gk.resolve()))  # gatekeys ro (emitted last; see NOTE re: overlap)
     assert argv[-2:] == ["--", "claude"]
 
 
@@ -292,6 +348,38 @@ def test_gatekeys_dir_is_read_only(tmp_path):
     # WRITE (forge a manifest) is kernel-denied.
     r = _run_wrapped(f"echo forged > {gk}/forged.json && echo LEAK || echo DENIED", policy)
     assert "DENIED" in r.stdout and "LEAK" not in r.stdout
+    assert not (gk / "forged.json").exists()
+
+
+@requires_sandbox
+def test_gatekeys_forge_denied_when_nested_under_rw(tmp_path):
+    # F1 (the exact case the reviewer reproduced live): the gatekeys/state dir is NESTED under an rw
+    # path (CI sets XDG_STATE_HOME under run_dir). Without the trailing deny / re-protect the rw
+    # file-write* rule silently upgrades the gatekeys dir to WRITABLE and a forge succeeds — the W3c
+    # close reverted with no warning. Build the policy through the REAL wrapper (populates
+    # protect_paths) and prove a forge is STILL kernel-denied while a read still works.
+    from types import SimpleNamespace
+
+    run = tmp_path / "run"
+    state = run / ".state"  # XDG_STATE_HOME NESTED under the rw run_dir — the overlap
+    gk = state / "cairn" / "guard-manifests"
+    gk.mkdir(parents=True)
+    (gk / "real.json").write_text('{"m":1}', encoding="utf-8")
+    inv = SimpleNamespace(
+        env={"HOME": os.environ.get("HOME", "/tmp"), "XDG_STATE_HOME": str(state),
+             "TMPDIR": os.environ.get("TMPDIR", "/tmp"), "CAIRN_WORKSPACE": str(run)},
+        network=False,
+    )
+    wrapper = build_wrapper("fs")
+    policy = wrapper._build_policy(inv, run, run)
+    assert policy.overlaps_rw(policy.protect_paths[0])  # precondition: gatekeys IS under rw
+    argv = _BACKEND.wrap(["/bin/sh", "-c",
+                          f"cat {gk}/real.json >/dev/null 2>&1 && echo READ-OK; "
+                          f"echo forged > {gk}/forged.json 2>/dev/null && echo LEAK || echo DENIED"],
+                         policy)
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=30, env=dict(os.environ))
+    assert "READ-OK" in r.stdout, r.stderr  # secret still readable (the hook needs it)
+    assert "DENIED" in r.stdout and "LEAK" not in r.stdout  # forge kernel-denied despite the overlap
     assert not (gk / "forged.json").exists()
 
 

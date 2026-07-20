@@ -242,7 +242,21 @@ hook reads the secret but cannot forge a manifest), and **network stays ON** (th
 Degradation is loud-not-silent (a `sandbox-unavailable` warning + `cairn doctor` WARN). Design:
 `docs/CLAUDE-SANDBOX-PLAN.md`; verified by `tests/unit/test_sandbox.py` (containment / gatekeys-RO /
 guard-chain-intact-through-the-wrap on a machine with the primitive, profile-generation strings on any
-OS). **Deferred (same seam):** the `strict`/`srt` network-egress tier, the `dontAsk` permission-mode
+OS). Security-review hardening (F1/F2): the gatekeys dir is protected write-deny **even when nested
+under an rw path** (SBPL trailing `(deny file-write*)` / bwrap ro-bind ordered after the rw bind — CI
+that sets `XDG_STATE_HOME` under `run_dir` no longer silently re-grants write); the bwrap argv
+`--unshare-pid`/`--unshare-ipc` to block cross-namespace ptrace/IPC escape; and the `--tmpfs /tmp`
+clobber with `TMPDIR=/tmp` is fixed.
+
+**Honest gating — the Linux leg is argv-verified-only.** `bwrap`/`landrun` are absent on the macOS
+build/CI host, so the Linux `NativeBackend` argv is UNIT-tested (string shape) but has **not** been run
+against a real primitive. Before the Linux leg is relied on in CI it needs a one-box real-Linux smoke:
+(1) write/read confinement, (2) the F1 nested-gatekeys forge-denial, (3) the F2(a) cross-namespace
+`ptrace` check. The macOS leg is exercised end-to-end (live escape attempts denied). Landlock/`landrun`
+composes rule rights by union (not last-match), so the F1 nested-gatekeys re-protection on the
+`landrun` fallback is UNCONFIRMED and flagged in-code (`# NOTE` at `linux_landrun_argv`).
+
+**Deferred (same seam):** the `strict`/`srt` network-egress tier, the `dontAsk` permission-mode
 spike, and a user-facing `sandbox.backend` config selector.
 
 *Original deferred writeup follows.*
