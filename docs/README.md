@@ -33,6 +33,7 @@ The docs are organised by the [Diátaxis](https://diataxis.fr) framework — eve
 | **[DISTRIBUTION.md](DISTRIBUTION.md)** | How-to + Explanation | *How is cairn packaged, versioned, and embedded in a coding agent?* |
 | **[RELEASING.md](RELEASING.md)** | How-to | *How do we cut a release?* |
 | **[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md)** | Historical record | *In what order was cairn built, and against what verifications?* |
+| **[TRIGGERS-PLAN.md](TRIGGERS-PLAN.md)** | Plan (not built) | *How will event triggers — inbox file-watch + poll cursors — work? (issue #3)* |
 
 The "How-to + Explanation" pages are labelled honestly: each opens by explaining a subsystem, then gives
 the concrete recipes for operating it. If you want only the recipe, skip to that page's task sections.
