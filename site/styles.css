@@ -594,10 +594,11 @@ html.js .reveal.is-visible { opacity: 1; transform: translateY(0); }
   align-items: center;
   justify-content: center;
 }
-.hero__fallback-glyph .g-stroke { fill: none; stroke: var(--granite-dim); stroke-width: 1.5; }
-.hero__fallback-glyph .g-fill { fill: var(--verdigris-bright); stroke: var(--verdigris-bright); stroke-width: 1.5; }
+.hero__fallback-glyph .g-stroke { fill: none; stroke: var(--granite); stroke-width: 1.5; }
+.hero__fallback-glyph .g-fill { fill: var(--verdigris); stroke: var(--verdigris); stroke-width: 1.5; }
 .hero__anim-frame video.is-hidden,
-.hero__anim-frame img.is-hidden { display: none; }
+.hero__anim-frame img.is-hidden,
+.hero__anim-fallback.is-hidden { display: none; }
 
 /* ---------- Two authorities diagram (builder-drawn SVG — no raster asset) ---------- */
 .authorities-diagram {
