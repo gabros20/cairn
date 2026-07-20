@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+"""Fake `kimi` CLI for executor tests. See fakebin/claude for the env-var contract.
+
+Unlike claude/codex, kimi gets its prompt on ARGV (`-p <prompt>`), not stdin (KimiExecutor
+returns stdin_text=None), so stdin.txt is captured but expected empty.
+
+  CAIRN_TEST_HELP_OMIT  comma-separated flag tokens to DROP from `--help` output
+                      (W5b doctor flag-drift tests)
+  CAIRN_TEST_HELP_FAIL  if set, `--help` fails (exit 1, no output)
+"""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+_NAME = "kimi"
+_DEFAULT_VERSION = "kimi 0.28.0 (fake)"
+
+# Superset covering KimiExecutor._emitted_flags (cairn/executors/kimi.py) — W5b doctor
+# flag-presence check.
+_HELP_FLAGS = ["-p", "-m", "--output-format"]
+
+if "--version" in sys.argv:
+    print(os.environ.get("CAIRN_TEST_VERSION", _DEFAULT_VERSION))
+    sys.exit(0)
+
+if "--help" in sys.argv:
+    if os.environ.get("CAIRN_TEST_HELP_FAIL"):
+        sys.exit(1)
+    omit = set(os.environ.get("CAIRN_TEST_HELP_OMIT", "").split(","))
+    for flag in _HELP_FLAGS:
+        if flag not in omit:
+            print(f"  {flag}  fake help text")
+    sys.exit(0)
+
+scratch = Path(os.environ["CAIRN_TEST_SCRATCH"])
+scratch.mkdir(parents=True, exist_ok=True)
+(scratch / "argv.json").write_text(json.dumps(sys.argv), encoding="utf-8")
+(scratch / "env.json").write_text(json.dumps(dict(os.environ)), encoding="utf-8")
+(scratch / "cwd.txt").write_text(os.getcwd(), encoding="utf-8")
+(scratch / "stdin.txt").write_text(sys.stdin.read(), encoding="utf-8")
+
+sleep_s = os.environ.get("CAIRN_TEST_SLEEP")
+if sleep_s:
+    time.sleep(float(sleep_s))
+
+# `text` mode prefixes lines with `• ` — the sentinel must survive it (report §2). Emit the
+# bullet on the sentinel line to prove parse_step_sentinel scans for `<<<STEP` un-anchored.
+print(f"chatty {_NAME} preamble the sentinel must survive")
+print('• <<<STEP {"status": "done", "summary": "fake ok", "artifacts": []} STEP>>>')
+sys.exit(int(os.environ.get("CAIRN_TEST_EXIT", "0")))
