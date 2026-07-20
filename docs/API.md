@@ -381,7 +381,7 @@ class Result:
     exit_code: int
     duration_s: float
     usage: dict | None = None       # executor-reported tokens/cost; outranks the model's
-                                    # STEP-block self-report. All three executors run plain-text
+                                    # STEP-block self-report. All CLI executors run plain-text
                                     # output today and pass None — a json output-format is the
                                     # future source; the stable schema is the value now
 

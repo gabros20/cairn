@@ -83,7 +83,8 @@ The design: executors render fragments to their native permission surface (Claud
 `permissions.allow`, Codex Rules, Grok `[permission]`) — authored once. Destructive verbs of an
 allowed tool get a `guards:` entry on top (the F18 pattern): allowlist says *may run*, guard says
 *checked before running*. *Status: the planner parses the fragments today (agents reference them via
-`tools.bash`), and the **guards** engine enforces at runtime across all three vendor CLIs through
+`tools.bash`), and the **guards** engine enforces at runtime across every vendor CLI executor
+(claude/codex/grok and the newer cursor/opencode/hermes/kimi/agy alike) through
 its **shim + post** layers — a fresh per-run PATH-shim dir wraps every executor (`_wrap_guards` →
 `build_shims` → `GuardedExecutor`) and validators re-check after each step. Its **hook** layer is
 built but the per-executor `install_guards` is still a documented no-op stub: the CLIs' native

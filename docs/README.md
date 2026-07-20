@@ -157,7 +157,7 @@ $ cairn plan brease-rebuild --param mode=reimagine # static verify + printed exe
 | **Step** | one delegation: agent / script / manual | pipeline file | `API.md §2.3` |
 | **Artifact** | typed file contract (path + schema + validator) | pipeline `artifacts:` | `API.md §2.2` |
 | **Agent** | worker declaration: tier, effort, skills, tools | `agents/*.yaml` | `API.md §3` |
-| **Executor** | CLI binding (claude/codex/grok/shell) | plugin + `cairn.toml` | `API.md §6` |
+| **Executor** | CLI binding (claude/codex/grok/cursor/opencode/hermes/kimi/agy/shell) | plugin + `cairn.toml` | `API.md §6` |
 | **Skill** | markdown capability pack | `skills/<name>/SKILL.md` | `CONCEPTS.md §7` |
 | **Gate** | human decision point → decision artifact | pipeline step | `API.md §2.4` |
 | **Guard** | pre-execution command policy | `guards:` + `guards/*.py` | `API.md §5` |
@@ -235,11 +235,12 @@ sequence is in [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md).
 
 ## Status
 
-**Kernel built and green (802 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
-artifacts, trail/runstate, guards, expression + template engines, config, doctor, scaffold); all
-five executors (`shell`/`stub` live; the **`claude`, `codex`, and `grok` executors all live-verified**,
+**Kernel built and green (1137 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
+artifacts, trail/runstate, guards, expression + template engines, config, doctor, scaffold); ten
+executors (`shell`/`stub` live; the **`claude`, `codex`, and `grok` executors all live-verified**,
 with the first live runs recorded as offline stub regressions, plus a live-proven **mixed fleet** —
-one pipeline spanning codex → claude → grok, per-step models recorded in `run.json`); the workspace
+one pipeline spanning codex → claude → grok, per-step models recorded in `run.json`; and five
+adapter-complete, smoke-pending additions: **`cursor`, `opencode`, `hermes`, `kimi`, `agy`**); the workspace
 test layer (`cairn test` + `record`); and the full CLI — `batch` / `learnings` / `gc` / `schedule` are
 **live** (no longer stubbed), with first-class **scheduling shipped** (`schedules.yaml`,
 cron/launchd/systemd installers, content-key idempotency).

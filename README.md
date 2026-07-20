@@ -79,7 +79,7 @@ flowchart LR
     Y["pipeline.yaml<br/>+ params"] --> P["cairn plan<br/>load · resolve · verify"]
     P --> W["walker<br/>walk nodes in order"]
     W --> C["compose<br/>prompt envelope"]
-    C --> X["executor subprocess<br/>claude · codex · grok · shell"]
+    C --> X["executor subprocess<br/>claude · codex · grok · cursor · opencode · hermes · kimi · agy · shell"]
     X --> A["artifact<br/>on disk"]
     A --> V{"validator<br/>gate"}
     V -->|pass| T["trail.jsonl<br/>step-done"]
@@ -178,7 +178,9 @@ Every verb from `cairn --help`:
 ## Executors
 
 An executor is the only CLI-aware code in the system — a plugin binding an abstract worker to a real
-subprocess. All five are live-verified:
+subprocess. The first five are live-verified end-to-end; the four newest are adapter-complete
+(flag surfaces sourced from vendor docs and local `--help` probes, unit-tested against fake
+binaries) with a real-CLI smoke run still pending:
 
 | Executor | Runs | Status |
 |---|---|---|
@@ -187,6 +189,15 @@ subprocess. All five are live-verified:
 | `claude` | `claude -p` (Claude Code) | Live-verified; first real run captured as an offline stub regression. |
 | `codex` | `codex exec` | Live-verified; same. |
 | `grok` | `grok --prompt-file` | Live-verified; same. A mixed fleet spanning codex → claude → grok has run end-to-end. |
+| `cursor` | `agent -p` (Cursor CLI) | Adapter-complete; smoke pending. Uses cursor's own sandbox (`--sandbox enabled`), codex-style. |
+| `opencode` | `opencode run` | Adapter-complete; smoke pending. Flags probed against a local opencode 1.17.15. |
+| `hermes` | `hermes -z` (Nous Research) | Adapter-complete; smoke pending. Flags probed against a local install. |
+| `kimi` | `kimi -p` (Kimi Code / K3) | Adapter-complete; smoke pending. Model + effort ride a per-run generated `KIMI_CODE_HOME` config. |
+| `agy` | `agy -p` (Antigravity / Gemini) | Adapter-complete; smoke pending. **Local-only**: auth is interactive OS-keyring sign-in — no API-key/CI path exists (Google-confirmed), doctor errors actionably. |
+
+`cursor`/`opencode`/`hermes`/`kimi`/`agy` headless modes auto-approve with no native approval gate
+(cursor excepted — it ships its own sandbox), so `opencode`/`hermes`/`kimi`/`agy` run under cairn's
+OS filesystem sandbox (`sandbox: fs`), the same containment claude gets.
 
 ## Documentation
 
@@ -211,7 +222,8 @@ docs index.
 
 ## Status
 
-**v0.1.0 tagged; 802 tests passing.** The kernel and all five executors are built and green,
+**v0.4.0 released; 1137 tests passing.** The kernel and all ten executors are built and green
+(claude/codex/grok live-verified; cursor/opencode/hermes/kimi/agy adapter-complete, smoke pending),
 scheduling / batch / learnings / gc have shipped, and the hardening backlog is in (heartbeat trail
 events, a webhook sink, kernel-side secret redaction, cross-version resume gates, tool enforcement,
 one aware-UTC clock). The self-improve pipeline ships as scaffold furniture — the framework provides

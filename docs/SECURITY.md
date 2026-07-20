@@ -149,8 +149,14 @@ An injected instruction that a model obeys still cannot exceed the step's cage:
   model API), so `bash curl` **exfiltration** is an accepted residual closed only by the deferred
   **`strict`/`srt`** egress-controlling tier. A missing OS primitive degrades **loud-not-silent**:
   the step runs UNSANDBOXED with a one-time `sandbox-unavailable` warning and `cairn doctor` WARNs
-  (availability > strictness) — never silently. codex/grok/shell/stub stay unwrapped (`sandbox: off`
-  — self-sandboxed or trusted; argv byte-identical to pre-C8). Two per-executor caveats: the
+  (availability > strictness) — never silently. codex/grok/cursor/shell/stub stay unwrapped
+  (`sandbox: off` — self-sandboxed or trusted; argv byte-identical to pre-C8; cursor emits its own
+  `--sandbox enabled` containment in-argv, codex-style), while `opencode`/`hermes`/`kimi`/`agy`
+  share claude's `fs` posture — their headless modes auto-approve with no native OS sandbox
+  underneath (the same threat class as `bypassPermissions`), so the same wrap, gatekeys-read-only
+  property, and CVE-2026-55607 layering caveat apply to them verbatim. (`agy` deliberately does
+  NOT emit its own `--sandbox` flag: nesting its sandbox-exec inside cairn's Seatbelt wrap is a
+  realistic breakage, and cairn's wrap is the trusted layer of the two.) Two per-executor caveats: the
   hook uses the same glob as the shim, so it does NOT catch absolute-path / `sh -c` / `env`-prefixed
   invocations (only `post` does); and grok's native hook fails open on hook crash/timeout/malformed
   output, so its shim and post layers carry the backstop even once its hook install lands;
@@ -211,7 +217,7 @@ property (no mid-build fetching).
 
 *Status: designed. `ExitCode.BUDGET` (7) is reserved in the kernel today, but no budget is enforced
 yet — the `usage` plumbing exists end-to-end (`Result.usage`, trail `step-done.usage`), but all
-three executors run plain-text output and pass `None`; budgets and the exit-7 halt activate once a
+CLI executors run plain-text output and pass `None`; budgets and the exit-7 halt activate once a
 json output-format supplies real tokens/cost — see IMPLEMENTATION-PLAN.*
 
 A 16-site batch with a looping art-review must have a ceiling. Budgets are declared, tracked from

@@ -25,7 +25,7 @@ initial ~2,500-line aspiration, but the two-dependency floor and the plugin boun
 │  + support:   config · expr · template · runstate · types ·     │
 │               errors · doctor · newkit · testkit · schemas      │
 ├────────────────────────────────────────────────────────────────┤
-│ EXECUTORS (plugins)  claude·codex·grok·shell·stub · (yours)     │
+│ EXECUTORS (plugins)  claude·codex·grok·cursor·opencode·hermes·kimi·agy·shell·stub · (yours) │
 ├────────────────────────────────────────────────────────────────┤
 │ WORKSPACE (data)      pipelines/ agents/ skills/ schemas/       │
 │                       validators/ guards/ prompts/ cairn.toml   │
@@ -49,7 +49,7 @@ graph LR
   WALK --> GATE["gatekit.py<br/>gate resolution"]
   WALK --> GUARD["guards.py<br/>hook · shim · post"]
 
-  COMPOSE --> EX["executors/*<br/>claude · codex · grok · shell · stub"]
+  COMPOSE --> EX["executors/*<br/>claude · codex · grok · cursor · opencode · hermes · kimi · agy · shell · stub"]
   GUARD -.wraps.-> EX
   EX --> ART["artifacts.py<br/>schema + validator"]
   ART -->|done predicate| WALK
@@ -190,18 +190,19 @@ runs — independent of the hook layer. The `hook` layer now **installs for `cla
 `ClaudeExecutor.install_guards` writes `<run_dir>/.claude/settings.json` with a `PreToolUse` array whose
 hook command runs `guards.py`'s `--hook-check` entry — the SAME guard chain (`_run_chain`) the shims run,
 so a `hook`-enforced guard blocks a guarded `Bash` command before it executes (deny-JSON on stdout;
-fail-closed on any error). A plan with no `hook`-enforced guards installs nothing. **`codex` and `grok`
-install remain no-ops** — their `install_guards` does not yet wire native hooks, so for those two a
+fail-closed on any error). A plan with no `hook`-enforced guards installs nothing. **Every other CLI
+executor's install remains a no-op** (`codex`/`grok`/`cursor`/`opencode`/`hermes`/`kimi`/`agy`) —
+their `install_guards` does not yet wire native hooks, so for those a
 guarded command is still caught by the shim and the post validator, not by a native hook. (The
 `--hook-check` install path is unit-tested; the live "claude actually blocks" fact is confirmed
 per-machine by `cairn doctor --probe-hooks`, not by the unit suite.)*
 
 *`Capabilities` now separates two facts that used to be conflated in one field (grok-F3 / W3b):
 `blocking_hooks` is the CLI-capability/probe question — "can this vendor's CLI block a tool call via a
-native hook at all" (`claude`=`True`, an asserted claim the C4 probe checks; `codex`/`grok`=`None`,
-unverified-by-cairn → the doctor probe decides); `installs_hooks` is the IMPLEMENTATION fact — "does
-cairn's own `install_guards` for this executor actually wire that hook for a run" (`claude`=`True`,
-`codex`/`grok`/`shell`/`stub`=`False`). Grok's CLI genuinely ships blocking PreToolUse hooks (see the
+native hook at all" (`claude`=`True`, an asserted claim the C4 probe checks; every other CLI
+executor=`None`, unverified-by-cairn → the doctor probe decides); `installs_hooks` is the
+IMPLEMENTATION fact — "does cairn's own `install_guards` for this executor actually wire that hook
+for a run" (`claude`=`True`, every other executor=`False`). Grok's CLI genuinely ships blocking PreToolUse hooks (see the
 probe note below) but cairn doesn't install one for it, so asserting `blocking_hooks=True` there was
 dishonest about what THIS FRAMEWORK does — it now reads `None`, same as codex. **`plan()` warns** (never
 errors — an under-enforced guard is a legitimate, if risky, authoring choice) when a guard's `enforce`
@@ -292,8 +293,10 @@ codex (`--sandbox workspace-write`) and grok (`--sandbox workspace`) self-contai
 the app-level gate). To bring claude to parity, `CliExecutor.invoke` prefixes the built argv with an
 OS-native sandbox launcher just before spawn (`cairn.kernel.sandbox`):
 
-- **`Capabilities.sandbox`** posture per executor (`off` | `fs` | `strict`): **claude → `fs`**;
-  codex/grok/shell/stub → `off` (unwrapped, argv byte-identical to pre-C8).
+- **`Capabilities.sandbox`** posture per executor (`off` | `fs` | `strict`): **claude, opencode,
+  hermes, kimi, agy → `fs`** (headless auto-approve with no native OS jail — the
+  `bypassPermissions` threat class); codex/grok/cursor/shell/stub → `off` (unwrapped, argv
+  byte-identical to pre-C8 — codex and cursor carry their own native sandbox in-argv).
 - **`SandboxWrapper`** resolves an OS-neutral **`SandboxPolicy`** (realpath-resolved rw / ro / tmp
   paths + network flag) and dispatches to a pluggable **`SandboxBackend`**. The `fs` scope: rw =
   `run_dir + workspace + TMPDIR`; ro = the **gatekeys state dir** (the hook/shim read the signed

@@ -28,7 +28,7 @@ graph TD
   STEP -->|delegates to| AG
   STEP -.->|inlines| SK
   STEP -->|needs / produces| ART[Artifact]
-  AG -->|bound at invocation| EX["Executor<br/>claude · codex · grok · shell"]
+  AG -->|bound at invocation| EX["Executor<br/>claude · codex · grok · cursor · opencode · hermes · kimi · agy · shell"]
   GRD -.->|hook · shim · post| STEP
 
   ART -->|"done ⇔ passes"| VAL
@@ -161,8 +161,9 @@ port re-edits every agent.
 operations (spec: `API.md §6`): `doctor` (preflight), `resolve_model` (tier+effort → flags),
 `invoke` (one headless process: prompt file in, artifacts + typed return out), `install_guards`
 (wire native hooks where the CLI has them), `render_workspace` (emit AGENTS.md-style files if the
-CLI wants them). Built-ins: `claude`, `codex`, `grok`, `shell` (which is how `run:` steps execute —
-even determinism goes through the same interface).
+CLI wants them). Built-ins: `claude`, `codex`, `grok`, `cursor`, `opencode`, `hermes`, `kimi`,
+`agy`, `shell` (which is how `run:` steps execute — even determinism goes through the same
+interface).
 
 **Capabilities are declared, not assumed** (`blocking_hooks`, `output_schema`, `session_capture`,
 `installs_hooks`), and the guard engine adapts enforcement to them — and warns at plan time when a

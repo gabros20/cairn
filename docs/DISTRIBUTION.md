@@ -185,8 +185,10 @@ now hard-stop before minting when a *scoped* tool's check fails, TOOLING §2). P
 (TOOLING §2).
 
 *Status: the per-executor line currently reports `healthy`/its first finding; the richer
-`(version, auth ok, hooks: blocking)` detail is still cosmetic follow-up now that all three vendor
-executors (claude, codex, grok) are live, and the `--probe-hooks` hook line has shipped. The
+`(version, auth ok, hooks: blocking)` detail is still cosmetic follow-up now that the three
+original vendor executors (claude, codex, grok) are live — five more (cursor, opencode, hermes,
+kimi, agy) are adapter-complete with a real-CLI smoke pending — and the `--probe-hooks` hook line
+has shipped. The
 `requires` pin is enforced at **plan** time (`cairn plan` refuses an out-of-range install, §3),
 and doctor now prints its own `requires` satisfied/not-satisfied line whenever the workspace pins
 one.*

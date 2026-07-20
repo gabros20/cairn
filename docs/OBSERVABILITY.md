@@ -73,7 +73,7 @@ trail event — it will emit once the per-executor guard wiring (`install_guards
 lands; the `post` validator backstop that enforces today surfaces instead as a `step-fail` with
 validator reasons. `usage` is plumbed end-to-end
 (`Result.usage`; an executor-reported figure outranks the model's STEP-block self-report) — all
-three executors run plain-text output today, so they pass `None` and the numbers arrive with a
+CLI executors run plain-text output today, so they pass `None` and the numbers arrive with a
 json output-format later; the stable schema is the deliverable.*
 
 Two events earn their keep specially: **`gate-pending`** turns the operator pattern from "poll and
