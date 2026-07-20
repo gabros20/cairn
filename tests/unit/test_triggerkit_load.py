@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from cairn.kernel.errors import ConfigError
-from cairn.kernel.triggerkit import Trigger, load_triggers
+from cairn.kernel.triggerkit import Trigger, load_triggers, watch_dir
 
 
 def _workspace(tmp_path: Path, triggers_yaml: str | None, *, pipelines=("handle-reply",)) -> Path:
@@ -181,6 +181,29 @@ def test_bad_on_done_fails(tmp_path):
     )
     with pytest.raises(ConfigError, match="'on_done' must be one of"):
         load_triggers(ws)
+
+
+def test_watch_symlink_escape_is_a_config_error_at_watch_dir_resolution(tmp_path):
+    # _validate_watch (load-time) only sees the *string* "inbox_link" — lexically clean,
+    # no leading "..", not absolute — so load_triggers accepts it. The escape only shows
+    # up once the symlink is resolved, which is watch_dir()'s job (F3).
+    outside = tmp_path / "outside_secret_dir"
+    outside.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ws = _workspace(
+        workspace,
+        """
+        handle-reply:
+          pipeline: handle-reply
+          watch: inbox_link
+        """,
+    )
+    (ws / "inbox_link").symlink_to(outside)
+
+    trigger = load_triggers(ws)["handle-reply"]
+    with pytest.raises(ConfigError, match="escapes the workspace via symlink"):
+        watch_dir(trigger, ws)
 
 
 def test_multiple_triggers(tmp_path):

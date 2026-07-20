@@ -2,8 +2,13 @@
 
 from __future__ import annotations
 
+import errno
+import os
 from pathlib import Path
 
+import pytest
+
+from cairn.kernel.errors import CairnError, ConfigError
 from cairn.kernel.triggerkit import (
     Trigger,
     claim,
@@ -30,6 +35,20 @@ def test_watch_dir_resolves_relative_to_workspace(tmp_path):
     assert watch_dir(trigger, tmp_path) == (tmp_path / "inbox" / "replies").resolve()
 
 
+def test_watch_dir_rejects_workspace_internal_symlink_escape(tmp_path):
+    # "watch:" is lexically clean (relative, no "..") so nothing at parse time can
+    # reject it — the escape only appears once the symlink is resolved (F3).
+    outside = tmp_path / "outside_secret_dir"
+    outside.mkdir()
+    ws = tmp_path / "workspace"
+    ws.mkdir()
+    (ws / "inbox_link").symlink_to(outside)
+    trigger = Trigger(name="handle-reply", pipeline="p", watch="inbox_link")
+
+    with pytest.raises(ConfigError, match="escapes the workspace via symlink"):
+        watch_dir(trigger, ws)
+
+
 # --------------------------------------------------------------------------- #
 # scan_candidates
 # --------------------------------------------------------------------------- #
@@ -37,6 +56,22 @@ def test_watch_dir_resolves_relative_to_workspace(tmp_path):
 
 def test_scan_candidates_missing_dir_is_empty(tmp_path):
     assert scan_candidates(tmp_path / "nope", "*") == []
+
+
+def test_scan_candidates_existing_empty_dir_is_empty(tmp_path):
+    # Distinct from the missing-dir case above: exercises the iterdir() path with zero
+    # entries rather than the is_dir() early-return (F5).
+    watch = _watch(tmp_path)
+    assert scan_candidates(watch, "*") == []
+
+
+def test_scan_candidates_unicode_and_odd_filenames(tmp_path):
+    watch = _watch(tmp_path)
+    names = ["café-évènement.json", "événement (1).json", "日本語.json", "with space.json"]
+    for n in names:
+        (watch / n).write_text("{}", encoding="utf-8")
+
+    assert scan_candidates(watch, "*") == sorted(watch / n for n in names)
 
 
 def test_scan_candidates_sorted_top_level_only(tmp_path):
@@ -120,6 +155,70 @@ def test_two_claimers_never_both_succeed(tmp_path):
     assert sorted(r is None for r in results) == [False, True]
 
 
+def test_claim_never_overwrites_stuck_claim(tmp_path):
+    # F1 regression: a claim already stuck in .claim/event.json (crash-recovery case)
+    # must survive when a *new*, unrelated file with the same name gets claimed — never
+    # silently overwritten by a POSIX rename-style replace.
+    watch = _watch(tmp_path)
+    claim_dir = watch / ".claim"
+    claim_dir.mkdir()
+    (claim_dir / "event.json").write_text("STUCK-ORIGINAL-DATA", encoding="utf-8")
+
+    candidate = watch / "event.json"
+    candidate.write_text("NEW-DATA", encoding="utf-8")
+
+    claimed = claim(watch, candidate)
+
+    assert claimed == claim_dir / "event-v2.json"
+    assert (claim_dir / "event.json").read_text(encoding="utf-8") == "STUCK-ORIGINAL-DATA"
+    assert claimed.read_text(encoding="utf-8") == "NEW-DATA"
+    assert not candidate.exists()
+    assert sorted(p.name for p in stuck_claims(watch)) == ["event-v2.json", "event.json"]
+
+
+def test_claim_and_consume_unicode_filename(tmp_path):
+    watch = _watch(tmp_path)
+    candidate = watch / "événement (1).json"
+    candidate.write_text("{}", encoding="utf-8")
+
+    claimed = claim(watch, candidate)
+    assert claimed == watch / ".claim" / "événement (1).json"
+
+    dest = consume(watch, claimed, ok=True, on_done="done")
+    assert dest == watch / ".done" / "événement (1).json"
+    assert dest.is_file()
+
+
+def test_claim_symlinked_candidate_links_the_symlink_not_its_target(tmp_path):
+    watch = _watch(tmp_path)
+    target = tmp_path / "outside_target.json"
+    target.write_text("TARGET-DATA", encoding="utf-8")
+    link = watch / "event.json"
+    link.symlink_to(target)
+
+    claimed = claim(watch, link)
+
+    assert claimed == watch / ".claim" / "event.json"
+    assert claimed.is_symlink()
+    assert os.path.realpath(claimed) == os.path.realpath(target)
+    # The real target is never touched: not read, not linked, not moved.
+    assert target.read_text(encoding="utf-8") == "TARGET-DATA"
+
+
+def test_claim_cross_device_link_raises_clear_cairn_error(tmp_path, monkeypatch):
+    watch = _watch(tmp_path)
+    candidate = watch / "event.json"
+    candidate.write_text("{}", encoding="utf-8")
+
+    def fake_link(src, dst, *, follow_symlinks=True):
+        raise OSError(errno.EXDEV, "Cross-device link")
+
+    monkeypatch.setattr(os, "link", fake_link)
+
+    with pytest.raises(CairnError, match="different filesystems"):
+        claim(watch, candidate)
+
+
 # --------------------------------------------------------------------------- #
 # consume
 # --------------------------------------------------------------------------- #
@@ -196,6 +295,23 @@ def test_consume_collision_increments_past_v2(tmp_path):
 
     assert dest == done_dir / "event-v3.json"
     assert dest.read_text(encoding="utf-8") == "v3"
+
+
+def test_consume_symlinked_claim_moves_the_symlink_not_its_target(tmp_path):
+    watch = _watch(tmp_path)
+    target = tmp_path / "outside_target.json"
+    target.write_text("TARGET-DATA", encoding="utf-8")
+    link = watch / "event.json"
+    link.symlink_to(target)
+    claimed = claim(watch, link)
+
+    dest = consume(watch, claimed, ok=True, on_done="done")
+
+    assert dest == watch / ".done" / "event.json"
+    assert dest.is_symlink()
+    assert os.path.realpath(dest) == os.path.realpath(target)
+    assert target.read_text(encoding="utf-8") == "TARGET-DATA"
+    assert not claimed.exists()
 
 
 def test_consume_never_overwrites_existing_consumed_file(tmp_path):

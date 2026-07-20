@@ -19,12 +19,16 @@ loop or daemon of its own (TRIGGERS-PLAN.md §0 doctrine: no daemon, no listener
   are always excluded.
 - :func:`claim` / :func:`consume` / :func:`stuck_claims` — the at-most-once ledger
   (TRIGGERS-PLAN.md §2). The host watcher may coalesce or duplicate firings, so the entry
-  point owns dedupe: ``claim`` is an atomic same-filesystem rename into ``.claim/`` —
-  two concurrent claimers of one file can never both win, and losing the race
-  (``FileNotFoundError``) means skip, never raise. ``consume`` retires a claim into
-  ``.done/`` (or deletes it, per ``on_done``) on success, into ``.failed/`` on failure —
-  a claim left behind in ``.claim/`` after a crash is surfaced by :func:`stuck_claims`
-  for the operator to re-drop or discard, never auto-retried.
+  point owns dedupe: ``claim`` hard-links ``candidate`` into ``.claim/`` and unlinks the
+  original — two concurrent claimers of one file can never both win, and losing the race
+  (``FileNotFoundError``) means skip, never raise. A name already occupied in ``.claim/``
+  (a stuck claim from an earlier crash) is never overwritten — a new candidate sharing
+  that name gets a ``-v2`` suffix instead, same as ``consume``'s collision handling.
+  Neither ``claim`` nor ``consume`` ever dereferences a symlinked event file: the
+  symlink itself moves through the ledger, its target's bytes untouched. ``consume``
+  retires a claim into ``.done/`` (or deletes it, per ``on_done``) on success, into
+  ``.failed/`` on failure — a claim left behind in ``.claim/`` after a crash is surfaced
+  by :func:`stuck_claims` for the operator to re-drop or discard, never auto-retried.
 
 No CLI wiring, no renderers, no Runner effects here — later tasks build on this pure
 core. stdlib + pyyaml only; no hidden clock, no network, no resident process.
@@ -32,6 +36,7 @@ core. stdlib + pyyaml only; no hidden clock, no network, no resident process.
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import os
 from dataclasses import dataclass
@@ -40,7 +45,7 @@ from typing import Any, NoReturn
 
 import yaml
 
-from cairn.kernel.errors import ConfigError
+from cairn.kernel.errors import CairnError, ConfigError
 from cairn.kernel.types import Finding
 
 TRIGGERS_YAML = "triggers.yaml"
@@ -164,8 +169,27 @@ def _validate_watch(name: str, watch: str, file: Path) -> None:
 
 
 def watch_dir(trigger: Trigger, workspace_dir: Path) -> Path:
-    """The resolved absolute watch directory for ``trigger``."""
-    return (Path(workspace_dir) / trigger.watch).resolve()
+    """The resolved absolute watch directory for ``trigger``.
+
+    ``_validate_watch`` at parse time only inspects the ``watch:`` STRING (rejects
+    absolute paths and a literal ``..`` component) — it cannot see through a symlink. A
+    ``watch:`` that is lexically clean but points, via a workspace-internal symlink,
+    outside the workspace root would otherwise resolve cleanly here and hand back a
+    directory nothing upstream ever validated. Resolving the workspace root ONCE and
+    checking the resolved watch dir stays under it (mirrors ``artifacts.py``'s
+    ``_assert_contained``) closes that gap: an escape via symlink is a ConfigError
+    naming the trigger and the offending path, not a silent escape.
+    """
+    workspace_dir = Path(workspace_dir)
+    real_workspace = workspace_dir.resolve()
+    resolved = (workspace_dir / trigger.watch).resolve()
+    if resolved != real_workspace and real_workspace not in resolved.parents:
+        _fail(
+            f"trigger {trigger.name!r}: 'watch' escapes the workspace via symlink: "
+            f"{trigger.watch!r} resolves to {resolved}",
+            workspace_dir / TRIGGERS_YAML,
+        )
+    return resolved
 
 
 def scan_candidates(watch_abs: Path, glob: str) -> list[Path]:
@@ -190,32 +214,118 @@ def scan_candidates(watch_abs: Path, glob: str) -> list[Path]:
 # --------------------------------------------------------------------------- #
 
 
-def claim(watch_abs: Path, candidate: Path) -> Path | None:
-    """Atomically claim ``candidate`` by renaming it into ``<watch_abs>/.claim/``.
+def _hardlink(src: Path, dest: Path) -> None:
+    """Hard-link ``src`` into ``dest`` without ever dereferencing a symlinked ``src``.
 
-    ``Path.rename`` is atomic on the same filesystem, so two concurrent claimers of one
-    file can never both succeed: the loser's source has already vanished underneath it,
-    which surfaces as ``FileNotFoundError`` — caught here and turned into ``None``
-    (lost the race), never raised.
+    ``os.link``'s default ``follow_symlinks=True`` would resolve a symlinked event file
+    and link its TARGET, not the symlink — a scan-accepted symlink (``Path.is_file()``
+    follows symlinks, so ``scan_candidates`` happily accepts one) would then silently
+    ledger the wrong bytes and orphan the real target outside the watch dir entirely.
+    Passing ``follow_symlinks=False`` links the symlink itself, so it moves through the
+    ledger intact and its target is never read here.
+
+    ``FileNotFoundError`` (src vanished) and ``FileExistsError`` (dest already taken)
+    pass through unchanged for the caller's own race/collision handling. Anything this
+    layer can't handle safely becomes a :class:`CairnError` — a clear error beats a
+    wrong or corrupted file:
+
+    - a platform whose ``os.link`` can't target a symlink without dereferencing it
+      (checked via ``os.supports_follow_symlinks``), when ``src`` actually is one;
+    - ``src``/``dest`` on different filesystems (``EXDEV``) — a hard link can never
+      cross a filesystem boundary, symlink or not.
+    """
+    if os.link in os.supports_follow_symlinks:
+        link_kwargs: dict[str, bool] = {"follow_symlinks": False}
+    elif src.is_symlink():
+        raise CairnError(
+            f"cannot link symlinked event {src} into {dest}: this platform's os.link "
+            "cannot target a symlink without dereferencing it"
+        )
+    else:
+        link_kwargs = {}
+    try:
+        os.link(src, dest, **link_kwargs)
+    except OSError as exc:
+        if exc.errno == errno.EXDEV:
+            raise CairnError(
+                f"cannot link {src} into {dest}: source and destination are on "
+                "different filesystems (cross-device link)"
+            ) from exc
+        raise
+
+
+def claim(watch_abs: Path, candidate: Path) -> Path | None:
+    """Claim ``candidate`` by hard-linking it into ``<watch_abs>/.claim/`` and unlinking
+    the original — never ``Path.rename``, because POSIX rename SILENTLY REPLACES an
+    existing destination. A stuck claim left behind by an earlier crash is exactly the
+    operator evidence :func:`stuck_claims` exists to surface; a rename-based claim would
+    let a same-named new candidate destroy it with no error and no trace.
+
+    ``os.link`` (via :func:`_hardlink`) fails atomically with ``FileExistsError`` when
+    the destination name is taken, so a genuine name collision — a different event that
+    happens to share a filename with something already sitting in ``.claim/`` — gets the
+    same ``-v2`` collision-suffix treatment :func:`_place` uses for ``.done``/
+    ``.failed``, rather than an overwrite: both the stuck claim and the new one survive
+    under distinct names.
+
+    Losing the race to claim ``candidate`` itself (a concurrent claimer already won and
+    moved it) surfaces as ``FileNotFoundError`` — caught here and turned into ``None``,
+    never raised, exactly as the ``Path.rename`` version did. A ``FileExistsError`` whose
+    destination turns out to already be a hard link to ``candidate`` itself (a concurrent
+    claimer's link narrowly beat ours to the very same source/name) is also a lost race,
+    not a name collision — detected via ``_links_same_source`` before falling through to
+    the ``-v2`` suffix path.
     """
     watch_abs = Path(watch_abs)
     candidate = Path(candidate)
     claim_dir = watch_abs / ".claim"
     claim_dir.mkdir(parents=True, exist_ok=True)
-    dest = claim_dir / candidate.name
-    try:
-        candidate.rename(dest)
-    except FileNotFoundError:
-        return None
+    name = candidate.name
+    stem, ext = Path(name).stem, Path(name).suffix
+    dest_name = name
+    suffix = 1
+    while True:
+        dest = claim_dir / dest_name
+        try:
+            _hardlink(candidate, dest)
+        except FileNotFoundError:
+            return None
+        except FileExistsError:
+            if _links_same_source(candidate, dest):
+                candidate.unlink(missing_ok=True)
+                return None
+            suffix += 1
+            dest_name = f"{stem}-v{suffix}{ext}"
+            continue
+        break
+    candidate.unlink()
     return dest
 
 
+def _links_same_source(candidate: Path, dest: Path) -> bool:
+    """Whether ``dest`` (which just refused a new hard link under this name) is already
+    a hard link to ``candidate`` itself, rather than an unrelated file that merely shares
+    a name. ``lstat`` (not ``stat``) compares by the symlink's own inode when
+    ``candidate`` is one, matching the ``follow_symlinks=False`` link :func:`_hardlink`
+    makes."""
+    try:
+        c = candidate.lstat()
+    except FileNotFoundError:
+        return True  # candidate already gone: someone else clearly won it
+    try:
+        d = dest.lstat()
+    except FileNotFoundError:
+        return False  # dest vanished between the FileExistsError and here: retry
+    return (c.st_dev, c.st_ino) == (d.st_dev, d.st_ino)
+
+
 def _place(claim_path: Path, dest_dir: Path, name: str) -> Path:
-    """Hard-link ``claim_path`` into ``dest_dir`` under ``name``, never overwriting an
-    existing file: a name collision gets a ``-v2``, ``-v3``, ... suffix before the
-    extension (the ``bootstrap_run`` convention — see ``walk.py``'s ``-v2`` collision
-    handling). ``os.link`` fails atomically with ``FileExistsError`` when the target name
-    is taken, so each attempt is race-safe even though the retry loop around it is not.
+    """Hard-link ``claim_path`` into ``dest_dir`` under ``name`` (never dereferencing a
+    symlinked claim — see :func:`_hardlink`), never overwriting an existing file: a name
+    collision gets a ``-v2``, ``-v3``, ... suffix before the extension (the
+    ``bootstrap_run`` convention — see ``walk.py``'s ``-v2`` collision handling).
+    ``os.link`` fails atomically with ``FileExistsError`` when the target name is taken,
+    so each attempt is race-safe even though the retry loop around it is not.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     stem, ext = Path(name).stem, Path(name).suffix
@@ -224,7 +334,7 @@ def _place(claim_path: Path, dest_dir: Path, name: str) -> Path:
     while True:
         dest = dest_dir / dest_name
         try:
-            os.link(claim_path, dest)
+            _hardlink(claim_path, dest)
         except FileExistsError:
             suffix += 1
             dest_name = f"{stem}-v{suffix}{ext}"
