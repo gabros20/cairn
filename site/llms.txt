@@ -1,0 +1,42 @@
+# cairn
+
+> Artifact-native pipeline orchestrator over coding-agent CLIs (Claude Code, Codex, Grok, Cursor, OpenCode, Hermes, Kimi, Antigravity). Python ≥3.11, two dependencies (pyyaml + jsonschema). Every step of a pipeline leaves a typed, validated artifact on disk; the trail of artifacts IS the execution state. No database, no checkpointer, no daemon — the filesystem is the state machine.
+
+Key facts: pipelines are declarative YAML with exactly five node kinds (step, gate, parallel, loop, manual); agent steps delegate to a swappable executor CLI as a fresh headless subprocess; deterministic `run:` steps and agentic `agent:` steps share one contract (`needs`/`produces`, validator-gated) in one dependency graph; `cairn plan` statically verifies everything before a token is spent; `cairn resume` re-walks a run directory to the last valid artifact; every event appends to `trail.jsonl`. Install: `uv tool install cairn-pipelines` (PyPI distribution `cairn-pipelines`; command and import package are both `cairn`).
+
+All links below are raw markdown — fetch them directly.
+
+## Start here
+
+- [README](https://raw.githubusercontent.com/gabros20/cairn/main/README.md): the pitch, quick start, executor support matrix (which CLIs are live-verified vs adapter-complete), design principles, packaging, status
+- [Getting started](https://raw.githubusercontent.com/gabros20/cairn/main/docs/GETTING-STARTED.md): hold-your-hand path from nothing to a real, resumable pipeline run — offline, zero API tokens
+- [Docs index](https://raw.githubusercontent.com/gabros20/cairn/main/docs/README.md): one-paragraph map of every doc and the reading order
+
+## Core model
+
+- [Concepts](https://raw.githubusercontent.com/gabros20/cairn/main/docs/CONCEPTS.md): the complete noun/verb model — artifacts, steps, gates, parallel, loop, manual, validators, params/dims, envelopes, the trail, run dirs, and what deliberately has NO place
+- [Architecture](https://raw.githubusercontent.com/gabros20/cairn/main/docs/ARCHITECTURE.md): how the kernel is built and exactly how execution behaves — the walker, composer, executor plugins, sandbox, guards
+- [API reference](https://raw.githubusercontent.com/gabros20/cairn/main/docs/API.md): complete file-format and protocol reference — pipeline YAML schema, cairn.toml, artifact/validator/gate contracts, STEP sentinel, entry points for custom executors
+
+## Operating pipelines
+
+- [Observability](https://raw.githubusercontent.com/gabros20/cairn/main/docs/OBSERVABILITY.md): the trail as a versioned append-only event protocol; cairn trail / ps / --follow --json; reading a run dir as a post-mortem
+- [Security & governance](https://raw.githubusercontent.com/gabros20/cairn/main/docs/SECURITY.md): secrets doctrine (env-only, never disk), OS filesystem sandbox postures per executor, guards, gates as blast-radius control, budgets
+- [Scheduling](https://raw.githubusercontent.com/gabros20/cairn/main/docs/SCHEDULING.md): first-class scheduled runs with no daemon — cairn emits cron/launchd units, headless gates resolve to defaults
+- [Testing & validation](https://raw.githubusercontent.com/gabros20/cairn/main/docs/TESTING.md): the validation ladder cheap→expensive — plan, validators, stub executor (recorded envelopes, zero tokens), live smoke
+- [Tooling & growth](https://raw.githubusercontent.com/gabros20/cairn/main/docs/TOOLING-AND-GROWTH.md): how external tools enter a pipeline ([tools] checks, skills, allowlists), agentic-vs-deterministic decision rule, the maturation ladder, the self-improve learning loop
+- [Distribution](https://raw.githubusercontent.com/gabros20/cairn/main/docs/DISTRIBUTION.md): what the package is, workspace scaffolding (cairn new workspace — ships pipelines, agents, skills like cairn-operator and self-improve-curator, validators, schemas), embedding cairn
+
+## Worked example
+
+- [brease-rebuild, expressed completely](https://raw.githubusercontent.com/gabros20/cairn/main/docs/EXAMPLE-BREASE-REBUILD.md): a real six-phase website-rebuild factory (capture → audit → blueprint → build → art-review loop → deploy) as a complete cairn workspace — the origin system cairn was distilled from
+
+## Optional
+
+- [Implementation plan](https://raw.githubusercontent.com/gabros20/cairn/main/docs/IMPLEMENTATION-PLAN.md): historical build record — read as history, not a roadmap
+- [Hardening plan](https://raw.githubusercontent.com/gabros20/cairn/main/docs/HARDENING-PLAN.md): remediation ledger from the three-model review panel
+- [Releasing](https://raw.githubusercontent.com/gabros20/cairn/main/docs/RELEASING.md): how releases ship (python-semantic-release, PyPI Trusted Publishing)
+- [Changelog](https://raw.githubusercontent.com/gabros20/cairn/main/CHANGELOG.md): version history
+- [GitHub repository](https://github.com/gabros20/cairn): source, issues
+- [PyPI: cairn-pipelines](https://pypi.org/project/cairn-pipelines/): the distribution
+- [Website](https://cairn-pipelines.vercel.app): human-facing overview of everything above
