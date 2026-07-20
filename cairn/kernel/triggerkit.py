@@ -30,8 +30,18 @@ loop or daemon of its own (TRIGGERS-PLAN.md §0 doctrine: no daemon, no listener
   ``.failed/`` on failure — a claim left behind in ``.claim/`` after a crash is surfaced
   by :func:`stuck_claims` for the operator to re-drop or discard, never auto-retried.
 
-No CLI wiring, no renderers, no Runner effects here — later tasks build on this pure
-core. stdlib + pyyaml only; no hidden clock, no network, no resident process.
+- :func:`render_trigger_launchd` / :func:`render_trigger_systemd` — RENDER-ONLY functions
+  returning the exact host-watcher text (a launchd ``WatchPaths`` plist; a systemd
+  ``.path`` + ``.service`` pair), fully unit-testable offline — mirror schedkit's
+  :func:`render_launchd` / :func:`render_systemd` conventions exactly. Argv is always the
+  stable entry ``cairn trigger run <name> --workspace <ws>``, never the expanded per-file
+  work, so editing ``triggers.yaml`` changes behavior without re-sync (the same property
+  SCHEDULING.md documents for schedules). cron has no file-watch facility — the sync verb
+  (a later task) refuses that backend rather than fake one here.
+
+No CLI wiring, no Runner effects here — later tasks build the effectful `sync`/`list`/
+`remove` verbs on this render-only core. stdlib + pyyaml only; no hidden clock, no
+network, no resident process.
 """
 
 from __future__ import annotations
@@ -39,6 +49,8 @@ from __future__ import annotations
 import errno
 import fnmatch
 import os
+import plistlib
+import shlex
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn
@@ -369,3 +381,100 @@ def stuck_claims(watch_abs: Path) -> list[Path]:
     if not claim_dir.is_dir():
         return []
     return sorted(p for p in claim_dir.iterdir() if p.is_file())
+
+
+# --------------------------------------------------------------------------- #
+# Backend rendering — RENDER-ONLY, fully offline (TRIGGERS-PLAN.md §3)
+# --------------------------------------------------------------------------- #
+
+
+def _trigger_argv(trigger: Trigger, workspace_dir: Path, cairn_bin: str) -> list[str]:
+    """The one stable entry every backend fires: never the expanded per-file work — a
+    host watcher only ever knows a directory changed, so the argv can't and shouldn't
+    encode which file. This also means editing ``triggers.yaml`` (pipeline, param, glob,
+    on_done) changes behavior without re-sync, the same property SCHEDULING.md documents
+    for ``cairn schedule run <name>``."""
+    return [cairn_bin, "trigger", "run", trigger.name, "--workspace", str(workspace_dir)]
+
+
+def trigger_launchd_label(name: str) -> str:
+    """The launchd job label for a trigger (also the plist basename stem).
+
+    The literal ``trigger.`` segment — vs schedkit's :func:`launchd_label`'s bare
+    ``io.cairn.<name>`` — means a trigger and a schedule sharing one name can never
+    collide as ~/Library/LaunchAgents plist labels.
+    """
+    return f"io.cairn.trigger.{name}"
+
+
+def render_trigger_launchd(trigger: Trigger, workspace_dir: Path, cairn_bin: str) -> str:
+    """Render one trigger as a launchd LaunchAgent plist (XML string) with a ``WatchPaths``
+    key, plistlib-generated (never hand-concatenated XML — malformed XML is a silently
+    dead LaunchAgent, not a load-time error a human sees).
+
+    ``ThrottleInterval: 10`` — WatchPaths fires on EVERY mutation inside the watched dir,
+    including the ``.claim/``/``.done/``/``.failed/`` renames ``cairn trigger run`` itself
+    performs while draining the inbox (TRIGGERS-PLAN.md §3). Without a floor, one real
+    event can cascade into a burst of self-triggered re-fires; ``scan_candidates`` always
+    excludes those dot-dirs, so each extra firing just scans an already-empty top level —
+    a cheap no-op — which is what makes throttling to once per 10s safe rather than lossy.
+    """
+    workspace_dir = Path(workspace_dir)
+    watch_abs = watch_dir(trigger, workspace_dir)
+    plist: dict[str, Any] = {
+        "Label": trigger_launchd_label(trigger.name),
+        "ProgramArguments": _trigger_argv(trigger, workspace_dir, cairn_bin),
+        "WatchPaths": [str(watch_abs)],
+        "ThrottleInterval": 10,
+    }
+    return plistlib.dumps(plist, sort_keys=False).decode("utf-8")
+
+
+def trigger_systemd_unit_names(name: str) -> tuple[str, str]:
+    """The (``.path``, ``.service``) unit filenames for a trigger.
+
+    The ``trigger-`` segment — vs schedkit's :func:`systemd_unit_names`'s bare
+    ``cairn-<name>.service``/``.timer`` — means a trigger and a schedule sharing one name
+    install as distinct unit files in the same systemd user directory rather than one
+    silently overwriting the other's ``.service``.
+    """
+    return (f"cairn-trigger-{name}.path", f"cairn-trigger-{name}.service")
+
+
+def render_trigger_systemd(
+    trigger: Trigger, workspace_dir: Path, cairn_bin: str
+) -> tuple[str, str]:
+    """Render one trigger as a systemd (``.path``, ``.service``) unit pair (text strings).
+
+    ``DirectoryNotEmpty=<abs watch dir>`` keeps re-firing while files remain in the watch
+    dir — the drain-the-inbox semantics TRIGGERS-PLAN.md §3 wants, unlike a one-shot
+    edge-triggered watch. ``ExecStart`` is the argv joined with shlex-style quoting (as
+    schedkit's host-command line building does for cron) because systemd word-splits
+    ``ExecStart=`` like a shell command line: an unquoted workspace path containing a
+    space would otherwise silently truncate the argv. ``[Install] WantedBy=default.target``
+    sits on the ``.path`` unit only — mirroring schedkit's asymmetry, where the
+    activation unit (there, the ``.timer``) carries ``[Install]`` and the oneshot
+    ``.service`` it triggers does not.
+    """
+    workspace_dir = Path(workspace_dir)
+    watch_abs = watch_dir(trigger, workspace_dir)
+    _, service_name = trigger_systemd_unit_names(trigger.name)
+    argv = _trigger_argv(trigger, workspace_dir, cairn_bin)
+    path_unit = (
+        "[Unit]\n"
+        f"Description=cairn trigger watch: {trigger.name}\n\n"
+        "[Path]\n"
+        f"DirectoryNotEmpty={watch_abs}\n"
+        f"Unit={service_name}\n\n"
+        "[Install]\n"
+        "WantedBy=default.target\n"
+    )
+    service_unit = (
+        "[Unit]\n"
+        f"Description=cairn trigger: {trigger.name}\n\n"
+        "[Service]\n"
+        "Type=oneshot\n"
+        f"WorkingDirectory={workspace_dir}\n"
+        f"ExecStart={shlex.join(argv)}\n"
+    )
+    return path_unit, service_unit
