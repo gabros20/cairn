@@ -51,6 +51,7 @@ class StubExecutor:
         blocking_hooks=False,
         output_schema=False,
         session_capture=None,
+        installs_hooks=False,  # stub never installs a hook
     )
 
     def __init__(self, config=None, *, stubs_root: Path | None = None) -> None:
@@ -82,7 +83,7 @@ class StubExecutor:
         step_block = self._step_block(stub_dir, step, copied)
         return Result(step=step_block, exit_code=0, duration_s=0.0)
 
-    def install_guards(self, guards, ws) -> None:
+    def install_guards(self, guards, ws, run_dir) -> None:
         return None
 
     def render_workspace(self, ws) -> None:

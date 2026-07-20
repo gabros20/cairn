@@ -24,6 +24,7 @@ class ShellExecutor:
         blocking_hooks=False,  # n/a for a shell step
         output_schema=False,
         session_capture=None,
+        installs_hooks=False,  # n/a — no hook mechanism, install_guards below is a no-op
     )
 
     def __init__(self, config=None) -> None:
@@ -54,8 +55,8 @@ class ShellExecutor:
             duration_s=duration_s,
         )
 
-    def install_guards(self, guards, ws) -> None:
-        return None  # guard wiring lands with the guards engine
+    def install_guards(self, guards, ws, run_dir) -> None:
+        return None  # shell has no native hook; the shim layer covers it
 
     def render_workspace(self, ws) -> None:
         return None

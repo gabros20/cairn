@@ -164,7 +164,7 @@ _AGENT_STUB = """\
 # {name} — a new agent. Referenced by an `agent: {name}` step.
 description: "TODO: what this agent does"
 tier: balanced          # reasoning | balanced | cheap
-effort: medium          # low | medium | high | xhigh
+effort: medium          # low | medium | high | xhigh | max
 skills: []
 tools:
   allow: [read, write, edit, bash]

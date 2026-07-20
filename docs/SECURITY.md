@@ -65,10 +65,40 @@ the actual control.
 
 *Status: built. The declaration + deny-by-default pass-through (§1.1–1.2) landed in C1, and the
 literal scrubber is now live: declared `[secrets]` values are scrubbed from step logs (line by
-line), captured output, and every trail event — applied structurally *before* serialization, so a
-secret containing quotes, backslashes, or JSON syntax cannot escape the scrub. Envelopes never
-contain resolved secret values (verified). Known limit: a secret split across two log lines evades
-the literal match; single-line tokens are unaffected.*
+line as they stream), captured output (a whole-content pass over the complete captured text, run
+before the walker parses it for the STEP block), and every trail event — applied structurally
+*before* serialization, so a secret containing quotes, backslashes, or JSON syntax cannot escape
+the scrub. Envelopes never contain resolved secret values (verified). A secret split across two
+log lines (W6-C, grok-F10) is caught by the whole-content pass in the captured text always, and in
+the on-disk log in the NORMAL case (the streaming per-line pass alone would miss it in both).
+Disclosed residual: the log's whole-content rewrite only runs once the pump thread has fully
+drained (its sole writer has finished) — a backgrounded grandchild holding the log's pipe open
+past the drain grace (the same pre-existing case that already limits timeout accounting) means the
+log gets only the per-line pass for whatever that grandchild still emits; the rewrite is skipped
+rather than risk a second concurrent writer on the file. The captured text handed to the walker is
+unaffected either way — it's an in-memory snapshot, not a second writer.*
+
+### 1.4 Artifact path containment — symlink resolution, and a disclosed TOCTOU residual
+
+`artifacts.py:resolve_path` rejects an absolute or `..`-containing rendered path by string before
+touching disk, then additionally resolves every concrete candidate (the plain path, and each glob
+match) and requires it to stay under the run dir (codex-F11) — a run-local path like
+`run/report.json` can pass the string checks while a symlink somewhere in its chain points at
+`/etc/passwd` or any other host file, which would otherwise let an external file falsely satisfy
+an artifact's done predicate and let reads escape the run dir. `resolve()` is strict, so a
+not-yet-existing artifact leaf (the normal case) still resolves fine as long as no symlink in its
+parent chain escapes.
+
+*Disclosed residual (not closed): `ResolvedArtifact.paths` stores the UNRESOLVED candidate, not
+the resolved path the containment check verified — downstream readers (`validate()`, the walker's
+artifact JSON reads) re-touch the filesystem through that unresolved path. In the narrow
+same-process window between the check and that later read, the sandboxed agent (who holds write
+access to the run dir) could swap the symlink to redirect the read. Storing the resolved path
+would close most of that window, but would also change what downstream code sees — a resolved
+leaf compared against an unresolved `run_dir` in `validate()`'s relative-path formatting could
+fall back to printing an absolute path in artifact-missing/schema-violation reasons. Given the
+brief for this containment fix (W6), that downstream contract change was out of scope; this is a
+known, accepted gap for a follow-up if it needs closing.*
 
 ## 2. Untrusted content — the prompt-injection posture
 
@@ -97,8 +127,54 @@ An injected instruction that a model obeys still cannot exceed the step's cage:
   wall is still pending (the CLI executors currently run headless under `bypassPermissions`), so
   meanwhile the **guards** layer below is the *enforced* backstop, not this one (TOOLING §3);
 - **guards** — mutating verbs are checked by code (F18, wrong-CMS) regardless of why the model
-  tried them (one per-executor caveat: grok's native hook layer fails open on hook crash/timeout/
-  malformed output — ARCHITECTURE §4 — so its shim and post layers carry the backstop);
+  tried them. Enforced today by the **shim** (any executor) and the **post** validator (always on);
+  for `claude` the native **hook** layer also installs now (`install_guards` writes a `PreToolUse`
+  hook running the same guard chain, fail-closed — ARCHITECTURE §4), while `codex`/`grok` hook
+  install is still a no-op there (shim + post carry them). The guard manifests (shim AND hook) and
+  the check scripts they name are **integrity-protected**: each manifest lives OUTSIDE the run dir
+  (gatekeys-protected state dir) and is HMAC-signed with the per-run secret, and each check script's
+  sha256 is signed in; the shim/hook re-verify both at decision time and **fail closed** on any
+  mismatch. So under a **write-sandboxed** executor (codex `workspace-write`) the guard inputs are
+  tamper-proof — the agent cannot write outside its cwd. **claude** runs `bypassPermissions`
+  (no app-level FS wall), so cairn wraps its process in an **OS filesystem sandbox** (C8/W3c,
+  `cairn.kernel.sandbox`; macOS `sandbox-exec`/Seatbelt, Linux `bubblewrap`/`landrun` — ARCHITECTURE
+  §4): writes are confined to `run_dir + workspace` (+ per-process temp) and the **gatekeys dir is
+  read-only**, so a compromised claude can still *read* the per-run secret its own hook needs but can
+  no longer *forge a manifest* or write outside the run dir. That makes claude's file-based guard
+  inputs **tamper-proof-in-practice** — parity with codex under its write-sandbox (the exact
+  reduction is `CLAUDE-SANDBOX-PLAN.md` §6). Two properties bound this: (i) **no single OS sandbox is
+  fully trusted** — a live Claude Code sandbox-escape CVE (CVE-2026-55607) is why the wrap is a
+  *layer*, not a new sole gate; **`post` remains the hard gate** and the W3a signed guards stay.
+  (ii) the `fs` posture confines the **filesystem only** — network stays ON (the CLI needs its own
+  model API), so `bash curl` **exfiltration** is an accepted residual closed only by the deferred
+  **`strict`/`srt`** egress-controlling tier. A missing OS primitive degrades **loud-not-silent**:
+  the step runs UNSANDBOXED with a one-time `sandbox-unavailable` warning and `cairn doctor` WARNs
+  (availability > strictness) — never silently. codex/grok/shell/stub stay unwrapped (`sandbox: off`
+  — self-sandboxed or trusted; argv byte-identical to pre-C8). Two per-executor caveats: the
+  hook uses the same glob as the shim, so it does NOT catch absolute-path / `sh -c` / `env`-prefixed
+  invocations (only `post` does); and grok's native hook fails open on hook crash/timeout/malformed
+  output, so its shim and post layers carry the backstop even once its hook install lands;
+- **guard activation** — a guard's `enforce`/`check`/`on_error` decl is static, but WHETHER it is
+  currently enforced can be runtime-conditional (a `when:` referencing `gates`/`artifacts`). The
+  **authority over the active set is the trusted walker**, not the sandboxed subprocess: it
+  evaluates `when` in-process against `self.plan.params/dims` (never re-read from the
+  agent-writable run dir), the W2-verified gate reader, and the W6-contained artifact resolver, then
+  writes a per-invocation SIGNED manifest containing only the active guards — the shim/hook
+  subprocess stays exactly what it always was, a dumb fail-closed executor of a manifest it can't
+  forge (C9 / `GUARD-WHEN-PLAN.md`). Two residuals, neither new: (a) **env redirection** — under
+  claude `bypassPermissions` an agent could point `CAIRN_SHIM_MANIFEST`/`CAIRN_HOOK_MANIFEST` at an
+  *older, still-validly-signed* manifest from earlier in the same run; bounded to manifests already
+  signed *this run* — for a monotonic gate `when` (gate answered once, stays answered) an older
+  manifest tends to be MORE restrictive (fewer gates answered → more guards active → over-block), but
+  a *non-monotonic* artifact-content `when` (e.g. `when: artifacts.qa.verdict=='NO-GO'`) can make an
+  earlier manifest LESS restrictive — replaying an invocation whose artifact then read `GO` omits a
+  guard that a later `NO-GO` should activate (under-block). C9 introduces this first class of
+  validly-signed, less-restrictive manifests, but under claude's OS FS sandbox (C8/W3c, above) the
+  gatekeys dir is read-only, so an agent cannot mint or plant a *new* signed manifest — only redirect
+  to an older one already signed *this run* — and `post` remains the hard gate regardless; the bound
+  is that redirection window, NOT manifest monotonicity; (b) a `run.*`-rooted guard `when` inherits the ordinary `run.json` trust level (that root
+  alone re-reads the agent-writable file) — prefer `gates`/`params`/`dims`/`artifacts` in a guard
+  `when` and treat `run.*` there the same way you'd treat a `run.*`-rooted step `when`;
 - **gates** — the two irreversible crossings (CMS populate, deploy) sit behind human gates, with
   headless defaults of *no*, and the deploy allowlist pins the org;
 - **isolation** — cwd is the run dir; a compromised step cannot reach sibling runs;
@@ -159,6 +235,45 @@ separate machinery.
 - **Run locking:** the walker takes an exclusive advisory lock (`.cairn.lock` in the run dir,
   flock) — two concurrent `cairn resume`s on the same run cannot interleave; the loser exits 4
   with "run is held by PID …". Batch's parallelism is across run dirs, so it never contends.
+- **Gate-decision authentication:** a gate is a human decision point; its answer lands at
+  `runs/<id>/gates/<name>.json` and, once written, is never re-asked. But the run dir is the
+  agent's own write scope (codex, e.g., gets `--sandbox workspace-write` over it), so a bare
+  decision file there proves nothing about *who* wrote it — an injected or compromised step could
+  drop `{"choice":"yes"}` and skip a production gate. So each decision is **authenticated**: the
+  kernel's writers sign a `mac` = HMAC-SHA256 over a canonical `{run,gate,choice,by,at}` payload,
+  keyed by a **per-run 32-byte secret minted at run creation and stored outside any run dir**
+  (`$XDG_STATE_HOME/cairn/gate-keys/<run_id>-<disc>.key`, mode 0600, dir 0700 — never under the
+  agent-writable cwd; `<disc>` is a hash of the run dir's absolute path so two runs that share a
+  `run_id` in different workspaces get distinct keys, and the same discriminator is folded into the
+  MAC). **Every** reader verifies — not just the gate's own proceed-decision (`resolve_gate`) but
+  every consumer of the recorded value: `when:` control-flow expressions (`gates.<name>.choice`),
+  the `{{ gate:<name> }}` command/prompt helper, `needs:` gate dependencies, and the prompt
+  **composer** (the "recorded choice: …" describe line and its own `{{ gate:… }}` arg rendering)
+  all recompute the MAC (constant-time) and honor the file only if it verifies *and* the choice is
+  one of the gate's declared options. The gate name is in the signed payload, so a decision for gate A cannot be
+  replayed at gate B. This closes the *post-resolution* forge: a step that overwrites a
+  legitimately-signed "no" with a forged "yes" mid-walk cannot flip a downstream `when:` or inject
+  the forged value into a shell command. **Any** failure — missing/mismatched MAC, an off-menu
+  choice, or a missing/unreadable secret — is treated as **unanswered** and fails safe: it emits a
+  `gate-tamper` trail event and the reader re-asks / halts needs-human / raises a config halt (a
+  tampered file is never better than a missing one). A missing secret is never read as "trust the
+  file" and never as "auto-pass". **The guarantee, stated honestly:** an attacker who cannot read
+  the per-run secret cannot forge a decision. That holds against every injected-file forge, and
+  against any executor whose sandbox denies out-of-cwd reads (the secret lives outside the run dir).
+  It does **not**, on its own, stop an *unsandboxed* executor that can read arbitrary host paths —
+  such a step could read the key and mint a valid MAC; closing that residual is W3's job (real
+  sandbox/hook enforcement of the out-of-cwd boundary). The key dir is resolved from
+  `XDG_STATE_HOME`/`HOME` at both mint and verify and must be **stable across `run` and `resume`**:
+  a shifted env makes the run fail safe (needs-human, never auto-pass), never resumable with a wrong
+  key. Two known residuals: the key file's own lifecycle is not yet wired into `cairn gc` (it
+  outlives the run dir until GC learns to reap it — a documented TODO, not a leak of anything
+  sensitive on its own), and `is_answered` is a pure file-existence check, so a forged file still
+  *blocks* the `cairn gate` overwrite path (an operator must delete it to answer) — a
+  denial-of-convenience, never a forged pass. **Upgrade note:** the signed payload gained a `run`
+  field in this version, so a gate answered by an *earlier* cairn no longer verifies after
+  upgrading — runs with gates answered before this version must re-answer them (it fails safe to
+  needs-human, never auto-passes). *Status: LIVE — built and tested (`gatekeys.py`, `gatekit.py`,
+  `compose.py`).*
 - **Retention:** capture-heavy runs are multi-GB. `cairn gc [--keep-days N] [--keep-last M]
   [--artifacts-only] [--include-needs-human] [--apply]` deletes or slims old runs
   (`--artifacts-only` keeps `run.json` + trail + `.cairn.lock` — the audit skeleton — while dropping

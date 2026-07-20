@@ -33,10 +33,32 @@ from typing import Any
 
 from cairn.kernel.artifacts import ArtifactDecl
 from cairn.kernel.config import Config
-from cairn.kernel.plan import Plan, StepNode
+from cairn.kernel.gatekit import GateTampered, GateUnanswered, read_verified_choice
+from cairn.kernel.plan import GateNode, LoopNode, ParallelNode, Plan, StepNode
 from cairn.kernel.schemas import get_schema
 from cairn.kernel.template import TemplateContext, TemplateError, render
 from cairn.kernel.trail import read_trail
+
+
+def _find_gate_node(plan: Plan, name: str) -> GateNode | None:
+    """The GateNode named ``name`` anywhere in ``plan`` (recursing parallels/loops), or None."""
+
+    def walk(nodes) -> GateNode | None:
+        for node in nodes:
+            if isinstance(node, GateNode):
+                if node.name == name:
+                    return node
+            elif isinstance(node, ParallelNode):
+                found = walk(node.steps)
+                if found is not None:
+                    return found
+            elif isinstance(node, LoopNode):
+                found = walk(node.body)
+                if found is not None:
+                    return found
+        return None
+
+    return walk(plan.nodes)
 
 # The T3 notice (SECURITY §2.1) — carried verbatim in block 5 of every envelope.
 T3_NOTICE = (
@@ -210,7 +232,7 @@ class Composer:
         # otherwise it is a gate: the recorded decision file.
         gate_path = run_dir / "gates" / f"{name}.json"
         out = [f"- `{name}` (gate decision){suffix}: `{gate_path}`"]
-        choice = self._gate_choice(run_dir, name)
+        choice = self._gate_choice(run_dir, name, plan)
         if choice is not None:
             out.append(f"  - recorded choice: {choice}")
         return out
@@ -375,13 +397,18 @@ class Composer:
         assert path.is_absolute(), f"expected an absolute workspace path, got {path!r}"
         return str(path)
 
-    def _gate_choice(self, run_dir: Path, name: str) -> Any:
-        path = run_dir / "gates" / f"{name}.json"
-        if not path.is_file():
+    def _gate_choice(self, run_dir: Path, name: str, plan: Plan) -> Any:
+        # Verify the MAC before surfacing a choice into an agent prompt — a compromised step
+        # can overwrite a legitimately-resolved decision file mid-walk, and a forged choice must
+        # not reach a downstream agent's context. On unanswered/tampered → None (the same
+        # fail-safe as a missing file), never the forged value. Trail emit is the walker's job;
+        # here the default no-op emit suffices — we just decline to surface an unverified value.
+        gate = _find_gate_node(plan, name)
+        if gate is None:
             return None
         try:
-            return json.loads(path.read_text(encoding="utf-8")).get("choice")
-        except (OSError, json.JSONDecodeError):
+            return read_verified_choice(run_dir, gate)
+        except (GateUnanswered, GateTampered):
             return None
 
     def _render_arg(self, value: Any, plan: Plan, run_dir: Path, cycle: int | None) -> str:
@@ -395,7 +422,7 @@ class Composer:
             return self._abs(run_dir, self._path(decl, plan, cycle))
 
         def _gate(name: str) -> Any:
-            choice = self._gate_choice(run_dir, name)
+            choice = self._gate_choice(run_dir, name, plan)
             if choice is None:
                 raise KeyError(name)
             return choice

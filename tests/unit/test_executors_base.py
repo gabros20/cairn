@@ -55,6 +55,7 @@ def make_inv(
     env: dict[str, str] | None = None,
     timeout_s: int = 30,
     scratch: Path | None = None,
+    network: bool = False,
 ) -> Invocation:
     scratch = scratch or (tmp_path / "scratch")
     prompt_file = tmp_path / "prompt.md"
@@ -70,6 +71,7 @@ def make_inv(
         timeout_s=timeout_s,
         log_path=tmp_path / "logs" / "step.log",
         return_schema=tmp_path / "return.json",
+        network=network,
     )
 
 
@@ -121,6 +123,29 @@ def test_last_WELL_FORMED_block_wins_over_a_trailing_broken_block():
         '<<<STEP {broken,,} STEP>>>'
     )
     assert parse_step_sentinel(text) == {"status": "done", "summary": "good"}
+
+
+def test_fully_valid_block_parses_with_learnings_intact():
+    text = (
+        '<<<STEP {"status": "done", "summary": "shipped", "artifacts": ["out.txt"], '
+        '"learnings": [{"note": "watch rate limits", "tag": "capture"}]} STEP>>>'
+    )
+    obj = parse_step_sentinel(text)
+    assert obj["status"] == "done"
+    assert obj["artifacts"] == ["out.txt"]
+    assert obj["learnings"] == [{"note": "watch rate limits", "tag": "capture"}]
+
+
+def test_status_outside_enum_returns_none():
+    obj = parse_step_sentinel('<<<STEP {"status": "done-ish", "summary": "ok"} STEP>>>')
+    assert obj is None
+
+
+def test_artifacts_not_a_list_of_strings_returns_none():
+    obj = parse_step_sentinel(
+        '<<<STEP {"status": "done", "summary": "ok", "artifacts": [1, 2]} STEP>>>'
+    )
+    assert obj is None
 
 
 # --------------------------------------------------------------------------- #
@@ -294,6 +319,95 @@ def test_run_process_redacts_the_log_and_captured_output(tmp_path):
     on_disk = log.read_text()
     assert "sk-live-DEADBEEF" not in on_disk and "∎REDACTED:TOKEN∎" in on_disk
     assert "sk-live-DEADBEEF" not in out and "∎REDACTED:TOKEN∎" in out
+
+
+def test_run_process_redacts_a_multiline_secret_from_captured_and_log(tmp_path):
+    # A secret VALUE containing an embedded newline isn't caught by the per-line pass alone
+    # (each streamed line only holds half of it) — the whole-content pass run after the
+    # process exits (W6-C, grok-F10) must still catch it, both in the text the walker parses
+    # for the STEP block and in the on-disk log (this repo's choice (a): a final rewrite pass
+    # over the bounded step log).
+    secret = "sk-live-DEAD\nBEEF"
+
+    def redact(text: str) -> str:
+        return text.replace(secret, "∎REDACTED:TOKEN∎")
+
+    log = tmp_path / "out.log"
+    code, out, _ = run_process(
+        ["/bin/sh", "-c", "printf 'token=sk-live-DEAD\\nBEEF-tail\\n'"],
+        stdin_text=None,
+        env={"PATH": "/usr/bin:/bin"},
+        cwd=tmp_path,
+        timeout_s=10,
+        log_path=log,
+        redactor=redact,
+    )
+    assert code == 0
+    assert secret not in out
+    assert "∎REDACTED:TOKEN∎" in out
+    on_disk = log.read_text()
+    assert secret not in on_disk
+    assert "∎REDACTED:TOKEN∎" in on_disk
+
+
+def test_run_process_skips_log_rewrite_when_reader_still_alive(tmp_path):
+    # Same shape as test_run_process_grandchild_holding_pipe_does_not_stall_or_false_timeout:
+    # a backgrounded grandchild inherits the stdout pipe and holds it open past the drain
+    # grace, so the pump thread is still the log's writer when run_process would otherwise
+    # rewrite it. The reader-gated rewrite (W6-C) must SKIP in that case (no second writer,
+    # no corruption) — proven here by a MULTILINE secret that survives on disk (residual)
+    # while still being caught in the RETURNED text (never gated on the reader).
+    secret = "SEC\nRET"
+
+    def redact(text: str) -> str:
+        return text.replace(secret, "∎REDACTED:TOKEN∎")
+
+    log = tmp_path / "l.log"
+    code, out, _ = run_process(
+        ["/bin/sh", "-c", "printf 'a=SEC\\nRET-b\\n'; sleep 30 & echo started"],
+        stdin_text=None,
+        env={"PATH": "/usr/bin:/bin"},
+        cwd=tmp_path,
+        timeout_s=15,
+        log_path=log,
+        redactor=redact,
+    )
+    assert code == 0
+    # The whole-content pass on the returned/parsed text always runs — it's an in-memory
+    # snapshot, not a second writer, so it never needs the reader-drained gate.
+    assert secret not in out
+    assert "∎REDACTED:TOKEN∎" in out
+    # The on-disk log, by contrast, only gets the per-line pass here (documented residual):
+    # the reader was still alive, so the whole-content rewrite was skipped, not raced.
+    on_disk = log.read_text()
+    assert secret in on_disk
+    assert "started" in on_disk  # log is intact, not corrupted or truncated by a race
+
+
+def test_run_process_timeout_path_rewrites_log_when_reader_drains(tmp_path):
+    # On a timeout, the whole process GROUP is SIGKILLed (no surviving backgrounded
+    # grandchild in this case) — the pipe closes, the pump drains, and the reader-gated
+    # rewrite (W6-C) must still run on this path even though it raises instead of
+    # returning: a multiline secret is caught in the log here too.
+    secret = "TOK\nEN99"
+
+    def redact(text: str) -> str:
+        return text.replace(secret, "∎REDACTED:TOKEN∎")
+
+    log = tmp_path / "l.log"
+    with pytest.raises(ExecTimeout):
+        run_process(
+            ["/bin/sh", "-c", "printf 'x=TOK\\nEN99-y\\n'; sleep 30"],
+            stdin_text=None,
+            env={"PATH": "/usr/bin:/bin"},
+            cwd=tmp_path,
+            timeout_s=0.5,
+            log_path=log,
+            redactor=redact,
+        )
+    on_disk = log.read_text()
+    assert secret not in on_disk
+    assert "∎REDACTED:TOKEN∎" in on_disk
 
 
 def test_run_process_without_redactor_is_byte_identical(tmp_path):

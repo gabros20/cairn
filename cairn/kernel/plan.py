@@ -887,7 +887,28 @@ def _check_needs(node: StepNode, available: set[str], producers: dict[str, list[
             )
 
 
-def _verify_dataflow(nodes: list[Node], producers: dict[str, list[str]], ctx: _Ctx) -> None:
+def _produce_path_has_cycle(path: str) -> bool:
+    """Whether an artifact path template varies by ``{cycle}``: a bare ``{cycle}`` value
+    placeholder (the SAME scanner ``_scan_check``/``_check_value_body`` use), OR a helper
+    whose first argument is ``cycle`` (e.g. ``{slug(cycle)}`` — mirrors how ``_check_helper``
+    inspects a helper's first argument; artifact paths allow ``{cycle}`` as a helper arg same
+    as bare, and it renders distinctly per cycle there too)."""
+    for ph in scan(path):
+        if ph.kind == "value" and ph.raw == "cycle":
+            return True
+        if ph.kind == "helper":
+            match = _HELPER_RE.fullmatch(ph.raw)
+            if match and match.group(2).split(",")[0].strip() == "cycle":
+                return True
+    return False
+
+
+def _verify_dataflow(
+    nodes: list[Node],
+    producers: dict[str, list[str]],
+    ctx: _Ctx,
+    artifact_decls: dict[str, ArtifactDecl],
+) -> None:
     produced: set[str] = set()
     for node in nodes:
         if isinstance(node, StepNode):
@@ -917,11 +938,20 @@ def _verify_dataflow(nodes: list[Node], producers: dict[str, list[str]], ctx: _C
                 for name in child.produces:
                     _add_produce(name, produced, in_loop=False, node_id=child.id, ctx=ctx)
         elif isinstance(node, LoopNode):
+            # NOTE: a nested ParallelNode/LoopNode inside this body is invisible to both this
+            # check and _completed_cycles (walk.py) — both only look at direct StepNode
+            # children. Pre-existing, identical blind spot in both places, so not a hazard by
+            # itself; out of scope here.
+            #
             # The sanctioned re-production (§2.6) is a body step re-writing an artifact that
             # existed BEFORE the loop. A brand-new name introduced twice inside the body is a
             # real duplicate — so exempt only names present at loop entry.
             before_loop = set(produced)
             loop_new: dict[str, str] = {}
+            # Counts loop_new entries that are declared ARTIFACTS (as opposed to e.g. a new
+            # gate name) — i.e. exactly the set _completed_cycles (walk.py) keys on. A gate
+            # doesn't help it discover the cycle count, so it must not count here either.
+            new_artifact_produces = 0
             for child in node.body:
                 names = child.produces if isinstance(child, StepNode) else (child.name,)
                 cid = child.id if isinstance(child, StepNode) else child.name
@@ -940,6 +970,44 @@ def _verify_dataflow(nodes: list[Node], producers: dict[str, list[str]], ctx: _C
                     else:
                         loop_new[name] = cid
                         produced.add(name)
+                        # codex-F3 (critical): a NEW artifact first produced inside a loop body
+                        # is what _completed_cycles (walk.py) re-renders per cycle to discover
+                        # how many cycles already completed. If its path never varies by
+                        # {cycle}, every cycle renders the identical file — once it validates,
+                        # nothing can ever tell cycle N from cycle N+1 apart, so cycle discovery
+                        # cannot terminate on its own (walk.py's `while True`). A re-produced
+                        # BEFORE-loop artifact (the branch above) is exempt on purpose: it is
+                        # the same ArtifactDecl used outside the loop too, where no cycle exists
+                        # to substitute — forcing {cycle} into its path would break rendering
+                        # there, not just here.
+                        decl = artifact_decls.get(name)
+                        if decl is not None:
+                            new_artifact_produces += 1
+                            if not _produce_path_has_cycle(decl.path):
+                                _err(
+                                    f"loop {node.name!r}: step {cid!r} produces {name!r} whose "
+                                    f"path {decl.path!r} does not reference {{cycle}} — every "
+                                    "cycle would render the same artifact and the loop could "
+                                    "never detect how many cycles have completed",
+                                    ctx.file,
+                                )
+            if not new_artifact_produces:
+                # codex-F3 follow-up (medium): _completed_cycles (walk.py) collects EVERY body
+                # StepNode's produces that are declared artifacts, with no new/reproduction
+                # distinction. If the body ONLY re-produces before-loop artifacts (all exempt
+                # from the {cycle} check above, and all cycle-invariant by construction — see
+                # the note there), _completed_cycles has nothing cycle-varying to key on: every
+                # decl renders identically for every cycle, so it validates on the very first
+                # call and returns the cap immediately — the loop is reported DONE having run
+                # zero real cycles. A NEW artifact is what breaks that tie (its {cycle}-varying
+                # path is guaranteed above), so at least one must exist.
+                _err(
+                    f"loop {node.name!r}: its body must produce at least one new {{cycle}}-"
+                    "varying artifact; a body that only re-produces before-loop artifacts (or "
+                    "produces no artifact at all) cannot discover its own cycle count and would "
+                    "report done having run zero cycles",
+                    ctx.file,
+                )
 
 
 # --------------------------------------------------------------------------- #
@@ -1069,6 +1137,28 @@ def _lint_conditional_gates(raw_nodes: list, ctx: _Ctx) -> None:
 # Step 5 (part) — guards.
 # --------------------------------------------------------------------------- #
 
+# Kept here (not in guards.py) so this plan-time check and guards.py's build_shims share
+# ONE implementation — guards.py already imports GuardDecl from this module, so importing
+# _binary_name the other way round (plan.py → guards.py) would be circular.
+_GLOB_STOP = set(" \t*?[")
+
+# The supported `enforce:` layers (docs/ARCHITECTURE.md §4). Defined once, referenced by
+# _parse_guards' validation below AND by the effective-layer predicate near plan()'s emit —
+# codex-F13 / claude-F10: an unknown or empty `enforce` used to plan clean and silently
+# enforce nothing (or only the layer whose name happened to match).
+GUARD_LAYERS = ("hook", "shim", "post")
+
+
+def _binary_name(pattern: str) -> str:
+    """The real binary a ``match_command`` guards: its literal prefix up to the first
+    glob metachar or space. ``"brease* createMedia*"`` → ``"brease"``."""
+    out: list[str] = []
+    for ch in pattern:
+        if ch in _GLOB_STOP:
+            break
+        out.append(ch)
+    return "".join(out)
+
 
 def _parse_guards(raw_guards: Any, ctx: _Ctx) -> list[GuardDecl]:
     if not raw_guards:
@@ -1081,6 +1171,7 @@ def _parse_guards(raw_guards: Any, ctx: _Ctx) -> list[GuardDecl]:
         if not name:
             _err("a guard needs a 'name'", ctx.file)
         match = g.get("match", {}) or {}
+        match_command = str(match.get("command", ""))
         check_rel = g.get("check")
         if not check_rel:
             _err(f"guard {name!r} needs a 'check' script", ctx.file)
@@ -1090,6 +1181,38 @@ def _parse_guards(raw_guards: Any, ctx: _Ctx) -> list[GuardDecl]:
         on_error = g.get("on_error", "deny")
         if on_error not in ("allow", "deny"):
             _err(f"guard {name!r}: on_error must be 'allow' or 'deny', got {on_error!r}", ctx.file)
+
+        enforce = tuple(g.get("enforce", []) or [])
+        # codex-F13 / claude-F10: an unknown or empty `enforce` used to plan clean and
+        # silently enforce nothing (or only whichever layer happened to spell right) — that's
+        # a config bug, not a silent no-op, so reject it here rather than let it plan quiet.
+        unknown = [e for e in enforce if e not in GUARD_LAYERS]
+        if unknown:
+            _err(
+                f"guard {name!r}: enforce has unknown layer(s) {unknown!r} — must be one or "
+                f"more of {GUARD_LAYERS!r}",
+                ctx.file,
+            )
+        if not enforce:
+            _err(
+                f"guard {name!r}: enforce is empty — a guard that declares no layer enforces "
+                f"nothing; declare at least one of {GUARD_LAYERS!r}",
+                ctx.file,
+            )
+        if "shim" in enforce:
+            # codex-F4 (critical): build_shims derives the shimmed binary from this same
+            # prefix (guards.py:_binary_name) and does `shim_dir / binary` — a binary with a
+            # '/' collapses that join to an absolute path (Path("/a") / "/b" == Path("/b")),
+            # landing an executable OUTSIDE the shim dir at plan/run build time. Reject here,
+            # before any file is written, rather than let build_shims discover it.
+            binary = _binary_name(match_command)
+            if not binary or "/" in binary or binary in (".", ".."):
+                _err(
+                    f"guard {name!r}: match_command {match_command!r} has binary {binary!r}, "
+                    "not a bare command name (no path separators, no '.'/'..' segments, not "
+                    "empty) — a shim can only be built for a plain command on PATH",
+                    ctx.file,
+                )
 
         when_runtime = None
         src = g.get("when")
@@ -1106,14 +1229,118 @@ def _parse_guards(raw_guards: Any, ctx: _Ctx) -> list[GuardDecl]:
             GuardDecl(
                 name=name,
                 match_tool=str(match.get("tool", "")),
-                match_command=str(match.get("command", "")),
+                match_command=match_command,
                 check=check_path,
-                enforce=tuple(g.get("enforce", []) or []),
+                enforce=enforce,
                 on_error=on_error,
                 when=when_runtime,
             )
         )
     return out
+
+
+# --------------------------------------------------------------------------- #
+# claude-F10 — warn when a guard has no EFFECTIVE pre-execution layer for THIS plan's
+# resolved executor(s). `_parse_guards` above already rejects a garbage `enforce`; this is
+# the honesty check one level up — a *valid* `enforce` can still enforce nothing in practice
+# (e.g. `hook`-only under codex/grok, which don't install one). Never an error: an
+# under-enforced guard is a legitimate (if risky) authoring choice — the point is to stop it
+# being a SILENT one.
+# --------------------------------------------------------------------------- #
+
+
+def _installs_hooks(exec_name: str) -> bool:
+    """Whether cairn's own ``install_guards`` for ``exec_name`` wires a real pre-execution
+    blocking hook — read from the executor plugin's own ``Capabilities.installs_hooks`` (the
+    single source of truth, ``cairn/executors/*.py``), never hardcoded here, so a third-party
+    plugin's honest claim is respected exactly like the four built-ins. Loaded lazily via
+    ``cairn.cli``'s entry-point registry (a function-local import, matching
+    ``doctor.py:_doctor_probe_hooks`` — importing ``cairn.cli`` at module scope would cycle,
+    since ``cli.py`` imports ``plan`` at module scope). A plugin that fails to load, or isn't
+    registered, can't be credited with installing a hook — conservative default False; this is
+    a warning enrichment, never a reason to fail planning."""
+    from cairn.cli import load_executor_class
+
+    try:
+        return bool(load_executor_class(exec_name).capabilities.installs_hooks)
+    except (KeyError, AttributeError):
+        return False
+
+
+def _warn_ineffective_guards(
+    guards: list[GuardDecl],
+    resolved_models: dict[str, tuple[str, str, str | None]],
+    warnings: list[Finding],
+) -> None:
+    """Append one warning per guard whose ``enforce`` yields no effective pre-execution layer
+    (see the section note above). Effective iff: ``"shim" in enforce`` (always wired for shim
+    guards, for EVERY executor — `cli.py`'s ``_wrap_guards`` prepends the shim dir to every
+    invocation's PATH regardless of which executor(s) the plan resolves) OR (``"hook" in
+    enforce`` AND EVERY executor this plan resolves has ``installs_hooks``). ``post``-only is
+    never pre-execution — it's the artifact-validator backstop, which cannot stop a
+    side-effecting command before it runs.
+
+    The ``hook`` check is deliberately per-executor, not "any resolved executor installs
+    hooks": a plan mixing e.g. ``claude`` and ``codex`` steps has hook coverage for the claude
+    steps only — a matching command under the codex step is NOT blocked pre-execution, and a
+    plan-wide "some executor installs hooks" verdict would silently hide that gap. When
+    coverage is partial, the warning names exactly which resolved executor(s) don't install
+    hooks, so the guard author knows which steps are actually unprotected.
+
+    Also: if the plan has agent steps (``resolved_models`` non-empty) and declares ZERO guards
+    at all, one informational warning — agent tool use is otherwise wholly unrestricted before
+    execution."""
+    if not guards:
+        if resolved_models:
+            warnings.append(
+                Finding(
+                    "info",
+                    "no guards declared — agent tool use is unrestricted before execution; "
+                    "only the post artifact-validator applies",
+                )
+            )
+        return
+
+    exec_names = {exec_name for exec_name, _model, _effort in resolved_models.values()}
+    uncovered = sorted(name for name in exec_names if not _installs_hooks(name))
+
+    for guard in guards:
+        if "shim" in guard.enforce:
+            continue
+        if "hook" in guard.enforce:
+            if exec_names and not uncovered:
+                continue  # every resolved executor installs hooks — fully effective
+            if uncovered:
+                uncovered_repr = "{" + ", ".join(repr(n) for n in uncovered) + "}"
+                warnings.append(
+                    Finding(
+                        "warning",
+                        f"guard {guard.name!r}: enforce={guard.enforce!r} but executor(s) "
+                        f"{uncovered_repr} do not install hooks — the command is NOT blocked "
+                        "before it runs under them; only the post validator applies",
+                    )
+                )
+            else:
+                # No agent step in the sliced range resolves ANY executor — there is no
+                # PreToolUse to intercept at all, so a hook-enforced guard is unreachable.
+                warnings.append(
+                    Finding(
+                        "warning",
+                        f"guard {guard.name!r}: enforce={guard.enforce!r} but no agent step "
+                        "in this plan resolves an executor that installs hooks — only the "
+                        "post validator applies; the command is NOT blocked before it runs",
+                    )
+                )
+            continue
+        # enforce == ("post",) — the only remaining valid, non-empty combination
+        warnings.append(
+            Finding(
+                "warning",
+                f"guard {guard.name!r}: enforce={guard.enforce!r} — post is a backstop "
+                "only (the artifact validator; it cannot stop a side-effecting command "
+                "before it runs) — no pre-execution layer is configured",
+            )
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -1419,7 +1646,7 @@ def plan(
     )
 
     active, skips = _build(raw_steps, ctx, in_loop=False)
-    _verify_dataflow(active, producers, ctx)
+    _verify_dataflow(active, producers, ctx, artifact_decls)
     _lint_conditional_gates(raw_steps, ctx)
 
     for name in artifact_decls:
@@ -1441,6 +1668,11 @@ def plan(
     guards = _parse_guards(doc.get("guards", []), ctx)
 
     emitted, resolved_models = _emit(active, executor, step_executors, config, from_node, to_node, str(pfile))
+
+    # claude-F10: honest enforcement — warn (never error) when a guard's declared enforce
+    # layers yield no effective pre-execution block for THIS plan's resolved executor(s), or
+    # when agent steps run wholly unguarded. Only in range guards + resolved_models are used.
+    _warn_ineffective_guards(guards, resolved_models, warnings)
 
     # Range-scoped tool preflight — offline; the workspace-wide scan is a lazy fallback
     # that only runs for a needed_by target the current pipeline can't account for. The

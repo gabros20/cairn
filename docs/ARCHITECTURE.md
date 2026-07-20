@@ -169,7 +169,11 @@ operator"), then validate `produces` like any step.
 ## 4. Guard enforcement matrix
 
 Guards declare `enforce:` layers; the engine wires what each executor supports and *always* keeps
-`post` on:
+`post` on. `enforce:` is **validated at plan time** (codex-F13/claude-F10, W3b): every member must be
+one of `plan.GUARD_LAYERS = ("hook", "shim", "post")` and the list must be non-empty — an unknown
+member (a typo like `shimm`) or an empty `enforce: []` is a `ConfigError` naming the guard and the bad
+value, not a silent no-op. This catches the *spelling* class of "declared but not actually enforced";
+see below for the *no executor actually enforces it* class, which is a warning, not an error.
 
 | Layer | Claude | Codex | Grok | shell |
 |---|---|---|---|---|
@@ -182,11 +186,52 @@ walker's hard artifact gate, always on. `shim` is live too: for any plan carryin
 guards, `cairn run`/`resume` builds a fresh per-run shim dir (`.cairn/shims`, via
 `guards.build_shims`) and wraps every executor in a `GuardedExecutor` that prepends that dir to each
 invocation's PATH (`cli.py:_wrap_guards`), so a guarded, PATH-resolved binary is intercepted before it
-runs — independent of the hook layer. The `hook` layer is **built** (the capability flags, `guards.py`'s
-check chain + `--shim-check` entry shared with the shims, and the empirical `cairn doctor --probe-hooks`,
-C4 — see IMPLEMENTATION-PLAN) but its per-executor **install is still a documented no-op**: the inner
-executors' `install_guards` does not yet wire the native pre-tool hooks. So today a guarded command is
-caught by the shim and the post validator, not by a native hook.*
+runs — independent of the hook layer. The `hook` layer now **installs for `claude`**:
+`ClaudeExecutor.install_guards` writes `<run_dir>/.claude/settings.json` with a `PreToolUse` array whose
+hook command runs `guards.py`'s `--hook-check` entry — the SAME guard chain (`_run_chain`) the shims run,
+so a `hook`-enforced guard blocks a guarded `Bash` command before it executes (deny-JSON on stdout;
+fail-closed on any error). A plan with no `hook`-enforced guards installs nothing. **`codex` and `grok`
+install remain no-ops** — their `install_guards` does not yet wire native hooks, so for those two a
+guarded command is still caught by the shim and the post validator, not by a native hook. (The
+`--hook-check` install path is unit-tested; the live "claude actually blocks" fact is confirmed
+per-machine by `cairn doctor --probe-hooks`, not by the unit suite.)*
+
+*`Capabilities` now separates two facts that used to be conflated in one field (grok-F3 / W3b):
+`blocking_hooks` is the CLI-capability/probe question — "can this vendor's CLI block a tool call via a
+native hook at all" (`claude`=`True`, an asserted claim the C4 probe checks; `codex`/`grok`=`None`,
+unverified-by-cairn → the doctor probe decides); `installs_hooks` is the IMPLEMENTATION fact — "does
+cairn's own `install_guards` for this executor actually wire that hook for a run" (`claude`=`True`,
+`codex`/`grok`/`shell`/`stub`=`False`). Grok's CLI genuinely ships blocking PreToolUse hooks (see the
+probe note below) but cairn doesn't install one for it, so asserting `blocking_hooks=True` there was
+dishonest about what THIS FRAMEWORK does — it now reads `None`, same as codex. **`plan()` warns** (never
+errors — an under-enforced guard is a legitimate, if risky, authoring choice) when a guard's `enforce`
+yields no EFFECTIVE pre-execution layer for the plan's resolved executor(s): effective iff
+`"shim" in enforce` (always wired, for EVERY executor — the shim dir is prepended to PATH regardless of
+which executor(s) the plan resolves) OR (`"hook" in enforce` AND **every** executor the plan resolves has
+`installs_hooks=True`). The `hook` check is deliberately per-executor, not "some resolved executor
+installs hooks": a plan mixing `claude` and `codex` steps has hook coverage for the claude steps only, so
+a plan-wide "some executor installs hooks" verdict would silently hide a codex step's guarded command
+going unblocked. When coverage is partial, the warning names exactly which resolved executor(s) lack it
+— `guard 'no-deploy': enforce=('hook',) but executor(s) {'codex'} do not install hooks — the command is
+NOT blocked before it runs under them; only the post validator applies` — so `claude`+`codex`+`hook`-only
+warns naming `codex` even though `claude` IS covered, and `claude`-only never warns. A `post`-only guard
+warns under any executor set. Separately, a plan with agent steps and **zero** guards at all gets one
+informational warning that agent tool use is unrestricted pre-execution.*
+
+*Both the shim and hook manifests (the guard decls a command is checked against) live OUTSIDE the run
+dir in the gatekeys-protected state dir and are **authenticated**: a per-run HMAC over the manifest
+content plus a sha256 of each check script, keyed by the run secret held outside the agent's write
+scope (`gatekeys`). A sandboxed executor (codex `--sandbox workspace-write`) therefore cannot rewrite
+the policy — the manifest is not in its cwd; and even under claude `bypassPermissions` (whole-FS write)
+a rewritten manifest or a swapped check script **fails verification and denies** (fail-closed) unless
+the agent also steals the run secret. What the `hook` does NOT do is widen the matcher: it uses the
+SAME `fnmatch` glob as the shim, so an absolute-path / `sh -c` / `env`-prefixed / leading-space
+invocation of a guarded binary MISSES the glob and is caught only by `post` — the hook does **not**
+backstop the shim's absolute-path gap (corrected: earlier text claimed it did). The claude
+`bypassPermissions` residual is now closed by the **OS filesystem sandbox** (C8/W3c — see §5.1): the
+`SandboxWrapper` (`cairn.kernel.sandbox`) prefixes claude's argv with an OS-native launcher that makes
+the **gatekeys dir read-only**, so the agent can read the secret its hook needs but cannot forge or
+plant a manifest, nor write outside `run_dir + workspace`. `post` remains the hard gate regardless.*
 
 **The C4 probe settles a specific burden.** The `claude` executor runs headless with
 `--permission-mode bypassPermissions` (it must — see API §7 / SECURITY §1.2: the default mode refuses
@@ -198,8 +243,11 @@ dev machine it does: `claude` PreToolUse **fires+blocks** under `bypassPermissio
 is falsified where probed. `bypassPermissions` bypasses the interactive prompt but does **not** disable
 hooks. This is a per-machine, per-CLI-version fact, not a universal guarantee: treat
 `blocking_hooks=True` as the design's assumption and the probe as the standing per-machine check that
-confirms it. (Codex's `blocking_hooks` stays `None` in code by design — the probe, not the capability
-field, carries codex's per-machine truth.)
+confirms it. (Codex's and, since W3b, grok's `blocking_hooks` both stay `None` in code by design — the
+probe, not the capability field, carries their per-machine truth. Grok's CLI probes hook-primary just
+like claude's — see below — but cairn's `install_guards` doesn't wire it, so `blocking_hooks=True`
+would have overstated what *this framework* enforces; `installs_hooks=False` says that honestly and
+`None` leaves the CLI-capability question to the probe, exactly as codex already did.)
 
 `cairn doctor --probe-hooks` empirically probes hook firing per executor — it spawns a throwaway canary
 project carrying a native deny-hook, invokes the vendor CLI headlessly under the executor's real argv
@@ -213,6 +261,21 @@ other hook failure (crash, timeout, malformed output) fails OPEN**, so for grok 
 layers are the backstop against a broken hook, not just a bypassed one. The check script contract is
 one file, one convention (exit 0/2), reused across all three layers.
 
+**Guard activation — runtime `when` (C9).** A `guards:` entry may carry a `when:`. A plan-time `when`
+(references only `params`/`dims`) is settled by the planner: an inactive guard is dropped entirely,
+before it ever reaches a run. A **runtime** `when` (references `gates`/`artifacts`/`run`/`cycle`) can't
+be settled until mid-run, so it is evaluated by the **walker**, per invocation, against trusted
+in-memory state (`self.plan.params/dims`, the W2-verified gate reader, the W6-contained artifact
+resolver) — never by the subprocess, and never re-read from the agent-writable `run.json`. The walker
+writes a fresh, per-invocation SIGNED manifest (same `write_manifest`/MAC machinery as the static
+install, keyed by step+cycle so `parallel:` children never share a path) containing only the
+CURRENTLY-active guards, and points that invocation's `CAIRN_SHIM_MANIFEST`/`CAIRN_HOOK_MANIFEST` at it
+(env-first: the static once-per-run manifest is the fallback when no guard has a runtime `when`, which
+is the common case and costs nothing extra). The shim/hook decision path (`_run_chain`) is completely
+unaware of any of this — an inactive guard is simply absent from the manifest it loads, which it
+already treats as "skip". A guard whose `when` can't evaluate (e.g. a referenced gate/artifact is
+missing) is treated ACTIVE, never dropped — full design and rationale in `GUARD-WHEN-PLAN.md`.
+
 ## 5. Isolation & environment
 
 Each invocation gets: `cwd = run dir`; env `CAIRN_RUN_DIR`, `CAIRN_STEP`, `CAIRN_WORKSPACE`
@@ -221,6 +284,77 @@ runs are safe by construction; the executor's own sandbox flags (`--sandbox work
 `--cwd`, permission mode) from its config; the guard shims prepended to PATH. The envelope states
 the isolation rule and the wrong-run tripwire (assert `run.json.params.url` matches) — belt over
 the environment's suspenders, unchanged from today.
+
+### 5.1 OS filesystem sandbox — the `SandboxWrapper` seam (C8/W3c)
+
+codex (`--sandbox workspace-write`) and grok (`--sandbox workspace`) self-contain at the OS level;
+**claude** runs `--permission-mode bypassPermissions` (whole-FS r/w, no OS sandbox — its guards are
+the app-level gate). To bring claude to parity, `CliExecutor.invoke` prefixes the built argv with an
+OS-native sandbox launcher just before spawn (`cairn.kernel.sandbox`):
+
+- **`Capabilities.sandbox`** posture per executor (`off` | `fs` | `strict`): **claude → `fs`**;
+  codex/grok/shell/stub → `off` (unwrapped, argv byte-identical to pre-C8).
+- **`SandboxWrapper`** resolves an OS-neutral **`SandboxPolicy`** (realpath-resolved rw / ro / tmp
+  paths + network flag) and dispatches to a pluggable **`SandboxBackend`**. The `fs` scope: rw =
+  `run_dir + workspace + TMPDIR`; ro = the **gatekeys state dir** (the hook/shim read the signed
+  manifest + per-run secret, but deny-default blocks *writes* there — the W3c close) + the
+  interpreter prefixes + cairn source (so the guard subprocess can exec python and import cairn
+  inside the cage); everything else denied. **Network stays ON** (the CLI's own model API needs it;
+  egress control is the deferred `strict`/`srt` tier).
+- **`NativeBackend`** (default, cairn-owned, no runtime dep) drives OS primitives already present:
+  macOS **`sandbox-exec`** with an inline SBPL profile (`(import "system.sb")` + `(deny default)` +
+  explicit `file-read*`/`file-write*` `subpath` allows + `(allow network*)`); Linux **`bwrap`**
+  (mount+pid namespaces, net left shared — no `--unshare-net`, env not cleared) with a **`landrun`**
+  (Landlock, no userns) fallback where unprivileged user namespaces are AppArmor-blocked. The seam
+  keeps a future `SrtBackend` (`@anthropic-ai/sandbox-runtime`, which also brings egress control for
+  `strict`) a drop-in behind the same interface.
+- **Degradation is loud-not-silent:** a missing/failed primitive → the step runs UNSANDBOXED with a
+  one-time `sandbox-unavailable` warning; `cairn doctor` WARNs per `fs` executor. Availability >
+  strictness by default (`post` remains the hard gate); no single OS sandbox is trusted alone
+  (CVE-2026-55607). Full design: `docs/CLAUDE-SANDBOX-PLAN.md`.
+
+**Config isolation per CLI (W4).** Each executor also seals its process from *ambient user
+config*, so identical pipeline runs are deterministic regardless of the operator's local
+`~/.claude`, `$CODEX_HOME/config.toml`, or `~/.grok` state:
+- **claude**: `--setting-sources project` loads only the run-dir `.claude/settings.json`
+  (the "project" source) that `install_guards` writes — the cairn guard hook stays authoritative
+  while the user's `~/.claude/settings.json` is dropped; `--strict-mcp-config` drops any ambient
+  MCP servers. The prompt itself rides on stdin, not argv (`-p`/`--print` without the positional
+  `prompt` arg reads stdin) — keeps the envelope off `ps`/`/proc/*/cmdline` and off the
+  `MAX_ARG_STRLEN` ceiling. `--no-session-persistence` disables the on-disk session transcript
+  entirely, so `Capabilities.session_capture` is `None` (there is nothing to capture).
+- **codex**: `--ignore-user-config` skips `$CODEX_HOME/config.toml` (auth still uses
+  `CODEX_HOME`); `--ignore-rules` skips user/project execpolicy `.rules` files; `--ephemeral`
+  (W5b) runs without persisting session files to disk, so `Capabilities.session_capture` is
+  `None` — the old `~/.codex/sessions/**` glob was dead, nothing ever consumed it.
+- **grok**: `--no-memory` disables cross-session memory; `--sandbox workspace` applies the
+  built-in `workspace` sandbox profile (read everywhere, write only cwd + `~/.grok/` + temp
+  dirs) — the workspace-write equivalent to codex's `--sandbox workspace-write`.
+
+**Network policy (W5b, codex-F5).** An agent's `tools.network` (API.md §3) resolves through
+`StepNode.network` (plan.py) into `Invocation.network` — parsed since plan.py existed but never
+reached an executor until this field was added. **codex** consumes it: `-c
+sandbox_workspace_write.network_access=true|false`, emitted on every invocation (not only
+under `network: true`) so a step's `false` is stated explicitly rather than left to the
+sandbox's undeclared default. **grok**'s `--sandbox <PROFILE>` is a single profile governing
+filesystem AND network together, with no separate toggle to verify against the captured
+`--help` (and no enumerated profile roster to pick an alternate one from); **claude**'s CLI has
+no analogous flag. Both leave `inv.network` unconsumed on purpose rather than invent an
+unverified flag — future work, tracked in each adapter (`cairn/executors/{grok,claude}.py`).
+
+**Doctor drift checks (W5b, codex-F19/grok-F14/claude-F15).** `cairn doctor` re-verifies two
+things per in-scope executor, both WARN-level and never a reason to fail the doctor exit: (1)
+**flag presence** — each adapter declares a small `_emitted_flags` const (the flags/tokens its
+`_build_command` can emit); doctor greps the installed CLI's `--help` (`codex exec --help` for
+codex) for each as a whole token, and warns by name on a miss (e.g. "claude --setting-sources
+not advertised by installed claude"); (2) **model validation** — grok's configured tier models
+are checked against `grok models`' live roster; claude's against the alias set
+(opus/sonnet/haiku/fable) plus the dated-id shape; codex has no queryable model roster, so
+nothing is checked (documented, not silent). A help-fetch failure is one warning, never a crash
+and never a false positive per flag. The doctor version probe itself is also hardened: a
+bad-shim/ENOEXEC binary that `shutil.which` resolves but that fails to spawn raises
+`ExecutorSpawnError` (a `CairnError`, post-W1) — caught into a clean Finding, mirroring the
+`cli.py` fix from W5a.
 
 ## 6. The envelope — AX as a specification
 
@@ -294,10 +428,21 @@ it as a tool. Composition happens above the pipeline, never inside a step.
 
 ## 10. Reproducibility
 
-`run.json` records: pipeline content-hash, workspace git rev (if any), cairn version, executor
-versions (`codex --version` …), resolved model IDs per step (date-pinned where the vendor allows),
-params, dims. `cairn resume` warns on any drift. Two runs with equal hashes and params differ only
-by model nondeterminism — the maximum honesty possible in this domain.
+`run.json` records: pipeline content-hash, workspace git rev + dirty flag (if any — `null` outside
+a git repo or when `git` is unavailable), cairn version, executor versions (each resolved
+executor's `--version`, probed once at mint; a probe failure records `null`, never a mint crash),
+resolved model IDs per step (date-pinned where the vendor allows), params, dims. `cairn resume`
+warns (never refuses) on drift in either the executor versions or the git rev — a newer CLI or a
+workspace commit since mint doesn't invalidate what's already on disk, unlike a changed pipeline
+(hash drift, refuses without `--force`) or a cross-major cairn version. Two runs with equal hashes
+and params differ only by model nondeterminism — the maximum honesty possible in this domain.
+
+Every node's `run.json` `at` is the REAL wall-clock transition time (`datetime.now(timezone.utc)`
+at the moment the status is written), not the walk's construction-time clock — a multi-hour run's
+`cairn ps` and post-mortems reflect when nodes actually finished, not all-at-second-zero. Path and
+`{datetime}`-placeholder rendering still uses the walk's frozen clock, deliberately: that
+determinism (the same run renders the same artifact paths on every resume) is a different
+guarantee from an event timestamp's honesty, and the two must not be conflated.
 
 ## 11. Extension points (the pi-mono discipline)
 
@@ -314,3 +459,9 @@ Small kernel; five sanctioned plugin surfaces, each a tiny protocol + entry-poin
 Nothing else is pluggable **on purpose** — node kinds, envelope block order, the STEP protocol, and
 run-dir layout are fixed. That fixedness is what makes every cairn workspace legible to every tool
 (and every agent) that has seen one before.
+
+An Executor plugin's declared surface (`Capabilities`, the argv `_build_command` emits) is a
+claim about the vendor CLI, and claims drift out from under a plugin author as the vendor ships
+new releases. `cairn doctor` is the per-machine check on that claim (§5 above): it re-verifies a
+plugin's emitted flags and configured models against the *installed* CLI, not just that the
+binary runs — WARN-level, so a stale claim is surfaced without blocking the workspace.

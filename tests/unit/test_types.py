@@ -33,7 +33,8 @@ def test_exit_code_is_int_usable_as_process_code():
 
 def test_tiers_and_efforts_pinned():
     assert TIERS == ("reasoning", "balanced", "cheap")
-    assert EFFORTS == ("low", "medium", "high", "xhigh")
+    # W4 (claude-F11): "max" added — the claude CLI accepts it and codex/grok map it natively.
+    assert EFFORTS == ("low", "medium", "high", "xhigh", "max")
 
 
 def test_result_usage_defaults_to_none():

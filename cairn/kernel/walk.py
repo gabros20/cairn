@@ -45,7 +45,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
@@ -62,9 +62,20 @@ from cairn.kernel.compose import render_artifact_path
 from cairn.kernel.config import Config
 from cairn.kernel.errors import CairnError
 from cairn.kernel.expr import EvalError, Expr
-from cairn.kernel.gatekit import GateNeedsHuman, gate_path, resolve_gate
+from cairn.kernel.gatekeys import ensure_run_key, guard_manifest_path
+from cairn.kernel.gatekit import (
+    GateNeedsHuman,
+    GateTampered,
+    GateUnanswered,
+    read_verified_choice,
+    read_verified_decision,
+    resolve_gate,
+)
+from cairn.kernel.guards import write_manifest
+from cairn.kernel.hookprobe import _looks_like_auth_failure
 from cairn.kernel.plan import (
     GateNode,
+    GuardDecl,
     LoopNode,
     ParallelNode,
     Plan,
@@ -92,6 +103,24 @@ from cairn.kernel.types import ExitCode, Invocation
 _PLACEHOLDER = re.compile(r"\{([^{}]*)\}")
 _HELPER_CALL = re.compile(r"(\w+)\((.*)\)")
 _VALUE_KEYWORDS = frozenset({"pipeline", "date", "datetime", "cycle"})
+
+# A real auth/executor failure is terminal: the vendor CLI prints the error and exits, so the
+# signal sits in the last handful of lines, not mid-transcript. Classifying from the whole log
+# would false-positive on a legitimate (possibly long) coding step whose output happens to
+# contain a broad sign ("please run", "authentication", "/login", "log in to") — or whose task
+# IS auth/login work — and costs an unbounded read on a large agent log. 8 KiB comfortably
+# covers a vendor CLI's closing error block.
+_AUTH_TAIL_BYTES = 8192
+
+
+def _tail_text(path: Path, max_bytes: int) -> str:
+    """The last ``max_bytes`` of ``path``, decoded leniently. Empty string if absent."""
+    if not path.exists():
+        return ""
+    with open(path, "rb") as f:
+        size = f.seek(0, os.SEEK_END)
+        f.seek(max(0, size - max_bytes))
+        return f.read().decode("utf-8", errors="replace")
 
 
 # --------------------------------------------------------------------------- #
@@ -164,7 +193,9 @@ def bootstrap_run(
 
     if run_dir is not None:
         run_dir = Path(run_dir)
-        return create_run(run_dir.parent, run_dir.name, payload(run_dir.name))
+        created = create_run(run_dir.parent, run_dir.name, payload(run_dir.name))
+        ensure_run_key(created)  # mint the gate-decision secret before any gate commits
+        return created
 
     root = Path(runs_root) if runs_root is not None else workspace_dir / "runs"
     base = render_run_id(plan, now)
@@ -172,10 +203,13 @@ def bootstrap_run(
     suffix = 1
     while True:
         try:
-            return create_run(root, run_id, payload(run_id))
+            created = create_run(root, run_id, payload(run_id))
         except RunExistsError:
             suffix += 1
             run_id = f"{base}-v{suffix}"
+            continue
+        ensure_run_key(created)  # mint the gate-decision secret before any gate commits
+        return created
 
 
 # --------------------------------------------------------------------------- #
@@ -244,6 +278,7 @@ class _Walk:
         self._trail = None  # set in run()
         self._redactor: Callable[[str], str] | None = None  # built in run() from [secrets]
         self._schema_path = self.run_dir / ".cairn" / "step-return.json"
+        self._gate_nodes: dict[str, GateNode] | None = None  # name→GateNode, built lazily
 
     # -- top-level orchestration -------------------------------------------- #
 
@@ -275,29 +310,38 @@ class _Walk:
 
         with trail_writer as trail:
             self._trail = trail
-            self._emit(
-                "run-start",
-                data={
-                    "params": self.plan.params,
-                    "dims": self.plan.dims,
-                    "executors": {"default": self.plan.executor_default or ""},
-                },
-            )
-            self._install_guards()
-            self._emit(
-                "plan",
-                data={
-                    "pipeline_hash": run_doc.get("pipeline_hash"),
-                    "nodes": [self._node_id(n) for n in self.plan.nodes],
-                    "models": {
-                        sid: (f"{m}/{e}" if e else m)
-                        for sid, (_x, m, e) in self.plan.resolved_models.items()
-                    },
-                },
-            )
+            # The whole run body — run-start, guard install, the plan emit, the node loop,
+            # AND the success tail — lives inside this one try. Anything that can raise
+            # before the first node even dispatches (e.g. a plugin's install_guards) must
+            # hit the same belt as a mid-walk failure: a bare `except BaseException` scoped
+            # only around the node loop would let those escape with run.json stuck
+            # "running" — the exact corpse the belt exists to prevent (claude-F4).
             try:
+                self._emit(
+                    "run-start",
+                    data={
+                        "params": self.plan.params,
+                        "dims": self.plan.dims,
+                        "executors": {"default": self.plan.executor_default or ""},
+                    },
+                )
+                self._install_guards()
+                self._emit(
+                    "plan",
+                    data={
+                        "pipeline_hash": run_doc.get("pipeline_hash"),
+                        "nodes": [self._node_id(n) for n in self.plan.nodes],
+                        "models": {
+                            sid: (f"{m}/{e}" if e else m)
+                            for sid, (_x, m, e) in self.plan.resolved_models.items()
+                        },
+                    },
+                )
                 for node in self.plan.nodes:
                     self._dispatch(node, None)
+                self._emit("run-done", data={"nodes": len(self.plan.nodes)})
+                self._mark_run("done")
+                return ExitCode.OK
             except _Halt as halt:
                 if halt.node is not None:
                     # A needs-human halt (manual/gate awaiting an operator) is not a node
@@ -317,10 +361,23 @@ class _Walk:
                 )
                 self._mark_run("halted")
                 return halt.exit_code
-
-            self._emit("run-done", data={"nodes": len(self.plan.nodes)})
-            self._mark_run("done")
-            return ExitCode.OK
+            except BaseException as exc:
+                # Any escape that is not a clean _Halt (an unguarded stdlib exception, a
+                # kernel bug) must still leave the run in a terminal, non-"running" state —
+                # gc (SECURITY §5) never collects a run stuck "running" (claude-F4 belt).
+                # Record the halt, then re-raise unchanged so the CLI still exits non-zero;
+                # this never swallows the exception.
+                self._emit(
+                    "run-halt",
+                    node=None,
+                    data={
+                        "reason": f"internal-error: {exc}",
+                        "validator_reasons": [],
+                        "exit_code": int(ExitCode.EXECUTOR),
+                    },
+                )
+                self._mark_run("halted")
+                raise
 
     def _install_guards(self) -> None:
         seen: set[int] = set()
@@ -328,7 +385,7 @@ class _Walk:
             if id(ex) in seen:
                 continue
             seen.add(id(ex))
-            ex.install_guards(self.plan.guards, self.workspace_dir)
+            ex.install_guards(self.plan.guards, self.workspace_dir, self.run_dir)
 
     def _dispatch(self, node: Any, cycle: int | None) -> None:
         if isinstance(node, StepNode):
@@ -388,6 +445,7 @@ class _Walk:
                 )
 
         env = self._build_env(step)
+        env.update(self._active_guard_manifest(step, cycle))
         retry_attempts, feedback = step.retry
         model_str = f"{model}/{effort}" if effort else model
         reasons: list[str] = []
@@ -415,6 +473,7 @@ class _Walk:
                 timeout_s=step.timeout_s,
                 log_path=log_path,
                 return_schema=self._schema_path,
+                network=step.network,
                 redactor=self._redactor,
             )
             try:
@@ -428,7 +487,13 @@ class _Walk:
                 raise _Halt(ExitCode.EXECUTOR, step.id, f"executor failure: {exc}") from exc
 
             block = result.step or {}
+            # Defensive belt: parse_step_sentinel schema-validates learnings before returning a
+            # block (executors/base.py), but Result.step is a plain dict any Executor can hand
+            # back directly (bypassing that gate) — guard so a non-object member never raises
+            # AttributeError deep in the walker (codex-F10).
             for learn in block.get("learnings") or []:
+                if not isinstance(learn, dict):
+                    continue
                 self._emit("learn", node=step.id, cycle=cycle, data={k: learn.get(k) for k in ("note", "tag")})
 
             status = block.get("status")
@@ -443,7 +508,28 @@ class _Walk:
                 raise _Halt(ExitCode.GATE_FAILED, step.id, "step returned blocked", blockers)
 
             ok, validator_reasons = self._validate_produces(step, cycle)
-            if step.kind == "run" and result.exit_code != 0:
+            if result.exit_code != 0:
+                # A non-zero exit is checked for every step kind now (codex-F7/grok-F11/
+                # claude-F3) — an agent CLI that fails auth/API but happens to leave a
+                # valid-looking artifact must not be recorded step-done. Split by shape:
+                # an auth/executor signature in the output TAIL is exit 4, not a content
+                # problem — retrying it just re-invokes a CLI that cannot succeed, so halt
+                # immediately and skip whatever retry budget remains. Everything else is a
+                # genuine content failure and keeps the existing retry-with-feedback path.
+                tail_text = _tail_text(log_path, _AUTH_TAIL_BYTES)
+                if _looks_like_auth_failure(tail_text, result.exit_code):
+                    self._emit(
+                        "step-fail",
+                        node=step.id,
+                        attempt=attempt,
+                        cycle=cycle,
+                        data={"error": f"command exited with code {result.exit_code} (executor/auth failure)"},
+                    )
+                    raise _Halt(
+                        ExitCode.EXECUTOR,
+                        step.id,
+                        f"executor failure: command exited with code {result.exit_code}",
+                    )
                 ok = False
                 validator_reasons = validator_reasons + [f"command exited with code {result.exit_code}"]
 
@@ -513,13 +599,18 @@ class _Walk:
             self._set_status(gate.name, "skipped")
             return
         try:
+            # The REAL transition time (like _set_status, claude-F12's fix), not self.now: the
+            # `now` passed here only ever feeds gatekit._commit's `at` stamp on the decision
+            # file (gates/<name>.json, signed into the W2 HMAC as-written and verified
+            # as-written — no path/render/determinism use), so there's no determinism
+            # requirement pulling it back to the frozen construction-time clock.
             resolve_gate(
                 gate,
                 self.run_dir,
                 interactive=self.interactive,
                 presets=self.gate_presets,
                 emit=self._emit,
-                now=self.now,
+                now=datetime.now(timezone.utc),
             )
         except GateNeedsHuman as exc:
             raise _Halt(ExitCode.NEEDS_HUMAN, gate.name, "gate needs a human decision") from exc
@@ -592,7 +683,15 @@ class _Walk:
         self._set_status(node.name, "done", cycles=completed)
 
     def _completed_cycles(self, node: LoopNode) -> int:
-        """Largest N with cycles 1..N ALL having every body ``produces`` valid (re-validated)."""
+        """Largest N with cycles 1..N ALL having every body ``produces`` valid (re-validated).
+
+        Bounded by the loop's own cap (codex-F3 runtime backstop): a cycle-invariant produce
+        (one whose path template omits ``{cycle}``) renders byte-identically every cycle, so
+        it would otherwise never fail validation and this loop would spawn validators forever.
+        cairn.kernel.plan rejects that shape at plan time (a new loop-body produce must
+        reference ``{cycle}``); this cap is the backstop for a plan that reaches the walker
+        without going through that check (e.g. hand-built, or an older/bypassed plan).
+        """
         decls = [
             (name, self.plan.artifacts[name])
             for child in node.body
@@ -602,8 +701,9 @@ class _Walk:
         ]
         if not decls:
             return 0
+        cap = node.max_interactive if self.interactive else node.max_headless
         n = 0
-        while True:
+        while n < cap:
             k = n + 1
             for name, decl in decls:
                 rendered = render_artifact_path(
@@ -614,6 +714,7 @@ class _Walk:
                 if not validate(resolved, decl, self.run_dir, self.workspace_dir, self.timeout).ok:
                     return n
             n = k
+        return n
 
     # -- artifact predicates ------------------------------------------------ #
 
@@ -684,8 +785,16 @@ class _Walk:
                 if not exists(resolve_path(decl, rendered, self.run_dir)):
                     raise _Halt(ExitCode.CONFIG, step.id, f"required input {name!r} is missing")
             else:  # a gate name
-                if not gate_path(self.run_dir, name).is_file():
-                    raise _Halt(ExitCode.CONFIG, step.id, f"required gate {name!r} is unanswered")
+                gate = self._gate_node(name)
+                if gate is None:
+                    raise _Halt(ExitCode.CONFIG, step.id, f"required gate {name!r} is unknown")
+                # Verify, not just exist: a forged file must not satisfy a gate dependency.
+                try:
+                    read_verified_decision(self.run_dir, gate, self._emit)
+                except (GateUnanswered, GateTampered) as exc:
+                    raise _Halt(
+                        ExitCode.CONFIG, step.id, f"required gate {name!r} is unanswered"
+                    ) from exc
 
     # -- environment (SECURITY §1.2 — deny by default) ---------------------- #
 
@@ -694,7 +803,13 @@ class _Walk:
         # USER/LOGNAME are identity, not secrets: a macOS Keychain lookup (how `claude`/`codex`
         # find their stored OAuth credential) needs USER, so stripping it makes every executor
         # report "Not logged in". Kept in the deny-by-default baseline for that reason.
-        for key in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME"):
+        # XDG_STATE_HOME must pass through so a guard-check subprocess (the shim or the claude
+        # PreToolUse hook) resolves the SAME gatekeys/guard-manifest dir the parent minted+signed
+        # under — without it, a run with XDG_STATE_HOME set can't load the per-run secret and every
+        # guarded command fails closed (an availability break). It points at the state dir, not at
+        # a secret; the key stays 0600 outside the run dir (SECURITY §6 — the sandbox is the guard,
+        # not path secrecy).
+        for key in ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "XDG_STATE_HOME"):
             if key in os.environ:
                 env[key] = os.environ[key]
         env["CAIRN_RUN_DIR"] = str(self.run_dir)
@@ -782,11 +897,16 @@ class _Walk:
             return str(self.run_dir / rendered)
 
         def gate(name: str) -> Any:
-            path = gate_path(self.run_dir, name)
-            if not path.is_file():
+            gate_node = self._gate_node(name)
+            if gate_node is None:
                 raise KeyError(name)
-
-            return json.loads(path.read_text(encoding="utf-8")).get("choice")
+            # A forged choice must never reach a rendered shell command. A tampered file is
+            # treated as unavailable (KeyError → command placeholder error → CONFIG halt); the
+            # accessor emits gate-tamper before we raise.
+            try:
+                return read_verified_choice(self.run_dir, gate_node, self._emit)
+            except (GateUnanswered, GateTampered) as exc:
+                raise KeyError(name) from exc
 
         return TemplateContext(
             params=self.plan.params,
@@ -824,6 +944,64 @@ class _Walk:
             return bool(expr.evaluate(self._resolver(cycle)))
         except EvalError as exc:
             raise _Halt(ExitCode.CONFIG, node_id, f"expression error: {exc}") from exc
+
+    def _guard_active(self, guard: GuardDecl, cycle: int | None) -> bool:
+        """Is ``guard`` currently enforced (GUARD-WHEN-PLAN.md §7)? A static guard (``when is
+        None``) is always active. A runtime ``when`` is evaluated against the SAME trusted
+        resolver steps/gates use (``_resolver``) — ``params``/``dims`` from ``self.plan`` in
+        memory, ``gates`` via the W2-verified reader, ``artifacts`` via the contained resolver —
+        never re-parsed from the agent-writable run dir.
+
+        Unlike ``_eval`` (steps/gates: an unevaluable ``when`` halts the whole run), a guard whose
+        ``when`` raises ``EvalError`` is treated as ACTIVE and a warning is emitted, never halted
+        and never silently dropped: over-enforcing on ambiguity is fail-safe, dropping the guard
+        would be fail-OPEN (unsafe), and halting the run over one guard's `when` is too aggressive
+        for what is, at worst, an over-block."""
+        if guard.when is None:
+            return True
+        try:
+            return bool(guard.when.evaluate(self._resolver(cycle)))
+        except EvalError as exc:
+            self._emit(
+                "guard-when-error", node=guard.name, cycle=cycle, data={"error": str(exc)}
+            )
+            return True
+
+    def _active_guard_manifest(self, step: StepNode, cycle: int | None) -> dict[str, str]:
+        """Env overrides pointing this invocation at its per-invocation guard manifest(s), or
+        ``{}`` (GUARD-WHEN-PLAN.md §3, §8).
+
+        MANDATORY fast path: if no guard in the plan carries a runtime ``when``, every
+        invocation's active set is identical to the once-per-run static install — return ``{}``
+        and let the static shim manifest / baked hook fallback stand, byte-identical to pre-C9
+        behavior, with zero per-invocation overhead. This is the regression guard for "existing
+        (no-runtime-`when`) pipelines are unaffected".
+
+        Otherwise, for each layer the plan actually enforces guards at, evaluate the active
+        subset (``_guard_active``) and write a freshly SIGNED manifest (same ``write_manifest``
+        builder, same MAC — the subprocess enforcement path is untouched) containing ONLY the
+        active guards, at a path keyed by ``step.id`` + ``cycle`` (``gatekeys.guard_manifest_path``
+        ``key=``) so concurrent ``parallel:`` children never share a manifest file (§6; retries are
+        sequential and a guard's ``when`` doesn't change across attempts of the same step, so
+        attempt is not part of the key). The manifest never carries the `when` expression itself
+        (`_load_manifest_guard` still sets `when=None` on reload) — inactive guards are simply
+        absent, and absence is what `_run_chain` already treats as "skip"."""
+        if not any(g.when is not None for g in self.plan.guards):
+            return {}
+
+        key = f"{step.id}-c{cycle}"
+        overrides: dict[str, str] = {}
+        for layer, env_var in (("shim", "CAIRN_SHIM_MANIFEST"), ("hook", "CAIRN_HOOK_MANIFEST")):
+            if not any(layer in g.enforce for g in self.plan.guards):
+                continue
+            active = [
+                g for g in self.plan.guards
+                if layer in g.enforce and self._guard_active(g, cycle)
+            ]
+            path = guard_manifest_path(self.run_dir, layer, key=key)
+            write_manifest(active, workspace_dir=self.workspace_dir, run_dir=self.run_dir, path=path)
+            overrides[env_var] = str(path)
+        return overrides
 
     def _resolver(self, cycle: int | None) -> Callable[[str, tuple[str, ...]], Any]:
         def resolve(root: str, parts: tuple[str, ...]) -> Any:
@@ -880,15 +1058,44 @@ class _Walk:
             raise EvalError(f"artifact {name!r} is not readable JSON: {exc}") from exc
         return self._index(doc, parts[1:], f"artifacts.{name}") if parts[1:] else doc
 
+    def _gate_node(self, name: str) -> GateNode | None:
+        """The GateNode named ``name`` anywhere in the plan (recursing parallels/loops), or None.
+
+        Needed by every gate-decision reader other than ``resolve_gate`` so it can run the SAME
+        MAC verification (the accessor needs the node's ``name`` for the MAC and ``options`` for
+        the membership check). Built once, cached.
+        """
+        if self._gate_nodes is None:
+            index: dict[str, GateNode] = {}
+
+            def collect(nodes) -> None:
+                for node in nodes:
+                    if isinstance(node, GateNode):
+                        index[node.name] = node
+                    elif isinstance(node, ParallelNode):
+                        collect(node.steps)
+                    elif isinstance(node, LoopNode):
+                        collect(node.body)
+
+            collect(self.plan.nodes)
+            self._gate_nodes = index
+        return self._gate_nodes.get(name)
+
     def _resolve_gate_ref(self, parts: tuple[str, ...]) -> Any:
         if not parts:
             raise EvalError("gates needs a name (e.g. gates.tone.choice)")
         name = parts[0]
-        path = gate_path(self.run_dir, name)
-        if not path.is_file():
-            raise EvalError(f"gate {name!r} is unanswered")
-
-        doc = json.loads(path.read_text(encoding="utf-8"))
+        gate = self._gate_node(name)
+        if gate is None:
+            raise EvalError(f"unknown gate {name!r} in expression")
+        # Verify the MAC here too: a compromised step can overwrite a legitimately-resolved
+        # decision file within the same walk, and `when:` control flow must not trust a forge.
+        try:
+            doc = read_verified_decision(self.run_dir, gate, self._emit)
+        except GateUnanswered as exc:
+            raise EvalError(f"gate {name!r} is unanswered") from exc
+        except GateTampered as exc:
+            raise EvalError(f"gate {name!r} decision failed authentication") from exc
         return self._index(doc, parts[1:], f"gates.{name}") if parts[1:] else doc
 
     # -- trail / run.json bookkeeping (locked, single-writer) --------------- #
@@ -898,7 +1105,11 @@ class _Walk:
             return self._trail.emit(event, node=node, attempt=attempt, cycle=cycle, data=data)
 
     def _set_status(self, node_id: str, status: str, cycles: int | None = None) -> None:
-        at = format_at(self.now)
+        # The REAL transition time, not self.now (the walk's construction-time clock — kept
+        # for path/template rendering determinism elsewhere, see the `now=self.now` call
+        # sites above). A node's `at` is an event, not a rendered value: a 3-hour run must
+        # not record every node finishing at second zero (claude-F12).
+        at = format_at(datetime.now(timezone.utc))
         with self._lock:
             update_run(
                 self.run_dir,

@@ -10,6 +10,10 @@ vars so the *real* invocation env (which is inv.env EXACTLY) is what drives it:
   CAIRN_TEST_VERSION  string printed for `--version` (default below)
   CAIRN_TEST_SLEEP    seconds to sleep before responding (drives timeout tests)
   CAIRN_TEST_EXIT     exit code to return (default 0)
+  CAIRN_TEST_HELP_OMIT  comma-separated flag tokens to DROP from `--help` output (W5b doctor
+                      flag-drift tests — simulates a vendor removing a flag)
+  CAIRN_TEST_HELP_FAIL  if set, `--help` fails (exit 1, no output) — simulates a help-fetch
+                      failure (W5b doctor drift tests)
 """
 import json
 import os
@@ -20,8 +24,24 @@ from pathlib import Path
 _NAME = "claude"
 _DEFAULT_VERSION = "claude 2.1.0 (fake)"
 
+# Superset covering ClaudeExecutor._emitted_flags (cairn/executors/claude.py) — W5b doctor
+# flag-presence check.
+_HELP_FLAGS = [
+    "-p", "--model", "--effort", "--output-format", "--permission-mode",
+    "--setting-sources", "--strict-mcp-config", "--no-session-persistence",
+]
+
 if "--version" in sys.argv:
     print(os.environ.get("CAIRN_TEST_VERSION", _DEFAULT_VERSION))
+    sys.exit(0)
+
+if "--help" in sys.argv:
+    if os.environ.get("CAIRN_TEST_HELP_FAIL"):
+        sys.exit(1)
+    omit = set(os.environ.get("CAIRN_TEST_HELP_OMIT", "").split(","))
+    for flag in _HELP_FLAGS:
+        if flag not in omit:
+            print(f"  {flag}  fake help text")
     sys.exit(0)
 
 scratch = Path(os.environ["CAIRN_TEST_SCRATCH"])

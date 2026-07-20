@@ -191,6 +191,26 @@ def test_missing_cli_is_inconclusive(tmp_path, monkeypatch):
     assert "not found" in r.detail
 
 
+def test_spawn_failure_is_inconclusive_not_a_crash(fakebin, tmp_path, monkeypatch):
+    # L1 (whole-branch review): available() (shutil.which) is a TOCTOU check, not a guarantee —
+    # a resolvable-but-broken shim (asdf/mise/nvm-managed CLIs) can still fail to spawn, raising
+    # ExecutorSpawnError (a CairnError, post-W1), NOT a bare OSError. The fake claude IS on PATH
+    # (available() sees it), but every run_process call is forced to raise as if the binary
+    # couldn't actually start. Must FAIL against a bare `except ExecTimeout` (the error would
+    # propagate uncaught through probe() and this test would error, not assert) and PASS once
+    # hookprobe catches CairnError alongside ExecTimeout.
+    from cairn.kernel.errors import ExecutorSpawnError
+
+    def _boom(*args, **kwargs):
+        raise ExecutorSpawnError("'claude' failed to start: [Errno 8] Exec format error", executable="claude")
+
+    monkeypatch.setattr(hookprobe, "run_process", _boom)
+    r = probe(ClaudeHookRecipe(), workspace_dir=tmp_path)  # must not raise
+    assert r.outcome == "inconclusive"
+    assert r.cli_version is None  # version() hit the same spawn failure, best-effort → None
+    assert "failed to start" in r.detail
+
+
 # --------------------------------------------------------------------------- #
 # Codex recipe against its fake (isolated CODEX_HOME).
 # --------------------------------------------------------------------------- #
@@ -240,8 +260,11 @@ def test_grok_auth_failure_is_inconclusive(fakebin, tmp_path):
 
 
 def test_grok_exit_policy_true_falsified_is_error():
-    # GrokExecutor.capabilities.blocking_hooks is True, so a live no_fire/fires_no_block verdict
-    # is a FALSIFICATION → doctor error (falsified design claim). This must not be softened.
+    # render()'s policy math for an asserted blocking_hooks=True claim (grok used here only as
+    # a realistic ProbeResult.executor label — GrokExecutor.capabilities.blocking_hooks itself
+    # is None as of W3b, since cairn does not install a grok hook; see test_capabilities in
+    # test_executors_grok.py). A live no_fire/fires_no_block verdict against an asserted True
+    # is a FALSIFICATION → doctor error. This must not be softened.
     for outcome in ("no_fire", "fires_no_block"):
         lvl, _ = render(
             ProbeResult("grok", outcome, "d", "v", "under bypassPermissions", "m"), True
@@ -562,9 +585,30 @@ def test_codex_copied_auth_dies_with_the_canary(fakebin, tmp_path, monkeypatch):
 
 def test_claude_invocation_carries_bypass_permissions(tmp_path):
     argv, stdin_text = ClaudeHookRecipe().build_invocation(tmp_path, "PROMPT", "haiku")
-    assert argv[0] == "claude" and stdin_text is None
+    assert argv[0] == "claude" and stdin_text == "PROMPT"  # W4: prompt on stdin, not argv
     assert "--permission-mode" in argv and "bypassPermissions" in argv
     assert "haiku" in argv
+
+
+def test_claude_invocation_mirrors_real_executor_argv(tmp_path):
+    """The recipe argv must equal the REAL ClaudeExecutor argv (minus effort) EXACTLY.
+
+    Pinned by construction (not a copied list): drift in either direction — the executor
+    changing shape (W4: prompt to stdin, config-isolation flags) or the recipe growing stale —
+    fails this test loudly."""
+    from cairn.executors.claude import ClaudeExecutor
+    from cairn.kernel.config import ExecutorConfig
+    from cairn.kernel.types import Invocation
+
+    inv = Invocation(
+        prompt_file=tmp_path / "p.md", model="haiku", effort=None, cwd=tmp_path,
+        env={}, timeout_s=60, log_path=tmp_path / "l.log", return_schema=tmp_path / "s.json",
+    )
+    exec_argv, exec_stdin = ClaudeExecutor(ExecutorConfig(name="claude"))._build_command(inv, "PROMPT")
+    recipe_argv, recipe_stdin = ClaudeHookRecipe().build_invocation(tmp_path, "PROMPT", "haiku")
+
+    assert recipe_argv == exec_argv  # exact mirror — no probe-only extra flag for claude
+    assert recipe_stdin == exec_stdin == "PROMPT"
 
 
 # --------------------------------------------------------------------------- #

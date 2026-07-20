@@ -470,6 +470,248 @@ def test_missing_allowlist_fragment_is_an_error(tmp_path):
     assert "nope" in str(exc.value)
 
 
+_GUARD_CHECK = {"guards/check.sh": "#!/bin/sh\nexit 0\n"}
+
+
+def _guard_steps(match_command: str) -> str:
+    return (
+        "  - { id: one, run: 'echo', produces: [a] }\n"
+        "guards:\n"
+        "  - name: evil\n"
+        f"    match: {{ tool: bash, command: {match_command!r} }}\n"
+        "    check: guards/check.sh\n"
+        "    enforce: [shim]\n"
+    )
+
+
+def test_guard_with_absolute_match_command_binary_is_a_config_error(tmp_path):
+    # codex-F4: _binary_name stops only on glob metachars/space, not '/' — an absolute
+    # match_command's derived "binary" would collapse build_shims' shim_dir/binary join to
+    # an absolute path, writing an executable outside the shim dir. Must fail at plan time.
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps("/tmp/x *"), extra=_GUARD_CHECK)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    assert "evil" in str(exc.value) and "/tmp/x" in str(exc.value)
+
+
+def test_guard_with_traversing_match_command_binary_is_a_config_error(tmp_path):
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps("../x *"), extra=_GUARD_CHECK)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    assert "evil" in str(exc.value)
+
+
+def test_guard_with_bare_binary_match_command_plans_green(tmp_path):
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps("brease *"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW)
+    assert [g.name for g in p.guards] == ["evil"]
+
+
+# --------------------------------------------------------------------------- #
+# W3b — enforce enum validation (codex-F13 / claude-F10) + effective-layer warnings.
+# --------------------------------------------------------------------------- #
+
+
+def _guard_steps_enforce(match_command: str, enforce: str) -> str:
+    return (
+        "  - { id: one, run: 'echo', produces: [a] }\n"
+        "guards:\n"
+        "  - name: evil\n"
+        f"    match: {{ tool: bash, command: {match_command!r} }}\n"
+        "    check: guards/check.sh\n"
+        f"    enforce: [{enforce}]\n"
+    )
+
+
+def test_enforce_typo_layer_is_a_config_error(tmp_path):
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps_enforce("brease *", "shimm"), extra=_GUARD_CHECK)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    assert "evil" in str(exc.value) and "shimm" in str(exc.value)
+
+
+def test_enforce_bogus_layer_is_a_config_error(tmp_path):
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps_enforce("brease *", "bogus"), extra=_GUARD_CHECK)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    assert "evil" in str(exc.value) and "bogus" in str(exc.value)
+
+
+def test_enforce_mixed_valid_and_unknown_layer_is_a_config_error(tmp_path):
+    # enforce: [hook, bogus] — one valid member alongside one bad one. Must still reject, and
+    # must name ONLY the bad member (not falsely flag 'hook' as unknown too).
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps_enforce("brease *", "hook, bogus"), extra=_GUARD_CHECK)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    assert "evil" in str(exc.value)
+    assert "['bogus']" in str(exc.value)  # only the unknown member is named, not 'hook'
+
+
+def test_enforce_empty_is_a_config_error(tmp_path):
+    steps = (
+        "  - { id: one, run: 'echo', produces: [a] }\n"
+        "guards:\n"
+        "  - name: evil\n"
+        "    match: { tool: bash, command: 'brease *' }\n"
+        "    check: guards/check.sh\n"
+        "    enforce: []\n"
+    )
+    ws = _write_ws(tmp_path, _HEADER + steps, extra=_GUARD_CHECK)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    assert "evil" in str(exc.value) and "empty" in str(exc.value)
+
+
+def test_enforce_hook_and_post_plans_green(tmp_path):
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps_enforce("brease *", "hook, post"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW)
+    assert [g.enforce for g in p.guards] == [("hook", "post")]
+
+
+def test_enforce_shim_alone_plans_green(tmp_path):
+    ws = _write_ws(tmp_path, _HEADER + _guard_steps_enforce("brease *", "shim"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW)
+    assert [g.enforce for g in p.guards] == [("shim",)]
+
+
+def _write_multi_exec_ws(tmp_path: Path, pipeline_yaml: str, *, extra=None) -> Path:
+    """Like ``_write_ws`` but claude/codex/grok are all configured with matching tiers, and
+    an agent named ``worker`` exists — for the effective-pre-execution-layer warning tests,
+    which need a real resolved-executor set to check ``installs_hooks`` against."""
+    ws = tmp_path / "ws"
+    (ws / "pipelines").mkdir(parents=True)
+    (ws / "schemas").mkdir()
+    (ws / "validators").mkdir()
+    (ws / "agents").mkdir()
+    tiers = (
+        "[executors.{ex}]\nenabled = true\n[executors.{ex}.tiers]\n"
+        'reasoning = {{ model = "m1", effort = "high" }}\n'
+        'balanced = {{ model = "m2", effort = "medium" }}\n'
+        'cheap = {{ model = "m3", effort = "low" }}\n'
+    )
+    (ws / "cairn.toml").write_text(
+        '[workspace]\nname = "t"\ndefault_executor = "claude"\n'
+        + tiers.format(ex="claude")
+        + tiers.format(ex="codex")
+        + tiers.format(ex="grok")
+        + "[secrets]\nOK_TOKEN = {}\n",
+        encoding="utf-8",
+    )
+    (ws / "schemas" / "s.json").write_text('{"type":"object"}', encoding="utf-8")
+    (ws / "validators" / "v.py").write_text("#!/usr/bin/env python3\n", encoding="utf-8")
+    (ws / "pipelines" / "p.yaml").write_text(pipeline_yaml, encoding="utf-8")
+    (ws / "agents" / "worker.yaml").write_text(
+        "tier: balanced\ntools: { allow: [read] }\n", encoding="utf-8"
+    )
+    for rel, body in (extra or {}).items():
+        target = ws / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(body, encoding="utf-8")
+    return ws
+
+
+def _guarded_agent_steps(enforce: str) -> str:
+    return (
+        "  - { id: one, agent: worker, produces: [a] }\n"
+        "guards:\n"
+        "  - name: no-deploy\n"
+        "    match: { tool: bash, command: 'deploy *' }\n"
+        "    check: guards/check.sh\n"
+        f"    enforce: [{enforce}]\n"
+    )
+
+
+def test_hook_only_guard_warns_when_no_resolved_executor_installs_hooks(tmp_path):
+    ws = _write_multi_exec_ws(tmp_path, _HEADER + _guarded_agent_steps("hook"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW, executor="codex")
+    warns = [w.message for w in p.warnings if w.level == "warning"]
+    assert any(
+        "no-deploy" in w and "{'codex'}" in w and "do not install hooks" in w and "NOT blocked" in w
+        for w in warns
+    )
+
+
+def test_hook_only_guard_under_grok_also_warns(tmp_path):
+    ws = _write_multi_exec_ws(tmp_path, _HEADER + _guarded_agent_steps("hook"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW, executor="grok")
+    warns = [w.message for w in p.warnings if w.level == "warning"]
+    assert any("no-deploy" in w and "{'grok'}" in w for w in warns)
+
+
+def test_hook_only_guard_under_claude_does_not_warn(tmp_path):
+    ws = _write_multi_exec_ws(tmp_path, _HEADER + _guarded_agent_steps("hook"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW, executor="claude")
+    assert not [w for w in p.warnings if "no-deploy" in w.message]
+
+
+def test_shim_guard_never_warns_regardless_of_executor(tmp_path):
+    ws = _write_multi_exec_ws(tmp_path, _HEADER + _guarded_agent_steps("shim"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW, executor="codex")
+    assert not [w for w in p.warnings if "no-deploy" in w.message]
+
+
+def test_post_only_guard_always_warns(tmp_path):
+    ws = _write_multi_exec_ws(tmp_path, _HEADER + _guarded_agent_steps("post"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW, executor="claude")
+    warns = [w.message for w in p.warnings if w.level == "warning"]
+    assert any("no-deploy" in w and "backstop only" in w for w in warns)
+
+
+def _mixed_exec_guarded_steps(enforce: str) -> str:
+    # Two agent steps, both usable by the same `worker` agent — one left on the workspace
+    # default (claude), one overridable per-step via `step_executors`, so a single plan can
+    # resolve a MIXED executor set (the exact case the per-executor-coverage predicate exists
+    # to catch — see Finding 1 in .orchestrate/review-taskW3b-quality-r1.md).
+    return (
+        "  - { id: one, agent: worker, produces: [a] }\n"
+        "  - { id: two, agent: worker, produces: [b] }\n"
+        "guards:\n"
+        "  - name: no-deploy\n"
+        "    match: { tool: bash, command: 'deploy *' }\n"
+        "    check: guards/check.sh\n"
+        f"    enforce: [{enforce}]\n"
+    )
+
+
+def test_mixed_executor_plan_warns_naming_only_the_uncovered_executor(tmp_path):
+    # step 'one' resolves the default (claude, installs hooks); step 'two' is pinned to codex
+    # (does not) — partial coverage. The old "ANY resolved executor installs hooks" predicate
+    # would have missed this entirely (claude's presence made the whole plan look covered).
+    ws = _write_multi_exec_ws(tmp_path, _HEADER + _mixed_exec_guarded_steps("hook"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW, step_executors={"two": "codex"})
+    warns = [w.message for w in p.warnings if w.level == "warning"]
+    assert any(
+        "no-deploy" in w and "{'codex'}" in w and "'claude'" not in w and "NOT blocked" in w
+        for w in warns
+    )
+
+
+def test_mixed_executor_plan_all_claude_does_not_warn(tmp_path):
+    # Same two-step shape, but both resolve the workspace default (claude) — full coverage,
+    # no warning, confirming the tightened predicate isn't just always-warn on multi-step plans.
+    ws = _write_multi_exec_ws(tmp_path, _HEADER + _mixed_exec_guarded_steps("hook"), extra=_GUARD_CHECK)
+    p = plan(ws, "p", {}, now=NOW)
+    assert not [w for w in p.warnings if "no-deploy" in w.message]
+
+
+def test_zero_guards_with_agent_steps_gets_one_info_warning(tmp_path):
+    steps = "  - { id: one, agent: worker, produces: [a] }\n"
+    ws = _write_ws(
+        tmp_path, _HEADER + steps, agents={"worker": "tier: balanced\ntools: { allow: [read] }\n"}
+    )
+    p = plan(ws, "p", {}, now=NOW)
+    infos = [w for w in p.warnings if w.level == "info" and "no guards declared" in w.message]
+    assert len(infos) == 1
+
+
+def test_zero_guards_with_no_agent_steps_is_silent(tmp_path):
+    # A pure run:/shell pipeline has no agent tool use to warn about.
+    steps = "  - { id: one, run: 'echo', produces: [a] }\n"
+    ws = _write_ws(tmp_path, _HEADER + steps)
+    p = plan(ws, "p", {}, now=NOW)
+    assert not [w for w in p.warnings if "no guards declared" in w.message]
+
+
 def test_artifact_ref_inside_an_artifact_path_is_an_error(tmp_path):
     yaml_text = (
         "pipeline: p\nversion: 1\nrun_id: \"p-{date}\"\n"
@@ -601,6 +843,96 @@ def test_loop_body_may_reproduce_an_artifact_produced_before_the_loop(tmp_path):
         "      - { id: fix, run: 'echo', needs: [rev], produces: [seed] }\n"
     )
     ws = _write_ws(tmp_path, _LOOP_HEAD + body)
+    p = plan(ws, "p", {}, now=NOW)
+    assert isinstance(_node(p, "lp"), LoopNode)
+
+
+# --------------------------------------------------------------------------- #
+# (D) A NEW loop-body produce must vary by {cycle} (codex-F3).
+# --------------------------------------------------------------------------- #
+
+_LOOP_HEAD_INVARIANT = """pipeline: p
+version: 1
+run_id: "p-{date}"
+artifacts:
+  seed:   { path: seed.json, schema: schemas/s.json }
+  review: { path: review.json, schema: schemas/s.json }
+steps:
+  - { id: seed, run: 'echo', produces: [seed] }
+  - loop: lp
+    min: 1
+    max: { interactive: 2, headless: 1 }
+    until: "artifacts.review.ok == true"
+    body:
+"""
+
+
+def test_loop_body_produce_without_cycle_in_path_is_an_error(tmp_path):
+    # 'review' is a NEW name introduced inside the loop body (not a before-loop
+    # reproduction like 'seed'/'rev' in _LOOP_HEAD) whose path lacks {cycle} — every cycle
+    # would render the identical file, so cycle-discovery (_completed_cycles) could never
+    # tell cycle N from cycle N+1 apart.
+    body = "      - { id: review, run: 'echo', needs: [seed], produces: [review] }\n"
+    ws = _write_ws(tmp_path, _LOOP_HEAD_INVARIANT + body)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    msg = str(exc.value)
+    assert "lp" in msg and "review" in msg and "cycle" in msg.lower()
+
+
+def test_loop_body_produce_with_cycle_in_path_plans_green(tmp_path):
+    # 'rev' (from _LOOP_HEAD) is a NEW loop-body produce whose path is "rev-r{cycle}.json"
+    # — it varies by cycle, so the new check must let it through.
+    body = "      - { id: review, run: 'echo', needs: [seed], produces: [rev] }\n"
+    ws = _write_ws(tmp_path, _LOOP_HEAD + body)
+    p = plan(ws, "p", {}, now=NOW)
+    assert isinstance(_node(p, "lp"), LoopNode)
+
+
+def test_loop_body_producing_only_a_before_loop_reproduction_is_an_error(tmp_path):
+    # The body introduces NO new produce at all — it only re-produces 'seed' (declared and
+    # produced before the loop, so it's exempt from the {cycle} check above). walk.py's
+    # _completed_cycles would then have nothing cycle-varying to key on: the reproduced
+    # artifact's cycle-invariant render validates on the very first call, and the loop would
+    # be reported done having run zero real cycles. Must fail at plan time instead.
+    body = "      - { id: fix, run: 'echo', needs: [seed], produces: [seed] }\n"
+    ws = _write_ws(tmp_path, _LOOP_HEAD + body)
+    with pytest.raises(ConfigError) as exc:
+        plan(ws, "p", {}, now=NOW)
+    msg = str(exc.value)
+    assert "lp" in msg and "cycle" in msg.lower()
+
+
+def test_brease_art_review_loop_has_a_new_cycle_varying_produce(tmp_path):
+    # Guard against a regression where the shipped brease-rebuild loop's ONLY new produce
+    # stopped varying by cycle — it must keep planning green under the new "at least one new
+    # {cycle}-varying artifact" requirement too.
+    p = _brease("reimagine")
+    assert isinstance(_node(p, "art-review"), LoopNode)
+
+
+_LOOP_HEAD_HELPER_CYCLE = """pipeline: p
+version: 1
+run_id: "p-{date}"
+artifacts:
+  seed:   { path: seed.json, schema: schemas/s.json }
+  review: { path: "review-{slug(cycle)}.json", schema: schemas/s.json }
+steps:
+  - { id: seed, run: 'echo', produces: [seed] }
+  - loop: lp
+    min: 1
+    max: { interactive: 2, headless: 1 }
+    until: "artifacts.review.ok == true"
+    body:
+"""
+
+
+def test_loop_body_produce_with_helper_wrapped_cycle_in_path_plans_green(tmp_path):
+    # {slug(cycle)} is a helper call whose argument is cycle — it varies by cycle exactly
+    # like a bare {cycle} placeholder (and artifact paths already allow {cycle} as a helper
+    # arg); must NOT be rejected as cycle-invariant.
+    body = "      - { id: review, run: 'echo', needs: [seed], produces: [review] }\n"
+    ws = _write_ws(tmp_path, _LOOP_HEAD_HELPER_CYCLE + body)
     p = plan(ws, "p", {}, now=NOW)
     assert isinstance(_node(p, "lp"), LoopNode)
 

@@ -34,6 +34,19 @@ class ConfigError(CairnError):
         self.line = line
 
 
+class ExecutorSpawnError(CairnError):
+    """A subprocess failed to spawn (exit code 4): missing/non-executable binary, bad cwd, …
+
+    Carries the resolved executable name so the operator can act on it. Never carries the
+    full ``argv``/``env`` (SECURITY §1.3) — either can hold secrets — so the message is
+    limited to the executable name plus the OS diagnostic (errno/strerror).
+    """
+
+    def __init__(self, message: str, *, executable: str | None = None) -> None:
+        super().__init__(message)
+        self.executable = executable
+
+
 class ValidationFailure(CairnError):
     """An artifact failed its schema/validator (exit code 3).
 

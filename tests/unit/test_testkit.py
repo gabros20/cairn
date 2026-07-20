@@ -69,6 +69,7 @@ guards:
   - name: no-rm
     match: { tool: bash, command: "rm *" }
     check: guards/no-rm.py
+    enforce: [shim, post]
     on_error: deny
 steps:
   - id: think

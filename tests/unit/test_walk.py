@@ -16,7 +16,7 @@ import shutil
 import threading
 import time
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -26,22 +26,43 @@ from cairn.kernel.artifacts import ArtifactDecl
 from cairn.kernel.compose import make_composer
 from cairn.kernel.config import load_config
 from cairn.kernel.expr import parse as parse_expr
+from cairn.kernel.gatekeys import guard_manifests_dir
 from cairn.kernel.gatekit import answer_gate, gate_path
 from cairn.kernel.plan import (
     GateNode,
+    GuardDecl,
     LoopNode,
     ParallelNode,
     Plan,
     StepNode,
     plan as build_plan,
 )
-from cairn.kernel.runstate import load_run, node_status
+from cairn.kernel.runstate import load_run, node_status, update_run
 from cairn.kernel.trail import read_trail
 from cairn.kernel.types import ExitCode, Result
-from cairn.kernel.walk import bootstrap_run, walk
+from cairn.kernel.walk import _Walk, bootstrap_run, walk
 
 NOW = datetime(2026, 7, 3, 11, 4)
 REPO = Path(__file__).resolve().parents[2]
+GUARD_CHECKS = Path(__file__).parent / "fixtures" / "guard-checks"
+
+
+def guard(
+    check_name: str = "deny_all.py",
+    *,
+    name: str = "g",
+    tool: str = "bash",
+    command: str = "brease*",
+    on_error: str = "deny",
+    enforce: tuple[str, ...] = ("shim",),
+    when=None,
+) -> GuardDecl:
+    """A GuardDecl for walker-level `when`-activation tests (mirrors test_guards.py's ``guard``
+    builder, plus the ``when`` this module's tests actually exercise)."""
+    return GuardDecl(
+        name=name, match_tool=tool, match_command=command, check=GUARD_CHECKS / check_name,
+        enforce=enforce, on_error=on_error, when=when,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -90,12 +111,13 @@ def agent_step(
     skippable=False,
     when=None,
     env=(),
+    network=False,
 ) -> StepNode:
     return StepNode(
         id=step_id, kind="agent", agent=None, command=None, args={},
         needs=tuple(needs), needs_optional=(), produces=tuple(produces),
         when_runtime=when, timeout_s=1800, retry=retry, skippable=skippable,
-        executor="fake", tier="balanced", effort=None, env=tuple(env), network=False,
+        executor="fake", tier="balanced", effort=None, env=tuple(env), network=network,
     )
 
 
@@ -117,11 +139,11 @@ def manual_step(step_id: str, command: str, *, produces=()) -> StepNode:
     )
 
 
-def make_plan(nodes, artifacts, *, params=None, dims=None, resolved_models=None) -> Plan:
+def make_plan(nodes, artifacts, *, params=None, dims=None, resolved_models=None, guards=()) -> Plan:
     return Plan(
         pipeline="t", version=1, params=params or {}, dims=dims or {},
         run_id_template="t-{date}", nodes=tuple(nodes), artifacts=artifacts,
-        guards=(), warnings=[], executor_default="fake",
+        guards=tuple(guards), warnings=[], executor_default="fake",
         resolved_models=resolved_models or {}, skipped=(),
     )
 
@@ -146,7 +168,7 @@ class FakeExecutor:
     def resolve_model(self, tier, effort):
         return ("fake-model", effort)
 
-    def install_guards(self, guards, workspace):
+    def install_guards(self, guards, workspace, run_dir):
         return None
 
     def render_workspace(self, workspace):
@@ -199,8 +221,13 @@ def test_hello_pipeline_runs_end_to_end_headless(tmp_path: Path) -> None:
     assert (run_dir / "message.txt").read_text().strip() == "Friendly hello, world!"
 
     tone = json.loads((run_dir / "gates/tone.json").read_text())
-    # gate `at` is trail.format_at's canonical shape (UTC, ms, Z; naive NOW read as UTC).
-    assert tone == {"choice": "friendly", "by": "flag", "at": "2026-07-03T11:04:00.000Z"}
+    assert tone.pop("mac")  # HMAC-authenticated (gatekeys); asserted end-to-end in test_gatekit
+    # gate `at` is the REAL transition time (claude-F12's fix, extended to gate decisions —
+    # see test_gate_answer_records_real_time_not_frozen_now below), not the walk's frozen
+    # construction-time NOW; still trail.format_at's canonical shape (UTC, ms, Z).
+    at = tone.pop("at")
+    assert at.endswith("Z") and datetime.fromisoformat(at).tzinfo is not None
+    assert tone == {"choice": "friendly", "by": "flag"}
 
     events = [e["event"] for e in read_trail(run_dir)]
     assert events[0] == "run-start"
@@ -264,6 +291,70 @@ def test_agent_success_emits_learnings_and_usage(ws: Path, tmp_path: Path) -> No
     assert done_ev["data"]["usage"] == {"in_tokens": 10, "out_tokens": 4}
     assert done_ev["data"]["metrics"] == {"pages": 3}
     assert node_status(load_run(run_dir), "s") == "done"
+
+
+def test_invocation_network_defaults_false(ws: Path, tmp_path: Path) -> None:
+    # W5b (codex-F5): StepNode.network was parsed since plan.py but never reached an
+    # Invocation until this field was added — assert the walker's default posture is
+    # unchanged (false) when a step doesn't opt in.
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        (inv.cwd / "a.txt").write_text("hi")
+        return done_result()
+
+    ex = FakeExecutor(on_invoke)
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.OK
+    assert ex.invocations[0].network is False
+
+
+def test_invocation_network_true_reaches_the_executor(ws: Path, tmp_path: Path) -> None:
+    # W5b (codex-F5): a step's resolved network policy now threads through to Invocation —
+    # the walker construction site, not just plan.py's parse.
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan(
+        [agent_step("s", produces=["a"], network=True)], arts, resolved_models=models_for("s")
+    )
+
+    def on_invoke(inv, _n):
+        (inv.cwd / "a.txt").write_text("hi")
+        return done_result()
+
+    ex = FakeExecutor(on_invoke)
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.OK
+    assert ex.invocations[0].network is True
+
+
+def test_walker_ignores_non_dict_learnings_member_instead_of_raising(ws: Path, tmp_path: Path) -> None:
+    # codex-F10 defensive belt: parse_step_sentinel schema-validates learnings before returning
+    # a block, but Result.step is a plain dict any Executor can hand back directly, bypassing
+    # that gate. A non-object learnings member must be skipped, not raise AttributeError on
+    # `learn.get(...)` deep in the walker.
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        (inv.cwd / "a.txt").write_text("hi")
+        return Result(
+            step={
+                "status": "done",
+                "summary": "ok",
+                "artifacts": [],
+                "learnings": ["not-an-object", {"note": "kept", "tag": "capture"}],
+            },
+            exit_code=0,
+            duration_s=1.0,
+        )
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
+
+    learns = [e for e in read_trail(run_dir) if e["event"] == "learn"]
+    assert len(learns) == 1
+    assert learns[0]["data"]["note"] == "kept"
 
 
 def test_executor_reported_usage_on_result_wins_over_step_block(ws: Path, tmp_path: Path) -> None:
@@ -331,6 +422,42 @@ def test_created_at_and_node_at_are_z_terminated_utc(ws: Path, tmp_path: Path) -
     assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
     node_at = load_run(run_dir)["nodes"]["s"]["at"]
     assert node_at.endswith("Z") and datetime.fromisoformat(node_at).tzinfo is not None
+
+
+def test_two_step_run_records_differing_real_at_timestamps(ws: Path, tmp_path: Path) -> None:
+    # claude-F12: `_set_status` must stamp the REAL transition time, not the walk's frozen
+    # construction-time clock (NOW, fixed at 2026-07-03T11:04:00). Under the old bug every
+    # node's `at` was literally format_at(NOW) — identical across the whole run regardless of
+    # how long it actually took. A real sleep between two run: steps proves the fix: the
+    # trail is correct — the two records now agree.
+    arts = {
+        "a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws)),
+        "b": ArtifactDecl("b", "b.txt", validator=_nonempty(ws)),
+    }
+    plan = make_plan(
+        [
+            run_step("first", "sleep 0.3 && echo hi > {artifact:a}", produces=["a"]),
+            run_step("second", "sleep 0.1 && echo hi > {artifact:b}", needs=["a"], produces=["b"]),
+        ],
+        arts,
+    )
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    start = datetime.now(timezone.utc)
+    assert _walk(ws, plan, run_dir, {"shell": ShellExecutor()}) == ExitCode.OK
+
+    nodes = load_run(run_dir)["nodes"]
+    frozen = "2026-07-03T11:04:00.000Z"  # format_at(NOW) — the old (buggy) stamp every node got
+    assert nodes["first"]["at"] != frozen
+    assert nodes["second"]["at"] != frozen
+    assert nodes["first"]["at"] != nodes["second"]["at"]
+
+    at_first = datetime.fromisoformat(nodes["first"]["at"])
+    at_second = datetime.fromisoformat(nodes["second"]["at"])
+    # Each stamp reflects real elapsed wall-clock time since the walk started (not the
+    # frozen construction-time NOW), and they're strictly ordered by when each step's sleep
+    # actually finished — proof the trail and run.json now agree.
+    assert (at_first - start).total_seconds() >= 0.2
+    assert (at_second - at_first).total_seconds() >= 0.05
 
 
 def test_legacy_naive_created_at_still_loads(ws: Path, tmp_path: Path) -> None:
@@ -587,6 +714,33 @@ def test_gate_preset_records_by_flag_and_marks_node_done(ws: Path, tmp_path: Pat
     assert node_status(load_run(run_dir), "tone") == "done"
 
 
+def test_in_walk_gate_decision_records_real_time_not_frozen_now(ws: Path, tmp_path: Path) -> None:
+    # claude-F12's fix extends to gate decisions (found while auditing walk.py's self.now uses):
+    # resolve_gate's `now` only ever feeds gatekit._commit's `at` stamp on gates/<name>.json — an
+    # event time signed into the W2 HMAC as-written and verified as-written, with no
+    # path/render/determinism use — so it must track wall time exactly like _set_status, and
+    # exactly like `answer_gate`'s external-answer path already does (gatekit.py's own
+    # `datetime.now(timezone.utc)`, which never went through self.now in the first place).
+    gate = GateNode(name="tone", reads=(), ask="?", options=(("a", "A"),), default="a", when_runtime=None)
+    plan = make_plan([gate], {})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    start = datetime.now(timezone.utc)
+    assert _walk(ws, plan, run_dir, {}, presets={"tone": "a"}) == ExitCode.OK
+    decision = json.loads(gate_path(run_dir, "tone").read_text())
+    at = datetime.fromisoformat(decision["at"])
+
+    assert decision["at"] != "2026-07-03T11:04:00.000Z"  # not format_at(NOW), the frozen stamp
+    # format_at TRUNCATES to milliseconds (doesn't round), so `at` can read up to ~1ms before
+    # `start` even though both are real, live clock reads a few microseconds apart.
+    assert at >= start - timedelta(milliseconds=1)
+    # The MAC still verifies with the live `at` — resolve_gate re-reads and trusts the file on
+    # the very next call (a second walk() on the same run dir, i.e. resume), proving the W2
+    # gate-auth invariant holds for a live-clock `at` exactly as it did for the frozen one.
+    assert _walk(ws, plan, run_dir, {}, presets={"tone": "a"}) == ExitCode.OK
+    assert json.loads(gate_path(run_dir, "tone").read_text()) == decision  # untouched — trusted
+
+
 def test_gate_headless_without_default_halts_needs_human(ws: Path, tmp_path: Path) -> None:
     gate = GateNode(name="tone", reads=(), ask="?", options=(("a", "A"),), default="", when_runtime=None)
     plan = make_plan([gate], {})
@@ -605,7 +759,11 @@ def test_gate_tty_reprompts_then_records(ws: Path, tmp_path: Path, monkeypatch) 
     answers = iter(["nope", "b"])
     monkeypatch.setattr("builtins.input", lambda *_: next(answers))
     assert _walk(ws, plan, run_dir, {}, interactive=True) == ExitCode.OK
-    assert json.loads(gate_path(run_dir, "tone").read_text()) == {"choice": "b", "by": "tty", "at": "2026-07-03T11:04:00.000Z"}
+    tone = json.loads(gate_path(run_dir, "tone").read_text())
+    assert tone.pop("mac")  # HMAC-authenticated decision (gatekeys)
+    at = tone.pop("at")  # real transition time now, not the frozen NOW — see hello test above
+    assert at.endswith("Z") and datetime.fromisoformat(at).tzinfo is not None
+    assert tone == {"choice": "b", "by": "tty"}
 
 
 def test_externally_answered_gate_is_honored_on_walk(ws: Path, tmp_path: Path) -> None:
@@ -616,6 +774,62 @@ def test_externally_answered_gate_is_honored_on_walk(ws: Path, tmp_path: Path) -
 
     assert _walk(ws, plan, run_dir, {}) == ExitCode.OK  # no halt — already answered
     assert node_status(load_run(run_dir), "tone") == "done"
+
+
+def test_forged_gate_file_halts_needs_human_and_emits_gate_tamper(ws: Path, tmp_path: Path) -> None:
+    # End-to-end through the real walker + trail: an agent-forged (unsigned) decision file must
+    # NOT skip a defaultless gate — it halts needs-human and lands a gate-tamper trail event.
+    gate = GateNode(name="tone", reads=(), ask="?", options=(("a", "A"),), default="", when_runtime=None)
+    plan = make_plan([gate], {})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    gp = gate_path(run_dir, "tone")
+    gp.parent.mkdir(parents=True, exist_ok=True)
+    gp.write_text(json.dumps({"choice": "a", "by": "tty"}), encoding="utf-8")  # forged, no MAC
+
+    assert _walk(ws, plan, run_dir, {}) == ExitCode.NEEDS_HUMAN  # forge rejected, fail safe
+    events = [e["event"] for e in read_trail(run_dir)]
+    assert "gate-tamper" in events and events[-1] == "run-halt"
+
+
+def test_post_resolution_forge_does_not_reach_when_control_flow(ws: Path, tmp_path: Path) -> None:
+    # F-SEC-1: a gate resolves to a signed "no"; a later compromised step overwrites the decision
+    # file with a forged {"choice":"yes"}. A downstream `when: gates.deploy.choice == "yes"` step
+    # must NOT run — the `when:` reader verifies the MAC too, so the forge is rejected (gate-tamper)
+    # and the walk halts instead of shipping. This is the exact bypass F-SEC-1 flagged.
+    gate = GateNode(
+        name="deploy", reads=(), ask="?",
+        options=(("yes", "ship"), ("no", "hold")), default="no", when_runtime=None,
+    )
+    forge = agent_step("forge", produces=["fx"])
+    shipit = agent_step("shipit", produces=["fy"], when=parse_expr("gates.deploy.choice == 'yes'"))
+    arts = {
+        "fx": ArtifactDecl("fx", "fx.json", validator=_nonempty(ws)),
+        "fy": ArtifactDecl("fy", "fy.json", validator=_nonempty(ws)),
+    }
+    plan = make_plan([gate, forge, shipit], arts, resolved_models=models_for("forge", "shipit"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    answer_gate(run_dir, "deploy", "no")  # the human said NO — signed
+
+    ran: list[str] = []
+
+    def on_invoke(inv, _n):
+        step = inv.env["CAIRN_STEP"]
+        ran.append(step)
+        if step == "forge":  # the compromised step forges the human's decision to "yes", no MAC
+            gate_path(run_dir, "deploy").write_text(
+                json.dumps({"choice": "yes", "by": "tty"}), encoding="utf-8"
+            )
+            (inv.cwd / "fx.json").write_text('{"ok":1}', encoding="utf-8")
+        else:  # shipit — must never run
+            (inv.cwd / "fy.json").write_text('{"shipped":1}', encoding="utf-8")
+        return done_result()
+
+    code = _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)})
+
+    assert code == ExitCode.CONFIG               # the forged `when:` eval halts the walk
+    assert "shipit" not in ran                   # the deploy step never ran on a forged "yes"
+    assert not (run_dir / "fy.json").exists()
+    assert "gate-tamper" in [e["event"] for e in read_trail(run_dir)]
 
 
 # --------------------------------------------------------------------------- #
@@ -737,6 +951,36 @@ def test_loop_cap_continue_proceeds(ws: Path, tmp_path: Path) -> None:
     assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.OK
     assert len(ex.invocations) == 2  # ran to the cap
     assert any(e["event"] == "loop-capped" for e in read_trail(run_dir))
+
+
+def test_completed_cycles_is_bounded_by_the_loop_cap(ws: Path, tmp_path: Path) -> None:
+    """codex-F3 runtime backstop: _completed_cycles' cycle-discovery loop must not spin
+    forever on a cycle-INVARIANT produce (one whose path template omits {cycle}, so it
+    renders byte-identically — and validates identically — for cycle 1, 2, 3, ...).
+
+    cairn.kernel.plan rejects this shape at plan time for a new loop-body produce; this
+    test reaches _completed_cycles directly (bypassing that check, as a hand-built or
+    otherwise-bypassed Plan would) to prove the walker itself cannot hang on it either.
+    """
+    art = ArtifactDecl("review", "review.json", schema=_verdict_schema(ws))  # no {cycle}
+    body = agent_step("review", produces=["review"])
+    node = LoopNode(
+        name="art-review", min=1, max_interactive=3, max_headless=2,
+        until=parse_expr("artifacts.review.verdict == 'approve'"),
+        on_cap="continue", body=(body,), when_runtime=None,
+    )
+    plan_obj = make_plan([node], {"review": art}, resolved_models=models_for("review"))
+    run_dir = bootstrap_run(ws, plan_obj, now=NOW, runs_root=tmp_path / "runs")
+    # One file, at the fixed (cycle-invariant) path — it validates for every k, so nothing
+    # would ever stop a `while True` cycle-discovery loop.
+    (run_dir / "review.json").write_text(json.dumps({"verdict": "revise"}))
+
+    w = _Walk(
+        plan=plan_obj, run_dir=run_dir, workspace_dir=ws, config=load_config(ws),
+        executors={}, composer=lambda **kw: "PROMPT", interactive=False,
+        gate_presets={}, now=NOW, timeout=30,
+    )
+    assert w._completed_cycles(node) == 2  # returns at max_headless, not unbounded
 
 
 def test_loop_cap_halt_fails_gate(ws: Path, tmp_path: Path) -> None:
@@ -890,7 +1134,9 @@ def test_system_env_passthrough_is_exactly_the_pinned_set(ws: Path, tmp_path: Pa
     # env here "contains" every key, so the invocation env must equal EXACTLY the allowed
     # system set + the CAIRN_* mechanics — widening the passthrough (e.g. a secret-bearing
     # var slipping in) fails this test loudly and forces a deliberate decision.
-    monkeypatch.setattr(os, "environ", _UniversalEnv())
+    env = _UniversalEnv()
+    env["XDG_STATE_HOME"] = str(tmp_path / "xdg")  # keep the bootstrap key-mint hermetic
+    monkeypatch.setattr(os, "environ", env)
     arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
     plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
 
@@ -904,8 +1150,9 @@ def test_system_env_passthrough_is_exactly_the_pinned_set(ws: Path, tmp_path: Pa
     run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
     assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
     assert set(captured["env"]) == {
-        # the allowed system passthrough — identity + locale + tmp, nothing more
-        "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME",
+        # the allowed system passthrough — identity + locale + tmp, plus XDG_STATE_HOME so a
+        # guard-check subprocess resolves the same gatekeys/manifest dir the parent signed under
+        "PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "XDG_STATE_HOME",
         # the cairn mechanics the walker always injects
         "CAIRN_RUN_DIR", "CAIRN_STEP", "CAIRN_WORKSPACE", "CLAUDE_PROJECT_DIR",
     }
@@ -914,7 +1161,10 @@ def test_system_env_passthrough_is_exactly_the_pinned_set(ws: Path, tmp_path: Pa
 def test_absent_baseline_vars_are_omitted_not_none(ws: Path, tmp_path: Path, monkeypatch) -> None:
     # Absence tolerance: a parent env lacking USER/LOGNAME/TMPDIR/… simply omits those keys
     # from the child env — never a None value, never a crash.
-    monkeypatch.setattr(os, "environ", {"PATH": "/usr/bin:/bin", "HOME": "/tmp/h"})
+    monkeypatch.setattr(
+        os, "environ",
+        {"PATH": "/usr/bin:/bin", "HOME": "/tmp/h", "XDG_STATE_HOME": str(tmp_path / "xdg")},
+    )
     arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
     plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
 
@@ -929,7 +1179,7 @@ def test_absent_baseline_vars_are_omitted_not_none(ws: Path, tmp_path: Path, mon
     assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
     env = captured["env"]
     assert set(env) == {
-        "PATH", "HOME",
+        "PATH", "HOME", "XDG_STATE_HOME",  # XDG threaded for guard-check key-dir resolution
         "CAIRN_RUN_DIR", "CAIRN_STEP", "CAIRN_WORKSPACE", "CLAUDE_PROJECT_DIR",
     }
     assert None not in env.values()
@@ -993,6 +1243,156 @@ def test_run_command_nonzero_exit_fails_even_when_produces_validate(ws: Path, tm
 
     assert _walk(ws, plan, run_dir, {"shell": ShellExecutor()}) == ExitCode.GATE_FAILED
     assert (run_dir / "out.txt").read_text() == "ok"  # the produce IS valid — exit code still fails it
+
+
+# --------------------------------------------------------------------------- #
+# 13a2. Failure taxonomy — typed spawn errors, agent exit codes, no run left "running".
+# --------------------------------------------------------------------------- #
+
+
+def test_agent_step_absent_binary_halts_executor_not_traceback(ws: Path, tmp_path: Path) -> None:
+    """codex-F14/claude-F4: a missing executable is a typed run-halt at exit 4, not a
+    traceback that leaves run.json stuck "running"."""
+    from cairn.executors.base import run_process
+
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    class SpawnFailExecutor(FakeExecutor):
+        def __init__(self) -> None:
+            super().__init__(on_invoke=None)
+
+        def invoke(self, inv):
+            self.invocations.append(inv)
+            # Exercise the real spawn path (base.run_process), not a canned Result — this
+            # is the same OSError→ExecutorSpawnError conversion base.py:115 performs.
+            run_process(
+                ["cairn-definitely-not-a-real-binary-xyz"],
+                stdin_text=None,
+                env=inv.env,
+                cwd=inv.cwd,
+                timeout_s=inv.timeout_s,
+                log_path=inv.log_path,
+            )
+            raise AssertionError("unreachable — run_process must raise on a missing binary")
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"fake": SpawnFailExecutor()}) == ExitCode.EXECUTOR
+    assert load_run(run_dir)["status"] == "halted"
+    halt = next(e for e in read_trail(run_dir) if e["event"] == "run-halt")
+    assert halt["data"]["exit_code"] == int(ExitCode.EXECUTOR)
+
+
+def test_agent_nonzero_exit_with_auth_signature_halts_executor_and_skips_retries(
+    ws: Path, tmp_path: Path
+) -> None:
+    """codex-F7/grok-F11/claude-F3: an agent CLI that exits non-zero with an auth/executor
+    signature in its output is a step-fail → run-halt at exit 4 — even with a would-be-valid
+    artifact — and burns none of the retry budget (retrying auth failure is pure waste)."""
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"], retry=(2, True))], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        inv.log_path.parent.mkdir(parents=True, exist_ok=True)
+        inv.log_path.write_text("Error: not logged in. Please run `claude /login`.\n", encoding="utf-8")
+        (inv.cwd / "a.txt").write_text("would-be-valid", encoding="utf-8")  # a valid artifact
+        return Result(step={"status": "done", "summary": "ok", "artifacts": []}, exit_code=1, duration_s=1.0)
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    ex = FakeExecutor(on_invoke)
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.EXECUTOR
+    assert len(ex.invocations) == 1  # retry budget (2) untouched — auth failure isn't retried
+    events = [e["event"] for e in read_trail(run_dir)]
+    assert "step-fail" in events
+    assert events[-1] == "run-halt"
+
+
+def test_agent_nonzero_exit_without_auth_signature_still_retries(ws: Path, tmp_path: Path) -> None:
+    """The content-invalid retry path (walk.py ~469) stays intact: a non-zero exit with no
+    auth/executor signature in the output is a content failure, not an executor failure."""
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"], retry=(1, True))], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        inv.log_path.parent.mkdir(parents=True, exist_ok=True)
+        inv.log_path.write_text("some generic tool crash, nothing auth-related\n", encoding="utf-8")
+        (inv.cwd / "a.txt").write_text("", encoding="utf-8")  # always empty → always invalid
+        return Result(step={"status": "done", "summary": "ok", "artifacts": []}, exit_code=1, duration_s=1.0)
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    ex = FakeExecutor(on_invoke)
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.GATE_FAILED
+    assert len(ex.invocations) == 2  # original + one retry — content path preserved
+
+
+def test_agent_nonzero_exit_auth_signature_mid_transcript_does_not_halt(ws: Path, tmp_path: Path) -> None:
+    """M1/L1: classification reads only the log TAIL (walk.py's ``_tail_text``), not the whole
+    transcript. An auth-looking substring buried early — a legitimate (possibly long) coding
+    step's output, or one whose task is literally about auth — must not short-circuit
+    retries; only a signature in the CLOSING lines (where a real vendor CLI auth failure
+    actually prints, right before it exits) does."""
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"], retry=(1, True))], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        inv.log_path.parent.mkdir(parents=True, exist_ok=True)
+        early_auth_sign = "Error: not logged in. Please run `claude /login`.\n"
+        # Pad well past the 8 KiB tail window so the early sign falls outside it.
+        padding = "benign log line filling space\n" * 400
+        clean_tail = "some generic tool crash, nothing auth-related at the tail\n"
+        inv.log_path.write_text(early_auth_sign + padding + clean_tail, encoding="utf-8")
+        (inv.cwd / "a.txt").write_text("", encoding="utf-8")  # always empty → always invalid
+        return Result(step={"status": "done", "summary": "ok", "artifacts": []}, exit_code=1, duration_s=1.0)
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    ex = FakeExecutor(on_invoke)
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.GATE_FAILED
+    assert len(ex.invocations) == 2  # original + one retry — mid-transcript sign is ignored
+
+
+def test_unexpected_exception_does_not_leave_run_running(ws: Path, tmp_path: Path) -> None:
+    """claude-F4 belt: any non-_Halt exception escaping the walk still marks the run halted
+    (never "running") and records a run-halt, then re-raises so the CLI exits non-zero."""
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, _n):
+        raise RuntimeError("kaboom — not a CairnError, not an ExecTimeout")
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    with pytest.raises(RuntimeError, match="kaboom"):
+        _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)})
+
+    assert load_run(run_dir)["status"] != "running"
+    assert load_run(run_dir)["status"] == "halted"
+    halt = next(e for e in read_trail(run_dir) if e["event"] == "run-halt")
+    assert "internal-error" in halt["data"]["reason"]
+
+
+def test_install_guards_exception_does_not_leave_run_running(ws: Path, tmp_path: Path) -> None:
+    """The belt covers the whole run body, not just the node loop: an exception raised
+    BEFORE the first node ever dispatches (e.g. a plugin's install_guards, run-start/plan
+    emit) must still halt the run and record run-halt — a belt scoped only around the
+    `for node in self.plan.nodes` loop misses this call site entirely and reproduces the
+    exact "stuck running" bug sub-change 3 exists to close."""
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+
+    def unreachable(inv, _n):
+        raise AssertionError("unreachable — install_guards must raise before any node dispatches")
+
+    class GuardBoomExecutor(FakeExecutor):
+        def install_guards(self, guards, workspace, run_dir):
+            raise RuntimeError("guard plugin exploded")
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    with pytest.raises(RuntimeError, match="guard plugin exploded"):
+        _walk(ws, plan, run_dir, {"fake": GuardBoomExecutor(unreachable)})
+
+    assert load_run(run_dir)["status"] != "running"
+    assert load_run(run_dir)["status"] == "halted"
+    halt = next(e for e in read_trail(run_dir) if e["event"] == "run-halt")
+    assert "internal-error" in halt["data"]["reason"]
 
 
 # --------------------------------------------------------------------------- #
@@ -1097,3 +1497,155 @@ def test_bootstrap_suffixes_v2_on_collision(ws: Path, tmp_path: Path) -> None:
     second = bootstrap_run(ws, plan, now=NOW, runs_root=root)
     assert first.name == "t-20260703"
     assert second.name == "t-20260703-v2"
+
+
+# --------------------------------------------------------------------------- #
+# 15. Guard `when` — per-invocation manifest, walker-evaluated (C9, GUARD-WHEN-PLAN.md).
+# --------------------------------------------------------------------------- #
+
+
+def test_guard_when_gate_active_then_inactive_after_answer(ws: Path, tmp_path: Path) -> None:
+    # Before the gate is answered, `gates.approve.choice` can't be read → `_guard_active` fails
+    # safe (ACTIVE), exactly like an unresolvable ref (§7); once answered "yes" the `!=` goes
+    # false and the guard is OMITTED from the manifest — an active→inactive flip driven purely by
+    # a gate answer, the doc's motivating scenario (§1.2).
+    gate = GateNode(
+        name="approve", reads=(), ask="?", options=(("yes", "Y"), ("no", "N")),
+        default="no", when_runtime=None,
+    )
+    g = guard(
+        name="no-deploy", command="deploy*", enforce=("shim",),
+        when=parse_expr("gates.approve.choice != 'yes'"),
+    )
+    step = run_step("s", "deploy prod")
+    plan = make_plan([step, gate], {}, guards=[g])
+
+    run_a = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs-a")
+    ex_a = FakeExecutor(lambda inv, n: done_result())
+    assert _walk(ws, plan, run_a, {"shell": ex_a}) == ExitCode.OK
+    manifest_a = json.loads(Path(ex_a.invocations[0].env["CAIRN_SHIM_MANIFEST"]).read_text())
+    assert "no-deploy" in manifest_a["guards"]  # unanswered → fail-safe ACTIVE, denies
+
+    run_b = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs-b")
+    answer_gate(run_b, "approve", "yes")
+    ex_b = FakeExecutor(lambda inv, n: done_result())
+    assert _walk(ws, plan, run_b, {"shell": ex_b}) == ExitCode.OK
+    manifest_b = json.loads(Path(ex_b.invocations[0].env["CAIRN_SHIM_MANIFEST"]).read_text())
+    assert "no-deploy" not in manifest_b["guards"]  # approved → deactivated, allowed
+
+
+def test_guard_when_artifact_flips_with_content(ws: Path, tmp_path: Path) -> None:
+    arts = {"qa": ArtifactDecl("qa", "qa.json", schema=_verdict_schema(ws))}
+    g = guard(
+        name="release-gate", command="release*", enforce=("shim",),
+        when=parse_expr("artifacts.qa.verdict == 'NO-GO'"),
+    )
+    step = run_step("s", "release now")
+    plan = make_plan([step], arts, guards=[g])
+
+    run_a = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs-a")
+    (run_a / "qa.json").write_text(json.dumps({"verdict": "NO-GO"}), encoding="utf-8")
+    ex_a = FakeExecutor(lambda inv, n: done_result())
+    assert _walk(ws, plan, run_a, {"shell": ex_a}) == ExitCode.OK
+    manifest_a = json.loads(Path(ex_a.invocations[0].env["CAIRN_SHIM_MANIFEST"]).read_text())
+    assert "release-gate" in manifest_a["guards"]
+
+    run_b = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs-b")
+    (run_b / "qa.json").write_text(json.dumps({"verdict": "GO"}), encoding="utf-8")
+    ex_b = FakeExecutor(lambda inv, n: done_result())
+    assert _walk(ws, plan, run_b, {"shell": ex_b}) == ExitCode.OK
+    manifest_b = json.loads(Path(ex_b.invocations[0].env["CAIRN_SHIM_MANIFEST"]).read_text())
+    assert "release-gate" not in manifest_b["guards"]
+
+
+def test_static_guards_fast_path_writes_no_per_invocation_manifest(ws: Path, tmp_path: Path) -> None:
+    # No guard in the plan carries a runtime `when` → `_active_guard_manifest` MUST be a pure
+    # no-op: `{}` back, zero manifest files written, env untouched. The regression guard for
+    # "every existing (no-runtime-`when`) pipeline is unaffected" — this fast path is MANDATORY.
+    g = guard(name="static", command="deploy*", enforce=("shim",), when=None)
+    step = run_step("s", "deploy prod")
+    plan = make_plan([step], {}, guards=[g])
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    w = _Walk(
+        plan=plan, run_dir=run_dir, workspace_dir=ws, config=load_config(ws),
+        executors={}, composer=lambda **kw: "PROMPT", interactive=False,
+        gate_presets={}, now=NOW, timeout=30,
+    )
+    assert w._active_guard_manifest(step, None) == {}
+
+    before = set(guard_manifests_dir().glob("*"))
+    ex = FakeExecutor(lambda inv, n: done_result())
+    assert _walk(ws, plan, run_dir, {"shell": ex}) == ExitCode.OK
+    assert "CAIRN_SHIM_MANIFEST" not in ex.invocations[0].env  # no per-invocation override
+    assert set(guard_manifests_dir().glob("*")) == before  # zero per-invocation writes
+
+
+def test_parallel_children_get_distinct_guard_manifests(ws: Path, tmp_path: Path) -> None:
+    g = guard(
+        name="release-gate", command="deploy*", enforce=("shim",),
+        when=parse_expr("artifacts.qa.verdict == 'NO-GO'"),
+    )
+    arts = {
+        "qa": ArtifactDecl("qa", "qa.json", schema=_verdict_schema(ws)),
+        "a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws)),
+        "b": ArtifactDecl("b", "b.txt", validator=_nonempty(ws)),
+    }
+    child_a = agent_step("deploy-a", produces=["a"])
+    child_b = agent_step("deploy-b", produces=["b"])
+    node = ParallelNode(name="pair", on_fail="wait_all", steps=(child_a, child_b), when_runtime=None)
+    plan = make_plan([node], arts, guards=[g], resolved_models=models_for("deploy-a", "deploy-b"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    (run_dir / "qa.json").write_text(json.dumps({"verdict": "NO-GO"}), encoding="utf-8")
+
+    def on_invoke(inv, _n):
+        step = inv.env["CAIRN_STEP"]
+        (inv.cwd / ("a.txt" if step == "deploy-a" else "b.txt")).write_text("ok")
+        return done_result()
+
+    ex = FakeExecutor(on_invoke)
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.OK
+    assert len(ex.invocations) == 2
+    manifests = {inv.env["CAIRN_STEP"]: inv.env["CAIRN_SHIM_MANIFEST"] for inv in ex.invocations}
+    assert manifests["deploy-a"] != manifests["deploy-b"]  # distinct paths — no shared file/race
+    for path in manifests.values():
+        content = json.loads(Path(path).read_text())
+        assert "release-gate" in content["guards"]  # each independently, correctly enforced
+
+
+def test_guard_when_eval_error_is_fail_safe_active_with_warning(ws: Path, tmp_path: Path) -> None:
+    g = guard(
+        name="missing-ref-guard", command="deploy*", enforce=("shim",),
+        when=parse_expr("artifacts.nope.verdict == 'x'"),
+    )
+    step = run_step("s", "deploy prod")
+    plan = make_plan([step], {}, guards=[g])
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    ex = FakeExecutor(lambda inv, n: done_result())
+    assert _walk(ws, plan, run_dir, {"shell": ex}) == ExitCode.OK  # NOT a run halt
+    manifest = json.loads(Path(ex.invocations[0].env["CAIRN_SHIM_MANIFEST"]).read_text())
+    assert "missing-ref-guard" in manifest["guards"]  # ACTIVE despite the eval error — fail-safe
+
+    events = [e["event"] for e in read_trail(run_dir)]
+    assert "guard-when-error" in events  # visible, never silently swallowed
+
+
+def test_guard_when_params_read_from_memory_not_forged_run_json(ws: Path, tmp_path: Path) -> None:
+    # A params-only `when` is normally SETTLED at plan time (dropped, or made static — it never
+    # reaches here as a live Expr); hand-built directly (as every node in this module is) to prove
+    # the RESOLVER's `params` root reads `self.plan.params` in memory, never `run.json` — an agent
+    # with run-dir write access cannot flip this guard by editing the (agent-writable) file.
+    g = guard(
+        name="strict-only", command="deploy*", enforce=("shim",),
+        when=parse_expr("params.mode == 'strict'"),
+    )
+    step = run_step("s", "deploy prod")
+    plan = make_plan([step], {}, params={"mode": "strict"}, guards=[g])
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    update_run(run_dir, lambda doc: doc.__setitem__("params", {"mode": "off"}))
+
+    ex = FakeExecutor(lambda inv, n: done_result())
+    assert _walk(ws, plan, run_dir, {"shell": ex}) == ExitCode.OK
+    manifest = json.loads(Path(ex.invocations[0].env["CAIRN_SHIM_MANIFEST"]).read_text())
+    assert "strict-only" in manifest["guards"]  # still ACTIVE — the forged run.json is ignored

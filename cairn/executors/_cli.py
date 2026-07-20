@@ -9,7 +9,9 @@ here. Shell is deliberately NOT built on this (no model, no config, its own invo
 from __future__ import annotations
 
 import os
+import re
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -22,7 +24,8 @@ from cairn.executors.base import (
     run_process,
 )
 from cairn.kernel.config import ExecutorConfig
-from cairn.kernel.errors import ConfigError
+from cairn.kernel.errors import CairnError, ConfigError
+from cairn.kernel.sandbox import SandboxWrapper, build_wrapper
 
 
 def _render_doctrine(doctrine: Path) -> str:
@@ -31,22 +34,43 @@ def _render_doctrine(doctrine: Path) -> str:
     return f"{header}\n\n{doctrine.read_text(encoding='utf-8')}"
 
 
-def _probe_version(name: str, timeout_s: float = 15.0) -> tuple[int | None, str]:
-    """Run ``<name> --version`` for doctor. Uses the ambient env (a machine preflight, not an
-    agent invocation) so PATH/HOME are available. Returns (exit_code|None-on-timeout, output)."""
+def probe_argv(argv: list[str], timeout_s: float = 15.0) -> tuple[int | None, str]:
+    """Run ``argv`` for doctor (a ``--version``, ``--help``, or vendor-subcommand probe like
+    ``grok models``). Public (no leading underscore): every adapter's doctor extension needs it,
+    not just this module. Uses the ambient env (a machine preflight, not an agent invocation) so
+    PATH/HOME are available. Returns (exit_code|None-on-timeout, output). A Popen spawn failure
+    (``ExecutorSpawnError``, a ``CairnError`` per W1/W5a) is NOT caught here — it propagates so
+    callers can tell "the binary ran and said no" from "the binary couldn't even start" and
+    report each precisely."""
     with tempfile.TemporaryDirectory() as td:
         try:
             code, out, _ = run_process(
-                [name, "--version"],
+                argv,
                 stdin_text=None,
                 env=os.environ.copy(),
                 cwd=Path.cwd(),
                 timeout_s=timeout_s,
-                log_path=Path(td) / "version.log",
+                log_path=Path(td) / "probe.log",
             )
         except ExecTimeout:
             return None, ""
         return code, out.strip()
+
+
+def _probe_version(name: str, timeout_s: float = 15.0) -> tuple[int | None, str]:
+    """Run ``<name> --version`` for doctor. See :func:`probe_argv`."""
+    return probe_argv([name, "--version"], timeout_s)
+
+
+def _flag_present(flag: str, help_text: str) -> bool:
+    """Is ``flag`` present as a whole TOKEN in ``help_text`` (tolerant of column-wrapped ``--help``
+    output, e.g. ``argparse``/``clap`` two-column layouts)? Bounded on both sides by "not a word
+    char or hyphen" so ``-p`` doesn't false-match inside ``--print`` and ``--model`` doesn't
+    false-match inside a longer ``--model-foo`` some future flag might add. No manual memoization
+    here — ``re.compile`` already caches identical pattern strings internally (stdlib
+    ``re._cache``), so a second cache layer on top would just duplicate memory for nothing."""
+    pattern = re.compile(rf"(?<![\w-]){re.escape(flag)}(?![\w-])")
+    return pattern.search(help_text) is not None
 
 
 class CliExecutor:
@@ -56,9 +80,30 @@ class CliExecutor:
     name: str = ""
     _workspace_file: str | None = None  # CLAUDE.md / AGENTS.md / None
     _install_hint: str = ""
+    # The flags/tokens `_build_command` can emit — doctor asserts each is still advertised by
+    # the installed CLI's `--help` (W5b sub-change A.1). A small declared const per subclass
+    # (cleaner and less brittle than scraping `_build_command`'s argv construction). Empty here
+    # ⇒ no check — the base class itself is never instantiated directly.
+    # NOTE: this is NOT derived from `_build_command` — the two must be kept in sync by hand
+    # when an adapter's argv changes (an accepted tradeoff per the W5b brief: a declared const
+    # is cleaner/less brittle than scraping argv construction, at the cost of manual upkeep).
+    _emitted_flags: tuple[str, ...] = ()
 
     def __init__(self, config: ExecutorConfig) -> None:
         self.config = config
+
+    def _help_argv(self) -> list[str]:
+        """argv that prints the help text covering the flags `_build_command` emits. Override
+        when that help lives under a subcommand (codex: `codex exec --help`, not the top-level
+        `codex --help` — `exec`'s flags are a different set)."""
+        return [self.name, "--help"]
+
+    def _model_findings(self) -> list[Finding]:
+        """Best-effort: do the workspace's configured tier models look like ones the installed
+        CLI actually knows about (W5b sub-change A.2)? Override per-executor; the default here
+        is a documented no-op, not a silent gap — see the executor that relies on it (codex: no
+        CLI command enumerates a model roster to check against)."""
+        return []
 
     # -- model resolution --------------------------------------------------- #
 
@@ -79,6 +124,21 @@ class CliExecutor:
     def invoke(self, inv: Invocation) -> Result:
         prompt_text = inv.prompt_file.read_text(encoding="utf-8")
         argv, stdin_text = self._build_command(inv, prompt_text)
+        # C8/W3c: prefix argv with the OS filesystem-sandbox launcher for a `fs`/`strict` executor
+        # (claude). A no-op passthrough when the posture is `off` (codex/grok/shell/stub → argv
+        # byte-identical to pre-C8) or when the primitive is unavailable (loud-not-silent
+        # degradation — a single `sandbox-unavailable` warning, the step still runs). The prompt
+        # is delivered on stdin (unchanged), and run_process spawns EXACTLY this argv.
+        sandbox = self._sandbox()
+        workspace = inv.env.get("CAIRN_WORKSPACE")
+        argv = sandbox.wrap(
+            argv, inv, run_dir=inv.cwd,
+            workspace=Path(workspace) if workspace else inv.cwd,  # walk.py always sets it; fall
+            # back to the run dir rather than KeyError if a caller omits it (off-posture ignores it)
+        )
+        reason = sandbox.take_warning()
+        if reason is not None:
+            print(f"cairn: sandbox-unavailable: {self.name}: {reason}", file=sys.stderr)
         exit_code, output, duration_s = run_process(
             argv,
             stdin_text=stdin_text,
@@ -99,6 +159,17 @@ class CliExecutor:
         CLI's ``--help`` at doctor time; vendors drift."""
         raise NotImplementedError
 
+    def _sandbox(self) -> SandboxWrapper:
+        """The OS filesystem-sandbox wrapper for this executor, built once from its
+        ``capabilities.sandbox`` posture and cached. ``off`` posture → a pure passthrough
+        (codex/grok/shell/stub); ``fs`` → the OS-default backend (C8/W3c)."""
+        wrapper = getattr(self, "_sandbox_wrapper", None)
+        if wrapper is None:
+            posture = getattr(self.capabilities, "sandbox", "off")
+            wrapper = build_wrapper(posture)
+            self._sandbox_wrapper = wrapper
+        return wrapper
+
     # -- workspace + guards ------------------------------------------------- #
 
     def render_workspace(self, ws) -> None:
@@ -113,15 +184,32 @@ class CliExecutor:
             return  # idempotent: only write when missing or changed
         target.write_text(content, encoding="utf-8")
 
-    def install_guards(self, guards, ws) -> None:
-        return None  # guard wiring lands with the guards engine
+    def install_guards(self, guards, ws, run_dir) -> None:
+        return None  # base no-op; ClaudeExecutor overrides to install the PreToolUse hook
 
     # -- doctor ------------------------------------------------------------- #
 
     def doctor(self) -> list[Finding]:
         if shutil.which(self.name) is None:
             return [Finding("error", f"executor {self.name!r} not found", fix=self._install_hint)]
-        code, out = _probe_version(self.name)
+        try:
+            code, out = _probe_version(self.name)
+        except (OSError, CairnError) as exc:
+            # which() is a TOCTOU check, not a guarantee: the binary can vanish between the
+            # check and the spawn, or resolve to a broken shim (asdf/mise/nvm-managed CLIs are
+            # a realistic case) that fails to exec. Either raises here as OSError or
+            # ExecutorSpawnError (a CairnError, post-W1). This doesn't change whether `cairn
+            # doctor` itself crashes — doctor.py's `_doctor_executor` already wraps `ex.doctor()`
+            # in a broad `except Exception`, so that CLI path was already caught. What this DOES
+            # fix: doctor() is a documented protocol (API.md §6, "return list[Finding]") any
+            # caller can invoke directly — every unit test in this file does — and an uncaught
+            # exception there breaks that contract regardless of the CLI wrapper; this gives a
+            # precise Finding (naming the executor and the underlying error) instead of either a
+            # raw traceback (direct callers) or doctor.py's generic "doctor failed: <str(exc)>"
+            # (mirrors cli.py's _probe_executor_versions fix, W5a, same precision motive there).
+            return [
+                Finding("error", f"{self.name} --version failed to run: {exc}", fix=self._install_hint)
+            ]
         if code is None:
             return [Finding("error", f"{self.name} --version timed out", fix=self._install_hint)]
         if code != 0:
@@ -138,4 +226,54 @@ class CliExecutor:
                     fix=f"install {self.name}@{pin}",
                 )
             )
+        findings += self._flag_findings()
+        findings += self._model_findings()
+        findings += self._sandbox_findings()
         return findings
+
+    def _sandbox_findings(self) -> list[Finding]:
+        """WARN when this executor declares an OS FS-sandbox posture (``fs``/``strict``) but the
+        machine's sandbox primitive is missing/non-functional — the step would then run UNSANDBOXED
+        (loud-not-silent, C8/W3c). ``off``-posture executors emit nothing. Never an error: the
+        degradation policy is availability > strictness (``post`` remains the hard gate), so this is
+        a WARN, matching how missing sandboxing degrades at run time."""
+        posture = getattr(self.capabilities, "sandbox", "off")
+        wrapper = self._sandbox()
+        backend = wrapper.backend
+        if backend is None:  # off posture
+            return []
+        if backend.available():
+            return []
+        from cairn.kernel.sandbox import NativeBackend
+
+        reason = (
+            backend._unavailable_reason()
+            if isinstance(backend, NativeBackend)
+            else "no functional OS filesystem sandbox primitive"
+        )
+        return [
+            Finding(
+                "warning",
+                f"{self.name} declares sandbox posture {posture!r} but {reason}; "
+                f"steps will run UNSANDBOXED (post-validator remains the hard gate)",
+            )
+        ]
+
+    def _flag_findings(self) -> list[Finding]:
+        """Re-verify `_emitted_flags` against the installed CLI's `--help` (W5b sub-change A.1).
+        Cheap, offline, per-machine. A help-fetch failure (spawn error, timeout, non-zero exit,
+        or empty output) is ONE warning, never a crash and never a per-flag false positive."""
+        if not self._emitted_flags:
+            return []
+        argv = self._help_argv()
+        try:
+            code, out = probe_argv(argv)
+        except (OSError, CairnError):
+            code, out = None, ""
+        if code is None or code != 0 or not out:
+            return [Finding("warning", f"could not run {' '.join(argv)} — skipping flag drift check")]
+        return [
+            Finding("warning", f"{self.name} {flag} not advertised by installed {self.name}")
+            for flag in self._emitted_flags
+            if not _flag_present(flag, out)
+        ]

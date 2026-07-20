@@ -19,6 +19,7 @@ import pytest
 import cairn
 from cairn.cli import SUBCOMMANDS, main
 from cairn.kernel import newkit
+from cairn.kernel.errors import ExecutorSpawnError
 from cairn.kernel.types import ExitCode
 
 REPO = Path(__file__).resolve().parents[2]
@@ -353,6 +354,183 @@ def test_resume_honors_recorded_executor_overrides(tmp_path, monkeypatch):
     # recorded stub override was honored.
     assert main(["resume", str(rd)]) == int(ExitCode.OK)
     assert (rd / "art2.json").is_file()
+
+
+# --------------------------------------------------------------------------- #
+# run.json reproducibility record (ARCHITECTURE §10, codex-F16/claude-F12's W5a fix):
+# executor versions + workspace git rev at mint, and a resume-time drift warning.
+# --------------------------------------------------------------------------- #
+
+
+def _git_init(ws: Path) -> None:
+    """A throwaway git repo over ``ws`` with one commit — hermetic (local ``-c`` identity,
+    never the ambient/global git config)."""
+    subprocess.run(["git", "-C", str(ws), "init", "-q"], check=True)
+    subprocess.run(["git", "-C", str(ws), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(ws), "-c", "user.email=test@example.com", "-c", "user.name=test",
+         "commit", "-q", "-m", "init"],
+        check=True,
+    )
+
+
+def test_run_mint_records_executor_versions(tmp_path, monkeypatch):
+    # `--executor stub` swaps only the RUNTIME invocation (walk.py's fleet); resolved_models
+    # (and so the mint-time probe) still names the workspace's real default, `claude` —
+    # verifying the fix actually probes the executor the plan resolved, not the stub shim.
+    ws = _twofleet_ws(tmp_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PATH", f"{FAKEBIN}{os.pathsep}{os.environ['PATH']}")
+    rc = main(["run", "twofleet", "--executor", "stub", "--headless"])
+    assert rc == int(ExitCode.OK)
+    ex = json.loads((_run_dir(ws, "twofleet") / "run.json").read_text())["executors"]
+    assert ex["default"] == "claude"
+    assert ex["versions"] == {"claude": "claude 2.1.0 (fake)"}  # fakebin/claude's canned --version
+
+
+def test_run_mint_records_null_versions_when_executor_missing(tmp_path, monkeypatch):
+    # An empty PATH — `claude` unresolvable (this dev machine's own `claude` CLI would
+    # otherwise shadow the fixture). Mint must record null, never crash (ARCHITECTURE §10:
+    # a probe failure records null and continues, same as a missing tool check).
+    ws = _twofleet_ws(tmp_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PATH", str(tmp_path / "empty-bin"))
+    rc = main(["run", "twofleet", "--executor", "stub", "--headless"])
+    assert rc == int(ExitCode.OK)
+    ex = json.loads((_run_dir(ws, "twofleet") / "run.json").read_text())["executors"]
+    assert ex["versions"] == {"claude": None}
+
+
+def test_run_mint_records_null_on_executor_spawn_error(tmp_path, monkeypatch):
+    # W1's run_process wraps a Popen spawn failure into ExecutorSpawnError — a CairnError,
+    # NOT an OSError — so `shutil.which` finding the binary is not enough to guarantee a
+    # clean probe: a TOCTOU removal, or a resolvable-but-broken shim (asdf/mise/nvm-managed
+    # CLIs are a realistic case), can still raise past a which()-only guard. This asserts the
+    # handler catches CairnError too — it must FAIL against a bare `except OSError`.
+    ws = _twofleet_ws(tmp_path)
+    monkeypatch.chdir(ws)  # real PATH — `claude` resolves via shutil.which on this machine
+
+    def _boom(name: str, timeout_s: float = 15.0):
+        raise ExecutorSpawnError(f"{name!r} failed to start", executable=name)
+
+    monkeypatch.setattr("cairn.cli._probe_version", _boom)
+    rc = main(["run", "twofleet", "--executor", "stub", "--headless"])
+    assert rc == int(ExitCode.OK)  # never crashes the mint
+    ex = json.loads((_run_dir(ws, "twofleet") / "run.json").read_text())["executors"]
+    assert ex["versions"] == {"claude": None}
+
+
+def test_resume_survives_executor_spawn_error_during_drift_probe(tmp_path, monkeypatch):
+    # Same fix, the resume-side call site (_reproducibility_drift_guard): a probe raising
+    # ExecutorSpawnError during the drift check must not crash the resume either.
+    ws = _twofleet_ws(tmp_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PATH", f"{FAKEBIN}{os.pathsep}{os.environ['PATH']}")
+    assert main(["run", "twofleet", "--executor", "stub", "--headless"]) == 0
+    rd = _run_dir(ws, "twofleet")
+
+    def _boom(name: str, timeout_s: float = 15.0):
+        raise ExecutorSpawnError(f"{name!r} failed to start", executable=name)
+
+    monkeypatch.setattr("cairn.cli._probe_version", _boom)
+    rc = main(["resume", str(rd)])
+    assert rc == int(ExitCode.OK)  # drift-probe failure is silent, never a crash
+
+
+def test_run_mint_records_git_rev_and_dirty_flag(hello_ws, monkeypatch):
+    monkeypatch.chdir(hello_ws)
+    _git_init(hello_ws)
+    head = subprocess.run(
+        ["git", "-C", str(hello_ws), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+    rc = main(["run", "hello", "--headless", "--gate", "tone=friendly"])
+    assert rc == int(ExitCode.OK)
+    doc = json.loads((_run_dir(hello_ws, "hello-world") / "run.json").read_text())
+    assert doc["git_rev"] == head
+    assert doc["git_dirty"] is False
+
+    # An uncommitted edit since the last commit → dirty=True on the next mint.
+    (hello_ws / "pipelines" / "hello.yaml").write_text(
+        (hello_ws / "pipelines" / "hello.yaml").read_text() + "\n# scratch\n", encoding="utf-8"
+    )
+    rc2 = main(["run", "hello", "--headless", "--gate", "tone=friendly", "--run-dir", str(hello_ws / "r2")])
+    assert rc2 == int(ExitCode.OK)
+    doc2 = json.loads((hello_ws / "r2" / "run.json").read_text())
+    assert doc2["git_rev"] == head
+    assert doc2["git_dirty"] is True
+
+
+def test_run_mint_records_null_git_rev_outside_a_repo(hello_ws, monkeypatch):
+    monkeypatch.chdir(hello_ws)  # a fresh tmp_path scaffold — not inside a git worktree
+    rc = main(["run", "hello", "--headless", "--gate", "tone=friendly"])
+    assert rc == int(ExitCode.OK)
+    doc = json.loads((_run_dir(hello_ws, "hello-world") / "run.json").read_text())
+    assert doc["git_rev"] is None
+    assert doc["git_dirty"] is None
+
+
+def test_resume_warns_on_executor_version_drift(tmp_path, monkeypatch, capsys):
+    ws = _twofleet_ws(tmp_path)
+    monkeypatch.chdir(ws)
+    monkeypatch.setenv("PATH", f"{FAKEBIN}{os.pathsep}{os.environ['PATH']}")
+    assert main(["run", "twofleet", "--executor", "stub", "--headless"]) == 0
+    rd = _run_dir(ws, "twofleet")
+    doc_path = rd / "run.json"
+    doc = json.loads(doc_path.read_text())
+    doc["executors"]["versions"]["claude"] = "claude 1.0.0 (was)"
+    doc_path.write_text(json.dumps(doc, indent=2), encoding="utf-8")
+    capsys.readouterr()
+
+    # Nothing on disk was deleted, so resume re-verifies the (already `done`) nodes without
+    # invoking the executor — the drift guard alone is under test here.
+    rc = main(["resume", str(rd)])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.OK)
+    assert "claude" in err and "version drift" in err
+    assert "1.0.0 (was)" in err and "2.1.0 (fake)" in err  # names old → new
+
+
+def test_resume_warns_on_workspace_git_rev_drift(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    _git_init(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=friendly"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    old_rev = json.loads((rd / "run.json").read_text())["git_rev"]
+
+    (hello_ws / "README.md").write_text("drift\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(hello_ws), "add", "-A"], check=True)
+    subprocess.run(
+        ["git", "-C", str(hello_ws), "-c", "user.email=test@example.com", "-c", "user.name=test",
+         "commit", "-q", "-m", "drift"],
+        check=True,
+    )
+    capsys.readouterr()
+
+    rc = main(["resume", str(rd)])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.OK)
+    assert old_rev in err and "workspace drift" in err
+
+
+def test_resume_same_versions_and_git_rev_is_silent(tmp_path, monkeypatch, capsys):
+    # A git-initialized workspace, so `git_rev` is a real recorded value (not None) — the
+    # no-drift path for BOTH executor versions and git rev is actually exercised here, not
+    # just the versions half (a bare, non-git ws would leave git_rev None and never touch
+    # the git-rev comparison branch of _reproducibility_drift_guard at all).
+    ws = _twofleet_ws(tmp_path)
+    monkeypatch.chdir(ws)
+    _git_init(ws)
+    monkeypatch.setenv("PATH", f"{FAKEBIN}{os.pathsep}{os.environ['PATH']}")
+    assert main(["run", "twofleet", "--executor", "stub", "--headless"]) == 0
+    rd = _run_dir(ws, "twofleet")
+    doc = json.loads((rd / "run.json").read_text())
+    assert doc["git_rev"] is not None  # confirm this run actually has a git_rev to compare
+    capsys.readouterr()
+    rc = main(["resume", str(rd)])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.OK)
+    assert "version drift" not in err and "workspace drift" not in err
 
 
 def _phantom_ws(tmp_path: Path) -> Path:

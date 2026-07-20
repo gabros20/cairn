@@ -6,8 +6,31 @@ cairn's EFFORTS exactly, so tier-resolved effort flows through like the other ex
 
 from __future__ import annotations
 
-from cairn.executors._cli import CliExecutor
-from cairn.executors.base import Capabilities, Invocation
+import re
+
+from cairn.executors._cli import CliExecutor, probe_argv
+from cairn.executors.base import Capabilities, Finding, Invocation
+from cairn.kernel.errors import CairnError
+
+
+# `grok models` prints e.g. (live-verified output, logged-in: .orchestrate/raw/
+# grok-models-live.txt):
+#   You are logged in with grok.com.
+#
+#   Default model: grok-4.5
+#
+#   Available models:
+#     * grok-4.5 (default)
+#     - grok-composer-2.5-fast
+# One model slug per "  * " / "  - " bulleted line; strip the leading marker and any trailing
+# "(default)" annotation (the `\S+` capture already stops before the space that precedes it) —
+# confirmed against the live capture above: matches both the "*" default line and the "-" line,
+# and stops each capture before " (default)".
+_GROK_MODEL_LINE_RE = re.compile(r"^\s*[-*]\s+(\S+)", re.MULTILINE)
+
+
+def _parse_grok_models(help_text: str) -> set[str]:
+    return {m.group(1) for m in _GROK_MODEL_LINE_RE.finditer(help_text)}
 
 
 class GrokExecutor(CliExecutor):
@@ -19,18 +42,70 @@ class GrokExecutor(CliExecutor):
         # 10-hooks.md): JSON files in ~/.grok/hooks/*.json (global, always trusted) or
         # <project>/.grok/hooks/*.json (requires folder trust — `--trust` / /hooks-trust).
         # A hook denies a tool call via stdout {"decision":"deny","reason":...} (honored
-        # regardless of exit code) or exit 2; every other failure is fail-open. The doctor
-        # hook-probe still validates the mechanism end to end before guards rely on it.
-        blocking_hooks=True,
+        # regardless of exit code) or exit 2; every other failure is fail-open. BUT this is a
+        # CLI-capability fact only — cairn's own install_guards below does not wire it (see
+        # installs_hooks), so leave None: unknown/unasserted → the doctor hook-probe decides,
+        # rather than assert True for a mechanism cairn never installs (grok-F3).
+        blocking_hooks=None,
         # grok has native --json-schema (implies --output-format json), but it is NOT
-        # wired: native schema is a later bonus; the STEP sentinel is the contract.
-        output_schema=True,
+        # wired: native schema is a later bonus; the STEP sentinel is the contract. W5b
+        # sub-change B: this previously asserted True, overstating what cairn actually uses
+        # (grok-F2).
+        output_schema=False,
         session_capture=None,
+        installs_hooks=False,  # install_guards is a no-op — cairn does not wire a grok hook yet
     )
+    # The flags `_build_command` emits — doctor re-verifies these against the installed CLI's
+    # `grok --help` (W5b sub-change A.1). `--no-auto-update` is DELIBERATELY excluded: the
+    # captured help (and grok 0.2.82 live) hides it from `--help` while still accepting it (see
+    # the comment on the flag below) — asserting it here would WARN on every healthy install.
+    _emitted_flags: tuple[str, ...] = (
+        "--prompt-file", "--cwd", "-m", "--output-format", "--permission-mode",
+        "--no-alt-screen", "--no-memory", "--sandbox", "--effort",
+    )
+
+    def _model_findings(self) -> list[Finding]:
+        # W5b sub-change A.2: grok is the one executor with a queryable model roster —
+        # `grok models` (captured help: "List available models and exit"). This is a LOCAL
+        # metadata listing (reads the CLI's cached model roster for the logged-in account), not
+        # a billed inference call — live-verified: returns in ~1s (.orchestrate/raw/
+        # grok-models-live.txt), so the extra doctor probe is cheap, same posture as the
+        # --version/--help probes. Best-effort: a fetch failure or an unparseable roster is one
+        # warning, never a crash; the goal is catching model-slug drift before the first paid
+        # run, not gatekeeping.
+        try:
+            code, out = probe_argv([self.name, "models"])
+        except (OSError, CairnError):
+            code, out = None, ""
+        if code is None or code != 0 or not out:
+            return [Finding("warning", f"could not run `{self.name} models` — skipping model drift check")]
+        known = _parse_grok_models(out)
+        if not known:
+            return [
+                Finding(
+                    "warning",
+                    f"`{self.name} models` returned no parseable model list — skipping model drift check",
+                )
+            ]
+        findings = []
+        for tier in sorted(self.config.tiers):
+            model = self.config.tiers[tier].model
+            if model not in known:
+                findings.append(
+                    Finding(
+                        "warning",
+                        f"{self.name} tier {tier!r} model {model!r} not in `{self.name} models` "
+                        f"(known: {', '.join(sorted(known))})",
+                    )
+                )
+        return findings
 
     def _build_command(self, inv: Invocation, prompt_text: str) -> tuple[list[str], str | None]:
         # re-verify against `grok --help` at doctor time; vendors drift.
-        # Live-verified against grok 0.2.82 (6d0b07d2de0f):
+        # Live-verified against grok 0.2.82 (6d0b07d2de0f) at the original build; the W4 additions
+        # below (--no-memory, --sandbox, and the --effort/--reasoning-effort alias) were
+        # separately live-verified against 0.2.101, the version installed when W4 landed — the
+        # two version numbers below are not a typo, just two verification passes over time:
         #   * Headless mode does NOT read the prompt from stdin — bare `-p` is an argv
         #     error ("a value is required for '--single <PROMPT>'") and the headless docs
         #     state piped stdin is never read into the prompt. The envelope can be multi-KB
@@ -46,6 +121,14 @@ class GrokExecutor(CliExecutor):
         #   * `--no-auto-update` is hidden from --help on 0.2.82 but still accepted
         #     (unknown flags are rejected at parse time, this one is not) and remains
         #     documented for headless use — keep it so runs never trigger update checks.
+        #     Drift risk flagged by the panel (grok-F1: a hidden flag can be silently
+        #     removed with no --help diff to catch it). Re-verified LIVE on grok 0.2.101
+        #     (W6): `grok --no-auto-update models` exits 0 (accepted), while a fake flag
+        #     (`grok --this-flag-does-not-exist models`) exits 2 ("unexpected argument") —
+        #     so the flag is hidden-but-accepted and works today. The W5b doctor
+        #     emitted-flags drift check can't verify a flag --help doesn't list, so this
+        #     comment IS the verification record; re-check it by hand on the next grok
+        #     version bump.
         argv = [
             "grok",
             "--prompt-file", str(inv.prompt_file),
@@ -55,11 +138,44 @@ class GrokExecutor(CliExecutor):
             "--permission-mode", "bypassPermissions",
             "--no-alt-screen",
             "--no-auto-update",
+            # W4 config isolation (grok-F6): disable cross-session memory so identical pipeline
+            # runs are deterministic (captured help: "Disable cross-session memory for this
+            # session").
+            "--no-memory",
+            # W4 (grok-F5): `--sandbox <PROFILE>` — the CLI help does not enumerate profile names,
+            # but the installed CLI ships ~/.grok/docs/user-guide/18-sandbox.md documenting the
+            # built-in profiles, and `workspace` is live-verified on grok 0.2.101: `grok --sandbox
+            # workspace inspect` applies cleanly (no warning), while a bogus profile name is
+            # refused ("could not apply … sandbox profile; refusing to start"). `workspace` reads
+            # everywhere and writes only CWD + ~/.grok/ + temp dirs — the workspace-write
+            # equivalent to codex's `--sandbox workspace-write`, and cwd here is always the run
+            # dir.
+            # NOTE (W5-doctor-drift): this profile name is a hard, ungated argv literal — the
+            # W5b doctor drift check (sub-change A.1) verifies the `--sandbox` FLAG is still
+            # advertised by the installed CLI (`_emitted_flags` above), but the captured help
+            # still doesn't enumerate profile NAMES, so "workspace" itself stays unverified; a
+            # future grok renaming/removing that profile would still hard-fail every grok step
+            # with no earlier warning.
+            #
+            # NOTE (W5b sub-change C, codex-F5): StepNode.network now reaches
+            # Invocation.network (see its docstring), but it is NOT consumed here. grok's
+            # `--sandbox <PROFILE>` is a SINGLE profile governing filesystem AND network
+            # together (captured help: "Sandbox profile for filesystem and network access") —
+            # there is no separate network on/off flag to verify, and the help doesn't enumerate
+            # profile names to pick an alternate "no-network" one from. Wiring `inv.network`
+            # here would mean inventing an unverified profile name, which sub-change C
+            # explicitly forbids. Left unconsumed on purpose: codex is wired today; grok mapping
+            # is future work.
+            "--sandbox", "workspace",
         ]
         if inv.effort is not None:
-            # Native effort: the headless-only `--effort` flag takes low|medium|high|xhigh
-            # (+max) — a superset of cairn's EFFORTS. NOT `--reasoning-effort`: that is a
-            # separate per-model reasoning knob, and both models shipped on 0.2.82 report
-            # supports_reasoning_effort=false in models_cache.json (it would be a no-op).
+            # Native effort: `--effort` IS `--reasoning-effort` — the captured help lists them as
+            # the same flag ("--reasoning-effort <EFFORT> ... [aliases: --effort]"), confirmed
+            # live on the installed 0.2.101. It takes low|medium|high|xhigh|max — matches cairn's
+            # EFFORTS exactly (W4 added "max") — and IS forwarded to the model, not a dead knob.
+            # Whether it changes anything is per-model (models_cache.json's
+            # `supports_reasoning_effort`; e.g. grok-4.5 reports true, grok-composer-2.5-fast
+            # reports false today) — cairn's job is to pass the tier-resolved effort through, not
+            # to second-guess per-model support, so the flag is always emitted when effort is set.
             argv += ["--effort", inv.effort]
         return argv, None  # prompt delivered via --prompt-file; stdin is not read headlessly

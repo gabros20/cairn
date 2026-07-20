@@ -27,9 +27,10 @@ The mechanic, per executor (a :class:`HookRecipe`):
    absent           absent          ``inconclusive``   — the agent attempted no guarded tool
    ===============  ==============  ===================================================
 
-CLI missing / timeout / auth failure is also ``inconclusive`` (a probe of a different reality,
-not a verdict). Results are **never cached** — a probe run is a fresh fact each time, and it
-only runs under the explicit ``--probe-hooks`` flag, so the token cost is opt-in.
+CLI missing / timeout / spawn failure (a resolvable-but-broken shim) / auth failure is also
+``inconclusive`` (a probe of a different reality, not a verdict). Results are **never cached**
+— a probe run is a fresh fact each time, and it only runs under the explicit ``--probe-hooks``
+flag, so the token cost is opt-in.
 
 Stdlib + pinned kernel/executor-base modules only.
 """
@@ -50,6 +51,8 @@ from typing import Literal
 # reuses them so a canary invocation runs through exactly the same subprocess machinery a real
 # step does (streamed log, group-kill on timeout, EXACT env — never os.environ).
 from cairn.executors.base import ExecTimeout, run_process
+from cairn.kernel.errors import CairnError
+from cairn.kernel.guards import deny_json
 
 Outcome = Literal["fires_blocks", "fires_no_block", "no_fire", "no_mechanism", "inconclusive"]
 
@@ -64,15 +67,9 @@ _SIDECAR_REL = f"{_PROBE_SUBDIR}/sidecar"
 # INSTALLED binaries (claude 2.1.199, codex-cli 0.142.5): both honor a `hookSpecificOutput`
 # object with `permissionDecision: "deny"` for PreToolUse (grep of each binary's embedded hook
 # schema — PreToolUsePermissionDecisionWire = {allow, deny, ask}; deny needs a non-empty reason).
-_DENY_JSON = json.dumps(
-    {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "deny",
-            "permissionDecisionReason": "cairn hook probe: blocked by design",
-        }
-    }
-)
+# ONE builder (kernel.guards.deny_json) shared with the production `--hook-check` entry so the
+# probe canary and the real hook can never drift.
+_DENY_JSON = deny_json("cairn hook probe: blocked by design")
 
 # grok's PreToolUse deny shape is DIFFERENT from claude/codex: a top-level
 # ``{"decision": "deny", "reason": ...}`` on stdout, honored REGARDLESS of exit code (grok
@@ -100,7 +97,7 @@ _GROK_COMPAT_OFF_TOML = (
 # baseline every real agent step gets). Kept in lockstep so the probe measures the same reality a
 # run experiences: USER/LOGNAME are load-bearing (macOS Keychain OAuth lookup), TMPDIR/HOME/LANG
 # shape tool behaviour, PATH resolves the vendor CLI. If walk.py's set changes, change this too.
-_ENV_PASSTHROUGH = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME")
+_ENV_PASSTHROUGH = ("PATH", "HOME", "LANG", "LC_ALL", "TMPDIR", "USER", "LOGNAME", "XDG_STATE_HOME")
 
 # Substrings that mark a CLI's own auth/login failure → inconclusive, not a hook verdict.
 _AUTH_SIGNS = (
@@ -156,7 +153,12 @@ class HookRecipe:
         return shutil.which(self.name, path=env.get("PATH")) is not None
 
     def version(self, env: dict[str, str]) -> str | None:
-        """``<name> --version`` under the probe env; None on timeout/failure."""
+        """``<name> --version`` under the probe env; None on timeout/failure. ``available()``
+        (``shutil.which``) is a TOCTOU check, not a guarantee — a resolvable-but-broken shim
+        (asdf/mise/nvm-managed CLIs) can still fail to spawn here, raising ``ExecutorSpawnError``
+        (a ``CairnError``, post-W1) rather than a bare ``OSError``. Caught alongside
+        ``ExecTimeout``: version is best-effort telemetry for the probe report, same as a
+        timeout — an unknown version, not a probe crash."""
         with tempfile.TemporaryDirectory() as td:
             try:
                 code, out, _ = run_process(
@@ -167,7 +169,7 @@ class HookRecipe:
                     timeout_s=15.0,
                     log_path=Path(td) / "v.log",
                 )
-            except ExecTimeout:
+            except (ExecTimeout, CairnError):
                 return None
             return out.strip() if code == 0 else None
 
@@ -250,15 +252,21 @@ class ClaudeHookRecipe(HookRecipe):
     def build_invocation(
         self, canary: Path, prompt_text: str, model: str
     ) -> tuple[list[str], str | None]:
-        # Mirrors ClaudeExecutor._build_command (minus effort): prompt as an argv arg, text
-        # output, and the load-bearing bypassPermissions the probe exists to stress.
+        # LOCKSTEP with cairn/executors/claude.py::ClaudeExecutor._build_command (minus effort):
+        # prompt on stdin (W4), text output, --setting-sources project + --strict-mcp-config +
+        # --no-session-persistence (W4 isolation), and the load-bearing bypassPermissions the
+        # probe exists to stress. `--setting-sources project` also means the probe's own
+        # write_canary settings.json (the "project" source, canary is cwd) is what fires — same
+        # posture a real run gets from install_guards' run-dir settings.json.
         argv = [
-            "claude", "-p", prompt_text,
+            "claude", "-p",
             "--model", model,
             "--output-format", "text",
             "--permission-mode", "bypassPermissions",
+            "--setting-sources", "project", "--strict-mcp-config",
+            "--no-session-persistence",
         ]
-        return argv, None
+        return argv, prompt_text
 
     def build_prompt(self, sidecar: Path) -> str:
         return (
@@ -313,11 +321,16 @@ class CodexHookRecipe(HookRecipe):
     def build_invocation(
         self, canary: Path, prompt_text: str, model: str
     ) -> tuple[list[str], str | None]:
-        # LOCKSTEP with cairn/executors/codex.py::CodexExecutor._build_command (effort=None
-        # branch) — pinned by test_codex_invocation_mirrors_real_executor_argv; change that
-        # executor and this recipe together. Live-verified on codex-cli 0.142.5:
+        # LOCKSTEP with cairn/executors/codex.py::CodexExecutor._build_command (effort=None,
+        # network=False branch) — pinned by test_codex_invocation_mirrors_real_executor_argv;
+        # change that executor and this recipe together. Live-verified on codex-cli 0.142.5:
         # `-a/--ask-for-approval` no longer exists on `codex exec` (argv error), and
-        # `--skip-git-repo-check` is required (the canary tempdir is not a git repo). The one
+        # `--skip-git-repo-check` is required (the canary tempdir is not a git repo).
+        # `--ephemeral` (W5b) matches the real executor's session-less posture.
+        # `--ignore-user-config`/`--ignore-rules` (W4) skip $CODEX_HOME/config.toml + execpolicy
+        # .rules — belt-over-suspenders with the empty config.toml write_canary already plants.
+        # `-c sandbox_workspace_write.network_access=false` (W5b) mirrors the real executor's
+        # default-false network policy — the probe canary never needs network. The one
         # probe-only addition is --dangerously-bypass-hook-trust, so the freshly-written canary
         # hook runs without persisted hook trust. Prompt on stdin.
         argv = [
@@ -326,6 +339,10 @@ class CodexHookRecipe(HookRecipe):
             "-m", model,
             "--sandbox", "workspace-write",
             "--skip-git-repo-check",
+            "--ephemeral",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "-c", "sandbox_workspace_write.network_access=false",
             "--dangerously-bypass-hook-trust",
         ]
         return argv, prompt_text
@@ -423,6 +440,8 @@ class GrokHookRecipe(HookRecipe):
         # (stdin is dead headless), so write it into the canary and reference it; return stdin=None.
         # NO probe-only extra flag: the hook is GLOBAL (always trusted), so unlike codex there is
         # no folder-trust to bypass — recipe argv == executor argv exactly.
+        # W4: --no-memory + --sandbox workspace added to match the executor's config-isolation
+        # posture (cairn-F5/F6) — also tightens the probe itself, on top of the relocated GROK_HOME.
         #
         # Deliberately duplicates the engine's own prompt.md write (_probe_in materializes the
         # same path/content just before calling this): the recipe stays self-contained — the file
@@ -440,6 +459,8 @@ class GrokHookRecipe(HookRecipe):
             "--permission-mode", "bypassPermissions",
             "--no-alt-screen",
             "--no-auto-update",
+            "--no-memory",
+            "--sandbox", "workspace",
             "--effort", self.effort,
         ]
         return argv, None
@@ -602,6 +623,17 @@ def _probe_in(
         return ProbeResult(
             recipe.name, "inconclusive",
             f"the canary invocation timed out after {timeout_s}s",
+            version, recipe.posture, recipe.mechanism,
+        )
+    except CairnError as exc:
+        # available() (shutil.which) is a TOCTOU check, not a guarantee — a resolvable-but-
+        # broken shim can still fail to spawn here, raising ExecutorSpawnError (a CairnError,
+        # post-W1) rather than a bare OSError. Same "different reality, not a verdict" bucket
+        # as a timeout or auth failure (module docstring) — inconclusive, never an uncaught
+        # traceback out of `cairn doctor --probe-hooks`.
+        return ProbeResult(
+            recipe.name, "inconclusive",
+            f"the canary invocation failed to start: {exc}",
             version, recipe.posture, recipe.mechanism,
         )
 

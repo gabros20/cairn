@@ -231,6 +231,114 @@ mismatch is refused at plan time (**done** — `cairn plan` via `config.check_re
 
 ---
 
+## C8 — claude filesystem containment (W3c)  *(landed — `fs` posture; `strict`/`srt` egress tier deferred)*
+
+**Status (landed).** The `fs`-posture OS filesystem sandbox is implemented in `cairn/kernel/sandbox.py`
+(`SandboxWrapper` + pluggable `SandboxBackend` + cairn-owned `NativeBackend`: macOS `sandbox-exec`/SBPL,
+Linux `bwrap` with a `landrun`/Landlock fallback), wired into `CliExecutor.invoke` and gated by
+`Capabilities.sandbox` (**claude → `fs`**; codex/grok/shell/stub → `off`). claude's writes are confined
+to `run_dir + workspace` (+ per-process temp), the **gatekeys dir is read-only** (the W3c close — the
+hook reads the secret but cannot forge a manifest), and **network stays ON** (the model API needs it).
+Degradation is loud-not-silent (a `sandbox-unavailable` warning + `cairn doctor` WARN). Design:
+`docs/CLAUDE-SANDBOX-PLAN.md`; verified by `tests/unit/test_sandbox.py` (containment / gatekeys-RO /
+guard-chain-intact-through-the-wrap on a machine with the primitive, profile-generation strings on any
+OS). Security-review hardening (F1/F2): the gatekeys dir is protected write-deny **even when nested
+under an rw path** (SBPL trailing `(deny file-write*)` / bwrap ro-bind ordered after the rw bind — CI
+that sets `XDG_STATE_HOME` under `run_dir` no longer silently re-grants write); the bwrap argv
+`--unshare-pid`/`--unshare-ipc` to block cross-namespace ptrace/IPC escape; and the `--tmpfs /tmp`
+clobber with `TMPDIR=/tmp` is fixed.
+
+**Honest gating — the Linux leg is argv-verified-only.** `bwrap`/`landrun` are absent on the macOS
+build/CI host, so the Linux `NativeBackend` argv is UNIT-tested (string shape) but has **not** been run
+against a real primitive. Before the Linux leg is relied on in CI it needs a one-box real-Linux smoke:
+(1) write/read confinement, (2) the F1 nested-gatekeys forge-denial, (3) the F2(a) cross-namespace
+`ptrace` check. The macOS leg is exercised end-to-end (live escape attempts denied). Landlock/`landrun`
+composes rule rights by union (not last-match), so the F1 nested-gatekeys re-protection on the
+`landrun` fallback is UNCONFIRMED and flagged in-code (`# NOTE` at `linux_landrun_argv`).
+
+**Deferred (same seam):** the `strict`/`srt` network-egress tier, the `dontAsk` permission-mode
+spike, and a user-facing `sandbox.backend` config selector.
+
+*Original deferred writeup follows.*
+
+## C8 — claude filesystem containment (W3c)  *(historical — original deferred writeup)*
+
+*Surfaced by the 2026-07-14 hardening review (see `HARDENING-PLAN.md` and the panel synthesis). The
+guard engine now authenticates its manifest and pins each check-script's hash with the per-run secret
+(`gatekeys`), and the claude `PreToolUse` hook actually installs and blocks (C2/W3a). That makes guard
+inputs **tamper-proof under a write-sandboxed executor** (codex `--sandbox workspace-write` cannot write
+outside its cwd). It does **not** contain a fully-adversarial `claude`.*
+
+**The residual (documented, SECURITY §2.2).** The `claude` executor must run headless under
+`--permission-mode bypassPermissions` (the default mode refuses every tool use). Under that mode the
+agent has **unrestricted local filesystem read/write** — no OS sandbox. So a determined in-sandbox
+claude agent can defeat the guard layer by (a) reading the per-run secret from the `gatekeys` state dir
+and forging a validly-signed empty manifest, or (b) rewriting `<run_dir>/.claude/settings.json` to drop
+the hook. Tamper by an *injected* (non-secret-stealing) agent is detected and fails closed; a *fully
+adversarial* one is not stopped by file-based guards. **The post artifact-validator remains the honest
+hard gate for claude.** Guards must not be described as unconditional containment for the claude executor.
+
+**Build (when prioritized):** give `claude` real filesystem confinement so the agent cannot read the
+secret or write outside the run dir — an OS sandbox wrapper (`sandbox-exec` on macOS, `bwrap`/bubblewrap
+on Linux) around the claude invocation, and/or tool-scoping (`--disallowedTools`/`--allowedTools`,
+`--add-dir` confinement) that still lets legitimate steps write their declared artifacts. A subprocess
+wrapper stays within the two-dependency kernel floor (it adds no Python dependency). Platform-specific,
+so gate it behind a capability/doctor probe and degrade honestly where unavailable.
+
+**Verify:** with W3c active, the C1-style empirical probe (the same shape as `cairn doctor
+--probe-hooks`) must show a claude agent CANNOT (a) read the per-run gate/guard secret, nor (b) write
+outside the run dir — i.e. the guard-tamper exploits confirmed in the W3a security review now fail. Until
+then, `blocking_hooks`/`installs_hooks` describe the mechanism honestly and the post-validator is the
+documented backstop.
+
+---
+
+## C9 — runtime `when` on guards (codex-F12 / W6-guard-when)  *(done — 2026-07-15)*
+
+**Landed 2026-07-15.** Full design in `docs/GUARD-WHEN-PLAN.md` (status: done). Built as **Option
+B**, NOT the Option A sketched in "Build (when prioritized)" below (that paragraph is left
+as-written, a superseded record): the `when` is evaluated in the trusted **walker**
+(`walk.py::_guard_active`/`_active_guard_manifest`), which writes a fresh, SIGNED,
+**per-invocation** manifest containing only the currently-active guards; the subprocess
+enforcement path (`_run_chain`/`_shim_check`/`_hook_check`/`_load_verified_manifest`, the MAC +
+check-hash pinning) is byte-for-byte unchanged — an inactive guard is simply absent from the
+manifest. A guard whose `when` can't evaluate (missing gate/artifact) is treated ACTIVE
+(fail-safe) with a `guard-when-error` warning, never dropped and never a run halt. A plan with no
+runtime-`when` guards takes a mandatory fast path (`{}` override, zero per-invocation writes) —
+byte-identical to pre-C9 behavior, proven by a dedicated regression test.
+
+*Surfaced by the same 2026-07-14 hardening review. A guard whose `when:` is decidable at plan time
+(params/dims only) is already handled: the planner drops an inactive guard entirely. The gap is a guard
+whose `when:` references **runtime** roots (gates/artifacts) — that `Expr` is stored on `GuardDecl.when`
+but set to `None` when the guard is reloaded from the (now-signed) manifest in the shim/hook decision
+path (`guards.py` `_load_manifest_guard`), so the guard's condition is lost and it runs its check on
+**every** invocation.*
+
+**The residual.** A runtime-conditional guard therefore over-applies: it runs its check even when its
+`when:` is currently false. This **fails safe** — it can only produce an incorrect *denial* / an extra
+check run (over-strict), never a missed block (it is never wrongly *deactivated*). No security
+weakening; a correctness/availability edge for the rarely-used runtime-`when`-on-a-guard shape.
+
+**Why deferred, not fixed in W6.** The correct fix requires **per-step re-evaluation** of the `when`
+expression against current on-disk state — the guard installs once per run, but a runtime `when`
+(e.g. `gates.approve.choice == 'yes'`) only becomes decidable mid-run. That means serializing the
+`when` source into the signed manifest and evaluating it inside the W3a-hardened, HMAC-authenticated
+`_run_chain` (building an expression context from `run.json` params/dims, the W2-verified gate
+decisions, and produced artifacts). Adding an expression evaluator + context-builder to the
+freshly-hardened security-critical decision path is real new surface; doing it as the tail item of the
+hardening run, without soak, is lower-reliability than deferring it — the same judgment applied to C8.
+
+**Build (when prioritized):** serialize `when` (source string) into the signed manifest; in `_run_chain`,
+before running a guard's check, re-parse and evaluate it against a context from `run.json` +
+`read_verified_choice` gate state + artifacts; `when=false` → guard inactive (skip, allow); an
+evaluation error → treat the guard as **active** (fail-safe, run the check). The earlier waves make this
+safe to add now: the `when` inputs (manifest, gates, artifacts) are all authenticated/contained
+(W3a/W2/W6), so a forged gate can't wrongly deactivate a guard. **Verify:** a guard with a runtime
+`when` that resolves false does not run its check; one that resolves true does; a forged/tampered gate
+cannot flip an active guard to inactive.
+
+---
+
 ## Decision gates along the way
 
 | At | Decision | Default |

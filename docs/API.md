@@ -97,7 +97,7 @@ balanced  = { model = "grok-build",             effort = "medium" }
 cheap     = { model = "grok-composer-2.5-fast", effort = "low" }
 ```
 
-Effort values are the shared enum `low | medium | high | xhigh`. Precedence is specific-over-general:
+Effort values are the shared enum `low | medium | high | xhigh | max`. Precedence is specific-over-general:
 a fired `escalate.effort` (§3) wins, then an agent's own `effort:`, then a tier entry's `effort` as
 the fallback used when the agent pins none; if none of them set it, effort is `None` and the executor
 applies its own default. So a tier may supply a default effort for the agents that omit one, but it
@@ -299,7 +299,7 @@ validators like everything else — never a config knob that quietly writes else
 ```yaml
 description: "P0 worker: crawls the source site into structured captures/"
 tier: balanced                   # reasoning | balanced | cheap
-effort: medium                   # low | medium | high | xhigh — wins over the tier's effort (§1)
+effort: medium                   # low | medium | high | xhigh | max — wins over the tier's effort (§1)
 escalate:                        # optional conditional tier bump
   when: "dims.design != 'reproduce'"
   tier: reasoning
@@ -350,9 +350,13 @@ misspellings must not silently disable steps.
 ```python
 @dataclass
 class Capabilities:
-    blocking_hooks: bool | None     # None = unknown → doctor probes empirically
+    blocking_hooks: bool | None     # CLI-capability/probe question: None = unknown → doctor probes
     output_schema: bool             # native typed-return support (used as bonus only)
     session_capture: str | None     # glob of session files to copy into logs/, if any
+    installs_hooks: bool            # IMPLEMENTATION fact: does cairn's install_guards for this
+                                     # executor actually wire a pre-execution blocking hook (True
+                                     # only for claude today; W3b, ARCHITECTURE §4) — distinct from
+                                     # blocking_hooks (whether the vendor CLI *can*, at all)
 
 @dataclass
 class Invocation:
@@ -364,6 +368,12 @@ class Invocation:
     timeout_s: int
     log_path: Path
     return_schema: Path
+    network: bool = False           # the step's resolved network policy (StepNode.network,
+                                    # plan.py) — default false. codex consumes it today (`-c
+                                    # sandbox_workspace_write.network_access=...`, W5b); grok's
+                                    # sandbox profile has no separate network toggle to verify
+                                    # against, claude's CLI has none at all — both leave it
+                                    # unconsumed on purpose, not a silent drop (ARCHITECTURE §5)
 
 @dataclass
 class Result:
@@ -389,28 +399,49 @@ Built-in `invoke` shapes (as actually built; flags re-verified at doctor time �
 `[--effort …]`/`[-c …]` appear only when the step resolves an effort:
 
 ```
-claude:  claude -p "<envelope text>" --model {model} [--effort {effort}] --output-format text
+claude:  claude -p --model {model} [--effort {effort}] --output-format text
              --permission-mode bypassPermissions
-             (prompt passed as the -p argument; nothing on stdin. bypassPermissions is required:
-              headless `claude -p` under the default mode refuses every tool use and exits 0
-              without producing the artifact — cairn's blocking PreToolUse guards are the
-              enforcement layer instead of an interactive prompt)
+             --setting-sources project --strict-mcp-config --no-session-persistence
+             < envelope
+             (prompt on stdin — the positional `prompt` arg is omitted, so `-p`/`--print` reads
+              stdin instead; keeps the envelope off `ps`/`/proc/*/cmdline` and off the argv
+              `MAX_ARG_STRLEN` (128 KiB) ceiling a skill-heavy envelope could trip. bypassPermissions
+              is required: headless `claude -p` under the default mode refuses every tool use and
+              exits 0 without producing the artifact — cairn's blocking PreToolUse guards are the
+              enforcement layer instead of an interactive prompt. `--setting-sources project` seals
+              the process from the user's ambient `~/.claude/settings.json` while keeping the
+              run-dir `.claude/settings.json` install_guards writes (that IS the "project" source);
+              `--strict-mcp-config` drops any ambient MCP servers; `--no-session-persistence`
+              disables the on-disk session transcript entirely — session_capture is None, there is
+              nothing to capture)
 codex:   codex exec -C {cwd} -m {model} --sandbox workspace-write --skip-git-repo-check
+             --ephemeral --ignore-user-config --ignore-rules
+             -c sandbox_workspace_write.network_access={true|false}
              [-c model_reasoning_effort={effort}]  < envelope
              (prompt on stdin; `-a/--ask-for-approval` is gone from `codex exec` as of codex-cli
               0.142.5 — exec hardwires approval-never; `--skip-git-repo-check` because codex refuses a
               non-git/untrusted cwd and cairn's `--sandbox` flag + guards are the enforcement layer;
-              --output-schema is NOT wired yet — the STEP sentinel is the contract)
-grok:    grok --prompt-file {envelope} --cwd {cwd} -m {model} [--effort {effort}]
+              `--ephemeral` (W5b) runs without persisting session files, so session_capture is None
+              — nothing under ~/.codex/sessions/** to capture; `--ignore-user-config` skips
+              `$CODEX_HOME/config.toml` (auth still uses CODEX_HOME), `--ignore-rules` skips
+              user/project execpolicy `.rules` files — both seal the process from ambient config;
+              `-c sandbox_workspace_write.network_access=...` (W5b, codex-F5) threads
+              Invocation.network through, emitted unconditionally so `false` is stated
+              explicitly, not left to the sandbox's undeclared default; --output-schema is NOT
+              wired yet — the STEP sentinel is the contract)
+grok:    grok --prompt-file {envelope} --cwd {cwd} -m {model}
              --output-format plain --permission-mode bypassPermissions
-             --no-alt-screen --no-auto-update
-             (grok 0.2.82: headless mode does NOT read stdin — the envelope is delivered via
+             --no-alt-screen --no-auto-update --no-memory --sandbox workspace
+             [--effort {effort}]
+             (grok 0.2.101: headless mode does NOT read stdin — the envelope is delivered via
               --prompt-file; `--output-format text` is gone (valid: plain|json|streaming-json);
               bypassPermissions is required — `dontAsk` silently denies file writes (exit 0,
               empty output, no artifact) and PreToolUse hooks still apply under bypass;
-              `--effort low|medium|high|xhigh` is grok's native headless effort flag — NOT
+              `--effort low|medium|high|xhigh|max` is grok's native headless effort flag — NOT
               `--reasoning-effort`, a separate per-model knob; native --json-schema exists but
-              is NOT wired — the STEP sentinel is the contract)
+              is NOT wired — the STEP sentinel is the contract; `--no-memory` disables
+              cross-session memory and `--sandbox workspace` applies the built-in workspace-write
+              equivalent sandbox profile — both seal the process from ambient config/access)
 shell:   the run: command verbatim (this executor is how deterministic steps execute)
 stub:    copies tests/stubs/<pipeline>/<step>[.c<cycle>]/ into the run dir + returns a canned
          STEP — the L1 test executor (TESTING.md §5); selectable like any other, so a full
@@ -438,6 +469,17 @@ mechanism for gate UIs (`cairn.gates`) and trail sinks (`cairn.sinks`).
 ```
 Emitted between `<<<STEP` / `STEP>>>` sentinels as the final message. Authority rule: artifact
 validation outranks this block in both directions (ARCHITECTURE §7).
+
+`parse_step_sentinel` (`executors/base.py`) extracts this block defensively: it locates each
+`<<<STEP` marker and reads the first complete JSON value after it with `json.JSONDecoder.raw_decode`
+(real JSON parsing, not a regex to the closing marker), so a `STEP>>>` substring quoted inside a
+`summary`/`note` string does not truncate the block. The parsed object is then validated against
+this schema with `required` dropped — so a status-only block (e.g. `{"status": "blocked",
+"summary": "…"}`, no `artifacts`) still parses, but a wrong-shaped field (e.g. `"learnings":
+["x"]`, a bare string instead of an object with `note`) does not. The last marker that yields a
+schema-valid object wins; anything that fails to parse or validate is skipped in favour of an
+earlier well-formed block, and if none validates the result is `None` — a soft signal, never a
+hard failure.
 
 ## 8. Run directory layout & schemas
 
@@ -474,11 +516,14 @@ loop body — cycle 1 is `.c1` — and absent only for steps outside a loop.
   "params": { "url": "…", "mode": "redesign", "pages": "gate", "brease": "off" },
   "dims":   { "content": "keep", "design": "redesign", "brand": "keep", "routes": "keep" },
   "executors": { "default": "codex", "overrides": { "review": "claude" },
-                 "versions": { "codex": "0.138.0" } },
+                 "versions": { "codex": "0.138.0" } },  // probed at mint; null on a failed probe
   "models":  { "capture": "gpt-5.4/medium", "review": "opus/high" },
+  "git_rev": "…", "git_dirty": false,   // workspace HEAD + dirty flag at mint; both null outside git
   "created_at": "…", "status": "running | done | halted",
   "nodes": { "<node-id>": { "status": "running|done|skipped|halted", "at": "…", "cycles": 2 } } }
 ```
+`at` is the node's real transition time (not the run's `created_at` clock) — `cairn ps` and a
+post-mortem trail reflect when each node actually finished (ARCHITECTURE §10).
 
 ### 8.2 Trail events (one JSON per line — the Trail Protocol, full spec: OBSERVABILITY.md)
 

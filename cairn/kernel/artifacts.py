@@ -142,12 +142,52 @@ def _resolve_ref(
 # --------------------------------------------------------------------------- #
 
 
+def _assert_contained(
+    decl_name: str, rendered_path: str, candidate: Path, real_run_dir: Path
+) -> None:
+    """Resolve ``candidate`` (following symlinks) and require it to stay under ``real_run_dir``
+    (the caller's already-resolved run dir — resolved ONCE per ``resolve_path`` call, not
+    once per glob match).
+
+    The string checks in ``resolve_path`` catch an absolute/``..`` rendered path before any
+    disk access, but they cannot catch a SYMLINK: a run-local path like ``run/report.json``
+    can pass those checks while pointing (via a symlink somewhere in its chain) at
+    ``/etc/passwd`` or any other host file — a valid external file would then falsely satisfy
+    the artifact's schema/validator, and reads would escape the run dir (codex-F11).
+
+    ``resolve()`` is strict=False: a not-yet-existing artifact leaf (the normal case — the
+    step will write it) still resolves fine as long as its PARENT chain contains no
+    escaping symlink, so this never rejects the common "artifact doesn't exist yet" path.
+
+    Known residual (TOCTOU, disclosed not closed): ``ResolvedArtifact.paths`` stores the
+    UNRESOLVED candidate (``run_dir / rendered_path``, or the raw glob match), not the
+    resolved path checked here — downstream readers (``validate()``, ``walk.py``'s artifact
+    JSON reads) re-touch the filesystem through that unresolved path. In the narrow
+    same-process window between this check and that later read, a symlink swapped in by the
+    sandboxed agent (who holds write access to the run dir) could still redirect the read.
+    Storing the resolved path instead would close most of that window, but would also change
+    what downstream code sees: ``validate()._rel`` computes paths relative to the (unresolved)
+    ``run_dir`` it's separately handed, and a resolved leaf under a differently-resolved
+    ``run_dir`` (e.g. a symlinked run root) could fail that ``relative_to`` and fall back to
+    printing an absolute path in artifact-missing/schema-violation reasons — a downstream
+    contract change this cleanup should not force. Accepted as a documented residual; see
+    SECURITY.md §1.3.
+    """
+    resolved = candidate.resolve()
+    if resolved != real_run_dir and real_run_dir not in resolved.parents:
+        raise ConfigError(
+            f"artifact {decl_name!r} path escapes the run dir via symlink: {rendered_path}"
+        )
+
+
 def resolve_path(decl: ArtifactDecl, rendered_path: str, run_dir: Path) -> ResolvedArtifact:
     """Resolve an already-rendered path to concrete path(s) inside ``run_dir``.
 
     Plain paths → ``[run_dir / rendered_path]``. Glob patterns (containing ``*``) →
     the sorted set of matches under the run dir (empty when none match). The path may
-    never escape the run dir: an absolute path or one containing ``..`` is a ConfigError.
+    never escape the run dir: an absolute path or one containing ``..`` is a ConfigError
+    (checked first, fail-fast before touching disk), nor may it escape via a SYMLINK
+    (checked by resolving each concrete candidate — see ``_assert_contained``).
     """
     run_dir = Path(run_dir)
     candidate = Path(rendered_path)
@@ -160,14 +200,18 @@ def resolve_path(decl: ArtifactDecl, rendered_path: str, run_dir: Path) -> Resol
             f"artifact {decl.name!r} path escapes the run dir (..): {rendered_path}"
         )
 
+    real_run_dir = run_dir.resolve()  # resolved ONCE — every candidate is checked against it
     if _is_glob(rendered_path):
         # A glob names a set of *files*: drop directory matches, and expand a trailing
         # bare ``**`` to ``**/*`` (pathlib's bare ``**`` matches directories only), so the
         # kernel and the scaffold's nonempty.py agree on what ``blueprints/**`` means.
         pattern = f"{rendered_path}/*" if rendered_path.endswith("**") else rendered_path
         paths = sorted(p for p in run_dir.glob(pattern) if p.is_file())
+        for p in paths:
+            _assert_contained(decl.name, rendered_path, p, real_run_dir)
     else:
         paths = [run_dir / rendered_path]
+        _assert_contained(decl.name, rendered_path, paths[0], real_run_dir)
     return ResolvedArtifact(name=decl.name, paths=paths, rendered_path=rendered_path)
 
 
