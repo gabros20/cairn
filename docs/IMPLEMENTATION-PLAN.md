@@ -231,7 +231,23 @@ mismatch is refused at plan time (**done** — `cairn plan` via `config.check_re
 
 ---
 
-## C8 — claude filesystem containment (W3c)  *(future — deferred)*
+## C8 — claude filesystem containment (W3c)  *(landed — `fs` posture; `strict`/`srt` egress tier deferred)*
+
+**Status (landed).** The `fs`-posture OS filesystem sandbox is implemented in `cairn/kernel/sandbox.py`
+(`SandboxWrapper` + pluggable `SandboxBackend` + cairn-owned `NativeBackend`: macOS `sandbox-exec`/SBPL,
+Linux `bwrap` with a `landrun`/Landlock fallback), wired into `CliExecutor.invoke` and gated by
+`Capabilities.sandbox` (**claude → `fs`**; codex/grok/shell/stub → `off`). claude's writes are confined
+to `run_dir + workspace` (+ per-process temp), the **gatekeys dir is read-only** (the W3c close — the
+hook reads the secret but cannot forge a manifest), and **network stays ON** (the model API needs it).
+Degradation is loud-not-silent (a `sandbox-unavailable` warning + `cairn doctor` WARN). Design:
+`docs/CLAUDE-SANDBOX-PLAN.md`; verified by `tests/unit/test_sandbox.py` (containment / gatekeys-RO /
+guard-chain-intact-through-the-wrap on a machine with the primitive, profile-generation strings on any
+OS). **Deferred (same seam):** the `strict`/`srt` network-egress tier, the `dontAsk` permission-mode
+spike, and a user-facing `sandbox.backend` config selector.
+
+*Original deferred writeup follows.*
+
+## C8 — claude filesystem containment (W3c)  *(historical — original deferred writeup)*
 
 *Surfaced by the 2026-07-14 hardening review (see `HARDENING-PLAN.md` and the panel synthesis). The
 guard engine now authenticates its manifest and pins each check-script's hash with the per-run secret

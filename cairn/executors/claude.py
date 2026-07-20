@@ -40,6 +40,11 @@ class ClaudeExecutor(CliExecutor):
         # claude-F7. No code ever read this glob; the transcripts it pointed at now don't exist.
         session_capture=None,
         installs_hooks=True,  # install_guards below actually wires the PreToolUse hook (W3a)
+        # C8/W3c: claude runs `--permission-mode bypassPermissions` (whole-FS r/w, no OS sandbox),
+        # so cairn wraps its process in an OS filesystem sandbox — writes confined to
+        # run_dir+workspace, gatekeys dir read-only (the hook can read the per-run secret but the
+        # agent cannot forge a manifest). codex/grok/shell/stub stay `off` (self-sandboxed/trusted).
+        sandbox="fs",
     )
     # The flags `_build_command` emits — doctor re-verifies these against the installed CLI's
     # `claude --help` (W5b sub-change A.1).

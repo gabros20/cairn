@@ -227,9 +227,11 @@ a rewritten manifest or a swapped check script **fails verification and denies**
 the agent also steals the run secret. What the `hook` does NOT do is widen the matcher: it uses the
 SAME `fnmatch` glob as the shim, so an absolute-path / `sh -c` / `env`-prefixed / leading-space
 invocation of a guarded binary MISSES the glob and is caught only by `post` — the hook does **not**
-backstop the shim's absolute-path gap (corrected: earlier text claimed it did). Closing the claude
-`bypassPermissions` residual outright (an OS FS-sandbox or tool-scoping so claude cannot read the run
-secret or write outside the run dir) is tracked as **W3c**.*
+backstop the shim's absolute-path gap (corrected: earlier text claimed it did). The claude
+`bypassPermissions` residual is now closed by the **OS filesystem sandbox** (C8/W3c — see §5.1): the
+`SandboxWrapper` (`cairn.kernel.sandbox`) prefixes claude's argv with an OS-native launcher that makes
+the **gatekeys dir read-only**, so the agent can read the secret its hook needs but cannot forge or
+plant a manifest, nor write outside `run_dir + workspace`. `post` remains the hard gate regardless.*
 
 **The C4 probe settles a specific burden.** The `claude` executor runs headless with
 `--permission-mode bypassPermissions` (it must — see API §7 / SECURITY §1.2: the default mode refuses
@@ -282,6 +284,34 @@ runs are safe by construction; the executor's own sandbox flags (`--sandbox work
 `--cwd`, permission mode) from its config; the guard shims prepended to PATH. The envelope states
 the isolation rule and the wrong-run tripwire (assert `run.json.params.url` matches) — belt over
 the environment's suspenders, unchanged from today.
+
+### 5.1 OS filesystem sandbox — the `SandboxWrapper` seam (C8/W3c)
+
+codex (`--sandbox workspace-write`) and grok (`--sandbox workspace`) self-contain at the OS level;
+**claude** runs `--permission-mode bypassPermissions` (whole-FS r/w, no OS sandbox — its guards are
+the app-level gate). To bring claude to parity, `CliExecutor.invoke` prefixes the built argv with an
+OS-native sandbox launcher just before spawn (`cairn.kernel.sandbox`):
+
+- **`Capabilities.sandbox`** posture per executor (`off` | `fs` | `strict`): **claude → `fs`**;
+  codex/grok/shell/stub → `off` (unwrapped, argv byte-identical to pre-C8).
+- **`SandboxWrapper`** resolves an OS-neutral **`SandboxPolicy`** (realpath-resolved rw / ro / tmp
+  paths + network flag) and dispatches to a pluggable **`SandboxBackend`**. The `fs` scope: rw =
+  `run_dir + workspace + TMPDIR`; ro = the **gatekeys state dir** (the hook/shim read the signed
+  manifest + per-run secret, but deny-default blocks *writes* there — the W3c close) + the
+  interpreter prefixes + cairn source (so the guard subprocess can exec python and import cairn
+  inside the cage); everything else denied. **Network stays ON** (the CLI's own model API needs it;
+  egress control is the deferred `strict`/`srt` tier).
+- **`NativeBackend`** (default, cairn-owned, no runtime dep) drives OS primitives already present:
+  macOS **`sandbox-exec`** with an inline SBPL profile (`(import "system.sb")` + `(deny default)` +
+  explicit `file-read*`/`file-write*` `subpath` allows + `(allow network*)`); Linux **`bwrap`**
+  (mount+pid namespaces, net left shared — no `--unshare-net`, env not cleared) with a **`landrun`**
+  (Landlock, no userns) fallback where unprivileged user namespaces are AppArmor-blocked. The seam
+  keeps a future `SrtBackend` (`@anthropic-ai/sandbox-runtime`, which also brings egress control for
+  `strict`) a drop-in behind the same interface.
+- **Degradation is loud-not-silent:** a missing/failed primitive → the step runs UNSANDBOXED with a
+  one-time `sandbox-unavailable` warning; `cairn doctor` WARNs per `fs` executor. Availability >
+  strictness by default (`post` remains the hard gate); no single OS sandbox is trusted alone
+  (CVE-2026-55607). Full design: `docs/CLAUDE-SANDBOX-PLAN.md`.
 
 **Config isolation per CLI (W4).** Each executor also seals its process from *ambient user
 config*, so identical pipeline runs are deterministic regardless of the operator's local

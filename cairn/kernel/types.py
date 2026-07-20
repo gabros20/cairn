@@ -67,6 +67,13 @@ class Capabilities:
     # blocking_hooks independently of this but do NOT install, so a hook-only guard under them
     # is not pre-execution-enforced.
     installs_hooks: bool
+    # The OS filesystem-sandbox posture cairn wraps this executor's process in (C8/W3c,
+    # cairn.kernel.sandbox). ``off`` = no wrap, argv unchanged (codex/grok self-sandbox via their
+    # own ``--sandbox``; shell/stub are trusted). ``fs`` = confine writes to run_dir+workspace,
+    # gatekeys dir read-only (claude — the residual close). ``strict`` = fs + network egress control
+    # (deferred srt tier). Defaulted so every existing ``Capabilities(...)`` stays valid; only
+    # claude sets it non-default today.
+    sandbox: str = "off"
 
 
 @dataclass(frozen=True)

@@ -119,9 +119,10 @@ def test_capabilities():
     caps = ClaudeExecutor(CFG).capabilities
     # W4 (claude-F7): session_capture retired to None — --no-session-persistence means there
     # are no transcripts to capture, and nothing ever consumed the old glob.
+    # C8/W3c: sandbox="fs" — claude's process is wrapped in the OS filesystem sandbox.
     assert caps == Capabilities(
         blocking_hooks=True, output_schema=False, session_capture=None,
-        installs_hooks=True,
+        installs_hooks=True, sandbox="fs",
     )
 
 

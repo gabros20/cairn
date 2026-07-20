@@ -11,6 +11,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import sys
 import tempfile
 from pathlib import Path
 
@@ -24,6 +25,7 @@ from cairn.executors.base import (
 )
 from cairn.kernel.config import ExecutorConfig
 from cairn.kernel.errors import CairnError, ConfigError
+from cairn.kernel.sandbox import SandboxWrapper, build_wrapper
 
 
 def _render_doctrine(doctrine: Path) -> str:
@@ -122,6 +124,21 @@ class CliExecutor:
     def invoke(self, inv: Invocation) -> Result:
         prompt_text = inv.prompt_file.read_text(encoding="utf-8")
         argv, stdin_text = self._build_command(inv, prompt_text)
+        # C8/W3c: prefix argv with the OS filesystem-sandbox launcher for a `fs`/`strict` executor
+        # (claude). A no-op passthrough when the posture is `off` (codex/grok/shell/stub → argv
+        # byte-identical to pre-C8) or when the primitive is unavailable (loud-not-silent
+        # degradation — a single `sandbox-unavailable` warning, the step still runs). The prompt
+        # is delivered on stdin (unchanged), and run_process spawns EXACTLY this argv.
+        sandbox = self._sandbox()
+        workspace = inv.env.get("CAIRN_WORKSPACE")
+        argv = sandbox.wrap(
+            argv, inv, run_dir=inv.cwd,
+            workspace=Path(workspace) if workspace else inv.cwd,  # walk.py always sets it; fall
+            # back to the run dir rather than KeyError if a caller omits it (off-posture ignores it)
+        )
+        reason = sandbox.take_warning()
+        if reason is not None:
+            print(f"cairn: sandbox-unavailable: {self.name}: {reason}", file=sys.stderr)
         exit_code, output, duration_s = run_process(
             argv,
             stdin_text=stdin_text,
@@ -141,6 +158,17 @@ class CliExecutor:
         """Return (argv, stdin_text). The ONE place argv is shaped — re-verify against the
         CLI's ``--help`` at doctor time; vendors drift."""
         raise NotImplementedError
+
+    def _sandbox(self) -> SandboxWrapper:
+        """The OS filesystem-sandbox wrapper for this executor, built once from its
+        ``capabilities.sandbox`` posture and cached. ``off`` posture → a pure passthrough
+        (codex/grok/shell/stub); ``fs`` → the OS-default backend (C8/W3c)."""
+        wrapper = getattr(self, "_sandbox_wrapper", None)
+        if wrapper is None:
+            posture = getattr(self.capabilities, "sandbox", "off")
+            wrapper = build_wrapper(posture)
+            self._sandbox_wrapper = wrapper
+        return wrapper
 
     # -- workspace + guards ------------------------------------------------- #
 
@@ -200,7 +228,36 @@ class CliExecutor:
             )
         findings += self._flag_findings()
         findings += self._model_findings()
+        findings += self._sandbox_findings()
         return findings
+
+    def _sandbox_findings(self) -> list[Finding]:
+        """WARN when this executor declares an OS FS-sandbox posture (``fs``/``strict``) but the
+        machine's sandbox primitive is missing/non-functional — the step would then run UNSANDBOXED
+        (loud-not-silent, C8/W3c). ``off``-posture executors emit nothing. Never an error: the
+        degradation policy is availability > strictness (``post`` remains the hard gate), so this is
+        a WARN, matching how missing sandboxing degrades at run time."""
+        posture = getattr(self.capabilities, "sandbox", "off")
+        wrapper = self._sandbox()
+        backend = wrapper.backend
+        if backend is None:  # off posture
+            return []
+        if backend.available():
+            return []
+        from cairn.kernel.sandbox import NativeBackend
+
+        reason = (
+            backend._unavailable_reason()
+            if isinstance(backend, NativeBackend)
+            else "no functional OS filesystem sandbox primitive"
+        )
+        return [
+            Finding(
+                "warning",
+                f"{self.name} declares sandbox posture {posture!r} but {reason}; "
+                f"steps will run UNSANDBOXED (post-validator remains the hard gate)",
+            )
+        ]
 
     def _flag_findings(self) -> list[Finding]:
         """Re-verify `_emitted_flags` against the installed CLI's `--help` (W5b sub-change A.1).

@@ -135,11 +135,22 @@ An injected instruction that a model obeys still cannot exceed the step's cage:
   (gatekeys-protected state dir) and is HMAC-signed with the per-run secret, and each check script's
   sha256 is signed in; the shim/hook re-verify both at decision time and **fail closed** on any
   mismatch. So under a **write-sandboxed** executor (codex `workspace-write`) the guard inputs are
-  tamper-proof — the agent cannot write outside its cwd. Under **claude `bypassPermissions`** the
-  agent has whole-FS access, so file-based guards are defense-in-depth: tamper (rewritten manifest or
-  swapped check) is **DETECTED and denied** unless the agent steals the per-run secret, and `post`
-  remains the hard gate. The definitive claude fix — an OS FS-sandbox / tool-scoping so claude cannot
-  read the secret or write outside the run dir — is tracked as **W3c**. Two per-executor caveats: the
+  tamper-proof — the agent cannot write outside its cwd. **claude** runs `bypassPermissions`
+  (no app-level FS wall), so cairn wraps its process in an **OS filesystem sandbox** (C8/W3c,
+  `cairn.kernel.sandbox`; macOS `sandbox-exec`/Seatbelt, Linux `bubblewrap`/`landrun` — ARCHITECTURE
+  §4): writes are confined to `run_dir + workspace` (+ per-process temp) and the **gatekeys dir is
+  read-only**, so a compromised claude can still *read* the per-run secret its own hook needs but can
+  no longer *forge a manifest* or write outside the run dir. That makes claude's file-based guard
+  inputs **tamper-proof-in-practice** — parity with codex under its write-sandbox (the exact
+  reduction is `CLAUDE-SANDBOX-PLAN.md` §6). Two properties bound this: (i) **no single OS sandbox is
+  fully trusted** — a live Claude Code sandbox-escape CVE (CVE-2026-55607) is why the wrap is a
+  *layer*, not a new sole gate; **`post` remains the hard gate** and the W3a signed guards stay.
+  (ii) the `fs` posture confines the **filesystem only** — network stays ON (the CLI needs its own
+  model API), so `bash curl` **exfiltration** is an accepted residual closed only by the deferred
+  **`strict`/`srt`** egress-controlling tier. A missing OS primitive degrades **loud-not-silent**:
+  the step runs UNSANDBOXED with a one-time `sandbox-unavailable` warning and `cairn doctor` WARNs
+  (availability > strictness) — never silently. codex/grok/shell/stub stay unwrapped (`sandbox: off`
+  — self-sandboxed or trusted; argv byte-identical to pre-C8). Two per-executor caveats: the
   hook uses the same glob as the shim, so it does NOT catch absolute-path / `sh -c` / `env`-prefixed
   invocations (only `post` does); and grok's native hook fails open on hook crash/timeout/malformed
   output, so its shim and post layers carry the backstop even once its hook install lands;
@@ -158,9 +169,10 @@ An injected instruction that a model obeys still cannot exceed the step's cage:
   a *non-monotonic* artifact-content `when` (e.g. `when: artifacts.qa.verdict=='NO-GO'`) can make an
   earlier manifest LESS restrictive — replaying an invocation whose artifact then read `GO` omits a
   guard that a later `NO-GO` should activate (under-block). C9 introduces this first class of
-  validly-signed, less-restrictive manifests, so the bound is the **C8/W3c** whole-FS-write residual
-  (the agent can rewrite the shim script / `settings.json` / steal the secret anyway under today's
-  executors — `post` remains the hard gate), NOT manifest monotonicity; (b) a `run.*`-rooted guard `when` inherits the ordinary `run.json` trust level (that root
+  validly-signed, less-restrictive manifests, but under claude's OS FS sandbox (C8/W3c, above) the
+  gatekeys dir is read-only, so an agent cannot mint or plant a *new* signed manifest — only redirect
+  to an older one already signed *this run* — and `post` remains the hard gate regardless; the bound
+  is that redirection window, NOT manifest monotonicity; (b) a `run.*`-rooted guard `when` inherits the ordinary `run.json` trust level (that root
   alone re-reads the agent-writable file) — prefer `gates`/`params`/`dims`/`artifacts` in a guard
   `when` and treat `run.*` there the same way you'd treat a `run.*`-rooted step `when`;
 - **gates** — the two irreversible crossings (CMS populate, deploy) sit behind human gates, with
