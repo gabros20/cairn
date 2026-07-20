@@ -121,9 +121,22 @@ class CliExecutor:
 
     # -- invocation --------------------------------------------------------- #
 
+    def _extra_env(self, inv: Invocation) -> dict[str, str] | None:
+        """Executor-specific env additions for this one invocation, merged over ``inv.env`` just
+        before spawn (never into ``inv.env`` itself — the walker owns that dict). The hook exists
+        for CLIs whose only config-isolation channel is a relocated home dir (kimi's
+        ``KIMI_CODE_HOME``, hermes's ``HERMES_HOME``): the executor generates a per-run home under
+        the run dir and points the CLI at it here. Default None — claude/codex/grok argv-only
+        adapters are byte-identical in env to pre-hook behavior."""
+        return None
+
     def invoke(self, inv: Invocation) -> Result:
         prompt_text = inv.prompt_file.read_text(encoding="utf-8")
         argv, stdin_text = self._build_command(inv, prompt_text)
+        env = inv.env
+        extra = self._extra_env(inv)
+        if extra:
+            env = {**env, **extra}
         # C8/W3c: prefix argv with the OS filesystem-sandbox launcher for a `fs`/`strict` executor
         # (claude). A no-op passthrough when the posture is `off` (codex/grok/shell/stub → argv
         # byte-identical to pre-C8) or when the primitive is unavailable (loud-not-silent
@@ -142,7 +155,7 @@ class CliExecutor:
         exit_code, output, duration_s = run_process(
             argv,
             stdin_text=stdin_text,
-            env=inv.env,
+            env=env,
             cwd=inv.cwd,
             timeout_s=inv.timeout_s,
             log_path=inv.log_path,

@@ -56,6 +56,7 @@ def make_inv(
     timeout_s: int = 30,
     scratch: Path | None = None,
     network: bool = False,
+    log_path: Path | None = None,
 ) -> Invocation:
     scratch = scratch or (tmp_path / "scratch")
     prompt_file = tmp_path / "prompt.md"
@@ -69,7 +70,11 @@ def make_inv(
         cwd=cwd,
         env=env if env is not None else fake_env(scratch),
         timeout_s=timeout_s,
-        log_path=tmp_path / "logs" / "step.log",
+        # Default matches the pre-existing fixed path (every prior test still gets one shared
+        # stem); callers exercising per-invocation isolation (H1, xcli-review-quality.md) pass a
+        # distinct log_path per invocation so two Invocations can share one `cwd` (as parallel
+        # steps of one run do, walk.py:471) while still deriving distinct generated homes.
+        log_path=log_path if log_path is not None else tmp_path / "logs" / "step.log",
         return_schema=tmp_path / "return.json",
         network=network,
     )
