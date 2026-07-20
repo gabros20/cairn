@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import errno
 import os
+import threading
 from pathlib import Path
 
 import pytest
@@ -174,6 +175,62 @@ def test_claim_never_overwrites_stuck_claim(tmp_path):
     assert claimed.read_text(encoding="utf-8") == "NEW-DATA"
     assert not candidate.exists()
     assert sorted(p.name for p in stuck_claims(watch)) == ["event-v2.json", "event.json"]
+
+
+def test_claim_winner_unlink_tolerates_losers_concurrent_cleanup(tmp_path, monkeypatch):
+    # G1 regression (review-T1-quality-r2.md): force the exact interleaving the round-2
+    # review identified — the loser's own candidate.unlink() (inside
+    # _links_same_source's True branch) can finish before the winner reaches its own
+    # candidate.unlink() at the end of claim(). The winner must still return its claim
+    # path, never raise FileNotFoundError, even though "its" unlink target is already
+    # gone by the time it runs.
+    watch = _watch(tmp_path)
+    candidate = watch / "event.json"
+    candidate.write_text("{}", encoding="utf-8")
+
+    real_link = os.link
+    lock = threading.Lock()
+    call_count = 0
+    linked = threading.Event()
+    loser_done = threading.Event()
+
+    def fake_link(src, dst, *, follow_symlinks=True):
+        nonlocal call_count
+        with lock:
+            call_count += 1
+            is_first = call_count == 1
+        if is_first:
+            real_link(src, dst, follow_symlinks=follow_symlinks)
+            linked.set()
+            # Hold the winner here until the loser has fully finished its own
+            # candidate.unlink() — the window G1 identified.
+            assert loser_done.wait(timeout=5), "loser never finished"
+            return None
+        assert linked.wait(timeout=5), "winner's link never happened"
+        return real_link(src, dst, follow_symlinks=follow_symlinks)  # raises FileExistsError
+
+    monkeypatch.setattr(os, "link", fake_link)
+
+    outcomes: list[Path | None] = []
+    errors: list[BaseException] = []
+
+    def worker():
+        try:
+            outcomes.append(claim(watch, candidate))
+        except BaseException as exc:  # noqa: BLE001 - capturing across threads for the assert below
+            errors.append(exc)
+        finally:
+            loser_done.set()
+
+    threads = [threading.Thread(target=worker) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert errors == []
+    assert sorted(outcomes, key=lambda p: p is None) == [watch / ".claim" / "event.json", None]
+    assert [p.name for p in (watch / ".claim").iterdir()] == ["event.json"]
 
 
 def test_claim_and_consume_unicode_filename(tmp_path):

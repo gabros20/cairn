@@ -298,7 +298,11 @@ def claim(watch_abs: Path, candidate: Path) -> Path | None:
             dest_name = f"{stem}-v{suffix}{ext}"
             continue
         break
-    candidate.unlink()
+    # missing_ok: a losing racer that hit the FileExistsError branch above may have
+    # already unlinked candidate (it links to the same inode we just landed at dest) —
+    # the postcondition (dest valid, candidate gone) holds regardless of which of the
+    # two racers physically performs this unlink (G1).
+    candidate.unlink(missing_ok=True)
     return dest
 
 
