@@ -34,7 +34,7 @@ moment the workspace exists.
 Today cairn installs **from source**. Clone the repo and install it as a uv tool:
 
 ```console
-$ git clone https://github.com/designatives/cairn.git
+$ git clone https://github.com/gabros20/cairn.git
 $ cd cairn
 $ uv tool install .
 ```

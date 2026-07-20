@@ -34,7 +34,7 @@ Under five minutes to your first run. cairn needs Python ≥ 3.11 and `uv`.
 **Install from source** (the path today):
 
 ```bash
-git clone https://github.com/designatives/cairn && cd cairn
+git clone https://github.com/gabros20/cairn && cd cairn
 uv tool install .          # installs the `cairn` command on your PATH
 ```
 
@@ -178,7 +178,7 @@ Every verb from `cairn --help`:
 ## Executors
 
 An executor is the only CLI-aware code in the system — a plugin binding an abstract worker to a real
-subprocess. The first five are live-verified end-to-end; the four newest are adapter-complete
+subprocess. The first five are live-verified end-to-end; the five newest are adapter-complete
 (flag surfaces sourced from vendor docs and local `--help` probes, unit-tested against fake
 binaries) with a real-CLI smoke run still pending:
 
@@ -222,7 +222,7 @@ docs index.
 
 ## Status
 
-**v0.4.0 released; 1137 tests passing.** The kernel and all ten executors are built and green
+**v0.5.0 released; 1137 tests passing.** The kernel and all ten executors are built and green
 (claude/codex/grok live-verified; cursor/opencode/hermes/kimi/agy adapter-complete, smoke pending),
 scheduling / batch / learnings / gc have shipped, and the hardening backlog is in (heartbeat trail
 events, a webhook sink, kernel-side secret redaction, cross-version resume gates, tool enforcement,

@@ -1,0 +1,657 @@
+<!doctype html>
+<html lang="en">
+<head>
+<script>document.documentElement.classList.add('js');</script>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cairn — Artifact-native pipelines over coding-agent CLIs</title>
+<meta name="description" content="cairn is a small, declarative orchestrator for multi-phase agentic pipelines that delegate to Claude Code, Codex, Grok and more. Every step leaves a validated artifact on disk — the filesystem is the state machine.">
+<link rel="canonical" href="https://cairn-pipelines.vercel.app/">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://cairn-pipelines.vercel.app/">
+<meta property="og:title" content="cairn — Artifact-native pipelines over coding-agent CLIs">
+<meta property="og:description" content="A small, declarative orchestrator for multi-phase agentic pipelines that delegate to Claude Code, Codex, Grok and more. Every step leaves a validated artifact on disk.">
+<meta property="og:image" content="https://cairn-pipelines.vercel.app/assets/img/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="cairn — Artifact-native pipelines over coding-agent CLIs">
+<meta name="twitter:description" content="A small, declarative orchestrator for multi-phase agentic pipelines that delegate to Claude Code, Codex, Grok and more.">
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<a class="visually-hidden" href="#main">Skip to content</a>
+
+<nav class="trail-gutter" aria-label="Section progress">
+  <svg class="trail-gutter__svg" viewBox="0 0 24 100" preserveAspectRatio="none" aria-hidden="true">
+    <line class="trail-line" x1="12" y1="0" x2="12" y2="100" vector-effect="non-scaling-stroke"></line>
+    <line class="trail-line__fill" id="trail-line-fill" x1="12" y1="0" x2="12" y2="100" vector-effect="non-scaling-stroke" pathLength="1"></line>
+  </svg>
+  <div class="trail-gutter__rail" id="trail-rail"></div>
+  <div class="trail-gutter__markers">
+    <button class="trail-marker" data-target="hero" aria-label="Jump to Hero">
+      <svg class="trail-marker__stone" viewBox="0 0 18 11"><path d="M2 10 L16 9 L13.5 2 L4 3 Z"></path></svg>
+    </button>
+    <button class="trail-marker" data-target="why-it-exists" aria-label="Jump to Why it exists">
+      <svg class="trail-marker__stone" viewBox="0 0 18 11"><path d="M2 10 L16 9 L13.5 2 L4 3 Z"></path></svg>
+    </button>
+    <button class="trail-marker" data-target="how-it-works" aria-label="Jump to How it works">
+      <svg class="trail-marker__stone" viewBox="0 0 18 11"><path d="M2 10 L16 9 L13.5 2 L4 3 Z"></path></svg>
+    </button>
+    <button class="trail-marker" data-target="the-trail" aria-label="Jump to The trail">
+      <svg class="trail-marker__stone" viewBox="0 0 18 11"><path d="M2 10 L16 9 L13.5 2 L4 3 Z"></path></svg>
+    </button>
+    <button class="trail-marker" data-target="decision-rule" aria-label="Jump to The decision rule">
+      <svg class="trail-marker__stone" viewBox="0 0 18 11"><path d="M2 10 L16 9 L13.5 2 L4 3 Z"></path></svg>
+    </button>
+    <button class="trail-marker" data-target="executors" aria-label="Jump to Executors">
+      <svg class="trail-marker__stone" viewBox="0 0 18 11"><path d="M2 10 L16 9 L13.5 2 L4 3 Z"></path></svg>
+    </button>
+    <button class="trail-marker" data-target="pipelines" aria-label="Jump to Pipelines">
+      <svg class="trail-marker__stone" viewBox="0 0 18 11"><path d="M2 10 L16 9 L13.5 2 L4 3 Z"></path></svg>
+    </button>
+    <button class="trail-marker" data-target="quickstart" aria-label="Jump to Quickstart">
+      <svg class="trail-marker__stone" viewBox="0 0 18 11"><path d="M2 10 L16 9 L13.5 2 L4 3 Z"></path></svg>
+    </button>
+    <button class="trail-marker" data-target="why-cairn" aria-label="Jump to Why cairn">
+      <svg class="trail-marker__stone" viewBox="0 0 18 11"><path d="M2 10 L16 9 L13.5 2 L4 3 Z"></path></svg>
+    </button>
+    <button class="trail-marker" data-target="closing" aria-label="Jump to Get started">
+      <svg class="trail-marker__stone" viewBox="0 0 18 11"><path d="M2 10 L16 9 L13.5 2 L4 3 Z"></path></svg>
+    </button>
+  </div>
+</nav>
+
+<div class="page">
+
+  <header class="site-header" id="site-header">
+    <div class="container site-header__bar">
+      <a class="site-header__brand" href="#hero">
+        <svg class="site-header__logo" viewBox="0 0 100 92" aria-hidden="true">
+          <path class="g-stroke" d="M10 88 L88 84 L80 70 L16 72 Z"></path>
+          <path class="g-stroke" d="M18 67 L82 64 L74 50 L24 52 Z"></path>
+          <path class="g-stroke" d="M30 47 L80 45 L73 31 L36 33 Z"></path>
+          <path class="g-fill" d="M34 29 L74 27 L67 13 L40 15 Z"></path>
+        </svg>
+        cairn
+      </a>
+      <nav class="site-header__nav" aria-label="Primary">
+        <a href="#why-it-exists">What it is</a>
+        <a href="#how-it-works">How it works</a>
+        <a href="#the-trail">The trail</a>
+        <a href="#executors">Executors</a>
+        <a href="#pipelines">Pipelines</a>
+        <a href="https://github.com/gabros20/cairn/tree/main/docs">Docs</a>
+      </nav>
+      <div class="site-header__actions">
+        <a class="site-header__github" href="https://github.com/gabros20/cairn">GitHub</a>
+        <a class="btn btn-primary" href="#quickstart">Install</a>
+      </div>
+    </div>
+    <div class="mobile-anchor-nav-wrap">
+      <nav class="mobile-anchor-nav" aria-label="Sections">
+        <a href="#why-it-exists">What it is</a>
+        <a href="#how-it-works">How it works</a>
+        <a href="#the-trail">The trail</a>
+        <a href="#decision-rule">Decision rule</a>
+        <a href="#executors">Executors</a>
+        <a href="#pipelines">Pipelines</a>
+        <a href="#quickstart">Quickstart</a>
+        <a href="#why-cairn">Why cairn</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+
+    <!-- ================= HERO ================= -->
+    <section class="section section--hero hero-section" id="hero">
+      <div class="container">
+        <div class="hero">
+          <div class="hero__copy reveal">
+            <h1 class="t-display-xl">Artifact-native pipelines over coding-agent CLIs.</h1>
+            <p class="t-body-lg hero__subhead">A small, declarative orchestrator for multi-phase agentic pipelines that delegate to Claude Code, Codex, Grok and more — as headless subprocesses. Every step leaves a validated artifact on disk. The trail of artifacts is the execution state. There is no database, no checkpointer, and no session to lose.</p>
+            <div class="hero__install">
+              <code id="install-cmd">uv tool install cairn-pipelines</code>
+              <button type="button" data-copy="uv tool install cairn-pipelines" aria-label="Copy install command">Copy</button>
+            </div>
+            <p class="t-body-sm hero__meta">Python ≥ 3.11 · MIT · two dependencies. On PyPI as <code>cairn-pipelines</code> (v0.5.0).</p>
+            <div class="hero__ctas">
+              <a class="btn btn-primary" href="#quickstart">Get started</a>
+              <a class="btn btn-secondary" href="https://github.com/gabros20/cairn/tree/main/docs">Read the docs</a>
+            </div>
+          </div>
+          <div class="hero__anim reveal">
+            <div class="hero__anim-bar">
+              <span class="terminal-panel__dot" aria-hidden="true"></span>
+              runs/hello-world-20260703/cairn-build
+            </div>
+            <div class="hero__anim-frame" id="hero-anim-frame">
+              <video id="hero-video" muted autoplay loop playsinline poster="assets/img/cairn-build-poster.png" width="1200" height="1200" aria-label="A cairn assembling stone by stone as a pipeline runs, each stone turning verdigris once its artifact validates.">
+                <source src="assets/anim/cairn-build.webm" type="video/webm">
+                <source src="assets/anim/cairn-build.mp4" type="video/mp4">
+              </video>
+              <img id="hero-poster" class="is-hidden" src="assets/img/cairn-build-poster.png" alt="A completed cairn: five stacked stones, each filled verdigris, meaning every step of the pipeline validated." width="1200" height="1200">
+              <div id="hero-fallback" class="hero__anim-fallback is-hidden" aria-hidden="true">
+                <svg class="hero__fallback-glyph" viewBox="0 0 100 92" width="55%" role="img" aria-label="A stacked cairn of four leaning stones, the top stone filled verdigris">
+                  <path class="g-stroke" d="M10 88 L88 84 L80 70 L16 72 Z"></path>
+                  <path class="g-stroke" d="M18 67 L82 64 L74 50 L24 52 Z"></path>
+                  <path class="g-stroke" d="M30 47 L80 45 L73 31 L36 33 Z"></path>
+                  <path class="g-fill" d="M34 29 L74 27 L67 13 L40 15 Z"></path>
+                </svg>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= WHY IT EXISTS ================= -->
+    <section class="section" id="why-it-exists">
+      <div class="container">
+        <div class="prose-center reveal">
+          <h2 class="t-display-lg">Where is this run, and is each step actually done?</h2>
+          <p class="t-body" style="margin-top:1.5rem; text-align:left;">That's the question you hit the moment a pipeline outgrows a single chat session. cairn's answer is the filesystem. Every step writes a typed artifact validated by JSON Schema plus optional Python checks; an append-only <code class="t-mono-sm">trail.jsonl</code> records every event; resume is just walking the run directory to the last valid artifact and re-running from there. <code class="t-mono-sm">kill -9</code> at any moment costs you at most one step's work.</p>
+          <p class="t-heading pull-line">One authority — the validated filesystem. No second source of truth to drift.</p>
+        </div>
+
+        <div class="reveal" role="img" aria-label="Diagram: on the left, a database cylinder and a stack of hollow file slabs, both labelled 'where is this run?', connected by a tense dashed line — two competing authorities. On the right, a single stack of verdigris-filled slabs labelled 'the validated filesystem' — one authority.">
+          <div class="authorities-diagram">
+            <div class="authorities-diagram__side">
+              <div class="authorities-diagram__pair">
+                <svg class="authorities-diagram__icon" viewBox="0 0 60 56" aria-hidden="true">
+                  <ellipse cx="30" cy="12" rx="19" ry="6.5"></ellipse>
+                  <path d="M11 12 L11 42 A19 6.5 0 0 0 49 42 L49 12"></path>
+                  <path d="M11 27 A19 6.5 0 0 0 49 27"></path>
+                </svg>
+                <span class="authorities-diagram__label t-mono-sm">where is this run?</span>
+              </div>
+              <div class="authorities-diagram__tension" aria-hidden="true">
+                <svg viewBox="0 0 8 36" preserveAspectRatio="none"><path d="M4 0 L1.5 12 L6.5 20 L3.5 36"></path></svg>
+              </div>
+              <div class="authorities-diagram__pair">
+                <svg class="authorities-diagram__icon" viewBox="0 0 60 50" aria-hidden="true">
+                  <path d="M6 46 L54 44 L48 34 L12 36 Z"></path>
+                  <path d="M12 33 L50 31 L45 21 L17 23 Z"></path>
+                  <path d="M18 20 L44 19 L40 9 L22 10 Z"></path>
+                </svg>
+                <span class="authorities-diagram__label t-mono-sm">where is this run?</span>
+              </div>
+            </div>
+            <div class="authorities-diagram__arrow" aria-hidden="true">
+              <svg viewBox="0 0 44 16"><line x1="0" y1="8" x2="36" y2="8"></line><path d="M28 1 L38 8 L28 15" fill="none"></path></svg>
+            </div>
+            <div class="authorities-diagram__side authorities-diagram__side--resolved">
+              <div class="authorities-diagram__pair">
+                <svg class="authorities-diagram__icon authorities-diagram__icon--lg" viewBox="0 0 112 102" aria-hidden="true">
+                  <path class="g-fill" d="M18 90 L92 87 L84 72 L26 74 Z" transform="rotate(-3 55 81)"></path>
+                  <path class="g-fill" d="M10 66 L94 64 L84 50 L20 52 Z" transform="rotate(4 52 58)"></path>
+                  <path class="g-fill" d="M28 45 L92 43 L82 30 L38 31 Z" transform="rotate(-2 60 37)"></path>
+                  <path class="g-fill" d="M20 26 L74 25 L66 11 L28 12 Z" transform="rotate(3 47 18)"></path>
+                </svg>
+                <span class="authorities-diagram__label t-mono-sm authorities-diagram__label--resolved">the validated filesystem</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= HOW IT WORKS ================= -->
+    <section class="section" id="how-it-works">
+      <div class="container">
+        <div class="section-heading reveal">
+          <h2 class="t-display-lg">A declarative trail the walker walks.</h2>
+          <p class="t-body" style="margin-top:1.5rem;">A pipeline is an ordered trail of nodes. <code class="t-mono-sm">cairn plan</code> resolves params, expands conditionals, and statically verifies dataflow, schemas, agents and skills — before a single token is spent. Then the walker drives each node: for an agent step it renders a prompt envelope to a file, invokes one fresh executor subprocess, and marks the step done only if the artifacts it produced pass their validators. Every event is appended to <code class="t-mono-sm">trail.jsonl</code>. <code class="t-mono-sm">cairn resume</code> re-walks from the first step whose artifact no longer validates.</p>
+        </div>
+
+        <div class="flow reveal" role="img" aria-label="Lifecycle: pipeline.yaml and params flow into cairn plan, then the walker, then compose, then an executor subprocess, producing an artifact on disk, checked by a validator gate. On pass, in verdigris, it appends to trail.jsonl and loops back to the walker. On fail, hollow, it halts or retries and cairn resume re-enters the walker.">
+          <div class="flow__track">
+            <div class="flow__node">pipeline.yaml<br>+ params</div>
+            <div class="flow__edge"></div>
+            <div class="flow__node">cairn plan<br>load · resolve · verify</div>
+            <div class="flow__edge"></div>
+            <div class="flow__node">walker<br>walk nodes in order</div>
+            <div class="flow__edge"></div>
+            <div class="flow__node">compose<br>prompt envelope</div>
+            <div class="flow__edge"></div>
+            <div class="flow__node">executor<br>subprocess</div>
+            <div class="flow__edge"></div>
+            <div class="flow__node">artifact<br>on disk</div>
+            <div class="flow__edge"></div>
+            <div class="flow__node">validator<br>gate</div>
+          </div>
+          <div class="flow__track" style="min-width:600px;">
+            <div class="flow__node" style="visibility:hidden;">validator gate</div>
+            <div class="flow__edge flow__edge--pass">
+              <span class="flow__edge-label flow__edge-label--pass">pass</span>
+            </div>
+            <div class="flow__node" style="border-color: var(--verdigris); color: var(--verdigris-deep);">trail.jsonl<br>step-done</div>
+            <div class="flow__edge flow__edge--pass"><span class="flow__edge-label flow__edge-label--pass">loop</span></div>
+            <div class="flow__node">walker</div>
+          </div>
+          <div class="flow__track" style="min-width:600px;">
+            <div class="flow__node" style="visibility:hidden;">validator gate</div>
+            <div class="flow__edge">
+              <span class="flow__edge-label flow__edge-label--fail">fail</span>
+            </div>
+            <div class="flow__node">halt / retry</div>
+            <div class="flow__edge"></div>
+            <div class="flow__node">cairn resume</div>
+          </div>
+        </div>
+
+        <div class="node-kinds reveal">
+          <h3 class="t-subheading node-kinds__heading">Exactly five node kinds — nothing else in the kernel.</h3>
+          <div class="node-kinds__grid">
+            <div class="node-kinds__item">
+              <svg class="node-kinds__glyph" viewBox="0 0 34 26" aria-hidden="true"><path class="g-stroke" d="M4 20 L30 20 L25 8 L9 8 Z"></path></svg>
+              <span class="node-kinds__id t-mono-sm">step</span>
+              <p class="node-kinds__desc">One unit of delegation: an <code class="t-mono-sm">agent:</code> process, a deterministic <code class="t-mono-sm">run:</code> script, or a checkable <code class="t-mono-sm">manual:</code> step. Same contract shape: <code class="t-mono-sm">needs</code> / <code class="t-mono-sm">produces</code> / validated.</p>
+            </div>
+            <div class="node-kinds__item">
+              <svg class="node-kinds__glyph" viewBox="0 0 34 26" aria-hidden="true">
+                <path class="g-stroke" d="M4 20 L22 20 L18 8 L9 8 Z"></path>
+                <path class="g-stroke" d="M22 20 L30 14 L24 8" fill="none"></path>
+              </svg>
+              <span class="node-kinds__id t-mono-sm">gate</span>
+              <p class="node-kinds__desc">A human decision as a first-class node; the choice is written to <code class="t-mono-sm">gates/&lt;name&gt;.json</code> and consumed downstream like any artifact. Never re-asked on resume.</p>
+            </div>
+            <div class="node-kinds__item">
+              <svg class="node-kinds__glyph" viewBox="0 0 34 26" aria-hidden="true">
+                <path class="g-stroke" d="M2 20 L14 20 L11 8 L5 8 Z"></path>
+                <path class="g-stroke" d="M18 20 L30 20 L27 8 L21 8 Z"></path>
+              </svg>
+              <span class="node-kinds__id t-mono-sm">parallel</span>
+              <p class="node-kinds__desc">A concurrent group; children must have disjoint <code class="t-mono-sm">produces</code>.</p>
+            </div>
+            <div class="node-kinds__item">
+              <svg class="node-kinds__glyph" viewBox="0 0 34 26" aria-hidden="true">
+                <path class="g-stroke" d="M4 20 L30 20 L25 8 L9 8 Z"></path>
+                <path class="g-stroke" d="M25 12 L30 8 L25 5" fill="none"></path>
+              </svg>
+              <span class="node-kinds__id t-mono-sm">loop</span>
+              <p class="node-kinds__desc">A bounded review⇄revise cycle, its exit read from artifact content (<code class="t-mono-sm">until: artifacts.art-review.verdict == 'approve'</code>).</p>
+            </div>
+            <div class="node-kinds__item">
+              <svg class="node-kinds__glyph" viewBox="0 0 34 26" aria-hidden="true">
+                <path class="g-stroke" d="M4 20 L30 20 L25 8 L9 8 Z"></path>
+                <path class="g-stroke" d="M13 14 L16 17 L22 11" fill="none"></path>
+              </svg>
+              <span class="node-kinds__id t-mono-sm">manual</span>
+              <p class="node-kinds__desc">Instructions printed to the operator, wait for confirmation, then validate.</p>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= THE TRAIL ================= -->
+    <section class="section" id="the-trail">
+      <div class="container">
+        <div class="section-heading reveal">
+          <h2 class="t-display-lg">Every run is one directory you can read.</h2>
+          <p class="t-body" style="margin-top:1.5rem;">One execution = one self-describing directory: the isolation boundary, the resume source of truth, and a complete post-mortem with no external service. The prompt is an artifact too — the exact rendered envelope is on disk next to the log.</p>
+        </div>
+
+        <div class="trail-proof__panels reveal">
+          <div class="terminal-panel">
+            <div class="terminal-panel__bar"><span class="terminal-panel__dot"></span>runs/hello-world-20260703/</div>
+            <div class="terminal-panel__body">
+<pre>runs/hello-world-20260703/
+├── run.json            <span class="yaml y-com"># pinned: params, dims, executor(s), resolved models, pipeline hash</span>
+├── trail.jsonl         <span class="yaml y-com"># append-only event log</span>
+├── greeting.json       <span class="yaml y-com"># a produced artifact (schema-validated)</span>
+├── message.txt         <span class="yaml y-com"># a produced artifact (validator-checked)</span>
+├── gates/
+│   └── tone.json       <span class="yaml y-com"># the gate decision, stored as an artifact — replayable, never re-asked</span>
+└── logs/
+    ├── greet.prompt.md <span class="yaml y-com"># the EXACT rendered envelope — the prompt is an artifact too</span>
+    └── greet.log       <span class="yaml y-com"># step stdout/stderr</span></pre>
+            </div>
+          </div>
+          <div class="terminal-panel">
+            <div class="terminal-panel__bar"><span class="terminal-panel__dot"></span>trail.jsonl</div>
+            <div class="terminal-panel__body">
+<pre class="trail-event">{<span class="e-key">"event"</span>:<span class="e-str">"run-start"</span>,<span class="e-key">"run"</span>:<span class="e-str">"hello-world-20260703"</span>,<span class="e-key">"pipeline"</span>:<span class="e-str">"hello"</span>}
+{<span class="e-key">"event"</span>:<span class="e-pass">"step-done"</span>,<span class="e-key">"step"</span>:<span class="e-str">"greet"</span>,<span class="e-key">"artifacts"</span>:[<span class="e-str">"greeting"</span>],<span class="e-key">"ms"</span>:38}
+{<span class="e-key">"event"</span>:<span class="e-str">"gate-answered"</span>,<span class="e-key">"gate"</span>:<span class="e-str">"tone"</span>,<span class="e-key">"choice"</span>:<span class="e-str">"friendly"</span>,<span class="e-key">"by"</span>:<span class="e-str">"default"</span>}
+{<span class="e-key">"event"</span>:<span class="e-pass">"step-done"</span>,<span class="e-key">"step"</span>:<span class="e-str">"compose"</span>,<span class="e-key">"artifacts"</span>:[<span class="e-str">"message"</span>],<span class="e-key">"ms"</span>:12}
+{<span class="e-key">"event"</span>:<span class="e-str">"run-done"</span>,<span class="e-key">"status"</span>:<span class="e-pass">"ok"</span>}</pre>
+            </div>
+          </div>
+        </div>
+
+        <p class="t-body-sm trail-proof__caption reveal"><code class="t-mono-sm">cairn trail &lt;run-dir&gt;</code> reads this back as a status tree; <code class="t-mono-sm">--follow --json</code> streams it as NDJSON. <code class="t-mono-sm">cairn ps</code> gives a cross-run fleet view — no daemon.</p>
+      </div>
+    </section>
+
+    <!-- ================= DECISION RULE ================= -->
+    <section class="section" id="decision-rule">
+      <div class="container">
+        <div class="reveal">
+          <h2 class="t-display-lg decision-rule__statement">If you can write the exact command, it's a <code class="heading-mono">run:</code> step. If it needs judgment, it's an <code class="heading-mono">agent:</code> step.</h2>
+          <p class="t-body" style="margin-top:1.5rem; max-width: var(--measure);">Both share one contract shape — <code class="t-mono-sm">needs</code>, <code class="t-mono-sm">produces</code>, validated the same way — and mix freely in one dependency graph. A <code class="t-mono-sm">run:</code> step is deterministic and costs no tokens; an <code class="t-mono-sm">agent:</code> step delegates the inside of the step to a model. Tools tend to graduate downward: a step enters agentic while you're still learning the right invocation, and once the trail shows the agent running essentially the same command every run, you demote it to <code class="t-mono-sm">run:</code>.</p>
+        </div>
+
+        <div class="decision-cards reveal">
+          <div class="terminal-panel">
+            <div class="terminal-panel__bar"><span class="terminal-panel__dot"></span>deterministic — no model</div>
+            <div class="terminal-panel__body">
+<pre class="yaml">- <span class="y-key">id:</span> select-urls
+  <span class="y-key">run:</span> <span class="y-str">"uv run python skills/crawl4ai/scripts/discover_urls.py
+         --select {gate:scope} --pages {params.pages}
+         --out {artifact:selected-urls}"</span>
+  <span class="y-key">needs:</span> [discovery]
+  <span class="y-key">produces:</span> [selected-urls]</pre>
+            </div>
+          </div>
+          <div class="terminal-panel">
+            <div class="terminal-panel__bar"><span class="terminal-panel__dot"></span>agentic — the model decides how</div>
+            <div class="terminal-panel__body">
+<pre class="yaml">- <span class="y-key">id:</span> capture
+  <span class="y-key">agent:</span> site-extractor          <span class="y-com"># skills:[crawl4ai], bash: allowlist.yaml#capture</span>
+  <span class="y-key">needs:</span> [discovery, selected-urls]
+  <span class="y-key">produces:</span> [site-map, design-signals]
+  <span class="y-key">timeout:</span> 60m</pre>
+            </div>
+          </div>
+          <p class="t-body-sm decision-bridge">Same <code class="t-mono-sm">needs</code>/<code class="t-mono-sm">produces</code> contract; same validation gate to "done". The only difference is what runs inside.</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= EXECUTORS ================= -->
+    <section class="section" id="executors">
+      <div class="container">
+        <div class="section-heading reveal">
+          <h2 class="t-display-lg">One abstract worker. Any CLI behind it.</h2>
+          <p class="t-body" style="margin-top:1.5rem;">A step names an abstract worker; the CLI that runs it is a swappable executor. Pipelines don't know which CLI runs them, and a mixed fleet spanning <code class="t-mono-sm">codex → claude → grok</code> has run end-to-end. The first three coding agents are live-verified; the five newest are adapter-complete — their flag surfaces sourced from vendor docs and local <code class="t-mono-sm">--help</code> probes and unit-tested against fake binaries — with a real-CLI smoke run still pending. The matrix says so.</p>
+        </div>
+
+        <div class="matrix reveal">
+          <table>
+            <thead>
+              <tr><th>Executor</th><th>Runs</th><th>Status</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>shell</td><td>a deterministic command — how <code class="t-mono-sm">run:</code> steps execute</td><td><span class="status-pill status-pill--validated">Live</span> — even determinism goes through the executor interface</td></tr>
+              <tr><td>stub</td><td>recorded envelopes replayed from fixtures</td><td><span class="status-pill status-pill--validated">Live</span> — powers offline pipeline tests through production code, zero tokens</td></tr>
+              <tr><td>claude</td><td><code class="t-mono-sm">claude -p</code> (Claude Code)</td><td><span class="status-pill status-pill--validated">Live-verified</span> — first real run captured as an offline stub regression</td></tr>
+              <tr><td>codex</td><td><code class="t-mono-sm">codex exec</code></td><td><span class="status-pill status-pill--validated">Live-verified</span></td></tr>
+              <tr><td>grok</td><td><code class="t-mono-sm">grok --prompt-file</code></td><td><span class="status-pill status-pill--validated">Live-verified</span> — the mixed <code class="t-mono-sm">codex → claude → grok</code> fleet ran here</td></tr>
+              <tr><td>cursor</td><td><code class="t-mono-sm">agent -p</code> (Cursor CLI)</td><td><span class="status-pill status-pill--pending">Adapter-complete · smoke pending</span> — uses cursor's own sandbox</td></tr>
+              <tr><td>opencode</td><td><code class="t-mono-sm">opencode run</code></td><td><span class="status-pill status-pill--pending">Adapter-complete · smoke pending</span> — probed against opencode 1.17.15</td></tr>
+              <tr><td>hermes</td><td><code class="t-mono-sm">hermes -z</code> (Nous Research)</td><td><span class="status-pill status-pill--pending">Adapter-complete · smoke pending</span></td></tr>
+              <tr><td>kimi</td><td><code class="t-mono-sm">kimi -p</code> (Kimi Code / K3)</td><td><span class="status-pill status-pill--pending">Adapter-complete · smoke pending</span></td></tr>
+              <tr><td>agy</td><td><code class="t-mono-sm">agy -p</code> (Antigravity / Gemini)</td><td><span class="status-pill status-pill--pending">Adapter-complete · smoke pending · local-only</span> — interactive OS-keyring auth, no CI path</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <p class="t-body-sm matrix__footnote reveal"><code class="t-mono-sm">cursor</code>/<code class="t-mono-sm">opencode</code>/<code class="t-mono-sm">hermes</code>/<code class="t-mono-sm">kimi</code>/<code class="t-mono-sm">agy</code> headless modes auto-approve with no native approval gate (cursor excepted — it ships its own sandbox), so <code class="t-mono-sm">opencode</code>/<code class="t-mono-sm">hermes</code>/<code class="t-mono-sm">kimi</code>/<code class="t-mono-sm">agy</code> run under cairn's OS filesystem sandbox (<code class="t-mono-sm">sandbox: fs</code>) — the same containment <code class="t-mono-sm">claude</code> gets. <code class="t-mono-sm">cairn doctor</code> preflights each: auth, version, hook support.</p>
+      </div>
+    </section>
+
+    <!-- ================= PIPELINES ================= -->
+    <section class="section" id="pipelines">
+      <div class="container">
+        <div class="section-heading reveal">
+          <h2 class="t-display-lg">Three real pipelines, not a hello-world.</h2>
+          <p class="t-body" style="margin-top:1.5rem;">These run in the repo today. Each mixes deterministic <code class="t-mono-sm">run:</code> steps, agentic <code class="t-mono-sm">agent:</code> steps, and human <code class="t-mono-sm">gate:</code> nodes in one dependency graph.</p>
+        </div>
+
+        <div class="reveal">
+          <div class="pipelines__tabs" role="tablist" aria-label="Example pipelines">
+            <button class="pipelines__tab is-active" role="tab" aria-selected="true" aria-controls="tab-rebuild" id="tabbtn-rebuild" data-tab="tab-rebuild">Rebuild a site</button>
+            <button class="pipelines__tab" role="tab" aria-selected="false" aria-controls="tab-learn" id="tabbtn-learn" data-tab="tab-learn">The learning loop</button>
+            <button class="pipelines__tab" role="tab" aria-selected="false" aria-controls="tab-day0" id="tabbtn-day0" data-tab="tab-day0">Day-0</button>
+          </div>
+
+          <div class="pipelines__panel is-active" id="tab-rebuild" role="tabpanel" aria-labelledby="tabbtn-rebuild">
+            <p class="t-body pipelines__gloss">A six-phase site rebuild — capture → audit → blueprint → build → review → deploy. A human gate scopes the capture; a concurrent pair writes the blueprint and the design system; a bounded loop runs art review until it approves; deploy is a deterministic <code class="t-mono-sm">run:</code> step gated on the QA verdict. This is the origin pipeline cairn was distilled from (brease-factory).</p>
+            <div class="terminal-panel pipelines__yaml">
+              <div class="terminal-panel__bar"><span class="terminal-panel__dot"></span>pipelines/brease-rebuild.yaml (trimmed)</div>
+              <div class="terminal-panel__body">
+<pre class="yaml"><span class="y-key">steps:</span>
+  - <span class="y-key">id:</span> discover
+    <span class="y-key">agent:</span> site-extractor
+    <span class="y-key">produces:</span> [discovery]
+
+  - <span class="y-key">gate:</span> scope                       <span class="y-com"># human decision, headless-safe via default</span>
+    <span class="y-key">reads:</span> [discovery]
+    <span class="y-key">ask:</span> <span class="y-str">"Which pages should we capture?"</span>
+    <span class="y-key">options:</span> { recommended: <span class="y-str">"nav-linked core pages"</span>, all: <span class="y-str">"everything"</span>, core: <span class="y-str">"home only"</span> }
+    <span class="y-key">default:</span> all
+
+  - <span class="y-key">id:</span> select-urls                   <span class="y-com"># deterministic — no model needed</span>
+    <span class="y-key">run:</span> <span class="y-str">"uv run python skills/crawl4ai/scripts/discover_urls.py
+           --select {gate:scope} --out {artifact:selected-urls}"</span>
+    <span class="y-key">needs:</span> [discovery]
+    <span class="y-key">produces:</span> [selected-urls]
+
+  - <span class="y-key">parallel:</span> blueprint               <span class="y-com"># concurrent pair, disjoint produces</span>
+    <span class="y-key">steps:</span>
+      - <span class="y-key">id:</span> architect
+        <span class="y-key">agent:</span> blueprint-architect
+        <span class="y-key">produces:</span> [blueprints]
+      - <span class="y-key">id:</span> design-author
+        <span class="y-key">agent:</span> design-director
+        <span class="y-key">produces:</span> [design-md]
+
+  - <span class="y-key">loop:</span> art-review                  <span class="y-com"># bounded review⇄revise, exit read from disk</span>
+    <span class="y-key">when:</span> dims.design != 'reproduce'
+    <span class="y-key">max:</span> { interactive: 3, headless: 2 }
+    <span class="y-key">until:</span> artifacts.art-review.verdict == <span class="y-pass">'approve'</span>
+    <span class="y-key">body:</span>
+      - <span class="y-key">id:</span> review
+        <span class="y-key">agent:</span> design-director
+        <span class="y-key">produces:</span> [art-review]
+        <span class="y-key">executor:</span> claude              <span class="y-com"># judgment stays on the strongest reviewer</span>
+      - <span class="y-key">id:</span> revise
+        <span class="y-key">agent:</span> frontend-builder
+        <span class="y-key">produces:</span> [frontend]
+
+  - <span class="y-key">id:</span> deploy                        <span class="y-com"># deterministic, gated on the QA verdict</span>
+    <span class="y-key">when:</span> params.deploy == 'on' &amp;&amp; artifacts.qa-report.verdict == <span class="y-pass">'GO'</span>
+    <span class="y-key">agent:</span> deployer
+    <span class="y-key">needs:</span> [frontend, qa-report]
+    <span class="y-key">produces:</span> [deploy-report]</pre>
+              </div>
+            </div>
+          </div>
+
+          <div class="pipelines__panel" id="tab-learn" role="tabpanel" aria-labelledby="tabbtn-learn">
+            <p class="t-body pipelines__gloss">cairn improving its own workspace with the same contracts as any other work. A deterministic <code class="t-mono-sm">aggregate</code> step freezes the ranked <code class="t-mono-sm">cairn learnings</code> view; an agent <code class="t-mono-sm">curate</code> step judges it into <code class="t-mono-sm">proposals.json</code>; a human <code class="t-mono-sm">approve</code> gate whose headless default is <strong>no</strong> means an unattended (cron) run records proposals and stops — it can never self-promote; the <code class="t-mono-sm">open-pr</code> step applies approved edits on a new branch and opens a PR. Proposals arrive as branches/PRs, never as direct commits.</p>
+            <div class="terminal-panel pipelines__yaml">
+              <div class="terminal-panel__bar"><span class="terminal-panel__dot"></span>templates/workspace/pipelines/self-improve.yaml</div>
+              <div class="terminal-panel__body">
+<pre class="yaml"><span class="y-key">steps:</span>
+  - <span class="y-key">id:</span> aggregate                     <span class="y-com"># deterministic, zero tokens</span>
+    <span class="y-key">run:</span> <span class="y-str">'cd "$CAIRN_WORKSPACE" && cairn learnings > "{artifact:learnings-snapshot}"'</span>
+    <span class="y-key">produces:</span> [learnings-snapshot]
+
+  - <span class="y-key">id:</span> curate                        <span class="y-com"># judgment → an agent step</span>
+    <span class="y-key">agent:</span> curator
+    <span class="y-key">needs:</span> [learnings-snapshot]
+    <span class="y-key">produces:</span> [proposals]
+
+  - <span class="y-key">gate:</span> approve                     <span class="y-com"># a HUMAN decides; headless default is "no"</span>
+    <span class="y-key">reads:</span> [proposals]
+    <span class="y-key">ask:</span> <span class="y-str">"Promote these proposals into the workspace (new branch + PR)?"</span>
+    <span class="y-key">options:</span>
+      <span class="y-str">"yes"</span>: <span class="y-str">"Apply every proposal on a new branch and open a PR"</span>
+      <span class="y-str">"no"</span>:  <span class="y-str">"Stop here — keep the proposals as a run record, change nothing"</span>
+    <span class="y-key">default:</span> <span class="y-str">"no"</span>
+
+  - <span class="y-key">id:</span> open-pr                       <span class="y-com"># deterministic: branch + PR, never a direct commit</span>
+    <span class="y-key">when:</span> <span class="y-str">"gates.approve.choice == 'yes'"</span>
+    <span class="y-key">run:</span> <span class="y-str">'python3 "$CAIRN_WORKSPACE/scripts/self-improve-open-pr.py"
+           "{artifact:proposals}" "{artifact:pr-record}"'</span>
+    <span class="y-key">needs:</span> [proposals, approve]
+    <span class="y-key">produces:</span> [pr-record]</pre>
+              </div>
+            </div>
+          </div>
+
+          <div class="pipelines__panel" id="tab-day0" role="tabpanel" aria-labelledby="tabbtn-day0">
+            <p class="t-body pipelines__gloss">The whole model in miniature — two <code class="t-mono-sm">run:</code> steps and one <code class="t-mono-sm">gate:</code>, no auth, no API key, no model. <code class="t-mono-sm">cairn run hello</code> works the moment the workspace exists. Grow it by turning a step that needs judgment into an <code class="t-mono-sm">agent:</code> step.</p>
+            <div class="terminal-panel pipelines__yaml">
+              <div class="terminal-panel__bar"><span class="terminal-panel__dot"></span>templates/workspace/pipelines/hello.yaml</div>
+              <div class="terminal-panel__body">
+<pre class="yaml"><span class="y-key">artifacts:</span>
+  greeting: { path: greeting.json, schema: schemas/greeting.json }
+  message:  { path: message.txt,  validator: validators/nonempty.py }
+
+<span class="y-key">steps:</span>
+  - <span class="y-key">id:</span> greet                         <span class="y-com"># run: — deterministic, no auth</span>
+    <span class="y-key">run:</span> <span class="y-str">&gt;-
+      python3 -c "import json,sys;
+      json.dump({'name': sys.argv[1]}, open(sys.argv[2],'w'))"
+      "{params.name}" "{artifact:greeting}"</span>
+    <span class="y-key">produces:</span> [greeting]
+
+  - <span class="y-key">gate:</span> tone                        <span class="y-com"># headless resolves to default</span>
+    <span class="y-key">reads:</span> [greeting]
+    <span class="y-key">ask:</span> <span class="y-str">"What tone should the message use?"</span>
+    <span class="y-key">options:</span> { friendly: <span class="y-str">"Warm and casual"</span>, formal: <span class="y-str">"Polished and professional"</span> }
+    <span class="y-key">default:</span> friendly
+
+  - <span class="y-key">id:</span> compose
+    <span class="y-key">run:</span> <span class="y-str">&gt;-
+      python3 -c "import json;
+      g=json.load(open('{artifact:greeting}'));
+      open('{artifact:message}','w').write('{gate:tone}'.capitalize()+' hello, '+g['name']+'!')"</span>
+    <span class="y-key">needs:</span> [greeting, tone]
+    <span class="y-key">produces:</span> [message]</pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ================= QUICKSTART ================= -->
+    <section class="section" id="quickstart">
+      <div class="container">
+        <div class="section-heading reveal">
+          <h2 class="t-display-lg">Under five minutes to your first run.</h2>
+          <p class="t-body" style="margin-top:1.5rem;">The day-0 pipeline needs no auth, no API key, and no model — it's built from deterministic <code class="t-mono-sm">run:</code> steps plus one gate. Needs Python ≥ 3.11 and <code class="t-mono-sm">uv</code>.</p>
+        </div>
+
+        <div class="terminal-panel quickstart__session reveal">
+          <div class="terminal-panel__bar"><span class="terminal-panel__dot"></span>quickstart session</div>
+          <div class="terminal-panel__body">
+            <span class="quickstart__line"><span class="quickstart__prompt">$</span><span class="quickstart__cmd">uv tool install cairn-pipelines</span>      <span class="quickstart__comment"># installs the `cairn` command on your PATH</span></span>
+            <span class="quickstart__line"><span class="quickstart__prompt">$</span><span class="quickstart__cmd">cairn new workspace demo --dir .</span>      <span class="quickstart__comment"># creates ./demo (--dir is the PARENT directory)</span></span>
+            <span class="quickstart__line"><span class="quickstart__prompt">$</span><span class="quickstart__cmd">cd demo</span></span>
+            <span class="quickstart__line"><span class="quickstart__prompt">$</span><span class="quickstart__cmd">cairn plan hello</span>                      <span class="quickstart__comment"># static-verify params, dataflow, schemas — zero tokens</span></span>
+            <span class="quickstart__line"><span class="quickstart__prompt">$</span><span class="quickstart__cmd">cairn run hello --headless</span>            <span class="quickstart__comment"># writes runs/hello-world-&lt;date&gt;/</span></span>
+            <span class="quickstart__line"><span class="quickstart__prompt">$</span><span class="quickstart__cmd">cairn trail runs/hello-world-*</span>        <span class="quickstart__comment"># replay what happened, step by step</span></span>
+          </div>
+        </div>
+
+        <p class="t-body-sm quickstart__note reveal">Installing from source works the same: <code class="t-mono-sm">git clone https://github.com/gabros20/cairn && cd cairn && uv tool install .</code> — the PyPI distribution is <code class="t-mono-sm">cairn-pipelines</code>; the command and the import package are both <code class="t-mono-sm">cairn</code>.</p>
+        <p class="t-body-sm quickstart__ref reveal">Full verb list — <code class="t-mono-sm">plan · run · resume · gate · validate · trail · ps · doctor · test · compose · batch · learnings · gc · schedule · new</code> — in the docs.</p>
+      </div>
+    </section>
+
+    <!-- ================= WHY CAIRN (POSITIONING) ================= -->
+    <section class="section" id="why-cairn">
+      <div class="container">
+        <div class="section-heading reveal">
+          <h2 class="t-display-lg">Keeps topology-as-data. Drops the rest.</h2>
+        </div>
+
+        <div class="positioning-table reveal">
+          <table>
+            <thead>
+              <tr><th>Instead of…</th><th>The tension</th><th>Where cairn sits</th></tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><code class="t-mono-sm">LangGraph</code>-style graph frameworks</td>
+                <td>its checkpointer DB and your artifacts become two competing authorities on "where is this run?"</td>
+                <td>one authority — the validated filesystem</td>
+              </tr>
+              <tr>
+                <td>CI runners (GitHub Actions…)</td>
+                <td>right skeleton (declarative steps, artifacts) but no agent envelope, no gates-as-data, no validation edges, and cloud-shaped</td>
+                <td>the same skeleton, built around headless agent processes and local run dirs</td>
+              </tr>
+              <tr>
+                <td>Staying inside one agent CLI</td>
+                <td>orchestration gets welded to that one vendor's subagent/workflow primitives</td>
+                <td>pipelines are portable; the CLI is a swappable executor</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+        <p class="t-body principles-line reveal">The principles it enforces: the filesystem is the state machine; agents are fresh processes, not shared sessions; contracts (typed artifacts) over parsed conversation; determinism is validated, not trusted; humans are first-class steps (gates); and a small, dependency-light core with a declarative surface.</p>
+        <p class="t-body-sm no-place-line reveal">Named non-features, so they don't creep in: no checkpointer / state DB, no message-passing between agents (artifacts or nothing), no dynamic topology, no async runtime, no cloud service. A run dir plus <code class="t-mono-sm">trail.jsonl</code> is the observability platform.</p>
+      </div>
+    </section>
+
+    <!-- ================= CLOSING CTA ================= -->
+    <section class="section section--closing closing" id="closing">
+      <div class="container">
+        <div class="reveal">
+          <svg class="closing__glyph" viewBox="0 0 112 102" aria-hidden="true">
+            <path class="g-fill" d="M18 90 L92 87 L84 72 L26 74 Z" transform="rotate(-3 55 81)"></path>
+            <path class="g-fill" d="M10 66 L94 64 L84 50 L20 52 Z" transform="rotate(4 52 58)"></path>
+            <path class="g-fill" d="M28 45 L92 43 L82 30 L38 31 Z" transform="rotate(-2 60 37)"></path>
+            <path class="g-fill" d="M20 26 L74 25 L66 11 L28 12 Z" transform="rotate(3 47 18)"></path>
+          </svg>
+          <h2 class="t-display-lg">Leave a trail worth resuming.</h2>
+          <p class="t-body closing__sub">v0.5.0 · 1137 tests passing · kernel and all ten executors built and green. MIT-licensed, two dependencies.</p>
+          <div class="hero__install closing__install">
+            <code>uv tool install cairn-pipelines</code>
+            <button type="button" data-copy="uv tool install cairn-pipelines" aria-label="Copy install command">Copy</button>
+          </div>
+          <div class="closing__ctas">
+            <a class="btn btn-primary" href="#quickstart">Get started</a>
+            <a class="btn btn-secondary" href="https://github.com/gabros20/cairn">View on GitHub</a>
+          </div>
+        </div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">
+      <div class="site-footer__grid">
+        <div>
+          <span class="site-footer__heading">Docs</span>
+          <ul class="site-footer__list">
+            <li><a href="https://github.com/gabros20/cairn/blob/main/docs/GETTING-STARTED.md">Getting started</a></li>
+            <li><a href="https://github.com/gabros20/cairn/blob/main/docs/CONCEPTS.md">Concepts</a></li>
+            <li><a href="https://github.com/gabros20/cairn/blob/main/docs/ARCHITECTURE.md">Architecture</a></li>
+            <li><a href="https://github.com/gabros20/cairn/blob/main/docs/API.md">API</a></li>
+            <li><a href="https://github.com/gabros20/cairn/blob/main/docs/SECURITY.md">Security</a></li>
+            <li><a href="https://github.com/gabros20/cairn/blob/main/docs/TOOLING-AND-GROWTH.md">Tooling &amp; growth</a></li>
+          </ul>
+        </div>
+        <div>
+          <span class="site-footer__heading">Project</span>
+          <ul class="site-footer__list">
+            <li><a href="https://github.com/gabros20/cairn">GitHub</a></li>
+            <li><a href="https://github.com/gabros20/cairn/blob/main/CHANGELOG.md">Changelog</a></li>
+            <li><a href="https://github.com/gabros20/cairn/blob/main/LICENSE">License (MIT)</a></li>
+            <li><a href="https://github.com/gabros20/cairn#status">Status</a></li>
+          </ul>
+        </div>
+        <div>
+          <span class="site-footer__heading">Lineage</span>
+          <p class="site-footer__lineage">Distilled from brease-factory — a six-phase website-rebuild pipeline built natively on Claude Code, generalized so it runs on any coding-agent CLI. The pipeline architecture that survived contact with reality, made reusable.</p>
+        </div>
+      </div>
+      <div class="site-footer__bottom t-mono-sm">cairn · MIT · gabros20/cairn</div>
+    </div>
+  </footer>
+
+</div>
+
+<script src="main.js"></script>
+</body>
+</html>
