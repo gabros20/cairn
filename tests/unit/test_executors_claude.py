@@ -8,6 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from cairn.kernel.gatekeys import guard_manifest_path
+from cairn.kernel.sandbox import NativeBackend
 
 from cairn.executors.claude import ClaudeExecutor
 from cairn.kernel.config import ExecutorConfig, TierSpec
@@ -139,6 +140,11 @@ def test_resolve_model_unknown_tier_raises():
 
 def test_doctor_healthy_with_fake_version(tmp_path, monkeypatch):
     use_fakebin(monkeypatch)
+    # Hermetic: stub the sandbox primitive as present so this asserts doctor's logic on a
+    # healthy machine, not whether the host has sandbox-exec/bwrap (a Linux runner without
+    # bwrap correctly WARNs — both branches are covered hermetically in test_sandbox.py's
+    # test_doctor_warns_when_fs_posture_unavailable / test_doctor_silent_when_available_or_off).
+    monkeypatch.setattr(NativeBackend, "available", lambda self: True)
     assert ClaudeExecutor(CFG).doctor() == []
 
 
