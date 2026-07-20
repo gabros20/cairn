@@ -502,6 +502,8 @@ runs/acme-redesign-20260703/
 │   ├── build.r2.prompt.md         #   .rN = retry attempt N (r2 = second attempt)
 │   ├── review.c1.log              #   .cK = loop cycle K (art-review cycle 1)
 │   └── review.c1.prompt.md
+├── superseded/                    # withdrawn proof from `resume --from NODE` (§9): one
+│   └── 20260705T101502Z/…         #   stamped snapshot per invalidation, relative paths preserved
 └── captures/  blueprints/  qa/ …  # the artifacts themselves, at each artifact's declared path:
 ```
 
@@ -551,7 +553,14 @@ cairn run  <pipeline> [--param k=v]... [--executor X] [--step-executor STEP=X]..
                                                 # {date}) content key: complete → no-op (exit 0);
                                                 # incomplete → resume it (same drift guard as resume);
                                                 # none → fresh run (SCHEDULING.md §3)
-cairn resume <run-dir> [--force]        # accept pipeline-hash drift explicitly
+cairn resume <run-dir> [--force] [--from NODE]
+                                        # --force accepts pipeline-hash/cairn-version drift AND re-pins
+                                        # run.json to the present, so the consent holds across later resumes;
+                                        # --from re-executes from NODE: its and every later node's records
+                                        # are cleared and their still-valid artifacts (all loop cycles; gate
+                                        # decisions too) move to superseded/<stamp>/ before the walk — the
+                                        # escape hatch when a step's code was fixed after the step ran and
+                                        # skip-if-done would keep serving the stale artifact
 cairn gate <run-dir> <name>=<choice>    # answer a pending gate externally (writes gates/<name>.json,
                                         # by:"external") — the operator-pattern hook for coding agents:
                                         # run exits 6 at an unanswered gate → operator asks the human in

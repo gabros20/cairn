@@ -73,7 +73,7 @@ SemVer on the tool, with **three declared compatibility surfaces**:
 |---|---|---|---|
 | **Pipeline schema** | `version: 1` in each pipeline file | at plan: kernel lists supported versions; unknown ⇒ exit 2 with migration pointer | new schema version + kernel keeps reading N−1 for one minor series |
 | **Executor protocol** | third-party executors declare `cairn_api = 1` | at load: mismatch ⇒ executor skipped with warning | major bump of the tool |
-| **Run-dir format** | `run.json.cairn_version` | at resume: same-minor ⇒ silent; cross-minor ⇒ warn; cross-major ⇒ refuse without `--force` | major bump + a `cairn migrate-run` shim only if ever actually needed |
+| **Run-dir format** | `run.json.cairn_version` | at resume: same-minor ⇒ silent; cross-minor ⇒ warn; cross-major ⇒ refuse without `--force`; a forced resume re-pins `cairn_version`/`pipeline_hash` to the present so the consent isn't re-paid every resume | major bump + a `cairn migrate-run` shim only if ever actually needed |
 
 Workspace side: `cairn.toml → requires = ">=0.1,<0.2"`, enforced at plan time (refuse, print the
 installed vs required range). `run.json` records the exact tool version, executor versions, and

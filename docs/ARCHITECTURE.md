@@ -162,6 +162,14 @@ path is to fix the *inputs* — the workspace, the upstream artifacts, or the st
 the step regenerate its output. (Answering an operator-blocked `manual`/`gate` out of band is the
 one sanctioned by-hand action, because those halt as needs-human, not as a validation failure.)
 
+**Re-executing a *done* step (`resume --from NODE`).** Skip-if-done deliberately trusts a valid
+artifact — so when the step's *code* was fixed after the step ran (a validator can't see code
+drift), a plain resume keeps serving the stale artifact. `cairn resume <run-dir> --from NODE`
+is the explicit invalidation: the named node and every later one (walk order) have their run.json
+records cleared and their still-valid artifacts — all loop cycles, and downstream gate decisions
+too, since they were made on evidence about to be regenerated — moved into `superseded/<stamp>/`
+(proof is withdrawn, never destroyed). The next walk then re-executes them for real.
+
 ### 3.6 `manual`
 Print instructions + the validation criterion, wait for Enter (headless: halt with "requires
 operator"), then validate `produces` like any step.

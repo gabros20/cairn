@@ -68,7 +68,7 @@ from cairn.kernel.schedkit import (
 )
 from cairn.kernel.trail import derive_status, follow, read_trail
 from cairn.kernel.types import ExitCode
-from cairn.kernel.walk import bootstrap_run, walk
+from cairn.kernel.walk import bootstrap_run, invalidate_from, walk
 
 # The full verb surface (docs/API.md §9). Order is the help-listing order.
 SUBCOMMANDS: list[str] = [
@@ -716,6 +716,29 @@ def _version_compat_guard(recorded: str | None, run_dir: Path, *, force: bool) -
     return None
 
 
+def _repin_manifest(run_dir: Path, run_doc: dict, current_hash: str) -> None:
+    """After an explicit ``--force`` accepted drift, re-pin run.json to the present:
+    ``cairn_version`` becomes the installed one and ``pipeline_hash`` the current file's.
+    Without this every later resume of the run trips the same guard and pays ``--force``
+    forever — the consent was already given once (issue #2). No-op when nothing drifted;
+    ``run_doc`` is updated in place so the rest of the resume sees the re-pinned values."""
+    updates: dict[str, str] = {}
+    installed = installed_version()
+    if run_doc.get("cairn_version") != installed:
+        updates["cairn_version"] = installed
+    if run_doc.get("pipeline_hash") != current_hash:
+        updates["pipeline_hash"] = current_hash
+    if not updates:
+        return
+    update_run(run_dir, lambda doc: doc.update(updates))
+    run_doc.update(updates)
+    print(
+        f"cairn: --force — re-pinned {', '.join(sorted(updates))} in run.json "
+        f"(later resumes won't need --force)",
+        file=sys.stderr,
+    )
+
+
 def _reproducibility_drift_guard(recorded: dict, ws: Path) -> None:
     """Warn — never refuse — when an executor version or the workspace git rev recorded at
     mint (ARCHITECTURE §10) has drifted by resume time. Unlike ``_pipeline_drift_guard``
@@ -797,13 +820,16 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         print(f"cairn: cannot resume — pipeline file {pfile} no longer exists", file=sys.stderr)
         return int(ExitCode.CONFIG)
 
-    fail = _pipeline_drift_guard(run_doc.get("pipeline_hash"), _pipeline_hash(ws, pipeline), pipeline, run_dir, force=args.force)
+    phash = _pipeline_hash(ws, pipeline)
+    fail = _pipeline_drift_guard(run_doc.get("pipeline_hash"), phash, pipeline, run_dir, force=args.force)
     if fail is not None:
         return fail
     fail = _version_compat_guard(run_doc.get("cairn_version"), run_dir, force=args.force)
     if fail is not None:
         return fail
     _reproducibility_drift_guard(run_doc, ws)
+    if args.force:
+        _repin_manifest(run_dir, run_doc, phash)
 
     # Reconstruct the recorded fleet (§8.1 executors) so a mixed-executor run resumes on the
     # same models, not the workspace defaults.
@@ -821,6 +847,20 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     fail = _preflight_tools(p)
     if fail is not None:
         return fail
+
+    if args.from_node:
+        try:
+            cleared, moved = invalidate_from(p, run_dir, args.from_node, now=now)
+        except ConfigError as exc:
+            return _print_config_error(exc)
+        except CairnError as exc:  # LockHeldError — another process holds the run
+            print(f"cairn: {exc}", file=sys.stderr)
+            return int(ExitCode.EXECUTOR)
+        print(
+            f"cairn: --from {args.from_node!r} — cleared {cleared} node record(s), "
+            f"superseded {moved} artifact file(s)",
+            file=sys.stderr,
+        )
 
     interactive = sys.stdin.isatty()
     try:
@@ -1523,7 +1563,15 @@ def _build_parser() -> argparse.ArgumentParser:
     # resume
     sp = sub.add_parser("resume", help="resume a run dir")
     sp.add_argument("run_dir", metavar="run-dir")
-    sp.add_argument("--force", action="store_true", help="accept pipeline-hash drift")
+    sp.add_argument(
+        "--force", action="store_true",
+        help="accept pipeline-hash/version drift (re-pins run.json so later resumes don't need it)",
+    )
+    sp.add_argument(
+        "--from", dest="from_node", metavar="NODE",
+        help="re-execute from this node: its and every later node's records are cleared and "
+             "their existing artifacts moved to superseded/<stamp>/ before the walk",
+    )
     sp.set_defaults(func=_cmd_resume)
 
     # gate

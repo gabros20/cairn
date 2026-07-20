@@ -60,7 +60,7 @@ from cairn.kernel.artifacts import (
 )
 from cairn.kernel.compose import render_artifact_path
 from cairn.kernel.config import Config
-from cairn.kernel.errors import CairnError
+from cairn.kernel.errors import CairnError, ConfigError
 from cairn.kernel.expr import EvalError, Expr
 from cairn.kernel.gatekeys import ensure_run_key, guard_manifest_path
 from cairn.kernel.gatekit import (
@@ -210,6 +210,96 @@ def bootstrap_run(
             continue
         ensure_run_key(created)  # mint the gate-decision secret before any gate commits
         return created
+
+
+def invalidate_from(plan: Plan, run_dir: Path, from_node: str, *, now: datetime) -> tuple[int, int]:
+    """``cairn resume --from <node>``: force every node from ``from_node`` onward (walk
+    order) to re-execute on the next walk, even though its artifacts still validate.
+
+    The walker's done-predicates are artifact-driven (:meth:`_Walk._is_done`,
+    :meth:`_Walk._completed_cycles`), so clearing recorded statuses alone re-runs nothing —
+    a stale-but-valid artifact immediately re-satisfies the predicate. That is the exact
+    failure this exists to fix: a step's code was corrected *after* the step ran, and
+    skip-if-done kept serving the artifact built by the buggy code. Invalidation therefore
+    does both halves:
+
+    - every existing artifact the affected nodes produce (all loop cycles; gate decision
+      files too — a decision made on evidence about to be regenerated must be re-confirmed)
+      moves into ``superseded/<stamp>/`` preserving relative paths: the proof is withdrawn,
+      never destroyed;
+    - the affected node records leave run.json (a recorded ``skipped``/``halted`` decision
+      must not outrank an explicit re-execution request) and the run status returns to
+      ``running``.
+
+    Returns ``(node records cleared, artifact files moved)``. An unknown node id raises
+    ConfigError naming the valid ids, mirroring the plan-range ``--from``.
+    """
+    run_dir = Path(run_dir)
+    ids = [n.id if isinstance(n, StepNode) else n.name for n in plan.nodes]
+    if from_node not in ids:
+        raise ConfigError(f"--from names unknown node {from_node!r} (nodes: {ids})")
+
+    node_ids: list[str] = []
+    to_move: dict[Path, None] = {}  # insertion-ordered set — cycle-invariant paths render identically per cycle
+
+    def step_files(step: StepNode, cycle: int | None) -> None:
+        for name in step.produces:
+            decl = plan.artifacts.get(name)
+            if decl is None:
+                continue
+            rendered = render_artifact_path(
+                decl, params=plan.params, dims=plan.dims,
+                pipeline=plan.pipeline, cycle=cycle, now=now,
+            )
+            for path in resolve_path(decl, rendered, run_dir).paths:
+                if path.is_file():
+                    to_move[path] = None
+
+    def collect(node: Any, cycles: list[int | None]) -> None:
+        if isinstance(node, StepNode):
+            node_ids.append(node.id)
+            for c in cycles:
+                step_files(node, c)
+        elif isinstance(node, GateNode):
+            node_ids.append(node.name)
+            decision = run_dir / "gates" / f"{node.name}.json"
+            if decision.is_file():
+                to_move[decision] = None
+        elif isinstance(node, ParallelNode):
+            node_ids.append(node.name)
+            for child in node.steps:
+                collect(child, cycles)
+        elif isinstance(node, LoopNode):
+            node_ids.append(node.name)
+            cap = max(node.max_interactive, node.max_headless)
+            for child in node.body:
+                collect(child, list(range(1, cap + 1)))
+
+    for node in plan.nodes[ids.index(from_node):]:
+        collect(node, [None])
+
+    dest_root = run_dir / "superseded" / now.strftime("%Y%m%dT%H%M%SZ")
+    moved = 0
+    with run_lock(run_dir):
+        for path in to_move:
+            dest = dest_root / path.relative_to(run_dir)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            path.rename(dest)
+            moved += 1
+
+        cleared = 0
+
+        def mutate(doc: dict) -> None:
+            nonlocal cleared
+            nodes = doc.get("nodes") or {}
+            for nid in node_ids:
+                if nodes.pop(nid, None) is not None:
+                    cleared += 1
+            doc["nodes"] = nodes
+            doc["status"] = "running"
+
+        update_run(run_dir, mutate)
+    return cleared, moved
 
 
 # --------------------------------------------------------------------------- #

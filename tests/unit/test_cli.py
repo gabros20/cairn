@@ -632,6 +632,108 @@ def test_resume_cross_minor_version_warns_and_proceeds(hello_ws, monkeypatch, ca
     assert (rd / "message.txt").exists()
 
 
+def test_resume_force_repins_version_so_later_resumes_are_clean(hello_ws, monkeypatch, capsys):
+    # Issue #2: a forced resume must rewrite run.json.cairn_version to the installed one —
+    # the consent was given once; every later resume of the run must not pay --force again.
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=friendly"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    _set_run_version(rd, "9.0.0")
+    (rd / "message.txt").unlink()
+    assert main(["resume", str(rd), "--force"]) == int(ExitCode.OK)
+    err = capsys.readouterr().err
+    assert "re-pinned" in err and "cairn_version" in err
+    doc = json.loads((rd / "run.json").read_text())
+    assert doc["cairn_version"] == cairn.__version__
+    # The second resume needs no --force and trips no guard.
+    (rd / "message.txt").unlink()
+    assert main(["resume", str(rd)]) == int(ExitCode.OK)
+    err = capsys.readouterr().err
+    assert "major-version drift" not in err and "version drift" not in err
+
+
+def test_resume_force_repins_pipeline_hash(hello_ws, monkeypatch, capsys):
+    # Same consent-once rule for the pipeline-hash guard: after --force accepted the edited
+    # file, the recorded hash is re-pinned to it and later resumes are clean.
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=friendly"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    pfile = hello_ws / "pipelines" / "hello.yaml"
+    pfile.write_text(pfile.read_text() + "\n# drift\n", encoding="utf-8")
+    (rd / "message.txt").unlink()
+    assert main(["resume", str(rd), "--force"]) == int(ExitCode.OK)
+    err = capsys.readouterr().err
+    assert "re-pinned" in err and "pipeline_hash" in err
+    (rd / "message.txt").unlink()
+    assert main(["resume", str(rd)]) == int(ExitCode.OK)
+    err = capsys.readouterr().err
+    assert "hash drift" not in err
+
+
+def test_resume_without_force_does_not_repin(hello_ws, monkeypatch, capsys):
+    # A plain warn-level resume (cross-minor) must NOT rewrite the mint provenance —
+    # re-pinning is the --force consent's effect, never a silent side effect.
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=friendly"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    _set_run_version(rd, "0.9.0")
+    assert main(["resume", str(rd)]) == int(ExitCode.OK)
+    doc = json.loads((rd / "run.json").read_text())
+    assert doc["cairn_version"] == "0.9.0"
+
+
+# --------------------------------------------------------------------------- #
+# resume --from: explicit re-execution across skip-if-done (issue #1).
+# --------------------------------------------------------------------------- #
+
+
+def test_resume_from_reexecutes_stale_done_step(hello_ws, monkeypatch, capsys):
+    # Issue #1 replay: a done step's artifact is stale-but-valid (the step's code was fixed
+    # after it ran). A plain resume must keep skipping it (skip-if-done semantics); a
+    # `resume --from <node>` must supersede the artifact and genuinely re-execute.
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=friendly"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    (rd / "message.txt").write_text("STALE\n")  # still passes the nonempty validator
+
+    assert main(["resume", str(rd)]) == int(ExitCode.OK)
+    assert (rd / "message.txt").read_text() == "STALE\n"  # skip-if-done served the stale artifact
+
+    assert main(["resume", str(rd), "--from", "compose"]) == int(ExitCode.OK)
+    err = capsys.readouterr().err
+    assert "--from 'compose'" in err
+    assert (rd / "message.txt").read_text() != "STALE\n"  # re-executed
+    superseded = list(rd.glob("superseded/*/message.txt"))
+    assert len(superseded) == 1 and superseded[0].read_text() == "STALE\n"  # proof withdrawn, not destroyed
+    doc = json.loads((rd / "run.json").read_text())
+    assert doc["nodes"]["compose"]["status"] == "done" and doc["status"] == "done"
+
+
+def test_resume_from_supersedes_downstream_gate_decision(hello_ws, monkeypatch, capsys):
+    # --from upstream of a gate withdraws the gate's decision too (it was made on evidence
+    # being regenerated); the headless re-walk re-resolves it to the default.
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=formal"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    assert "Formal" in (rd / "message.txt").read_text()
+
+    assert main(["resume", str(rd), "--from", "greet"]) == int(ExitCode.OK)
+    assert list(rd.glob("superseded/*/gates/tone.json"))  # old decision withdrawn
+    choice = json.loads((rd / "gates" / "tone.json").read_text())["choice"]
+    assert choice == "friendly"  # headless re-resolution → the default
+    assert "Friendly" in (rd / "message.txt").read_text()  # downstream re-ran on the new decision
+
+
+def test_resume_from_unknown_node_is_config_error(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=friendly"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    rc = main(["resume", str(rd), "--from", "no-such-node"])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "no-such-node" in err and "greet" in err  # names the valid ids
+
+
 def test_run_run_dir_existing_refuses_pipeline_drift(hello_ws, monkeypatch, capsys):
     # `run --run-dir <existing>` (no --idempotent) resumes — it must pass the same drift
     # guard as `cairn resume`, not silently resume the old run against an edited file.
