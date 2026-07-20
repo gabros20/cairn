@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Fake `agy` CLI for executor tests. See fakebin/claude for the env-var contract.
+
+Like kimi/grok, agy gets its prompt on ARGV (`-p <prompt>`), not stdin (AgyExecutor returns
+stdin_text=None), so stdin.txt is captured but expected empty.
+
+  CAIRN_TEST_HELP_OMIT   comma-separated flag tokens to DROP from `--help` output (doctor
+                       flag-drift tests)
+  CAIRN_TEST_HELP_FAIL   if set, `--help` fails (exit 1, no output)
+  CAIRN_TEST_MODELS      comma-separated model slugs `agy models` reports (default below covers
+                       this fixture dir's own test CFGs; override for drift tests). Empty string
+                       ⇒ an empty roster (exercises the unparseable/no-models warning branch).
+  CAIRN_TEST_MODELS_FAIL if set, `agy models` fails (exit 1, no output) — the unauthenticated
+                       signal AgyExecutor._model_findings turns into an actionable auth ERROR.
+"""
+import json
+import os
+import sys
+import time
+from pathlib import Path
+
+_NAME = "agy"
+_DEFAULT_VERSION = "agy 1.1.4 (fake)"
+
+# Superset covering AgyExecutor._emitted_flags (cairn/executors/agy.py) — doctor flag-presence
+# check.
+_HELP_FLAGS = [
+    "-p", "--cwd", "--model", "--dangerously-skip-permissions", "--print-timeout",
+]
+
+# Default `agy models` roster — includes the model slugs the executor test CFGs configure
+# (test_executors_agy.py) so the doctor-healthy tests stay green without CAIRN_TEST_MODELS. agy
+# slugs contain SPACES, unlike grok's single-token slugs (the parser must handle this).
+_DEFAULT_MODELS = ["Gemini 3.5 Flash", "Gemini 3.1 Pro"]
+
+if "--version" in sys.argv:
+    print(os.environ.get("CAIRN_TEST_VERSION", _DEFAULT_VERSION))
+    sys.exit(0)
+
+if "--help" in sys.argv:
+    if os.environ.get("CAIRN_TEST_HELP_FAIL"):
+        sys.exit(1)
+    omit = set(os.environ.get("CAIRN_TEST_HELP_OMIT", "").split(","))
+    for flag in _HELP_FLAGS:
+        if flag not in omit:
+            print(f"  {flag}  fake help text")
+    sys.exit(0)
+
+if sys.argv[1:2] == ["models"]:
+    if os.environ.get("CAIRN_TEST_MODELS_FAIL"):
+        sys.exit(1)
+    raw = os.environ.get("CAIRN_TEST_MODELS")
+    roster = [s for s in raw.split(",") if s] if raw is not None else _DEFAULT_MODELS
+    # An invented-but-plausible format (agy is uninstalled — the real format is [UNC]); the
+    # executor's parser is deliberately defensive about it.
+    print("Available models:")
+    for i, m in enumerate(roster):
+        marker = "*" if i == 0 else "-"
+        suffix = " (default)" if i == 0 else ""
+        print(f"  {marker} {m}{suffix}")
+    sys.exit(0)
+
+scratch = Path(os.environ["CAIRN_TEST_SCRATCH"])
+scratch.mkdir(parents=True, exist_ok=True)
+(scratch / "argv.json").write_text(json.dumps(sys.argv), encoding="utf-8")
+(scratch / "env.json").write_text(json.dumps(dict(os.environ)), encoding="utf-8")
+(scratch / "cwd.txt").write_text(os.getcwd(), encoding="utf-8")
+(scratch / "stdin.txt").write_text(sys.stdin.read(), encoding="utf-8")
+
+sleep_s = os.environ.get("CAIRN_TEST_SLEEP")
+if sleep_s:
+    time.sleep(float(sleep_s))
+
+print(f"chatty {_NAME} preamble the sentinel must survive")
+print('<<<STEP {"status": "done", "summary": "fake ok", "artifacts": []} STEP>>>')
+sys.exit(int(os.environ.get("CAIRN_TEST_EXIT", "0")))
