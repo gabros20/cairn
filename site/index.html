@@ -127,11 +127,11 @@
               runs/hello-world-20260703/cairn-build
             </div>
             <div class="hero__anim-frame" id="hero-anim-frame">
-              <video id="hero-video" muted autoplay loop playsinline poster="assets/img/cairn-build-poster.png" width="1200" height="1200" aria-label="A cairn assembling stone by stone as a pipeline runs, each stone turning verdigris once its artifact validates.">
-                <source src="assets/anim/cairn-build.webm" type="video/webm">
-                <source src="assets/anim/cairn-build.mp4" type="video/mp4">
+              <video id="hero-video" muted autoplay loop playsinline poster="assets/img/cairn-build-poster-v3.png" width="1200" height="1200" aria-label="A cairn assembling stone by stone as a pipeline runs, each stone turning verdigris once its artifact validates.">
+                <source src="assets/anim/cairn-build-v3.webm" type="video/webm">
+                <source src="assets/anim/cairn-build-v3.mp4" type="video/mp4">
               </video>
-              <img id="hero-poster" class="is-hidden" src="assets/img/cairn-build-poster.png" alt="A completed cairn: five stacked stones, each filled verdigris, meaning every step of the pipeline validated." width="1200" height="1200">
+              <img id="hero-poster" class="is-hidden" src="assets/img/cairn-build-poster-v3.png" alt="A completed cairn: five stacked stones, each filled verdigris, meaning every step of the pipeline validated." width="1200" height="1200">
               <div id="hero-fallback" class="hero__anim-fallback is-hidden" aria-hidden="true">
                 <svg class="hero__fallback-glyph" viewBox="0 0 100 92" width="55%" role="img" aria-label="A stacked cairn of four leaning stones, the top stone filled verdigris">
                   <path class="g-stroke" d="M10 88 L88 84 L80 70 L16 72 Z"></path>
@@ -206,77 +206,114 @@
         </div>
 
         <div class="flow reveal" role="img" aria-label="Lifecycle: pipeline.yaml and params flow into cairn plan, then the walker, then compose, then an executor subprocess, producing an artifact on disk, checked by a validator gate. On pass, in verdigris, it appends to trail.jsonl and loops back to the walker. On fail, hollow, it halts or retries and cairn resume re-enters the walker.">
-          <div class="flow__track">
-            <div class="flow__node">pipeline.yaml<br>+ params</div>
-            <div class="flow__edge"></div>
-            <div class="flow__node">cairn plan<br>load · resolve · verify</div>
-            <div class="flow__edge"></div>
-            <div class="flow__node">walker<br>walk nodes in order</div>
-            <div class="flow__edge"></div>
-            <div class="flow__node">compose<br>prompt envelope</div>
-            <div class="flow__edge"></div>
-            <div class="flow__node">executor<br>subprocess</div>
-            <div class="flow__edge"></div>
-            <div class="flow__node">artifact<br>on disk</div>
-            <div class="flow__edge"></div>
-            <div class="flow__node">validator<br>gate</div>
-          </div>
-          <div class="flow__track" style="min-width:600px;">
-            <div class="flow__node" style="visibility:hidden;">validator gate</div>
-            <div class="flow__edge flow__edge--pass">
-              <span class="flow__edge-label flow__edge-label--pass">pass</span>
-            </div>
-            <div class="flow__node" style="border-color: var(--verdigris); color: var(--verdigris-deep);">trail.jsonl<br>step-done</div>
-            <div class="flow__edge flow__edge--pass"><span class="flow__edge-label flow__edge-label--pass">loop</span></div>
-            <div class="flow__node">walker</div>
-          </div>
-          <div class="flow__track" style="min-width:600px;">
-            <div class="flow__node" style="visibility:hidden;">validator gate</div>
-            <div class="flow__edge">
-              <span class="flow__edge-label flow__edge-label--fail">fail</span>
-            </div>
-            <div class="flow__node">halt / retry</div>
-            <div class="flow__edge"></div>
-            <div class="flow__node">cairn resume</div>
-          </div>
+          <svg class="flow-diagram flow-diagram--wide" viewBox="0 0 1400 290" preserveAspectRatio="xMidYMin meet" aria-hidden="true">
+            <defs>
+              <marker id="arrowG1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 Z" fill="#6E7A7C"></path></marker>
+              <marker id="arrowV1" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 Z" fill="#2A7D69"></path></marker>
+            </defs>
+            <!-- main chain (box widths sized to their longest line so text never overflows) -->
+            <g class="fd-node"><rect x="20" y="20" width="150" height="50"></rect><text x="95" y="41"><tspan x="95">pipeline.yaml</tspan><tspan x="95" dy="17">+ params</tspan></text></g>
+            <line x1="170" y1="45" x2="196" y2="45" class="fd-edge" marker-end="url(#arrowG1)"></line>
+            <g class="fd-node"><rect x="200" y="20" width="240" height="50"></rect><text x="320" y="41"><tspan x="320">cairn plan</tspan><tspan x="320" dy="17">load · resolve · verify</tspan></text></g>
+            <line x1="440" y1="45" x2="466" y2="45" class="fd-edge" marker-end="url(#arrowG1)"></line>
+            <g class="fd-node"><rect x="470" y="20" width="210" height="50"></rect><text x="575" y="41"><tspan x="575">walker</tspan><tspan x="575" dy="17">walk nodes in order</tspan></text></g>
+            <line x1="680" y1="45" x2="706" y2="45" class="fd-edge" marker-end="url(#arrowG1)"></line>
+            <g class="fd-node"><rect x="710" y="20" width="150" height="50"></rect><text x="785" y="41"><tspan x="785">compose</tspan><tspan x="785" dy="17">prompt envelope</tspan></text></g>
+            <line x1="860" y1="45" x2="886" y2="45" class="fd-edge" marker-end="url(#arrowG1)"></line>
+            <g class="fd-node"><rect x="890" y="20" width="150" height="50"></rect><text x="965" y="41"><tspan x="965">executor</tspan><tspan x="965" dy="17">subprocess</tspan></text></g>
+            <line x1="1040" y1="45" x2="1066" y2="45" class="fd-edge" marker-end="url(#arrowG1)"></line>
+            <g class="fd-node"><rect x="1070" y="20" width="150" height="50"></rect><text x="1145" y="41"><tspan x="1145">artifact</tspan><tspan x="1145" dy="17">on disk</tspan></text></g>
+            <line x1="1220" y1="45" x2="1246" y2="45" class="fd-edge" marker-end="url(#arrowG1)"></line>
+            <g class="fd-node"><rect x="1250" y="20" width="110" height="50"></rect><text x="1305" y="41"><tspan x="1305">validator</tspan><tspan x="1305" dy="17">gate</tspan></text></g>
+            <!-- fork: validator gate connects to both pass and fail branches -->
+            <path d="M1305,70 L1305,95 M1265,95 L1345,95" class="fd-edge"></path>
+            <!-- pass branch -->
+            <path d="M1265,95 L1265,145 L1150,145" class="fd-edge fd-edge--pass" marker-end="url(#arrowV1)"></path>
+            <text x="1269" y="112" class="fd-edge-label fd-edge-label--pass">pass</text>
+            <g class="fd-node fd-node--pass"><rect x="1000" y="120" width="150" height="50"></rect><text x="1075" y="141"><tspan x="1075">trail.jsonl</tspan><tspan x="1075" dy="17">step-done</tspan></text></g>
+            <path d="M1000,145 L575,145 L575,72" class="fd-edge fd-edge--pass" marker-end="url(#arrowV1)"></path>
+            <text x="787" y="138" class="fd-edge-label fd-edge-label--pass">loop</text>
+            <!-- fail branch -->
+            <path d="M1345,95 L1345,225 L1150,225" class="fd-edge" marker-end="url(#arrowG1)"></path>
+            <text x="1349" y="160" class="fd-edge-label fd-edge-label--fail">fail</text>
+            <g class="fd-node"><rect x="1000" y="200" width="150" height="50"></rect><text x="1075" y="230">halt / retry</text></g>
+            <line x1="1000" y1="225" x2="974" y2="225" class="fd-edge" marker-end="url(#arrowG1)"></line>
+            <g class="fd-node"><rect x="820" y="200" width="150" height="50"></rect><text x="895" y="230">cairn resume</text></g>
+          </svg>
+          <svg class="flow-diagram flow-diagram--narrow" viewBox="0 0 360 900" preserveAspectRatio="xMidYMin meet" aria-hidden="true">
+            <defs>
+              <marker id="arrowG2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 Z" fill="#6E7A7C"></path></marker>
+              <marker id="arrowV2" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 Z" fill="#2A7D69"></path></marker>
+            </defs>
+            <g class="fd-node"><rect x="40" y="20" width="280" height="50"></rect><text x="180" y="41"><tspan x="180">pipeline.yaml</tspan><tspan x="180" dy="17">+ params</tspan></text></g>
+            <line x1="180" y1="70" x2="180" y2="106" class="fd-edge" marker-end="url(#arrowG2)"></line>
+            <g class="fd-node"><rect x="40" y="110" width="280" height="50"></rect><text x="180" y="131"><tspan x="180">cairn plan</tspan><tspan x="180" dy="17">load · resolve · verify</tspan></text></g>
+            <line x1="180" y1="160" x2="180" y2="196" class="fd-edge" marker-end="url(#arrowG2)"></line>
+            <g class="fd-node"><rect x="40" y="200" width="280" height="50"></rect><text x="180" y="221"><tspan x="180">walker</tspan><tspan x="180" dy="17">walk nodes in order</tspan></text></g>
+            <line x1="180" y1="250" x2="180" y2="286" class="fd-edge" marker-end="url(#arrowG2)"></line>
+            <g class="fd-node"><rect x="40" y="290" width="280" height="50"></rect><text x="180" y="311"><tspan x="180">compose</tspan><tspan x="180" dy="17">prompt envelope</tspan></text></g>
+            <line x1="180" y1="340" x2="180" y2="376" class="fd-edge" marker-end="url(#arrowG2)"></line>
+            <g class="fd-node"><rect x="40" y="380" width="280" height="50"></rect><text x="180" y="401"><tspan x="180">executor</tspan><tspan x="180" dy="17">subprocess</tspan></text></g>
+            <line x1="180" y1="430" x2="180" y2="466" class="fd-edge" marker-end="url(#arrowG2)"></line>
+            <g class="fd-node"><rect x="40" y="470" width="280" height="50"></rect><text x="180" y="491"><tspan x="180">artifact</tspan><tspan x="180" dy="17">on disk</tspan></text></g>
+            <line x1="180" y1="520" x2="180" y2="556" class="fd-edge" marker-end="url(#arrowG2)"></line>
+            <g class="fd-node"><rect x="40" y="560" width="280" height="50"></rect><text x="180" y="581"><tspan x="180">validator</tspan><tspan x="180" dy="17">gate</tspan></text></g>
+            <!-- fork -->
+            <path d="M180,610 L180,630 M180,630 L300,630" class="fd-edge"></path>
+            <!-- pass: continues straight down -->
+            <path d="M180,630 L180,646" class="fd-edge fd-edge--pass" marker-end="url(#arrowV2)"></path>
+            <text x="188" y="644" class="fd-edge-label fd-edge-label--pass">pass</text>
+            <g class="fd-node fd-node--pass"><rect x="70" y="650" width="220" height="50"></rect><text x="180" y="671"><tspan x="180">trail.jsonl</tspan><tspan x="180" dy="17">step-done</tspan></text></g>
+            <path d="M70,675 L16,675 L16,225 L38,225" class="fd-edge fd-edge--pass" marker-end="url(#arrowV2)"></path>
+            <text x="20" y="450" class="fd-edge-label fd-edge-label--pass" transform="rotate(-90 20 450)">loop</text>
+            <!-- fail: side branch -->
+            <path d="M300,630 L300,756" class="fd-edge" marker-end="url(#arrowG2)"></path>
+            <text x="252" y="622" class="fd-edge-label fd-edge-label--fail">fail</text>
+            <g class="fd-node"><rect x="140" y="760" width="180" height="50"></rect><text x="230" y="790">halt / retry</text></g>
+            <line x1="230" y1="810" x2="230" y2="826" class="fd-edge" marker-end="url(#arrowG2)"></line>
+            <g class="fd-node"><rect x="140" y="830" width="180" height="50"></rect><text x="230" y="860">cairn resume</text></g>
+          </svg>
         </div>
 
         <div class="node-kinds reveal">
           <h3 class="t-subheading node-kinds__heading">Exactly five node kinds — nothing else in the kernel.</h3>
           <div class="node-kinds__grid">
             <div class="node-kinds__item">
-              <svg class="node-kinds__glyph" viewBox="0 0 34 26" aria-hidden="true"><path class="g-stroke" d="M4 20 L30 20 L25 8 L9 8 Z"></path></svg>
+              <svg class="node-kinds__glyph" viewBox="0 0 48 48" aria-hidden="true"><path class="gs gs--fill" d="M8 32 L40.5 30 L37 19 L12.5 20.5 Z"></path></svg>
               <span class="node-kinds__id t-mono-sm">step</span>
               <p class="node-kinds__desc">One unit of delegation: an <code class="t-mono-sm">agent:</code> process, a deterministic <code class="t-mono-sm">run:</code> script, or a checkable <code class="t-mono-sm">manual:</code> step. Same contract shape: <code class="t-mono-sm">needs</code> / <code class="t-mono-sm">produces</code> / validated.</p>
             </div>
             <div class="node-kinds__item">
-              <svg class="node-kinds__glyph" viewBox="0 0 34 26" aria-hidden="true">
-                <path class="g-stroke" d="M4 20 L22 20 L18 8 L9 8 Z"></path>
-                <path class="g-stroke" d="M22 20 L30 14 L24 8" fill="none"></path>
+              <svg class="node-kinds__glyph" viewBox="0 0 48 48" aria-hidden="true">
+                <path class="gs" d="M4 28.5 L26 27 L23.5 18 L6.5 19.5 Z"></path>
+                <path class="gh" d="M26 23 C 33 23, 34 30, 41 30.5"></path>
+                <path class="ga" d="M26 23 C 33 23, 34 16, 41 15.5"></path>
+                <path class="ga" d="M38 12.5 L42.5 15.4 L38.6 18.6"></path>
               </svg>
               <span class="node-kinds__id t-mono-sm">gate</span>
               <p class="node-kinds__desc">A human decision as a first-class node; the choice is written to <code class="t-mono-sm">gates/&lt;name&gt;.json</code> and consumed downstream like any artifact. Never re-asked on resume.</p>
             </div>
             <div class="node-kinds__item">
-              <svg class="node-kinds__glyph" viewBox="0 0 34 26" aria-hidden="true">
-                <path class="g-stroke" d="M2 20 L14 20 L11 8 L5 8 Z"></path>
-                <path class="g-stroke" d="M18 20 L30 20 L27 8 L21 8 Z"></path>
+              <svg class="node-kinds__glyph" viewBox="0 0 48 48" aria-hidden="true">
+                <path class="gs gs--fill" d="M5 31 L21.5 30 L19.5 20.5 L7 21.5 Z"></path>
+                <path class="gs gs--fill-soft" d="M26.5 30 L43 29 L41 19.5 L28.5 20.5 Z"></path>
               </svg>
               <span class="node-kinds__id t-mono-sm">parallel</span>
               <p class="node-kinds__desc">A concurrent group; children must have disjoint <code class="t-mono-sm">produces</code>.</p>
             </div>
             <div class="node-kinds__item">
-              <svg class="node-kinds__glyph" viewBox="0 0 34 26" aria-hidden="true">
-                <path class="g-stroke" d="M4 20 L30 20 L25 8 L9 8 Z"></path>
-                <path class="g-stroke" d="M25 12 L30 8 L25 5" fill="none"></path>
+              <svg class="node-kinds__glyph" viewBox="0 0 48 48" aria-hidden="true">
+                <path class="gs" d="M9 34 L39.5 32 L36.5 22 L12.5 23.5 Z"></path>
+                <path class="ga" d="M35 17 C 32 10.5, 17 9.5, 13.5 15.5"></path>
+                <path class="ga" d="M12.8 10.5 L13.2 16.2 L18.6 15.2"></path>
               </svg>
               <span class="node-kinds__id t-mono-sm">loop</span>
               <p class="node-kinds__desc">A bounded review⇄revise cycle, its exit read from artifact content (<code class="t-mono-sm">until: artifacts.art-review.verdict == 'approve'</code>).</p>
             </div>
             <div class="node-kinds__item">
-              <svg class="node-kinds__glyph" viewBox="0 0 34 26" aria-hidden="true">
-                <path class="g-stroke" d="M4 20 L30 20 L25 8 L9 8 Z"></path>
-                <path class="g-stroke" d="M13 14 L16 17 L22 11" fill="none"></path>
+              <svg class="node-kinds__glyph" viewBox="0 0 48 48" aria-hidden="true">
+                <path class="gs" d="M8 33 L40.5 31 L37 20 L12.5 21.5 Z"></path>
+                <path class="ga ga--check" d="M18.5 26 L22.5 29.5 L30.5 21"></path>
               </svg>
               <span class="node-kinds__id t-mono-sm">manual</span>
               <p class="node-kinds__desc">Instructions printed to the operator, wait for confirmation, then validate.</p>
