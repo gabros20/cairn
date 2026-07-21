@@ -30,6 +30,9 @@ typed a command, add a `triggers.yaml` at the workspace root and sync it into th
 # handle-reply:
 #   pipeline: hello
 #   watch: inbox/replies/          # workspace-relative; one run per new file
+#   param: name                    # hello's only declared param — the claimed file's path
+#                                   # becomes the greeting name (quirky, but runnable as-is);
+#                                   # point a real pipeline's param at the payload instead
 # cairn trigger sync --backend launchd   # or systemd; cron cannot host a file watch
 ```
 

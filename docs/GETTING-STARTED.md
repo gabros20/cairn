@@ -393,8 +393,9 @@ and trail. From here:
   website-rebuild pipeline (parallel steps, a bounded review loop, gates) expressed in cairn.
 - **Grow the workspace** — [TOOLING-AND-GROWTH.md](TOOLING-AND-GROWTH.md): how external tools enter a
   pipeline, the maturation ladder, and closing the learning loop with `cairn run self-improve`.
-- **Run more than one thing** — `cairn batch` (one pipeline over a JSONL of params) and `cairn schedule`
-  (declared in `schedules.yaml`, installed into cron/launchd/systemd): [SCHEDULING.md](SCHEDULING.md).
+- **Run more than one thing** — `cairn batch` (one pipeline over a JSONL of params), `cairn schedule`
+  (declared in `schedules.yaml`, installed into cron/launchd/systemd): [SCHEDULING.md](SCHEDULING.md),
+  and `cairn trigger` (declared in `triggers.yaml`, fired by a file landing): [TRIGGERS.md](TRIGGERS.md).
 - **Operate it in production** — [OBSERVABILITY.md](OBSERVABILITY.md) (the trail protocol, webhooks,
   `cairn ps`) and [SECURITY.md](SECURITY.md) (secrets, untrusted content, budgets, run locking).
 

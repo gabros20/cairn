@@ -19,6 +19,7 @@ import argparse
 import dataclasses
 import hashlib
 import json
+import os
 import shutil
 import sys
 import tempfile
@@ -1422,12 +1423,18 @@ def _print_gc_result(result, plan) -> None:
 
 
 def _resolve_cairn_bin() -> str:
-    """The command host timer entries invoke. schedkit renders it as a single shlex-quoted
-    token (no multi-token ``python -m cairn`` form), so resolve the console script honestly:
-    its absolute path when on PATH, else the bare name with a doctor-style warning."""
+    """The command host timer entries invoke. schedkit/triggerkit render it as a single
+    shlex-quoted token (no multi-token ``python -m cairn`` form), so resolve the console
+    script honestly: its absolute path when on PATH; else the sibling console script next
+    to the *running* interpreter (every venv/uv install places one there, so this resolves
+    even when the venv's bin/ isn't on PATH — e.g. a bare `pytest` in an activated venv);
+    else the bare name with a doctor-style warning."""
     found = shutil.which("cairn")
     if found:
         return found
+    sibling = Path(sys.executable).parent / "cairn"
+    if sibling.is_file() and os.access(sibling, os.X_OK):
+        return str(sibling)
     print(
         "cairn: warning — 'cairn' is not on PATH; installed timer entries will invoke the bare "
         "name 'cairn' and may fail to launch. Install the console script (pip/uv) or add it to PATH.",

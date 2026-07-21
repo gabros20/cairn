@@ -1734,6 +1734,15 @@ def test_schedule_missing_yaml_is_config_error(hello_ws, monkeypatch, capsys):
 # --------------------------------------------------------------------------- #
 
 
+def _path_without_cairn() -> str:
+    """Real PATH, minus any directory that resolves an ambient `cairn` console script —
+    proves `_resolve_cairn_bin`'s sys.executable-sibling fallback (not PATH) is what finds
+    the binary, while leaving `python3` (the on-event pipelines' own `run:` step) resolvable
+    from whatever other directory it lives in."""
+    kept = [d for d in os.environ.get("PATH", "").split(os.pathsep) if not (Path(d) / "cairn").is_file()]
+    return os.pathsep.join(kept)
+
+
 def _write_triggers(ws: Path, entries: str) -> None:
     (ws / "triggers.yaml").write_text(entries, encoding="utf-8")
 
@@ -1863,7 +1872,11 @@ def test_trigger_run_unknown_name_is_config_error(hello_ws, monkeypatch, capsys)
 def test_trigger_run_drives_a_real_child_run_end_to_end(hello_ws, monkeypatch):
     # No _FakeRunner here — the real _SubprocessRunner, so `cairn trigger run` genuinely
     # spawns a child `cairn run on-event --headless --param event=<claimed-path>` process
-    # (requirement 4's "REAL child cairn run" smoke).
+    # (requirement 4's "REAL child cairn run" smoke). PATH has the ambient `cairn` console
+    # script stripped out (`_path_without_cairn`) so `_resolve_cairn_bin` can't lean on
+    # PATH resolution — it must fall back to the sibling of `sys.executable`, the same
+    # interpreter-tied guarantee the batch tests get from spawning
+    # `[sys.executable, "-m", "cairn", ...]` directly.
     _write_triggers(hello_ws, "handle-reply:\n  pipeline: on-event\n  watch: inbox/replies\n")
     _write_on_event_pipeline(hello_ws)
     inbox = hello_ws / "inbox" / "replies"
@@ -1871,6 +1884,7 @@ def test_trigger_run_drives_a_real_child_run_end_to_end(hello_ws, monkeypatch):
     event = inbox / "one.json"
     event.write_text('{"hello": "world"}', encoding="utf-8")
     monkeypatch.chdir(hello_ws)
+    monkeypatch.setenv("PATH", _path_without_cairn())
 
     rc = main(["trigger", "run", "handle-reply"])
     assert rc == int(ExitCode.OK)
@@ -1886,6 +1900,10 @@ def test_trigger_run_drives_a_real_child_run_end_to_end(hello_ws, monkeypatch):
 
 
 def test_trigger_run_failing_pipeline_moves_event_to_failed_and_exits_nonzero(hello_ws, monkeypatch):
+    # Same hermeticity precedent as the sibling test above: PATH has `cairn` stripped out
+    # (`_path_without_cairn`), forcing `_resolve_cairn_bin` off ambient PATH resolution and
+    # onto the sys.executable-sibling fallback, so this never depends on the test runner's
+    # PATH — only on the interpreter running the suite.
     _write_triggers(hello_ws, "handle-reply:\n  pipeline: on-event-fail\n  watch: inbox/replies\n")
     _write_on_event_fail_pipeline(hello_ws)
     inbox = hello_ws / "inbox" / "replies"
@@ -1893,6 +1911,7 @@ def test_trigger_run_failing_pipeline_moves_event_to_failed_and_exits_nonzero(he
     event = inbox / "bad.json"
     event.write_text('{"bad": true}', encoding="utf-8")
     monkeypatch.chdir(hello_ws)
+    monkeypatch.setenv("PATH", _path_without_cairn())
 
     rc = main(["trigger", "run", "handle-reply"])
     assert rc != 0
