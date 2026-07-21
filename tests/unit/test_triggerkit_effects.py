@@ -18,6 +18,7 @@ from cairn.kernel.triggerkit import (
     list_installed_triggers,
     remove_trigger,
     run_trigger,
+    stuck_claims,
     sync_triggers,
     trigger_launchd_label,
     trigger_systemd_unit_names,
@@ -37,10 +38,29 @@ X:
   watch: inbox/x
 """
 
+# "a" declared (and rendered) before "X" — dict/YAML-mapping order is preserved, so this
+# proves a pre-pass validates ALL declared triggers' ownership before writing ANY of them
+# (Finding 3): "a" would otherwise sync clean before hitting "X"'s collision.
+TRIGGERS_A_THEN_X = """\
+a:
+  pipeline: handle-reply
+  watch: inbox/a
+X:
+  pipeline: x-pipe
+  watch: inbox/x
+"""
+
 _SCHEDULE_OWNED_SERVICE = (
     "[Unit]\nDescription=cairn schedule: trigger-X\n\n[Service]\nType=oneshot\n"
     "WorkingDirectory=/ws/acme\nExecStart=cairn schedule run trigger-X\n"
 ).encode("utf-8")
+
+# A stray non-UTF-8 file — review-T3-quality-r1.md Finding 1's exact repro shape: content
+# that crashes Path.read_text(encoding="utf-8") with UnicodeDecodeError (a ValueError
+# subclass, not an OSError subclass) rather than anything a classifier's `except OSError`
+# would ever catch.
+_NON_UTF8_SERVICE_BYTES = b"ExecStart=\xff\xfe binary junk\n"
+_NON_UTF8_PATH_UNIT_BYTES = b"Unit=\xff\xfe binary junk\n"
 
 
 class FakeRunner:
@@ -148,6 +168,114 @@ def test_sync_refuses_to_overwrite_an_unmanaged_launchd_plist(tmp_path):
     assert foreign.read_text(encoding="utf-8") == "not a plist at all"
 
 
+# --- ownership classifiers survive non-UTF-8 / foreign content (Finding 1) ----
+
+
+def test_sync_systemd_survives_a_stray_non_utf8_foreign_service_file(tmp_path):
+    # A binary/corrupted file at an UNRELATED, undeclared trigger's stem sitting
+    # anywhere in the shared systemd-user dir must never crash the whole sync — the
+    # prune sweep classifies every cairn-trigger-*.service file it finds.
+    ws = _workspace(tmp_path, TRIGGERS_ONE)
+    systemd_dir = tmp_path / "systemd"
+    systemd_dir.mkdir()
+    foreign = systemd_dir / "cairn-trigger-unrelated.service"
+    foreign.write_bytes(_NON_UTF8_SERVICE_BYTES)
+    runner = FakeRunner()
+    touched = sync_triggers(ws, backend="systemd", runner=runner, cairn_bin="cairn", systemd_dir=systemd_dir)
+    path_name, service_name = trigger_systemd_unit_names("handle-reply")
+    assert set(touched) == {path_name, service_name}  # the declared trigger still synced fine
+    assert foreign.read_bytes() == _NON_UTF8_SERVICE_BYTES  # foreign file never touched
+
+
+def test_sync_systemd_survives_a_stray_non_utf8_foreign_path_unit_file(tmp_path):
+    ws = _workspace(tmp_path, TRIGGERS_ONE)
+    systemd_dir = tmp_path / "systemd"
+    systemd_dir.mkdir()
+    foreign = systemd_dir / "cairn-trigger-unrelated.path"
+    foreign.write_bytes(_NON_UTF8_PATH_UNIT_BYTES)
+    runner = FakeRunner()
+    sync_triggers(ws, backend="systemd", runner=runner, cairn_bin="cairn", systemd_dir=systemd_dir)
+    assert foreign.read_bytes() == _NON_UTF8_PATH_UNIT_BYTES
+
+
+def test_sync_systemd_ownership_prepass_leaves_dir_byte_for_byte_untouched_on_refusal(tmp_path):
+    # Two declared triggers, "a" then "X" — "X" collides with a pre-seeded
+    # schedule-owned cairn-trigger-X.service. The pre-pass validates ownership for
+    # EVERY declared trigger before writing ANY of them: "a"'s unit files must never
+    # land on disk from this call, and zero runner calls may fire (Finding 3) — without
+    # the fix, "a" (processed first) would already be written and reloaded by the time
+    # "X" raises.
+    ws = _workspace(tmp_path, TRIGGERS_A_THEN_X, pipelines=("handle-reply", "x-pipe"))
+    systemd_dir = tmp_path / "systemd"
+    systemd_dir.mkdir()
+    (systemd_dir / "cairn-trigger-X.service").write_bytes(_SCHEDULE_OWNED_SERVICE)
+    runner = FakeRunner()
+    with pytest.raises(ConfigError, match="schedule"):
+        sync_triggers(ws, backend="systemd", runner=runner, cairn_bin="cairn", systemd_dir=systemd_dir)
+    a_path_name, a_service_name = trigger_systemd_unit_names("a")
+    assert not (systemd_dir / a_path_name).exists()
+    assert not (systemd_dir / a_service_name).exists()
+    assert runner.calls == []
+
+
+def test_sync_launchd_ownership_prepass_leaves_dir_byte_for_byte_untouched_on_refusal(tmp_path):
+    # Same pre-pass requirement, launchd branch: "a" declared before "X", "X"'s plist
+    # is pre-seeded as unmanaged foreign content.
+    ws = _workspace(tmp_path, TRIGGERS_A_THEN_X, pipelines=("handle-reply", "x-pipe"))
+    launchd_dir = tmp_path / "launchd"
+    launchd_dir.mkdir()
+    foreign = launchd_dir / f"{trigger_launchd_label('X')}.plist"
+    foreign.write_text("not a plist at all", encoding="utf-8")
+    runner = FakeRunner()
+    with pytest.raises(ConfigError, match="unmanaged"):
+        sync_triggers(ws, backend="launchd", runner=runner, cairn_bin="cairn", launchd_dir=launchd_dir)
+    a_plist = launchd_dir / f"{trigger_launchd_label('a')}.plist"
+    assert not a_plist.exists()
+    assert runner.calls == []
+
+
+def test_sync_launchd_survives_a_stray_non_utf8_foreign_plist(tmp_path):
+    # _classify_plist already wraps plistlib.loads in a bare `except Exception` — this
+    # audits that the same posture holds for the launchd backend end to end.
+    ws = _workspace(tmp_path, TRIGGERS_ONE)
+    launchd_dir = tmp_path / "launchd"
+    launchd_dir.mkdir()
+    foreign = launchd_dir / "io.cairn.trigger.unrelated.plist"
+    foreign.write_bytes(b"\xff\xfe not a real plist at all")
+    runner = FakeRunner()
+    sync_triggers(ws, backend="launchd", runner=runner, cairn_bin="cairn", launchd_dir=launchd_dir)
+    assert foreign.read_bytes() == b"\xff\xfe not a real plist at all"
+
+
+def test_remove_trigger_systemd_treats_non_utf8_target_file_as_unmanaged_not_a_crash(tmp_path):
+    # The trigger's OWN service file is corrupted/foreign (non-UTF-8) — remove_trigger's
+    # ownership check on it must classify as unmanaged and refuse loud, never crash with
+    # an uncaught UnicodeDecodeError.
+    ws = _workspace(tmp_path, TRIGGERS_ONE)
+    systemd_dir = tmp_path / "systemd"
+    systemd_dir.mkdir()
+    _, service_name = trigger_systemd_unit_names("handle-reply")
+    foreign = systemd_dir / service_name
+    foreign.write_bytes(_NON_UTF8_SERVICE_BYTES)
+    with pytest.raises(ConfigError, match="unmanaged"):
+        remove_trigger("handle-reply", ws, backend="systemd", runner=FakeRunner(), systemd_dir=systemd_dir)
+    assert foreign.read_bytes() == _NON_UTF8_SERVICE_BYTES
+
+
+def test_list_installed_triggers_systemd_survives_a_stray_non_utf8_file(tmp_path):
+    ws = _workspace(tmp_path, TRIGGERS_ONE)
+    systemd_dir = tmp_path / "systemd"
+    runner = FakeRunner()
+    sync_triggers(ws, backend="systemd", runner=runner, cairn_bin="cairn", systemd_dir=systemd_dir)
+    foreign = systemd_dir / "cairn-trigger-unrelated.service"
+    foreign.write_bytes(_NON_UTF8_SERVICE_BYTES)
+    statuses = {
+        s.name: s for s in list_installed_triggers(ws, backend="systemd", runner=runner, systemd_dir=systemd_dir)
+    }
+    assert statuses["handle-reply"].declared and statuses["handle-reply"].installed
+    assert foreign.read_bytes() == _NON_UTF8_SERVICE_BYTES
+
+
 # --- remove_trigger ------------------------------------------------------------
 
 
@@ -196,6 +324,29 @@ def test_remove_trigger_refuses_to_delete_a_schedule_owned_file(tmp_path):
     with pytest.raises(ConfigError, match="schedule"):
         remove_trigger("X", ws, backend="systemd", runner=FakeRunner(), systemd_dir=systemd_dir)
     assert service_path.read_bytes() == _SCHEDULE_OWNED_SERVICE
+
+
+def test_remove_trigger_systemd_leaves_the_path_unit_alone_when_the_service_is_schedule_owned(tmp_path):
+    # The reviewer's exact Finding 2 repro: a trigger "X" is synced for real (BOTH
+    # .path and .service written as trigger-owned), then a later, unrelated
+    # `cairn schedule sync` clobbers cairn-trigger-X.service with schedule-owned bytes
+    # (addendum 2's collision scenario). remove_trigger must validate ownership of BOTH
+    # stems before touching EITHER — the .path unit must survive untouched and zero
+    # runner calls may fire, not just "the .service survives".
+    ws = _workspace(tmp_path, TRIGGERS_ONE_X, pipelines=("x-pipe",))
+    systemd_dir = tmp_path / "systemd"
+    runner = FakeRunner()
+    sync_triggers(ws, backend="systemd", runner=runner, cairn_bin="cairn", systemd_dir=systemd_dir)
+    path_name, service_name = trigger_systemd_unit_names("X")
+    assert (systemd_dir / path_name).is_file()
+    (systemd_dir / service_name).write_bytes(_SCHEDULE_OWNED_SERVICE)
+
+    runner.calls.clear()
+    with pytest.raises(ConfigError, match="schedule"):
+        remove_trigger("X", ws, backend="systemd", runner=runner, systemd_dir=systemd_dir)
+    assert (systemd_dir / path_name).is_file()  # NOT disabled/unlinked despite being checked first
+    assert (systemd_dir / service_name).read_bytes() == _SCHEDULE_OWNED_SERVICE
+    assert runner.calls == []  # refused before any runner call — including "disable --now"
 
 
 def test_remove_trigger_cron_backend_refuses(tmp_path):
@@ -363,3 +514,38 @@ def test_run_trigger_claim_hazard_halts_only_that_event_not_the_whole_drain(tmp_
     assert (watch_abs / "bad.json").is_file()  # never claimed — left exactly where it was
     assert not (watch_abs / ".failed" / "bad.json").exists()  # nothing to consume — never claimed
     assert (watch_abs / ".done" / "good.json").is_file()  # drain continued past the hazard
+
+
+def test_run_trigger_runner_hazard_after_claim_leaves_a_stuck_claim_but_continues_the_drain(tmp_path):
+    # The reviewer's exact Finding 4 repro: runner.run() itself RAISES (not just
+    # returns nonzero) for a candidate that was already successfully claimed — e.g. a
+    # missing cairn_bin. Per-candidate isolation must wrap the whole claim+spawn+consume
+    # unit of work, not just claim(): the exception must not abort the drain, and the
+    # already-claimed file (which never got a recorded outcome) is a stuck claim by
+    # definition — surfaced, not silently lost or retried.
+    ws = _workspace(tmp_path, TRIGGERS_ONE)
+    watch_abs = ws / "inbox" / "replies"
+    watch_abs.mkdir(parents=True)
+    (watch_abs / "bad.json").write_text("x", encoding="utf-8")
+    (watch_abs / "good.json").write_text("y", encoding="utf-8")
+
+    class FlakyRunner:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def run(self, argv, *, input=None, cwd=None):
+            self.calls.append({"argv": list(argv), "cwd": cwd})
+            if "bad.json" in argv[-1]:
+                raise FileNotFoundError("cairn_bin not found on PATH (simulated)")
+            return RunResult(returncode=0, stdout="", stderr="")
+
+    runner = FlakyRunner()
+    code = run_trigger("handle-reply", ws, runner=runner, cairn_bin="cairn", now=NOW)
+
+    assert code != 0  # the hazard counts as a failure
+    assert len(runner.calls) == 2  # BOTH candidates were attempted — the drain never stopped
+    assert (watch_abs / ".done" / "good.json").is_file()  # second candidate fully processed
+    stuck = stuck_claims(watch_abs)
+    assert [p.name for p in stuck] == ["bad.json"]  # claimed but never consumed — surfaced as stuck
+    assert not (watch_abs / ".failed" / "bad.json").exists()  # never consumed either way
+    assert not (watch_abs / "bad.json").exists()  # not left in the inbox — it WAS claimed

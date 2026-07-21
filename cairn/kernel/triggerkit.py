@@ -648,7 +648,16 @@ def _classify_systemd_service(path: Path) -> tuple[str, str | None]:
     """
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # A non-UTF-8 file at this stem is exactly the "foreign content" this
+        # function's own contract promises to shrug off as unmanaged (same posture as
+        # _classify_plist's bare `except Exception`) — `Path.read_text` raises
+        # UnicodeDecodeError (a ValueError subclass, NOT an OSError subclass) on
+        # non-UTF-8 bytes, and this classifier is called across every
+        # cairn-trigger-*.service in the target dir by _sync_systemd's prune sweep and
+        # _installed_trigger_names — one stray binary file anywhere in that shared
+        # directory must never crash the sweep for every trigger (review-T3-quality-r1.md
+        # Finding 1).
         return "unmanaged", None
     exec_line = next((line for line in text.splitlines() if line.startswith("ExecStart=")), None)
     if exec_line is None:
@@ -675,7 +684,10 @@ def _classify_systemd_path_unit(path: Path) -> tuple[str, str | None]:
     """
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, UnicodeDecodeError):
+        # Same posture as _classify_systemd_service (see its comment) — non-UTF-8
+        # content at this stem is foreign content, not a crash (review-T3-quality-r1.md
+        # Finding 1).
         return "unmanaged", None
     unit_line = next((line for line in text.splitlines() if line.startswith("Unit=")), None)
     if unit_line is None:
@@ -766,11 +778,18 @@ def _sync_launchd(
     launchd_dir: Path | None,
 ) -> list[str]:
     target = _require_dir(launchd_dir, "launchd", "launchd_dir")
+    # Pre-pass: validate ownership for EVERY declared trigger before writing ANY of
+    # them, so an ownership refusal for trigger N never leaves an earlier trigger's
+    # freshly-written plist on disk from this same call (review-T3-quality-r1.md
+    # Finding 3 — same "check everything, then act" pattern remove_trigger's systemd
+    # branch now uses for its own two-stem check).
+    for trigger in triggers.values():
+        filename = f"{trigger_launchd_label(trigger.name)}.plist"
+        _require_ownership(target / filename, trigger.name, _classify_plist)
     touched: list[str] = []
     for trigger in triggers.values():
         filename = f"{trigger_launchd_label(trigger.name)}.plist"
         path = target / filename
-        _require_ownership(path, trigger.name, _classify_plist)
         rendered = render_trigger_launchd(trigger, workspace_dir, cairn_bin)
         if path.is_file() and path.read_text(encoding="utf-8") == rendered:
             touched.append(filename)  # already current — zero host-watcher calls
@@ -797,6 +816,20 @@ def _sync_systemd(
     systemd_dir: Path | None,
 ) -> list[str]:
     target = _require_dir(systemd_dir, "systemd", "systemd_dir")
+    # Pre-pass: validate ownership of BOTH stems for EVERY declared trigger before
+    # writing ANY of them. Writes happen per-trigger inside the loop below but
+    # daemon-reload/enable are deferred until after the whole loop finishes — an
+    # ownership refusal raised mid-loop (a T3-only addition unrelated to disk I/O, so
+    # far more reachable than a raw write failure) would otherwise leave earlier
+    # triggers' unit files written to disk but never reloaded into systemd: a silent,
+    # undetectable-from-the-return-value inconsistency between disk and the live host
+    # scheduler (review-T3-quality-r1.md Finding 3). Validating everything up front
+    # keeps a refusal a true no-op: the target dir stays byte-for-byte untouched.
+    for trigger in triggers.values():
+        path_name, service_name = trigger_systemd_unit_names(trigger.name)
+        _require_ownership(target / path_name, trigger.name, _classify_systemd_path_unit)
+        _require_ownership(target / service_name, trigger.name, _classify_systemd_service)
+
     touched: list[str] = []
     to_enable: list[str] = []
     needs_reload = False
@@ -804,8 +837,6 @@ def _sync_systemd(
         path_name, service_name = trigger_systemd_unit_names(trigger.name)
         path_unit_path = target / path_name
         service_unit_path = target / service_name
-        _require_ownership(path_unit_path, trigger.name, _classify_systemd_path_unit)
-        _require_ownership(service_unit_path, trigger.name, _classify_systemd_service)
         path_text, service_text = render_trigger_systemd(trigger, workspace_dir, cairn_bin)
         unchanged = (
             path_unit_path.is_file()
@@ -881,14 +912,22 @@ def remove_trigger(
         path_name, service_name = trigger_systemd_unit_names(name)
         path_unit_path = target / path_name
         service_unit_path = target / service_name
-        removed = False
+        # Validate ownership of BOTH stems before acting on EITHER (mirrors
+        # _sync_systemd's write path) — checking .service only after already disabling
+        # and unlinking .path means an ownership refusal on .service (e.g. a
+        # same-named schedule's live unit file) leaves a real .path unit destructively
+        # removed behind what looks to the caller like a clean, no-op refusal
+        # (review-T3-quality-r1.md Finding 2).
         if path_unit_path.is_file():
             _require_ownership(path_unit_path, name, _classify_systemd_path_unit)
+        if service_unit_path.is_file():
+            _require_ownership(service_unit_path, name, _classify_systemd_service)
+        removed = False
+        if path_unit_path.is_file():
             runner.run(["systemctl", "--user", "disable", "--now", path_name])
             path_unit_path.unlink()
             removed = True
         if service_unit_path.is_file():
-            _require_ownership(service_unit_path, name, _classify_systemd_service)
             service_unit_path.unlink()
             removed = True
         if removed:
@@ -1007,11 +1046,13 @@ def run_trigger(
     paragraph). Kept as an injected parameter rather than a bare ``datetime.now()`` so a
     future addition (e.g. stuck-claim age reporting) never needs a signature change.
 
-    Exit code: ``0`` when every claimed candidate's child exited 0, OR there was nothing
-    to claim (an empty scan is a successful no-op drain, not a failure); nonzero iff at
-    least one child failed. A failing child never stops the drain — every remaining
-    candidate still gets claimed and run (the brief's rejected alternative is retrying a
-    failed event, not draining past it: draining past it is required). The failed
+    Exit code: ``0`` when every candidate was processed clean, OR there was nothing to
+    claim (an empty scan is a successful no-op drain, not a failure); nonzero when ANY
+    candidate failed to process — its child exited nonzero, OR the claim/spawn/consume
+    step itself hazarded (a raised exception, not just a nonzero child exit). A failing
+    candidate never stops the drain — every remaining candidate still gets claimed and
+    run (the brief's rejected alternative is retrying a failed event, not draining past
+    it: draining past it is required). The failed
     claim moves to ``.failed/`` (never auto-retried) while the run overall reports
     failure via its exit code.
 
@@ -1026,6 +1067,19 @@ def run_trigger(
     exactly where it was, to be picked up again on the NEXT firing once the underlying
     filesystem/platform hazard is fixed (a structural misconfiguration, not the
     poison-file scenario ``.failed/``-and-stop targets).
+
+    Once a candidate IS claimed, the child spawn (:func:`_run_one`) and :func:`consume`
+    are wrapped in that SAME per-candidate isolation, not just ``claim()`` — a runner
+    that can't even spawn the child (a missing ``cairn_bin``, a ``PermissionError``) or a
+    ``consume`` that hazards while retiring the claim (its own ``_hardlink`` path can
+    raise, per T1's docstring) must not abort the whole drain either
+    (review-T3-quality-r1.md Finding 4). Unlike the pre-claim hazard above, this
+    candidate's file IS now sitting in ``.claim/`` with no recorded outcome once such an
+    exception hits — by definition a stuck claim (never auto-retried; surfaced via
+    :func:`stuck_claims`/``trigger list`` for the operator to re-drop or discard by
+    hand), a deliberate choice rather than a bug: a claim whose child never ran has no
+    known outcome to consume it with, so surfacing it as stuck is honest, where silently
+    retrying it would risk re-running a child that already did partial, unknown work.
     """
     workspace_dir = Path(workspace_dir)
     triggers = load_triggers(workspace_dir)
@@ -1046,8 +1100,17 @@ def run_trigger(
             continue
         if claimed is None:
             continue  # lost the claim race to a concurrent firing — not our event
-        ok = _run_one(trigger, claimed, workspace_dir, runner, cairn_bin)
-        consume(watch_abs, claimed, ok=ok, on_done=trigger.on_done)
+        try:
+            ok = _run_one(trigger, claimed, workspace_dir, runner, cairn_bin)
+            consume(watch_abs, claimed, ok=ok, on_done=trigger.on_done)
+        except Exception:
+            # The child spawn or the consume step itself hazarded (see the docstring's
+            # "Once a candidate IS claimed" paragraph) — this candidate is now a stuck
+            # claim by definition, not silently lost or retried; count it as a failure
+            # and move on rather than aborting the whole drain (review-T3-quality-r1.md
+            # Finding 4).
+            any_failed = True
+            continue
         if not ok:
             any_failed = True
     return 1 if any_failed else 0
