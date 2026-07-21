@@ -516,6 +516,101 @@ def test_run_trigger_claim_hazard_halts_only_that_event_not_the_whole_drain(tmp_
     assert (watch_abs / ".done" / "good.json").is_file()  # drain continued past the hazard
 
 
+def test_run_trigger_reemits_captured_child_streams_to_injected_buffers(tmp_path):
+    # A halted child (e.g. NEEDS_HUMAN) captures output in the Runner — re-emit it so a
+    # launchd/systemd-fired trigger's operator sees the halt reason and resume hint
+    # instead of just an exit code (mirrors test_run_schedule_reemits_captured_streams...).
+    import io
+
+    ws = _workspace(tmp_path, TRIGGERS_ONE)
+    watch_abs = ws / "inbox" / "replies"
+    watch_abs.mkdir(parents=True)
+    (watch_abs / "one.json").write_text("event payload", encoding="utf-8")
+
+    runner = FakeRunner(
+        {("cairn", "run"): RunResult(6, "run halted at gate\n", "resume: cairn resume acme-x\n")}
+    )
+    out, err = io.StringIO(), io.StringIO()
+    code = run_trigger("handle-reply", ws, runner=runner, cairn_bin="cairn", now=NOW, out=out, err=err)
+
+    assert code != 0
+    assert out.getvalue() == "run halted at gate\n"
+    assert err.getvalue() == "resume: cairn resume acme-x\n"
+
+
+def test_run_trigger_stays_silent_when_no_buffers_given(tmp_path):
+    # backward compat: without out/err, the captured child streams are simply not
+    # re-emitted — return-code semantics are unchanged.
+    ws = _workspace(tmp_path, TRIGGERS_ONE)
+    watch_abs = ws / "inbox" / "replies"
+    watch_abs.mkdir(parents=True)
+    (watch_abs / "one.json").write_text("event payload", encoding="utf-8")
+
+    runner = FakeRunner({("cairn", "run"): RunResult(6, "noisy stdout", "noisy stderr")})
+    code = run_trigger("handle-reply", ws, runner=runner, cairn_bin="cairn", now=NOW)
+    assert code != 0  # no exception, nothing written anywhere
+
+
+def test_run_trigger_claim_hazard_writes_a_candidate_named_diagnostic_to_err(tmp_path, monkeypatch):
+    # WB-1 item 3, pre-claim branch: claim() hazarding must no longer be silently
+    # swallowed — a one-line diagnostic naming the candidate and the exception must
+    # land on the injected err, and the "left in place" wording must distinguish this
+    # from the post-claim (stuck-claim) case below.
+    import io
+
+    ws = _workspace(tmp_path, TRIGGERS_ONE)
+    watch_abs = ws / "inbox" / "replies"
+    watch_abs.mkdir(parents=True)
+    (watch_abs / "bad.json").write_text("x", encoding="utf-8")
+
+    import cairn.kernel.triggerkit as tk
+
+    def flaky_claim(watch_abs_arg, candidate):
+        raise CairnError("simulated cross-device hazard")
+
+    monkeypatch.setattr(tk, "claim", flaky_claim)
+    err = io.StringIO()
+    code = run_trigger(
+        "handle-reply", ws, runner=FakeRunner(), cairn_bin="cairn", now=NOW, err=err
+    )
+
+    assert code != 0  # exit-code contract unchanged
+    diagnostic = err.getvalue()
+    assert "handle-reply" in diagnostic
+    assert "bad.json" in diagnostic
+    assert "left in place" in diagnostic
+    assert "simulated cross-device hazard" in diagnostic
+
+
+def test_run_trigger_runner_hazard_after_claim_writes_a_stuck_claim_diagnostic_to_err(tmp_path):
+    # WB-1 item 3, post-claim branch: a spawn/consume hazard after a successful claim
+    # must also write a candidate-named diagnostic — distinguished from the pre-claim
+    # case by "stuck claim in .claim/" wording, since this candidate's file IS now
+    # sitting in .claim/ with no recorded outcome.
+    import io
+
+    ws = _workspace(tmp_path, TRIGGERS_ONE)
+    watch_abs = ws / "inbox" / "replies"
+    watch_abs.mkdir(parents=True)
+    (watch_abs / "bad.json").write_text("x", encoding="utf-8")
+
+    class FlakyRunner:
+        def run(self, argv, *, input=None, cwd=None):
+            raise FileNotFoundError("cairn_bin not found on PATH (simulated)")
+
+    err = io.StringIO()
+    code = run_trigger(
+        "handle-reply", ws, runner=FlakyRunner(), cairn_bin="cairn", now=NOW, err=err
+    )
+
+    assert code != 0  # exit-code contract unchanged
+    diagnostic = err.getvalue()
+    assert "handle-reply" in diagnostic
+    assert "bad.json" in diagnostic
+    assert ".claim/" in diagnostic and "stuck claim" in diagnostic
+    assert "cairn_bin not found on PATH" in diagnostic
+
+
 def test_run_trigger_runner_hazard_after_claim_leaves_a_stuck_claim_but_continues_the_drain(tmp_path):
     # The reviewer's exact Finding 4 repro: runner.run() itself RAISES (not just
     # returns nonzero) for a candidate that was already successfully claimed — e.g. a

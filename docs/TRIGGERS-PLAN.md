@@ -51,6 +51,9 @@ entry point owns dedupe, not the watcher:
 2. For each candidate, **claim by atomic rename** into `<watch>/.claim/<file>` —
    `rename(2)` is atomic on the same filesystem, so two concurrent firings can never both
    claim one file; losing the race (`FileNotFoundError`) means skip, not error.
+   (as shipped: an atomic hard-link + unlink, not `rename` — rename silently replaces an
+   existing destination and would destroy a stuck claim; see TRIGGERS.md §2 and
+   `claim()`'s docstring)
 3. Per claimed file: `cairn run <pipeline> --headless --param <param>=<claimed-path>`.
 4. Exit 0 → move claim to `.done/` (or delete per `on_done`); nonzero → `.failed/`.
    The claim file is the at-most-once ledger; a crash mid-run leaves it in `.claim/`,

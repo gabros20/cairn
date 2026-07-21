@@ -1558,12 +1558,17 @@ def _cmd_trigger(args: argparse.Namespace) -> int:
                 return int(ExitCode.CONFIG)
             # The exit code IS the contract (requirement 3): claim hazards and a failed
             # child both surface here, verbatim — never remapped into an ExitCode member.
+            # Thread our real streams through (mirrors `schedule run` above): the
+            # Runner-captured child output — halt reasons, hazard diagnostics — must
+            # reach the operator, never rot silently.
             return run_trigger(
                 args.name,
                 ws,
                 runner=runner,
                 cairn_bin=_resolve_cairn_bin(),
                 now=_now(),
+                out=sys.stdout,
+                err=sys.stderr,
             )
 
         if args.action == "sync":

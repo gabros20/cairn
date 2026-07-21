@@ -171,7 +171,7 @@ def _assert_contained(
     ``run_dir`` (e.g. a symlinked run root) could fail that ``relative_to`` and fall back to
     printing an absolute path in artifact-missing/schema-violation reasons — a downstream
     contract change this cleanup should not force. Accepted as a documented residual; see
-    SECURITY.md §1.3.
+    SECURITY.md §1.4.
     """
     resolved = candidate.resolve()
     if resolved != real_run_dir and real_run_dir not in resolved.parents:

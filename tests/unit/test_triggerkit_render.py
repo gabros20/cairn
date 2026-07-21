@@ -120,6 +120,9 @@ def test_render_trigger_systemd_quotes_workspace_with_spaces_and_non_ascii():
 
     # DirectoryNotEmpty= is a single unsplit value — no quoting needed or added
     assert f"DirectoryNotEmpty={ws / 'inbox/ingest'}" in path_unit
+    # WorkingDirectory= is likewise a single unsplit value (unlike word-split
+    # ExecStart=) — emitted unquoted, and must be pinned for the space-bearing path too
+    assert f"WorkingDirectory={ws}" in service_unit
     # ExecStart= IS word-split by systemd, so the space-and-accent-bearing --workspace
     # value must be shell-quoted or the argv would silently truncate at the space
     assert f"--workspace {ws!s}" not in service_unit

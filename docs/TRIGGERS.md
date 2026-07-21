@@ -116,8 +116,11 @@ cairn trigger sync [--backend cron|launchd|systemd] [--launchd-dir P] [--systemd
 cairn trigger list [--backend ...] [--json]      # declared vs installed vs stuck-claim diff
 cairn trigger remove <name> [--backend ...]      # remove one trigger's unit/plist file(s);
                                                  # idempotent — a re-run reports nothing to do
-cairn trigger run <name> [--workspace .]         # drain the inbox now — also what the
+cairn trigger run <name> [--workspace .] [--headless]  # drain the inbox now — also what the
                                                  # installed host unit calls when it fires
+                                                 # (--headless is accepted and ignored —
+                                                 # present only so the §3 cron-fallback
+                                                 # entry below is copy-paste runnable)
 ```
 
 **Default backend is `cron`** (mirroring `schedule`'s literal default), but cron **always
