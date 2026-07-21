@@ -201,7 +201,7 @@ mechanics — package anatomy, versioning surfaces, scaffold, onboarding, the op
 The workspace pins its tool (`cairn.toml: requires = ">=0.1,<0.2"`, checked at plan time);
 `run.json` records the exact version per run.
 
-**Four run postures, one binary:**
+**Five run postures, one binary:**
 1. **Terminal** (primary) — foreground process, TTY gates; `--headless` for CI/batch. No
    daemon: when no run is active, cairn doesn't exist.
 2. **Operated by a coding agent** — the agent drives cairn through Bash like any build tool. Gates
@@ -214,6 +214,11 @@ The workspace pins its tool (`cairn.toml: requires = ">=0.1,<0.2"`, checked at p
 4. **Scheduled** — declared in `schedules.yaml`, installed into the *host* scheduler
    (`cairn schedule install` → cron/launchd/systemd), fired as idempotent invocations. cairn
    owns schedulability, never the clock — no daemon ([SCHEDULING.md](SCHEDULING.md)).
+5. **Triggered** — declared in `triggers.yaml`, installed into the *host* watcher
+   (`cairn trigger sync` → launchd WatchPaths / systemd path-units). An event is a file in a
+   watched inbox; each is claimed at-most-once and becomes one headless run. cairn owns
+   triggerability, never the listener — the same no-daemon rule, event-side
+   ([TRIGGERS.md](TRIGGERS.md)).
 
 Ruled out: vendored kernels (the drift disease, one level up), `curl|bash` installers (uv exists),
 MCP-server-first (a later plugin at most — the operator pattern already works everywhere), and any
@@ -237,19 +242,24 @@ sequence is in [IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md).
 
 ## Status
 
-**Kernel built and green (1137 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
+**Kernel built and green (1269 tests).** Implemented: the kernel (planner, walker, gatekit, composer,
 artifacts, trail/runstate, guards, expression + template engines, config, doctor, scaffold); ten
 executors (`shell`/`stub` live; the **`claude`, `codex`, and `grok` executors all live-verified**,
 with the first live runs recorded as offline stub regressions, plus a live-proven **mixed fleet** —
 one pipeline spanning codex → claude → grok, per-step models recorded in `run.json`; and five
 adapter-complete, smoke-pending additions: **`cursor`, `opencode`, `hermes`, `kimi`, `agy`**); the workspace
-test layer (`cairn test` + `record`); and the full CLI — `batch` / `learnings` / `gc` / `schedule` are
-**live** (no longer stubbed), with first-class **scheduling shipped** (`schedules.yaml`,
-cron/launchd/systemd installers, content-key idempotency).
+test layer (`cairn test` + `record`); and the full CLI — `batch` / `learnings` / `gc` / `schedule` /
+`trigger` are **live** (no longer stubbed), with first-class **scheduling shipped** (`schedules.yaml`,
+cron/launchd/systemd installers, content-key idempotency) and its event-side complement, **triggers**
+(`triggers.yaml`, launchd-WatchPaths/systemd-path-unit installers, at-most-once inbox claims, the
+poll-cursor primitive on `run:` steps — [TRIGGERS.md](TRIGGERS.md)).
 
-**v0.1.0 is tagged.** The hardening backlog has since shipped: opt-in `heartbeat` events, the webhook
-trail sink, kernel-side secret redaction, cross-version resume gates, range-scoped tool enforcement,
-batch failures that name their reason, and one aware-UTC clock behind every persisted timestamp. The
+**v0.5.0 is tagged** (releases are cut by semantic-release from conventional commits). The hardening
+backlog shipped along the way: opt-in `heartbeat` events, the webhook trail sink, kernel-side secret
+redaction, cross-version resume gates (`resume --force` now re-pins the manifest so drift consent is
+paid once), the `resume --from NODE` escape hatch for stale-but-valid artifacts, range-scoped tool
+enforcement, batch failures that name their reason, and one aware-UTC clock behind every persisted
+timestamp. The
 learning loop is closed: the curate→promote `self-improve.yaml` pipeline ships as scaffold furniture —
 the framework provides the mechanism, the workspace owns the policy
 ([TOOLING-AND-GROWTH.md §7](TOOLING-AND-GROWTH.md)). The day-0 pipeline runs end-to-end offline

@@ -161,7 +161,7 @@ Every verb from `cairn --help`:
 |---|---|
 | `cairn plan <pipeline>` | Resolve params, expand conditionals, statically verify dataflow/schemas/agents/skills, and print the execution plan. No run. |
 | `cairn run <pipeline>` | Plan, then execute. `--executor codex` picks a fleet; `--step-executor review=claude` mixes them; `--headless` for CI/batch. |
-| `cairn resume <run-dir>` | Re-plan against recorded params and walk from the first invalid step. Re-running *is* the retry mechanism. |
+| `cairn resume <run-dir>` | Re-plan against recorded params and walk from the first invalid step. Re-running *is* the retry mechanism. `--from NODE` re-executes from a node even though its artifacts still validate (the stale-but-valid escape hatch — old artifacts move to `superseded/`, never deleted); `--force` accepts pipeline/version drift once and re-pins the manifest. |
 | `cairn gate <run-dir> <name>=<choice>` | Answer a pending gate out-of-band; refuses to overwrite an already-answered one. |
 | `cairn validate <run-dir> [artifact]` | Re-run validators ad-hoc over a run's produced artifacts. |
 | `cairn trail <run-dir>` | Read a run's trail as a status tree; `--follow --json` streams NDJSON. |
@@ -200,6 +200,21 @@ binaries) with a real-CLI smoke run still pending:
 (cursor excepted — it ships its own sandbox), so `opencode`/`hermes`/`kimi`/`agy` run under cairn's
 OS filesystem sandbox (`sandbox: fs`), the same containment claude gets.
 
+## On a clock, on an event — still no daemon
+
+cairn never runs a resident process; it makes itself perfectly *schedulable* and *triggerable*
+instead. `schedules.yaml` declares time-based runs and `cairn schedule install` syncs them into the
+host's own scheduler (cron / launchd / systemd timers). `triggers.yaml` declares event-driven runs —
+a watched inbox directory where **an event is just a file** — and `cairn trigger sync` installs
+launchd WatchPaths / systemd path-units that fire `cairn trigger run` to drain the inbox: each new
+file is claimed atomically (at-most-once, even under duplicate firings), becomes one `--headless`
+pipeline run with the file's path as a param, and is consumed to `.done/` or `.failed/`. For
+providers you must poll, a `cursor:` on a `run:` step gives the pipeline a persistent watermark the
+kernel only advances after the step's artifacts validate — a failed poll never loses events. The
+always-on part (a webhook receiver) stays outside the kernel as a documented bridge pattern:
+verify the signature, drop the payload file in the inbox. See [SCHEDULING](docs/SCHEDULING.md) and
+[TRIGGERS](docs/TRIGGERS.md).
+
 ## Documentation
 
 The design package lives in [`docs/`](docs/). Start with the getting-started tutorial, then the
@@ -220,15 +235,19 @@ docs index.
 | [OBSERVABILITY](docs/OBSERVABILITY.md) | The Trail Protocol, sinks, OTel mapping, `cairn ps`. |
 | [SECURITY](docs/SECURITY.md) | The secrets contract, prompt-injection posture, budgets. |
 | [SCHEDULING](docs/SCHEDULING.md) | First-class scheduling without a resident scheduler. |
+| [TRIGGERS](docs/TRIGGERS.md) | Event-driven runs: inbox file-watch, at-most-once claims, poll cursors, the webhook bridge. |
 
 ## Status
 
-**v0.5.0 released; 1137 tests passing.** The kernel and all ten executors are built and green
+**v0.5.0 released; 1269 tests passing.** The kernel and all ten executors are built and green
 (claude/codex/grok live-verified; cursor/opencode/hermes/kimi/agy adapter-complete, smoke pending),
 scheduling / batch / learnings / gc have shipped, and the hardening backlog is in (heartbeat trail
 events, a webhook sink, kernel-side secret redaction, cross-version resume gates, tool enforcement,
 one aware-UTC clock). The self-improve pipeline ships as scaffold furniture — the framework provides
-the mechanism, the workspace owns the policy.
+the mechanism, the workspace owns the policy. Since 0.5.0, on main awaiting release: **event
+triggers** (`triggers.yaml`, `cairn trigger`, the poll-cursor primitive — issue #3, closed) and the
+**resume escape hatches** (`resume --from NODE` for stale-but-valid artifacts; `--force` now re-pins
+the manifest so drift consent is paid once — issues #1/#2, closed).
 
 **Done (2026-07-04):** brease-factory (see Lineage) now runs as cairn's first real workspace — its
 `v2` branch is a three-pipeline workspace (clone / redesign / reimagine tracks) on cairn ≥0.3, and

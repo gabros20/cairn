@@ -433,7 +433,7 @@
     <section class="section" id="pipelines">
       <div class="container">
         <div class="section-heading reveal">
-          <h2 class="t-display-lg">Three real pipelines, not a hello-world.</h2>
+          <h2 class="t-display-lg">Four real pipelines, not a hello-world.</h2>
           <p class="t-body" style="margin-top:1.5rem;">These run in the repo today. Each mixes deterministic <code class="t-mono-sm">run:</code> steps, agentic <code class="t-mono-sm">agent:</code> steps, and human <code class="t-mono-sm">gate:</code> nodes in one dependency graph.</p>
         </div>
 
@@ -441,6 +441,7 @@
           <div class="pipelines__tabs" role="tablist" aria-label="Example pipelines">
             <button class="pipelines__tab is-active" role="tab" aria-selected="true" aria-controls="tab-rebuild" id="tabbtn-rebuild" data-tab="tab-rebuild">Rebuild a site</button>
             <button class="pipelines__tab" role="tab" aria-selected="false" aria-controls="tab-learn" id="tabbtn-learn" data-tab="tab-learn">The learning loop</button>
+            <button class="pipelines__tab" role="tab" aria-selected="false" aria-controls="tab-events" id="tabbtn-events" data-tab="tab-events">Event-driven</button>
             <button class="pipelines__tab" role="tab" aria-selected="false" aria-controls="tab-day0" id="tabbtn-day0" data-tab="tab-day0">Day-0</button>
           </div>
 
@@ -530,6 +531,40 @@
             </div>
           </div>
 
+          <div class="pipelines__panel" id="tab-events" role="tabpanel" aria-labelledby="tabbtn-events">
+            <p class="t-body pipelines__gloss">A pipeline that reacts to the outside world — with no daemon and no webhook server. An event is <strong>a file in a watched inbox</strong>: <code class="t-mono-sm">cairn trigger sync</code> installs a launchd WatchPaths / systemd path-unit that fires <code class="t-mono-sm">cairn trigger run</code>; each new file is claimed atomically (at-most-once, even under duplicate firings) and becomes one headless run with the file's path as a param. For providers you must poll, a <code class="t-mono-sm">cursor:</code> on a <code class="t-mono-sm">run:</code> step keeps a persistent watermark the kernel only advances after the step's artifacts validate — a failed poll never loses events. Webhooks stay outside the kernel: a documented bridge verifies the signature and drops the payload into the inbox.</p>
+            <div class="terminal-panel pipelines__yaml">
+              <div class="terminal-panel__bar"><span class="terminal-panel__dot"></span>triggers.yaml + pipelines/poll-events.yaml (trimmed)</div>
+              <div class="terminal-panel__body">
+<pre class="yaml"><span class="y-com"># triggers.yaml — the push half: one run per file dropped in the inbox</span>
+<span class="y-key">handle-reply:</span>
+  <span class="y-key">pipeline:</span> handle-reply             <span class="y-com"># checked against pipelines/ at parse time</span>
+  <span class="y-key">watch:</span> inbox/replies/               <span class="y-com"># claimed → run → .done/ (failed → .failed/)</span>
+  <span class="y-key">param:</span> event                       <span class="y-com"># the claimed file's path, as --param event=…</span>
+  <span class="y-key">glob:</span> <span class="y-str">"*.json"</span>
+
+<span class="y-com"># pipelines/poll-events.yaml — the pull half: scheduled poll with a kernel-managed cursor</span>
+<span class="y-key">steps:</span>
+  - <span class="y-key">id:</span> poll                          <span class="y-com"># deterministic; {cursor.value} = last watermark</span>
+    <span class="y-key">run:</span> <span class="y-str">"scripts/poll-provider --since {cursor.value}
+           --write-cursor {cursor.next} --emit inbox/replies/"</span>
+    <span class="y-key">cursor:</span> state/provider-cursor.json <span class="y-com"># commits ONLY after produces validate</span>
+    <span class="y-key">produces:</span> [poll-report]
+
+  - <span class="y-key">id:</span> triage                        <span class="y-com"># judgment on each event → an agent step</span>
+    <span class="y-key">agent:</span> reply-triager
+    <span class="y-key">needs:</span> [poll-report]
+    <span class="y-key">produces:</span> [triage]
+
+  - <span class="y-key">gate:</span> send                        <span class="y-com"># a human approves outbound; headless default: no</span>
+    <span class="y-key">reads:</span> [triage]
+    <span class="y-key">ask:</span> <span class="y-str">"Send the drafted follow-up?"</span>
+    <span class="y-key">options:</span> { <span class="y-str">"yes"</span>: <span class="y-str">"Send it"</span>, <span class="y-str">"no"</span>: <span class="y-str">"Hold — record the draft only"</span> }
+    <span class="y-key">default:</span> <span class="y-str">"no"</span></pre>
+              </div>
+            </div>
+          </div>
+
           <div class="pipelines__panel" id="tab-day0" role="tabpanel" aria-labelledby="tabbtn-day0">
             <p class="t-body pipelines__gloss">The whole model in miniature — two <code class="t-mono-sm">run:</code> steps and one <code class="t-mono-sm">gate:</code>, no auth, no API key, no model. <code class="t-mono-sm">cairn run hello</code> works the moment the workspace exists. Grow it by turning a step that needs judgment into an <code class="t-mono-sm">agent:</code> step.</p>
             <div class="terminal-panel pipelines__yaml">
@@ -588,7 +623,7 @@
         </div>
 
         <p class="t-body-sm quickstart__note reveal">Installing from source works the same: <code class="t-mono-sm">git clone https://github.com/gabros20/cairn && cd cairn && uv tool install .</code> — the PyPI distribution is <code class="t-mono-sm">cairn-pipelines</code>; the command and the import package are both <code class="t-mono-sm">cairn</code>.</p>
-        <p class="t-body-sm quickstart__ref reveal">Full verb list — <code class="t-mono-sm">plan · run · resume · gate · validate · trail · ps · doctor · test · compose · batch · learnings · gc · schedule · new</code> — in the docs.</p>
+        <p class="t-body-sm quickstart__ref reveal">Full verb list — <code class="t-mono-sm">plan · run · resume · gate · validate · trail · ps · doctor · test · compose · batch · learnings · gc · schedule · trigger · new</code> — in the docs.</p>
       </div>
     </section>
 
