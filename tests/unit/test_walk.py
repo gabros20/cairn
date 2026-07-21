@@ -1352,6 +1352,102 @@ def test_cursor_placeholder_on_cursorless_step_fails_loud_naming_the_step(ws: Pa
     assert "cursor" in halt["data"]["reason"]
 
 
+def test_cursor_commit_survives_non_utf8_committed_file_treating_it_as_absent(
+    ws: Path, tmp_path: Path
+) -> None:
+    # I1: _commit_cursor's read of the ALREADY-committed cursor file must catch
+    # UnicodeDecodeError the same way _cursor_value's sibling read of the same file does —
+    # a corrupt committed file must never crash a walk after a successful step.
+    (ws / "state").mkdir(parents=True)
+    (ws / _CURSOR_PATH).write_bytes(b"\xff\xfe not valid utf-8")
+
+    art = ArtifactDecl("a", "a.txt", validator=_nonempty(ws))
+    step = run_step("poll", _cursor_cmd("v1"), produces=["a"], cursor=_CURSOR_PATH)
+    plan = make_plan([step], {"a": art})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    assert _walk(ws, plan, run_dir, {"shell": ShellExecutor()}) == ExitCode.OK
+    assert (run_dir / "seen.txt").read_text() == ""  # corrupt file → {cursor.value} is "" too
+
+    doc = json.loads((ws / _CURSOR_PATH).read_text(encoding="utf-8"))
+    assert doc["value"] == "v1"  # commit succeeded, overwriting the corrupt file
+
+    commits = [e for e in read_trail(run_dir) if e["event"] == "cursor-commit"]
+    assert len(commits) == 1
+    assert commits[0]["data"] == {"path": _CURSOR_PATH, "value": "v1"}
+
+
+def test_cursor_non_utf8_scratch_does_not_advance_and_emits_warning(ws: Path, tmp_path: Path) -> None:
+    # I2: a step that writes NON-UTF-8 bytes to {cursor.next} still SUCCEEDED (produces
+    # valid, exit 0) — the walk must complete and must NOT advance the watermark, but the
+    # garbage scratch is a step-authoring bug the operator must see: folded into the
+    # existing step-done event as `cursor_warning`, not silently dropped and not a crash.
+    cmd = r"printf '\377\376BAD' > '{cursor.next}' && printf ok > '{artifact:a}'"
+    art = ArtifactDecl("a", "a.txt", validator=_nonempty(ws))
+    step = run_step("poll", cmd, produces=["a"], cursor=_CURSOR_PATH)
+    plan = make_plan([step], {"a": art})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    assert _walk(ws, plan, run_dir, {"shell": ShellExecutor()}) == ExitCode.OK
+    assert not (ws / _CURSOR_PATH).exists()  # unreadable scratch → no advance
+    assert not any(e["event"] == "cursor-commit" for e in read_trail(run_dir))
+
+    done_ev = next(e for e in read_trail(run_dir) if e["event"] == "step-done")
+    assert "unreadable" in done_ev["data"]["cursor_warning"]
+    assert "UnicodeDecodeError" in done_ev["data"]["cursor_warning"]
+
+
+def test_cursor_path_symlink_escape_is_a_typed_halt(ws: Path, tmp_path: Path) -> None:
+    # I3: plan-time (`plan._parse_cursor`) only lexically checks absolute/`..` — a symlink
+    # planted in the path's parent chain bypasses that check entirely. Runtime containment
+    # (mirroring artifacts._assert_contained, codex-F11) must catch it at USE time: a typed
+    # CONFIG halt naming the step and path, never a silent read/write outside the workspace.
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (ws / "state").symlink_to(outside, target_is_directory=True)
+
+    art = ArtifactDecl("a", "a.txt", validator=_nonempty(ws))
+    step = run_step("poll", _cursor_cmd("v1"), produces=["a"], cursor=_CURSOR_PATH)
+    plan = make_plan([step], {"a": art})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    assert _walk(ws, plan, run_dir, {"shell": ShellExecutor()}) == ExitCode.CONFIG
+    halt = next(e for e in read_trail(run_dir) if e["event"] == "run-halt")
+    assert halt["node"] == "poll"
+    assert "symlink" in halt["data"]["reason"]
+    assert _CURSOR_PATH in halt["data"]["reason"]
+    assert not (outside / "resend-cursor.json").exists()  # never wrote through the symlink
+
+
+def test_cursor_value_with_shell_special_characters_roundtrips_verbatim(ws: Path, tmp_path: Path) -> None:
+    # A cursor value containing shell-metacharacters (quotes, braces, $, spaces) must commit
+    # and render back into {cursor.value} verbatim on the next run — pins that json.dumps's
+    # escaping (_atomic_write_cursor) round-trips such values exactly, and that
+    # _render_command's single-pass re.sub never rescans the SUBSTITUTED-IN value for
+    # further `{...}` placeholders (the candidate's own literal `{something}` must survive
+    # untouched, not be mistaken for a second placeholder).
+    candidate = 'he said "hi" {something} $HOME and spaces'
+    art = ArtifactDecl("a", "a.txt", validator=_nonempty(ws))
+
+    write_cmd = (
+        "printf '%s' 'he said \"hi\" {something} $HOME and spaces' > '{cursor.next}' "
+        "&& printf ok > '{artifact:a}'"
+    )
+    step1 = run_step("poll", write_cmd, produces=["a"], cursor=_CURSOR_PATH)
+    plan1 = make_plan([step1], {"a": art})
+    run1 = bootstrap_run(ws, plan1, now=NOW, run_dir=tmp_path / "runs" / "r1")
+    assert _walk(ws, plan1, run1, {"shell": ShellExecutor()}) == ExitCode.OK
+    assert json.loads((ws / _CURSOR_PATH).read_text(encoding="utf-8"))["value"] == candidate
+
+    read_cmd = "printf '%s' '{cursor.value}' > seen.txt && printf ok > '{artifact:a}'"
+    step2 = run_step("poll", read_cmd, produces=["a"], cursor=_CURSOR_PATH)
+    plan2 = make_plan([step2], {"a": art})
+    run2 = bootstrap_run(ws, plan2, now=NOW, run_dir=tmp_path / "runs" / "r2")
+    assert _walk(ws, plan2, run2, {"shell": ShellExecutor()}) == ExitCode.OK
+
+    assert (run2 / "seen.txt").read_text() == candidate
+
+
 # --------------------------------------------------------------------------- #
 # 13a2. Failure taxonomy — typed spawn errors, agent exit codes, no run left "running".
 # --------------------------------------------------------------------------- #

@@ -171,6 +171,31 @@ def _atomic_write_cursor(path: Path, doc: dict) -> None:
         os.close(dir_fd)
 
 
+def _assert_cursor_contained(step_id: str, cursor_rel: str, candidate: Path, real_workspace_dir: Path) -> None:
+    """Resolve ``candidate`` (following symlinks) and require it to stay under
+    ``real_workspace_dir`` — mirrors ``artifacts._assert_contained`` (codex-F11), applied to
+    the workspace boundary instead of the run-dir boundary.
+
+    ``plan._parse_cursor`` already rejects an absolute/``..``-containing ``cursor:`` path at
+    PLAN time, but that is a lexical check only: a run-local-looking path can still point,
+    via a symlink anywhere in its chain, outside the workspace — and the workspace is the
+    one place a run deliberately reads/writes OUTSIDE its own run dir (§4's cross-run
+    watermark), so it is MORE exposed to this than a run dir is, not less (any earlier run's
+    step, or anything else with workspace write access, could have planted the symlink).
+    Checked at runtime, on every resolution, the same way ``resolve_path`` re-checks every
+    artifact candidate rather than trusting the plan-time parse alone.
+
+    ``resolve()`` is strict=False: a not-yet-committed cursor file still resolves fine as
+    long as its parent chain has no escaping symlink, so this never rejects the ordinary
+    "first commit" path.
+    """
+    resolved = candidate.resolve()
+    if resolved != real_workspace_dir and real_workspace_dir not in resolved.parents:
+        raise ConfigError(
+            f"step {step_id!r}: cursor path escapes the workspace via symlink: {cursor_rel}"
+        )
+
+
 # --------------------------------------------------------------------------- #
 # Internal control flow.
 # --------------------------------------------------------------------------- #
@@ -676,8 +701,7 @@ class _Walk:
                 # exit forced ok=False above unless it already _Halt'd on the auth path) —
                 # exactly the "step succeeded" gate the cursor commit must wait for (§4: a
                 # failed/halted poll must re-fetch, never silently advance the watermark).
-                if step.cursor:
-                    self._commit_cursor(step, cycle)
+                cursor_warning = self._commit_cursor(step, cycle) if step.cursor else None
                 data: dict[str, Any] = {
                     "artifacts": self._produced_paths(step, cycle),
                     "duration_s": result.duration_s,
@@ -692,6 +716,8 @@ class _Walk:
                 usage = result.usage if result.usage is not None else block.get("usage")
                 if usage:
                     data["usage"] = usage
+                if cursor_warning:  # I2 — folded into step-done, not a new trail event kind
+                    data["cursor_warning"] = cursor_warning
                 self._emit("step-done", node=step.id, attempt=attempt, cycle=cycle, data=data)
                 self._set_status(step.id, "done", cycles=cycle)
                 return
@@ -1059,7 +1085,7 @@ class _Walk:
         cursor = None
         if step.cursor:
             cursor = {
-                "value": self._cursor_value(step.cursor),
+                "value": self._cursor_value(step.id, step.cursor),
                 "next": str(self._cursor_scratch_path(step.id)),
             }
 
@@ -1096,11 +1122,22 @@ class _Walk:
         node dispatches), so a step's write here never needs its own mkdir."""
         return self.run_dir / ".cairn" / f"cursor-next-{step_id}"
 
-    def _cursor_value(self, cursor: str) -> str:
+    def _cursor_value(self, step_id: str, cursor: str) -> str:
         """The committed watermark for a ``cursor:`` step — ``""`` when the file is
         missing or unreadable (§4: the first-ever poll has no watermark yet; that must
-        render as empty, never raise)."""
+        render as empty, never raise).
+
+        The containment check runs FIRST and is NOT part of that leniency (I3): a symlink
+        escape must never be swallowed into "no value" — that would silently substitute a
+        foreign file's content into a rendered shell command. It is a typed CONFIG halt
+        naming the step and path instead, mirroring ``artifacts.resolve_path``'s runtime
+        symlink re-check (codex-F11).
+        """
         path = self.workspace_dir / cursor
+        try:
+            _assert_cursor_contained(step_id, cursor, path, self.workspace_dir.resolve())
+        except ConfigError as exc:
+            raise _Halt(ExitCode.CONFIG, step_id, str(exc)) from exc
         try:
             doc = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, UnicodeDecodeError):
@@ -1108,35 +1145,66 @@ class _Walk:
         value = doc.get("value") if isinstance(doc, dict) else None
         return value if isinstance(value, str) else ""
 
-    def _commit_cursor(self, step: StepNode, cycle: int | None) -> None:
+    def _commit_cursor(self, step: StepNode, cycle: int | None) -> str | None:
         """Commit ``{cursor.next}``'s scratch write to the step's watermark file. Called
         only from ``_execute_step``'s ``if ok:`` branch — i.e. after ``_validate_produces``
         passed AND ``exit_code == 0`` — so a failed/halted/still-retrying step never
         advances the watermark (§4: a failed poll must re-fetch its window, not skip it).
+
+        Returns a warning string when the scratch write existed but could not be trusted
+        (I2 — see below); ``None`` otherwise. The caller folds a non-``None`` return into
+        the SAME ``step-done`` event's data the successful step already emits.
 
         WHY (global constraint): this is the one deliberate exception to "a run writes
         only inside its own run dir" — ``step.cursor`` resolves under the WORKSPACE root
         (plan-time validated absolute/``..``-free by ``plan._parse_cursor``), because the
         watermark is cross-run state by design and would be meaningless scoped to one run.
         """
+        # I3: containment is checked at ENTRY, before the scratch-existence early return —
+        # a malicious/foreign symlink at `step.cursor` is a config problem independent of
+        # whether this attempt happened to write a scratch candidate. Never a silent
+        # read/write outside the workspace; always a typed CONFIG halt naming the step.
+        cursor_path = self.workspace_dir / step.cursor
+        try:
+            _assert_cursor_contained(step.id, step.cursor, cursor_path, self.workspace_dir.resolve())
+        except ConfigError as exc:
+            raise _Halt(ExitCode.CONFIG, step.id, str(exc)) from exc
+
         scratch = self._cursor_scratch_path(step.id)
         if not scratch.is_file():
-            return  # no scratch write this attempt → no advance, no error
-        candidate = scratch.read_text(encoding="utf-8").strip()
-        if not candidate:
-            return  # empty scratch → no advance, no error
+            return None  # no scratch write this attempt → no advance, no error
 
-        cursor_path = self.workspace_dir / step.cursor
+        # I2 — deliberate LOUD-vs-LENIENT split, decided here: the step already SUCCEEDED
+        # (produces validated, exit 0) by the time this runs, so an unreadable scratch must
+        # never crash the walk or retroactively fail the step — that would contradict the
+        # commit-on-valid protocol's own "step succeeded" gate. But it also must not be
+        # silently swallowed like a merely-empty scratch: non-UTF-8 content is a STEP-
+        # AUTHORING bug (the step's own command wrote garbage to {cursor.next}), and an
+        # operator watching the trail needs to see it. So: lenient on CONTROL FLOW (no
+        # advance, no halt, no exception), loud on SIGNAL — folded into the existing
+        # step-done event's data (no new trail event type; walk.py's module docstring
+        # commits to "every failure is a typed halt" for actual failures, and this isn't
+        # one, so reusing step-done over inventing a new event kind keeps the trail
+        # vocabulary as specified, not silently expanded).
+        try:
+            candidate = scratch.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeDecodeError) as exc:
+            return f"cursor scratch unreadable ({exc.__class__.__name__}) — watermark not advanced"
+        if not candidate:
+            return None  # empty scratch → no advance, no error
+
         with _cursor_lock(cursor_path):
             current = None
             if cursor_path.is_file():
                 try:
                     existing = json.loads(cursor_path.read_text(encoding="utf-8"))
                     current = existing.get("value") if isinstance(existing, dict) else None
-                except (OSError, json.JSONDecodeError):
-                    current = None  # unreadable committed file — treat as "no prior value"
+                except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                    current = None  # unreadable committed file — treat as "no prior value" (I1:
+                    # same lenient contract as _cursor_value's sibling read of this file — a
+                    # corrupt committed file must never crash a walk after a successful step)
             if current == candidate:
-                return  # unchanged watermark — no rewrite, no event (§4)
+                return None  # unchanged watermark — no rewrite, no event (§4)
 
             # REAL transition time, not self.now — mirrors _run_gate's gate-commit stamp
             # just above (the resolve_gate call): `updated_at` records when the kernel
@@ -1148,6 +1216,7 @@ class _Walk:
         self._emit(
             "cursor-commit", node=step.id, cycle=cycle, data={"path": step.cursor, "value": candidate}
         )
+        return None
 
     # -- expression evaluation (runtime resolver) --------------------------- #
 
