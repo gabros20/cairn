@@ -1377,11 +1377,16 @@ def test_cursor_commit_survives_non_utf8_committed_file_treating_it_as_absent(
     assert commits[0]["data"] == {"path": _CURSOR_PATH, "value": "v1"}
 
 
-def test_cursor_non_utf8_scratch_does_not_advance_and_emits_warning(ws: Path, tmp_path: Path) -> None:
+def test_cursor_non_utf8_scratch_does_not_advance_and_emits_warning(
+    ws: Path, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
     # I2: a step that writes NON-UTF-8 bytes to {cursor.next} still SUCCEEDED (produces
     # valid, exit 0) — the walk must complete and must NOT advance the watermark, but the
     # garbage scratch is a step-authoring bug the operator must see: folded into the
-    # existing step-done event as `cursor_warning`, not silently dropped and not a crash.
+    # existing step-done event as `cursor_warning` (programmatic consumers), AND printed as
+    # a "cairn: warning — ..." stderr line (round 2: the trail-only signal is functionally
+    # invisible in normal operation — `_print_walk_result` prints only "run complete" on OK
+    # and `trail --watch` never renders event data — so stderr is the operator-visible half).
     cmd = r"printf '\377\376BAD' > '{cursor.next}' && printf ok > '{artifact:a}'"
     art = ArtifactDecl("a", "a.txt", validator=_nonempty(ws))
     step = run_step("poll", cmd, produces=["a"], cursor=_CURSOR_PATH)
@@ -1395,6 +1400,9 @@ def test_cursor_non_utf8_scratch_does_not_advance_and_emits_warning(ws: Path, tm
     done_ev = next(e for e in read_trail(run_dir) if e["event"] == "step-done")
     assert "unreadable" in done_ev["data"]["cursor_warning"]
     assert "UnicodeDecodeError" in done_ev["data"]["cursor_warning"]
+
+    stderr = capsys.readouterr().err
+    assert "cairn: warning — step 'poll': cursor scratch unreadable (UnicodeDecodeError); cursor not advanced" in stderr
 
 
 def test_cursor_path_symlink_escape_is_a_typed_halt(ws: Path, tmp_path: Path) -> None:

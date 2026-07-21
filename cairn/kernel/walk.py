@@ -188,6 +188,12 @@ def _assert_cursor_contained(step_id: str, cursor_rel: str, candidate: Path, rea
     ``resolve()`` is strict=False: a not-yet-committed cursor file still resolves fine as
     long as its parent chain has no escaping symlink, so this never rejects the ordinary
     "first commit" path.
+
+    Known residual (TOCTOU, disclosed not closed — same shape as ``artifacts._assert_contained``'s,
+    SECURITY.md §1.4): callers read/write through the UNRESOLVED ``self.workspace_dir / cursor``
+    after this check passes, so a symlink swapped in during the narrow same-process window
+    between this check and that read/write could still redirect it; accepted as a documented
+    residual under the same "requires prior workspace write access" threat model.
     """
     resolved = candidate.resolve()
     if resolved != real_workspace_dir and real_workspace_dir not in resolved.parents:
@@ -1185,11 +1191,23 @@ class _Walk:
         # step-done event's data (no new trail event type; walk.py's module docstring
         # commits to "every failure is a typed halt" for actual failures, and this isn't
         # one, so reusing step-done over inventing a new event kind keeps the trail
-        # vocabulary as specified, not silently expanded).
+        # vocabulary as specified, not silently expanded). Round 2 found that data-only
+        # signal is functionally write-only, though: `_print_walk_result` only prints
+        # "run complete" on OK, and `trail --watch` never renders event data — so the
+        # operator-visible half is a stderr line in the codebase's established warning
+        # voice (cli.py's `_reproducibility_drift_guard`, "cairn: warning — ..."), the one
+        # channel that reaches both an interactive terminal and a headless scheduler's
+        # captured logs. The trail's `cursor_warning` field stays too, for programmatic
+        # `cairn trail` consumers — this adds the human-facing half, it doesn't replace it.
         try:
             candidate = scratch.read_text(encoding="utf-8").strip()
         except (OSError, UnicodeDecodeError) as exc:
-            return f"cursor scratch unreadable ({exc.__class__.__name__}) — watermark not advanced"
+            reason = f"unreadable ({exc.__class__.__name__})"
+            print(
+                f"cairn: warning — step {step.id!r}: cursor scratch {reason}; cursor not advanced",
+                file=sys.stderr,
+            )
+            return f"cursor scratch {reason} — watermark not advanced"
         if not candidate:
             return None  # empty scratch → no advance, no error
 
