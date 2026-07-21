@@ -14,7 +14,8 @@ a ``halted`` node re-runs unconditionally (a blocked step that wrote a valid stu
 silently pass), and every other status falls through to the artifact predicate (so a
 crash-mid-step with valid outputs still skips). See :meth:`_Walk._is_done`.
 
-The five node kinds (ARCHITECTURE §3.1-3.6):
+The four node shapes (ARCHITECTURE §3.1-3.6) — steps come in three actors (machine
+``run``, model ``agent``, human ``manual``) sharing one needs/produces contract:
 
 - **step** — done-skip → needs-check → compose/render → invoke → validate ``produces``
   (the authority over the STEP block, §7) → retry-with-feedback or halt. ``agent`` steps
