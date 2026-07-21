@@ -39,9 +39,23 @@ loop or daemon of its own (TRIGGERS-PLAN.md §0 doctrine: no daemon, no listener
   SCHEDULING.md documents for schedules). cron has no file-watch facility — the sync verb
   (a later task) refuses that backend rather than fake one here.
 
-No CLI wiring, no Runner effects here — later tasks build the effectful `sync`/`list`/
-`remove` verbs on this render-only core. stdlib + pyyaml only; no hidden clock, no
-network, no resident process.
+- :func:`sync_triggers` / :func:`remove_trigger` / :func:`list_installed_triggers` /
+  :func:`run_trigger` — the effectful verbs, every side effect dependency-injected via a
+  :class:`~cairn.kernel.proc.Runner` and explicit target dirs, mirroring schedkit's
+  ``install``/``uninstall``/``list_installed``/``run_schedule`` exactly (same
+  ``_require_dir``, ``_bad_backend``, managed-glob pruning). Two triggers-specific
+  hardenings beyond that mirror: ``sync_triggers`` never writes or prunes a file it
+  can't recognizably attribute to itself (a schedule named ``trigger-X`` and a trigger
+  named ``X`` both render ``cairn-trigger-X.service`` — the T2 namespace alone cannot
+  rule this out, so ownership is verified from the existing file's own rendered content
+  before it is ever touched); and a repeated sync of an unchanged ``triggers.yaml`` is a
+  true no-op — zero host-watcher calls, not just unwritten bytes. ``run_trigger`` is the
+  function the host watcher's ``cairn trigger run <name>`` argv (the T2 renderers'
+  stable entry) resolves to: it drains the claim engine one candidate at a time,
+  spawning one ``cairn run`` child per claim, and never lets one failed or hazardous
+  candidate stop the drain (TRIGGERS-PLAN.md §2).
+
+stdlib + pyyaml only; no hidden clock, no network, no resident process.
 """
 
 from __future__ import annotations
@@ -52,13 +66,16 @@ import os
 import plistlib
 import re
 import shlex
+from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any, NoReturn
 
 import yaml
 
 from cairn.kernel.errors import CairnError, ConfigError
+from cairn.kernel.proc import Runner
 from cairn.kernel.types import Finding
 
 TRIGGERS_YAML = "triggers.yaml"
@@ -551,3 +568,486 @@ def render_trigger_systemd(
         f"ExecStart={shlex.join(argv)}\n"
     )
     return path_unit, service_unit
+
+
+# --------------------------------------------------------------------------- #
+# Effectful verbs — every side effect is dependency-injected (TRIGGERS-PLAN.md §3)
+# --------------------------------------------------------------------------- #
+
+
+def _require_dir(value: Path | None, backend: str, param: str) -> Path:
+    """Mirrors schedkit's ``_require_dir`` exactly: an explicit target dir is mandatory
+    for launchd/systemd (there is no default ``~/Library`` this module will ever guess
+    at), and is created on demand so a first-ever sync doesn't need the caller to
+    pre-`mkdir` it."""
+    if value is None:
+        raise ConfigError(
+            f"{backend} backend requires an explicit {param} (the target directory)",
+            findings=[Finding("error", f"{backend}: missing {param}")],
+        )
+    path = Path(value)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _bad_backend(backend: str) -> NoReturn:
+    """Mirrors schedkit's ``_bad_backend`` exactly."""
+    raise ConfigError(
+        f"unknown backend {backend!r} (expected cron, launchd, or systemd)",
+        findings=[Finding("error", f"unknown backend {backend!r}")],
+    )
+
+
+def _cron_unsupported() -> NoReturn:
+    """The cron backend has no file-watch facility (TRIGGERS-PLAN.md §3) — refuse with
+    the documented fallback rather than fake a poll loop here. Shared by every effectful
+    verb so `sync`/`list`/`remove --backend cron` all fail the same loud, explanatory way
+    instead of `sync` refusing while `list`/`remove` silently report nothing installed.
+    """
+    message = (
+        "the cron backend has no file-watch facility and cannot host a trigger "
+        "(TRIGGERS-PLAN.md §3). Use the documented fallback instead: add a "
+        "schedules.yaml entry that polls the inbox, e.g.\n"
+        "  poll-<name>:\n"
+        '    cron: "*/5 * * * *"\n'
+        '    run: ["trigger", "run", "<name>", "--headless"]\n'
+        "and `cairn schedule sync --backend cron` it — idempotent and cheap on an "
+        "empty inbox, so a 5-minute poll costs nothing when there is nothing to do."
+    )
+    raise ConfigError(message, findings=[Finding("error", "cron backend not supported for triggers")])
+
+
+def _classify_plist(path: Path) -> tuple[str, str | None]:
+    """Classify an existing plist sitting at a trigger's managed stem, from its OWN
+    rendered content — never trust the filename alone (spec finding F1 / addendum 2).
+    Returns ``("trigger", name)`` when ``ProgramArguments`` has the exact
+    ``[cairn_bin, "trigger", "run", name, ...]`` shape :func:`_trigger_argv` renders
+    (this IS our prior render, for that trigger); ``("schedule", None)`` when it instead
+    has schedkit's ``[cairn_bin, "schedule", "run", ...]`` shape; ``("unmanaged", None)``
+    for anything else (foreign content, an unparseable/corrupted plist, or a shape that
+    matches neither convention).
+    """
+    try:
+        doc = plistlib.loads(path.read_bytes())
+    except Exception:
+        return "unmanaged", None
+    argv = doc.get("ProgramArguments")
+    if not isinstance(argv, list) or len(argv) < 4 or not all(isinstance(a, str) for a in argv):
+        return "unmanaged", None
+    if argv[1:3] == ["trigger", "run"]:
+        return "trigger", argv[3]
+    if len(argv) >= 3 and argv[1:2] == ["schedule"]:
+        return "schedule", None
+    return "unmanaged", None
+
+
+def _classify_systemd_service(path: Path) -> tuple[str, str | None]:
+    """The ``.service``-file counterpart of :func:`_classify_plist`: reads back the
+    ``ExecStart=`` line (shlex-split the same way systemd itself word-splits it) rather
+    than trusting the filename.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return "unmanaged", None
+    exec_line = next((line for line in text.splitlines() if line.startswith("ExecStart=")), None)
+    if exec_line is None:
+        return "unmanaged", None
+    try:
+        argv = shlex.split(exec_line[len("ExecStart=") :])
+    except ValueError:
+        return "unmanaged", None
+    if len(argv) >= 4 and argv[1:3] == ["trigger", "run"]:
+        return "trigger", argv[3]
+    if len(argv) >= 3 and argv[1:2] == ["schedule"]:
+        return "schedule", None
+    return "unmanaged", None
+
+
+def _classify_systemd_path_unit(path: Path) -> tuple[str, str | None]:
+    """The ``.path``-file counterpart of :func:`_classify_plist`. Only triggerkit ever
+    renders a ``.path`` unit — schedkit's systemd backend has no analogue — so this can
+    never collide with a *schedule's* file the way ``.service`` can; an operator hand-
+    placing an unrelated file at the managed stem is still possible, so content is
+    checked all the same rather than trusting presence alone. Reads the ``Unit=`` line
+    and recovers the trigger name from the ``cairn-trigger-<name>.service`` target it
+    names.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return "unmanaged", None
+    unit_line = next((line for line in text.splitlines() if line.startswith("Unit=")), None)
+    if unit_line is None:
+        return "unmanaged", None
+    match = re.fullmatch(r"cairn-trigger-(.+)\.service", unit_line[len("Unit=") :].strip())
+    if not match:
+        return "unmanaged", None
+    return "trigger", match.group(1)
+
+
+def _require_ownership(path: Path, trigger_name: str, classify: Callable[[Path], tuple[str, str | None]]) -> None:
+    """Refuse to write or prune ``path`` unless it is either absent or recognizably OUR
+    prior render for THIS trigger (spec finding F1, addendum 2 — a hard requirement,
+    not a heuristic nicety): a schedule named ``trigger-X`` and a trigger named ``X``
+    both render ``cairn-trigger-X.service``, and the T2 stem/label namespace alone
+    cannot make this impossible, so ownership is verified from the existing file's
+    content (via ``classify``) before it is ever touched, whether by a write in
+    `sync_triggers` or a delete in `remove_trigger`/`sync_triggers`'s prune pass.
+    """
+    if not path.is_file():
+        return
+    owner_kind, owner_name = classify(path)
+    if owner_kind == "trigger" and owner_name == trigger_name:
+        return
+    likely_owner = "a schedule" if owner_kind == "schedule" else "an unmanaged file"
+    message = (
+        f"refusing to write trigger {trigger_name!r}'s unit file {path}: it already "
+        f"exists and is not recognizably managed by this trigger — it looks like "
+        f"{likely_owner}. Sync never overwrites a file it doesn't own; rename or remove "
+        "it by hand if it is stale (TRIGGERS-PLAN.md §3, spec finding F1)."
+    )
+    raise ConfigError(message, findings=[Finding("error", message)], file=str(path))
+
+
+@dataclass(frozen=True)
+class TriggerStatus:
+    """One trigger's status as ``trigger list`` reports it (TRIGGERS-PLAN.md §2/§3):
+    declared in ``triggers.yaml``, installed on the host watcher, and any files sitting
+    in ``.claim/`` from a crash mid-firing — surfaced here so the operator can re-drop or
+    discard them; never auto-retried. ``stuck`` is only ever non-empty for a DECLARED
+    trigger (its ``watch:`` must resolve to inspect ``.claim/``); a trigger that's
+    installed but no longer declared has no ``watch:`` left to check.
+    """
+
+    name: str
+    declared: bool
+    installed: bool
+    stuck: tuple[Path, ...] = ()
+
+
+def sync_triggers(
+    workspace_dir: Path,
+    *,
+    backend: str,
+    runner: Runner,
+    cairn_bin: str,
+    launchd_dir: Path | None = None,
+    systemd_dir: Path | None = None,
+) -> list[str]:
+    """Install/update every declared trigger into the host watcher and prune managed
+    files whose trigger left ``triggers.yaml`` — mirrors schedkit's ``install`` verb's
+    Runner-injection and target-dir shape, with two triggers-specific hardenings this
+    module adds on top: a write or prune NEVER touches a file it can't attribute to
+    itself (:func:`_require_ownership`, spec finding F1 / addendum 2), and a repeated
+    sync of byte-identical rendered output issues ZERO host-watcher calls (unload/load,
+    daemon-reload, enable) — a true no-op, not merely an unchanged file on disk.
+
+    Returns the unit/plist filenames installed, updated, or pruned this call (a trigger
+    that was already current is still included — it's part of what's installed after
+    this call returns, even though nothing was written for it).
+    """
+    workspace_dir = Path(workspace_dir)
+    triggers = load_triggers(workspace_dir)
+    if backend == "cron":
+        _cron_unsupported()
+    if backend == "launchd":
+        return _sync_launchd(triggers, workspace_dir, runner, cairn_bin, launchd_dir)
+    if backend == "systemd":
+        return _sync_systemd(triggers, workspace_dir, runner, cairn_bin, systemd_dir)
+    _bad_backend(backend)
+
+
+def _sync_launchd(
+    triggers: dict[str, Trigger],
+    workspace_dir: Path,
+    runner: Runner,
+    cairn_bin: str,
+    launchd_dir: Path | None,
+) -> list[str]:
+    target = _require_dir(launchd_dir, "launchd", "launchd_dir")
+    touched: list[str] = []
+    for trigger in triggers.values():
+        filename = f"{trigger_launchd_label(trigger.name)}.plist"
+        path = target / filename
+        _require_ownership(path, trigger.name, _classify_plist)
+        rendered = render_trigger_launchd(trigger, workspace_dir, cairn_bin)
+        if path.is_file() and path.read_text(encoding="utf-8") == rendered:
+            touched.append(filename)  # already current — zero host-watcher calls
+            continue
+        path.write_text(rendered, encoding="utf-8")
+        runner.run(["launchctl", "unload", str(path)])  # idempotent reload, mirrors schedkit.install
+        runner.run(["launchctl", "load", str(path)])
+        touched.append(filename)
+    for path in sorted(target.glob("io.cairn.trigger.*.plist")):
+        owner_kind, owner_name = _classify_plist(path)
+        if owner_kind != "trigger" or owner_name in triggers:
+            continue  # not ours, or its trigger is still declared — never touch
+        runner.run(["launchctl", "unload", str(path)])
+        path.unlink()
+        touched.append(path.name)
+    return touched
+
+
+def _sync_systemd(
+    triggers: dict[str, Trigger],
+    workspace_dir: Path,
+    runner: Runner,
+    cairn_bin: str,
+    systemd_dir: Path | None,
+) -> list[str]:
+    target = _require_dir(systemd_dir, "systemd", "systemd_dir")
+    touched: list[str] = []
+    to_enable: list[str] = []
+    needs_reload = False
+    for trigger in triggers.values():
+        path_name, service_name = trigger_systemd_unit_names(trigger.name)
+        path_unit_path = target / path_name
+        service_unit_path = target / service_name
+        _require_ownership(path_unit_path, trigger.name, _classify_systemd_path_unit)
+        _require_ownership(service_unit_path, trigger.name, _classify_systemd_service)
+        path_text, service_text = render_trigger_systemd(trigger, workspace_dir, cairn_bin)
+        unchanged = (
+            path_unit_path.is_file()
+            and path_unit_path.read_text(encoding="utf-8") == path_text
+            and service_unit_path.is_file()
+            and service_unit_path.read_text(encoding="utf-8") == service_text
+        )
+        touched.extend([path_name, service_name])
+        if unchanged:
+            continue  # already current — zero host-watcher calls for this trigger
+        path_unit_path.write_text(path_text, encoding="utf-8")
+        service_unit_path.write_text(service_text, encoding="utf-8")
+        needs_reload = True
+        to_enable.append(path_name)
+    # Prune managed files whose trigger left triggers.yaml. `.path` and `.service` are
+    # swept independently (not derived from each other) so an orphaned half-pair — e.g.
+    # a `.service` deleted by hand while its `.path` survives — is still caught.
+    for path in sorted(target.glob("cairn-trigger-*.path")):
+        owner_kind, owner_name = _classify_systemd_path_unit(path)
+        if owner_kind != "trigger" or owner_name in triggers:
+            continue
+        runner.run(["systemctl", "--user", "disable", "--now", path.name])
+        path.unlink()
+        touched.append(path.name)
+        needs_reload = True
+    for path in sorted(target.glob("cairn-trigger-*.service")):
+        owner_kind, owner_name = _classify_systemd_service(path)
+        if owner_kind != "trigger" or owner_name in triggers:
+            continue
+        path.unlink()
+        touched.append(path.name)
+        needs_reload = True
+    if needs_reload:
+        runner.run(["systemctl", "--user", "daemon-reload"])
+    for path_name in to_enable:
+        runner.run(["systemctl", "--user", "enable", "--now", path_name])
+    return touched
+
+
+def remove_trigger(
+    name: str,
+    workspace_dir: Path,
+    *,
+    backend: str,
+    runner: Runner,
+    launchd_dir: Path | None = None,
+    systemd_dir: Path | None = None,
+) -> bool:
+    """Remove one trigger's managed unit/plist file(s) from the host watcher.
+
+    Returns whether anything was actually removed — ``False`` when nothing was
+    installed under this name (idempotent, mirrors schedkit's ``uninstall`` tolerating
+    a re-run). Applies the same ownership guard `sync_triggers` does
+    (:func:`_require_ownership`): a file sitting at this trigger's managed stem that
+    isn't recognizably OUR prior render for ``name`` is left untouched and raises loud,
+    rather than silently deleting a schedule's or an operator's file that happens to
+    share the stem.
+    """
+    workspace_dir = Path(workspace_dir)
+    if backend == "cron":
+        _cron_unsupported()
+    if backend == "launchd":
+        target = _require_dir(launchd_dir, backend, "launchd_dir")
+        path = target / f"{trigger_launchd_label(name)}.plist"
+        if not path.is_file():
+            return False
+        _require_ownership(path, name, _classify_plist)
+        runner.run(["launchctl", "unload", str(path)])
+        path.unlink()
+        return True
+    if backend == "systemd":
+        target = _require_dir(systemd_dir, backend, "systemd_dir")
+        path_name, service_name = trigger_systemd_unit_names(name)
+        path_unit_path = target / path_name
+        service_unit_path = target / service_name
+        removed = False
+        if path_unit_path.is_file():
+            _require_ownership(path_unit_path, name, _classify_systemd_path_unit)
+            runner.run(["systemctl", "--user", "disable", "--now", path_name])
+            path_unit_path.unlink()
+            removed = True
+        if service_unit_path.is_file():
+            _require_ownership(service_unit_path, name, _classify_systemd_service)
+            service_unit_path.unlink()
+            removed = True
+        if removed:
+            runner.run(["systemctl", "--user", "daemon-reload"])
+        return removed
+    _bad_backend(backend)
+
+
+def _installed_trigger_names(
+    backend: str, *, launchd_dir: Path | None, systemd_dir: Path | None
+) -> set[str]:
+    """The set of trigger names with a recognizably trigger-owned unit/plist file on the
+    host, read back straight from the target dir — no `runner` needed for launchd/
+    systemd (mirrors schedkit's `list_installed`, which likewise only actually invokes
+    its runner for the cron branch).
+    """
+    if backend == "launchd":
+        target = _require_dir(launchd_dir, backend, "launchd_dir")
+        names: set[str] = set()
+        for path in target.glob("io.cairn.trigger.*.plist"):
+            owner_kind, owner_name = _classify_plist(path)
+            if owner_kind == "trigger" and owner_name is not None:
+                names.add(owner_name)
+        return names
+    if backend == "systemd":
+        target = _require_dir(systemd_dir, backend, "systemd_dir")
+        names = set()
+        for path in target.glob("cairn-trigger-*.service"):
+            owner_kind, owner_name = _classify_systemd_service(path)
+            if owner_kind == "trigger" and owner_name is not None:
+                names.add(owner_name)
+        return names
+    if backend == "cron":
+        _cron_unsupported()
+    _bad_backend(backend)
+
+
+def list_installed_triggers(
+    workspace_dir: Path,
+    *,
+    backend: str,
+    runner: Runner,
+    launchd_dir: Path | None = None,
+    systemd_dir: Path | None = None,
+) -> list[TriggerStatus]:
+    """Declared vs installed vs stuck, one :class:`TriggerStatus` per name in the union
+    of ``triggers.yaml`` and what's actually on the host (TRIGGERS-PLAN.md §2/§3).
+
+    ``runner`` is accepted (never optional) for interface symmetry with schedkit's
+    ``list_installed`` and to keep the door open for a future cron-status read; the
+    launchd/systemd branches read the host state from the target directories directly
+    and never invoke it, exactly as schedkit's own ``list_installed`` only invokes ITS
+    runner for the cron branch.
+    """
+    workspace_dir = Path(workspace_dir)
+    triggers = load_triggers(workspace_dir)
+    installed_names = _installed_trigger_names(backend, launchd_dir=launchd_dir, systemd_dir=systemd_dir)
+    statuses: list[TriggerStatus] = []
+    for name in sorted(set(triggers) | installed_names):
+        trigger = triggers.get(name)
+        stuck: tuple[Path, ...] = ()
+        if trigger is not None:
+            stuck = tuple(stuck_claims(watch_dir(trigger, workspace_dir)))
+        statuses.append(
+            TriggerStatus(
+                name=name,
+                declared=name in triggers,
+                installed=name in installed_names,
+                stuck=stuck,
+            )
+        )
+    return statuses
+
+
+def _run_one(
+    trigger: Trigger, claimed_path: Path, workspace_dir: Path, runner: Runner, cairn_bin: str
+) -> bool:
+    """Fire the one child ``cairn run`` for a single claimed event (TRIGGERS-PLAN.md §2
+    step 3). ``claimed_path`` is ALWAYS the exact path :func:`claim` returned — including
+    any ``-v2`` collision suffix — never reconstructed from the original candidate's
+    basename (T1 quality finding G2 / addendum): the child must receive the ledger's
+    real location, not a guess at what it might be. Already absolute (built from
+    :func:`watch_dir`'s resolved watch dir), so no further resolution is applied here —
+    doing so would risk dereferencing a claimed file that is itself a symlink, which T1's
+    claim/consume deliberately never do.
+    """
+    argv = [
+        cairn_bin,
+        "run",
+        trigger.pipeline,
+        "--headless",
+        "--param",
+        f"{trigger.param}={claimed_path}",
+    ]
+    result = runner.run(argv, cwd=workspace_dir)
+    return result.returncode == 0
+
+
+def run_trigger(
+    name: str,
+    workspace_dir: Path,
+    *,
+    runner: Runner,
+    cairn_bin: str,
+    now: datetime,
+) -> int:
+    """Drain trigger ``name``'s inbox: scan, claim each candidate, fire one ``cairn run``
+    child per claim, consume on outcome (TRIGGERS-PLAN.md §2). This is the function the
+    host watcher's ``cairn trigger run <name>`` argv (the T2 renderers' stable entry)
+    resolves to.
+
+    ``now`` is accepted per the module's no-hidden-clock discipline (mirroring
+    schedkit's ``install``/``run_schedule`` posture) even though nothing in this
+    function currently branches on it — no timestamp is embedded at this layer (the
+    child's own ``run_id`` templating does that, per TRIGGERS-PLAN.md §2's closing
+    paragraph). Kept as an injected parameter rather than a bare ``datetime.now()`` so a
+    future addition (e.g. stuck-claim age reporting) never needs a signature change.
+
+    Exit code: ``0`` when every claimed candidate's child exited 0, OR there was nothing
+    to claim (an empty scan is a successful no-op drain, not a failure); nonzero iff at
+    least one child failed. A failing child never stops the drain — every remaining
+    candidate still gets claimed and run (the brief's rejected alternative is retrying a
+    failed event, not draining past it: draining past it is required). The failed
+    claim moves to ``.failed/`` (never auto-retried) while the run overall reports
+    failure via its exit code.
+
+    :func:`claim` can raise :class:`CairnError` for a filesystem/platform hazard (a
+    hardlink-unsupported platform, or ``.claim/`` on a different filesystem than the
+    watch dir — T1's ``_hardlink``) instead of returning ``None``/a path. That hazard
+    afflicts every candidate in this watch dir identically, not one poison file, but the
+    same principle applies: a clear halt of that ONE event beats a crash of the whole
+    drain. It is caught per-candidate, counted as a failure, and the loop moves on to
+    the next candidate rather than aborting the whole run. Nothing was ever claimed in
+    that case, so there is no claim path to :func:`consume` — the candidate is left
+    exactly where it was, to be picked up again on the NEXT firing once the underlying
+    filesystem/platform hazard is fixed (a structural misconfiguration, not the
+    poison-file scenario ``.failed/``-and-stop targets).
+    """
+    workspace_dir = Path(workspace_dir)
+    triggers = load_triggers(workspace_dir)
+    if name not in triggers:
+        raise ConfigError(
+            f"no trigger named {name!r} in triggers.yaml "
+            f"(declared: {', '.join(sorted(triggers)) or '(none)'})",
+            findings=[Finding("error", f"unknown trigger {name!r}")],
+        )
+    trigger = triggers[name]
+    watch_abs = watch_dir(trigger, workspace_dir)
+    any_failed = False
+    for candidate in scan_candidates(watch_abs, trigger.glob):
+        try:
+            claimed = claim(watch_abs, candidate)
+        except CairnError:
+            any_failed = True
+            continue
+        if claimed is None:
+            continue  # lost the claim race to a concurrent firing — not our event
+        ok = _run_one(trigger, claimed, workspace_dir, runner, cairn_bin)
+        consume(watch_abs, claimed, ok=ok, on_done=trigger.on_done)
+        if not ok:
+            any_failed = True
+    return 1 if any_failed else 0
