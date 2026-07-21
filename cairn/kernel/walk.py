@@ -1131,7 +1131,8 @@ class _Walk:
             current = None
             if cursor_path.is_file():
                 try:
-                    current = json.loads(cursor_path.read_text(encoding="utf-8")).get("value")
+                    existing = json.loads(cursor_path.read_text(encoding="utf-8"))
+                    current = existing.get("value") if isinstance(existing, dict) else None
                 except (OSError, json.JSONDecodeError):
                     current = None  # unreadable committed file — treat as "no prior value"
             if current == candidate:
