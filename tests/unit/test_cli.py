@@ -80,7 +80,7 @@ def test_version_via_console_script():
 def test_all_expected_subcommands_are_registered():
     assert SUBCOMMANDS == [
         "plan", "run", "resume", "gate", "validate", "trail", "ps",
-        "doctor", "test", "new", "compose", "batch", "learnings", "gc", "schedule",
+        "doctor", "test", "new", "compose", "batch", "learnings", "gc", "schedule", "trigger",
     ]
 
 
@@ -96,7 +96,7 @@ def test_no_subcommand_returns_config_and_prints_help(capsys):
     assert "usage" in capsys.readouterr().err.lower()
 
 
-# batch/learnings/gc/schedule are wired (C6+); their behavior is exercised in the sections below.
+# batch/learnings/gc/schedule/trigger are wired (C6+/T5); their behavior is exercised below.
 
 
 # --------------------------------------------------------------------------- #
@@ -1725,6 +1725,182 @@ def test_schedule_missing_yaml_is_config_error(hello_ws, monkeypatch, capsys):
     rc = main(["schedule", "install"])
     assert rc == int(ExitCode.CONFIG)
     assert "schedules.yaml" in capsys.readouterr().err
+
+
+# --------------------------------------------------------------------------- #
+# trigger — a FAKE runner + tmp target dirs for sync/list/remove (never the real
+# launchctl/systemctl); the REAL _SubprocessRunner for the end-to-end `trigger run` smoke,
+# which must drive an actual child `cairn run` (docs/TRIGGERS.md).
+# --------------------------------------------------------------------------- #
+
+
+def _write_triggers(ws: Path, entries: str) -> None:
+    (ws / "triggers.yaml").write_text(entries, encoding="utf-8")
+
+
+def _write_on_event_pipeline(ws: Path) -> None:
+    # A minimal "hello-style" run:-only pipeline: consumes the claimed event file's
+    # absolute path as --param event=<path> (triggerkit's default `param: event`) and
+    # copies its bytes into a validated artifact — proves the claimed path really reaches
+    # the child, with no agent/model/auth involved (offline, deterministic).
+    (ws / "pipelines" / "on-event.yaml").write_text(
+        "pipeline: on-event\n"
+        "version: 1\n"
+        "params:\n"
+        "  event: { type: string, required: true }\n"
+        "artifacts:\n"
+        "  echoed:\n"
+        "    path: echoed.txt\n"
+        "    validator: validators/nonempty.py\n"
+        "steps:\n"
+        "  - id: echo\n"
+        "    run: >-\n"
+        "      python3 -c \"import sys, shutil; shutil.copyfile(sys.argv[1], sys.argv[2])\"\n"
+        "      \"{params.event}\" \"{artifact:echoed}\"\n"
+        "    produces: [echoed]\n",
+        encoding="utf-8",
+    )
+
+
+def _write_on_event_fail_pipeline(ws: Path) -> None:
+    # Always exits nonzero, no artifacts — proves a failing child moves the claim to
+    # .failed/ (never .done/) and `trigger run` propagates a nonzero exit code.
+    (ws / "pipelines" / "on-event-fail.yaml").write_text(
+        "pipeline: on-event-fail\n"
+        "version: 1\n"
+        "params:\n"
+        "  event: { type: string, required: true }\n"
+        "steps:\n"
+        "  - id: boom\n"
+        '    run: "false"\n',
+        encoding="utf-8",
+    )
+
+
+def test_trigger_sync_cron_refuses(hello_ws, monkeypatch, capsys):
+    _write_triggers(hello_ws, "handle-reply:\n  pipeline: on-event\n  watch: inbox/replies\n")
+    _write_on_event_pipeline(hello_ws)
+    _inject_runner(monkeypatch, _FakeRunner())
+    monkeypatch.chdir(hello_ws)
+    rc = main(["trigger", "sync", "--backend", "cron"])
+    assert rc == int(ExitCode.CONFIG)
+    err = capsys.readouterr().err
+    assert "cron backend has no file-watch facility" in err
+    assert "schedules.yaml" in err
+
+
+def test_trigger_sync_with_no_triggers_yaml_is_a_clean_noop(hello_ws, monkeypatch, tmp_path, capsys):
+    # T1's deliberate divergence from schedkit: a missing triggers.yaml is `{}`, not a
+    # ConfigError — sync/list/remove all load fresh, so this must be a clean 0-trigger sync.
+    _inject_runner(monkeypatch, _FakeRunner())
+    monkeypatch.chdir(hello_ws)
+    ld = tmp_path / "LaunchAgents"
+    rc = main(["trigger", "sync", "--backend", "launchd", "--launchd-dir", str(ld)])
+    assert rc == int(ExitCode.OK)
+    assert "synced 0 trigger unit(s)" in capsys.readouterr().out
+    assert not list(ld.glob("*"))
+
+
+def test_trigger_sync_list_remove_launchd_roundtrip(hello_ws, monkeypatch, tmp_path, capsys):
+    _write_triggers(hello_ws, "handle-reply:\n  pipeline: on-event\n  watch: inbox/replies\n")
+    _write_on_event_pipeline(hello_ws)
+    _inject_runner(monkeypatch, _FakeRunner())
+    monkeypatch.chdir(hello_ws)
+    ld = tmp_path / "LaunchAgents"
+
+    assert main(["trigger", "sync", "--backend", "launchd", "--launchd-dir", str(ld)]) == int(ExitCode.OK)
+    assert list(ld.glob("io.cairn.trigger.*.plist"))  # written to the INJECTED dir, not ~/Library
+
+    capsys.readouterr()
+    assert main(["trigger", "list", "--backend", "launchd", "--launchd-dir", str(ld)]) == int(ExitCode.OK)
+    assert "handle-reply" in capsys.readouterr().out
+
+    capsys.readouterr()
+    assert main(["trigger", "list", "--backend", "launchd", "--launchd-dir", str(ld), "--json"]) == int(
+        ExitCode.OK
+    )
+    payload = json.loads(capsys.readouterr().out)
+    assert payload == [{"name": "handle-reply", "declared": True, "installed": True, "stuck": []}]
+
+    assert main(
+        ["trigger", "remove", "handle-reply", "--backend", "launchd", "--launchd-dir", str(ld)]
+    ) == int(ExitCode.OK)
+    assert not list(ld.glob("io.cairn.trigger.*.plist"))
+
+
+def test_trigger_remove_reports_nothing_installed(hello_ws, monkeypatch, tmp_path, capsys):
+    _inject_runner(monkeypatch, _FakeRunner())
+    monkeypatch.chdir(hello_ws)
+    ld = tmp_path / "LaunchAgents"
+    rc = main(["trigger", "remove", "ghost", "--backend", "launchd", "--launchd-dir", str(ld)])
+    assert rc == int(ExitCode.OK)
+    assert "no trigger named 'ghost' installed" in capsys.readouterr().out
+
+
+def test_trigger_run_requires_a_name(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    rc = main(["trigger", "run"])
+    assert rc == int(ExitCode.CONFIG)
+    assert "needs a trigger name" in capsys.readouterr().err
+
+
+def test_trigger_remove_requires_a_name(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    rc = main(["trigger", "remove"])
+    assert rc == int(ExitCode.CONFIG)
+    assert "needs a trigger name" in capsys.readouterr().err
+
+
+def test_trigger_run_unknown_name_is_config_error(hello_ws, monkeypatch, capsys):
+    _write_triggers(hello_ws, "handle-reply:\n  pipeline: on-event\n  watch: inbox/replies\n")
+    _write_on_event_pipeline(hello_ws)
+    monkeypatch.chdir(hello_ws)
+    rc = main(["trigger", "run", "ghost"])
+    assert rc == int(ExitCode.CONFIG)
+    assert "no trigger named 'ghost'" in capsys.readouterr().err
+
+
+def test_trigger_run_drives_a_real_child_run_end_to_end(hello_ws, monkeypatch):
+    # No _FakeRunner here — the real _SubprocessRunner, so `cairn trigger run` genuinely
+    # spawns a child `cairn run on-event --headless --param event=<claimed-path>` process
+    # (requirement 4's "REAL child cairn run" smoke).
+    _write_triggers(hello_ws, "handle-reply:\n  pipeline: on-event\n  watch: inbox/replies\n")
+    _write_on_event_pipeline(hello_ws)
+    inbox = hello_ws / "inbox" / "replies"
+    inbox.mkdir(parents=True)
+    event = inbox / "one.json"
+    event.write_text('{"hello": "world"}', encoding="utf-8")
+    monkeypatch.chdir(hello_ws)
+
+    rc = main(["trigger", "run", "handle-reply"])
+    assert rc == int(ExitCode.OK)
+
+    assert not event.exists()  # claimed and consumed, not left in the inbox
+    done = list((inbox / ".done").glob("*.json"))
+    assert [p.name for p in done] == ["one.json"]
+    assert done[0].read_text(encoding="utf-8") == '{"hello": "world"}'
+
+    run_dirs = [d for d in (hello_ws / "runs").iterdir() if d.name.startswith("on-event-")]
+    assert len(run_dirs) == 1
+    assert (run_dirs[0] / "echoed.txt").read_text(encoding="utf-8") == '{"hello": "world"}'
+
+
+def test_trigger_run_failing_pipeline_moves_event_to_failed_and_exits_nonzero(hello_ws, monkeypatch):
+    _write_triggers(hello_ws, "handle-reply:\n  pipeline: on-event-fail\n  watch: inbox/replies\n")
+    _write_on_event_fail_pipeline(hello_ws)
+    inbox = hello_ws / "inbox" / "replies"
+    inbox.mkdir(parents=True)
+    event = inbox / "bad.json"
+    event.write_text('{"bad": true}', encoding="utf-8")
+    monkeypatch.chdir(hello_ws)
+
+    rc = main(["trigger", "run", "handle-reply"])
+    assert rc != 0
+
+    assert not event.exists()
+    failed = list((inbox / ".failed").glob("*.json"))
+    assert [p.name for p in failed] == ["bad.json"]
+    assert not list((inbox / ".done").glob("*"))
 
 
 def test_subprocess_runner_actually_shells_out():

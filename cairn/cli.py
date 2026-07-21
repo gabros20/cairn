@@ -2,8 +2,8 @@
 
 Every subcommand parses its flags, wires kernel objects together, and prints; the logic
 stays in the kernel. Verbs (docs/API.md §9): plan/run/resume/gate/validate/trail/ps/doctor/
-test/compose/new plus the fleet verbs batch/learnings/gc/schedule are all live — each is a
-thin binding over its kernel module (batchkit/learnkit/gckit/schedkit).
+test/compose/new plus the fleet verbs batch/learnings/gc/schedule/trigger are all live —
+each is a thin binding over its kernel module (batchkit/learnkit/gckit/schedkit/triggerkit).
 
 Guard wiring (the pinned contract): in run/resume, a plan's ``shim``-enforced guards get a
 fresh PATH-shim dir per run (:func:`~cairn.kernel.guards.build_shims`), and every executor is
@@ -67,6 +67,13 @@ from cairn.kernel.schedkit import (
     uninstall as uninstall_schedules,
 )
 from cairn.kernel.trail import derive_status, follow, read_trail
+from cairn.kernel.triggerkit import (
+    TriggerStatus,
+    list_installed_triggers,
+    remove_trigger,
+    run_trigger,
+    sync_triggers,
+)
 from cairn.kernel.types import ExitCode
 from cairn.kernel.walk import bootstrap_run, invalidate_from, walk
 
@@ -87,6 +94,7 @@ SUBCOMMANDS: list[str] = [
     "learnings",
     "gc",
     "schedule",
+    "trigger",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -1524,6 +1532,115 @@ def _print_schedule_diff(diff, backend: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
+# trigger — sync triggers.yaml into the host watcher (sync/list/remove/run, TRIGGERS.md).
+# --------------------------------------------------------------------------- #
+
+
+def _cmd_trigger(args: argparse.Namespace) -> int:
+    ws = _workspace(args)
+    backend = args.backend
+    runner = _SubprocessRunner()
+    # Same target-dir resolution schedule uses (`--launchd-dir`/`--systemd-dir`, same
+    # per-user defaults) — triggerkit's sync/list/remove take the identical two knobs.
+    launchd_dir, systemd_dir = _schedule_dirs(args)
+
+    try:
+        if args.action == "run":
+            if not args.name:
+                print("cairn: `cairn trigger run` needs a trigger name", file=sys.stderr)
+                return int(ExitCode.CONFIG)
+            # The exit code IS the contract (requirement 3): claim hazards and a failed
+            # child both surface here, verbatim — never remapped into an ExitCode member.
+            return run_trigger(
+                args.name,
+                ws,
+                runner=runner,
+                cairn_bin=_resolve_cairn_bin(),
+                now=_now(),
+            )
+
+        if args.action == "sync":
+            names = sync_triggers(
+                ws,
+                backend=backend,
+                runner=runner,
+                cairn_bin=_resolve_cairn_bin(),
+                launchd_dir=launchd_dir,
+                systemd_dir=systemd_dir,
+            )
+            print(f"cairn: synced {len(names)} trigger unit(s) into the {backend} backend")
+            return int(ExitCode.OK)
+
+        if args.action == "remove":
+            if not args.name:
+                print("cairn: `cairn trigger remove` needs a trigger name", file=sys.stderr)
+                return int(ExitCode.CONFIG)
+            removed = remove_trigger(
+                args.name,
+                ws,
+                backend=backend,
+                runner=runner,
+                launchd_dir=launchd_dir,
+                systemd_dir=systemd_dir,
+            )
+            if removed:
+                print(f"cairn: removed trigger {args.name!r} from the {backend} backend")
+            else:
+                print(f"cairn: no trigger named {args.name!r} installed on the {backend} backend")
+            return int(ExitCode.OK)
+
+        if args.action == "list":
+            statuses = list_installed_triggers(
+                ws, backend=backend, runner=runner, launchd_dir=launchd_dir, systemd_dir=systemd_dir
+            )
+            if args.json:
+                print(json.dumps([_trigger_status_json(s) for s in statuses]))
+            else:
+                _print_trigger_list(statuses, backend)
+            return int(ExitCode.OK)
+    except ConfigError as exc:
+        return _print_config_error(exc)
+    except FileNotFoundError as exc:
+        # Same remedy as schedule's identical guard: a Runner call shelled out to a
+        # binary the host can't find (bare `cairn`/launchctl/systemctl off PATH).
+        missing = exc.filename or "cairn"
+        print(
+            f"cairn: cannot execute {missing!r} — the binary is not on PATH. Install the cairn "
+            "console script (pip/uv tool install cairn) or put it on the PATH the scheduler uses.",
+            file=sys.stderr,
+        )
+        return int(ExitCode.CONFIG)
+
+    print(f"cairn: unknown trigger action {args.action!r}", file=sys.stderr)
+    return int(ExitCode.CONFIG)
+
+
+def _trigger_status_json(status: TriggerStatus) -> dict[str, Any]:
+    return {
+        "name": status.name,
+        "declared": status.declared,
+        "installed": status.installed,
+        "stuck": [str(p) for p in status.stuck],
+    }
+
+
+def _print_trigger_list(statuses: list[TriggerStatus], backend: str) -> None:
+    print(f"cairn: triggers (declared vs installed on {backend}):")
+    if not statuses:
+        print("  (none)")
+    for s in statuses:
+        if s.declared and s.installed:
+            note = "= in sync"
+        elif s.declared:
+            note = "+ declared, not installed"
+        else:
+            note = "- installed, not declared"
+        print(f"  {note:32} {s.name}")
+        for claim_path in s.stuck:
+            print(f"      ! stuck claim (never auto-retried): {claim_path}")
+
+
+# --------------------------------------------------------------------------- #
 # Parser.
 # --------------------------------------------------------------------------- #
 
@@ -1663,6 +1780,23 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--launchd-dir", help="override the launchd LaunchAgents dir")
     sp.add_argument("--systemd-dir", help="override the systemd user-unit dir")
     sp.set_defaults(func=_cmd_schedule)
+
+    # trigger — sync triggers.yaml into the host watcher
+    sp = sub.add_parser("trigger", help="sync triggers.yaml → host watcher (sync/list/remove/run)")
+    sp.add_argument("action", choices=["sync", "list", "remove", "run"])
+    sp.add_argument("name", nargs="?", help="trigger name (required for remove/run)")
+    sp.add_argument("--backend", choices=["cron", "launchd", "systemd"], default="cron", help="host backend (default cron)")
+    sp.add_argument("--launchd-dir", help="override the launchd LaunchAgents dir")
+    sp.add_argument("--systemd-dir", help="override the systemd user-unit dir")
+    sp.add_argument("--workspace", default=".", help="workspace root (default .)")
+    sp.add_argument("--json", action="store_true", help="list: machine-readable output")
+    sp.add_argument(
+        "--headless", action="store_true",
+        help="accepted, ignored — a fired trigger's child run is already --headless by "
+             "construction; present so the documented cron-fallback schedules.yaml entry "
+             "(`run: [trigger, run, <name>, --headless]`, TRIGGERS.md §3) is copy-paste invocable",
+    )
+    sp.set_defaults(func=_cmd_trigger)
 
     return parser
 
