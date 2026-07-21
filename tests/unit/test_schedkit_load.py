@@ -148,6 +148,25 @@ def test_gc_and_resume_verbs_need_no_pipeline(tmp_path):
     assert scheds["cleanup"].run[0] == "gc"
 
 
+def test_trigger_verb_parses_and_is_not_forced_headless(tmp_path):
+    # Addendum 2 (T5, post-T3): T3's cron-refusal fallback message documents a
+    # schedules.yaml entry invoking `trigger run <name>` (TRIGGERS.md §3) — this proves
+    # that entry actually loads. `trigger` gets the same non-interactive exemption as
+    # `gc`: its own child run is already --headless by construction, so no --headless
+    # token is required on THIS argv (unlike run/batch/resume).
+    ws = _workspace(
+        tmp_path,
+        """
+        poll-inbox:
+          cron: "*/5 * * * *"
+          run: [trigger, run, handle-reply]
+        """,
+    )
+    scheds = load_schedules(ws)
+    assert set(scheds) == {"poll-inbox"}
+    assert scheds["poll-inbox"].run == ("trigger", "run", "handle-reply")
+
+
 def test_run_without_headless_is_rejected(tmp_path):
     # SCHEDULING.md §4: scheduled run/batch/resume are headless runs — required, not optional.
     ws = _workspace(

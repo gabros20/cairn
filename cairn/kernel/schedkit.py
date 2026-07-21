@@ -8,7 +8,9 @@ schedulable. This module is the engine behind the ``cairn schedule`` verb:
   :class:`Schedule` objects, with precise :class:`ConfigError`\\ s (unknown keys, bad
   cron expressions, unknown pipelines fail loudly at parse time where checkable). A
   scheduled ``run``/``batch``/``resume`` MUST carry ``--headless`` — a schedule can never
-  block on a human (SCHEDULING.md §4); ``gc`` is exempt (inherently non-interactive).
+  block on a human (SCHEDULING.md §4); ``gc`` and ``trigger`` are exempt (inherently
+  non-interactive — a fired trigger's own child run is already ``--headless`` by
+  construction, TRIGGERS.md §3).
 - :func:`idempotency_key` / :func:`find_idempotent_run` — the pure predicate that makes
   a scheduled ``cairn run --idempotent`` a no-op (or a resume) when an equivalent
   successful run already exists. This is the heart of "scheduling without a scheduler".
@@ -52,7 +54,13 @@ SCHEDULES_YAML = "schedules.yaml"
 
 # The leading verbs a schedule's `run:` argv may invoke (SCHEDULING.md §1: "schedules can
 # invoke run, batch, resume, gc, or the self-improve pipeline" — self-improve is `run self-improve`).
-_ALLOWED_VERBS = frozenset({"run", "batch", "resume", "gc"})
+# "trigger" is here so the cron-refusal fallback TRIGGERS.md §3 documents (poll a trigger's
+# inbox via a schedules.yaml entry invoking `trigger run <name>`) is actually loadable — it
+# gets the same non-interactive treatment as `gc` (below): never forced into _HEADLESS_VERBS,
+# because a fired trigger's own child run is already --headless by construction
+# (triggerkit.run_trigger → `cairn run ... --headless`), so there is nothing for THIS argv to
+# enforce.
+_ALLOWED_VERBS = frozenset({"run", "batch", "resume", "gc", "trigger"})
 # Verbs whose FIRST positional token is a pipeline name we can check against pipelines/.
 _PIPELINE_VERBS = frozenset({"run", "batch"})
 # Verbs that spawn an agent run and so MUST be headless when scheduled (SCHEDULING.md §4:
