@@ -50,6 +50,7 @@ import errno
 import fnmatch
 import os
 import plistlib
+import re
 import shlex
 from dataclasses import dataclass
 from pathlib import Path
@@ -64,6 +65,22 @@ TRIGGERS_YAML = "triggers.yaml"
 
 _TRIGGER_KEYS = frozenset({"pipeline", "watch", "param", "glob", "on_done"})
 _ON_DONE_VALUES = frozenset({"done", "delete"})
+
+# A trigger name becomes a launchd job label segment and a systemd unit filename stem
+# (trigger_launchd_label / trigger_systemd_unit_names) — both are structural identifiers,
+# not free text, so the charset is a strict slug: non-empty, no leading separator, no
+# path/section/shell metacharacters. This also rules out a name that could break a
+# rendered systemd unit's line-oriented [Section] syntax (review-T2-quality-r1.md
+# Finding 1), though render_trigger_systemd/_launchd keep their own defensive check
+# below since workspace_dir/cairn_bin never pass through this validation (they're CLI
+# args, not triggers.yaml fields).
+_TRIGGER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+
+# Characters that would break a rendered unit file's line-oriented syntax (a systemd
+# unit is line-oriented INI; a literal newline mid-value ends the current Key=Value line
+# and can open a new [Section]) if they ever reached render_trigger_systemd/_launchd
+# uncaught.
+_CONTROL_CHARS = ("\n", "\r", "\0")
 
 
 # --------------------------------------------------------------------------- #
@@ -125,6 +142,13 @@ def load_triggers(workspace_dir: Path) -> dict[str, Trigger]:
 
 
 def _parse_trigger(name: str, entry: Any, workspace_dir: Path, file: Path) -> Trigger:
+    if not _TRIGGER_NAME_RE.fullmatch(name):
+        _fail(
+            f"trigger name {name!r} must be a non-empty slug matching "
+            f"{_TRIGGER_NAME_RE.pattern!r} (it becomes a launchd job label and a systemd "
+            "unit filename stem — see trigger_launchd_label/trigger_systemd_unit_names)",
+            file,
+        )
     if not isinstance(entry, dict):
         _fail(f"trigger {name!r} must be a mapping with 'pipeline' and 'watch'", file)
     for key in entry:
@@ -167,7 +191,16 @@ def _parse_trigger(name: str, entry: Any, workspace_dir: Path, file: Path) -> Tr
 
 
 def _validate_watch(name: str, watch: str, file: Path) -> None:
-    """Reject a ``watch:`` that is absolute or that escapes the workspace via ``..``."""
+    """Reject a ``watch:`` that is absolute, that escapes the workspace via ``..``, or
+    that carries a control character — a newline in ``watch`` survives into
+    ``render_trigger_systemd``'s ``DirectoryNotEmpty=`` line unless caught here
+    (review-T2-quality-r1.md Finding 1)."""
+    if any(c in watch for c in _CONTROL_CHARS):
+        _fail(
+            f"trigger {name!r}: 'watch' must not contain a control character "
+            f"(newline/CR/NUL): {watch!r}",
+            file,
+        )
     p = Path(watch)
     if p.is_absolute():
         _fail(f"trigger {name!r}: 'watch' must be workspace-relative, not absolute: {watch!r}", file)
@@ -397,6 +430,28 @@ def _trigger_argv(trigger: Trigger, workspace_dir: Path, cairn_bin: str) -> list
     return [cairn_bin, "trigger", "run", trigger.name, "--workspace", str(workspace_dir)]
 
 
+def _assert_render_safe(what: str, value: str) -> None:
+    """Last line of defense before any value is interpolated into rendered unit text.
+
+    ``trigger.name``/``watch`` are already validated at load time
+    (``_parse_trigger``/``_validate_watch``), but ``workspace_dir`` and ``cairn_bin`` are
+    CLI arguments that never pass through ``load_triggers`` — load-time validation cannot
+    cover them, so this belt is what actually closes the section-injection vector a
+    control character in any rendered value opens (review-T2-quality-r1.md Finding 1:
+    a literal ``\\n`` in ``workspace_dir`` alone reaches the ``.service`` unit's
+    ``WorkingDirectory=`` line ahead of, and independently of, the already-quoted
+    ``ExecStart=``). Called for both backends — launchd's plistlib XML-escapes on its own,
+    but the guarantee is made explicit here rather than left implicit in a third-party
+    serializer's behavior.
+    """
+    if any(c in value for c in _CONTROL_CHARS):
+        message = (
+            f"cannot render trigger unit: {what} must not contain a control character "
+            f"(newline/CR/NUL): {value!r}"
+        )
+        raise ConfigError(message, findings=[Finding("error", message)])
+
+
 def trigger_launchd_label(name: str) -> str:
     """The launchd job label for a trigger (also the plist basename stem).
 
@@ -421,6 +476,13 @@ def render_trigger_launchd(trigger: Trigger, workspace_dir: Path, cairn_bin: str
     """
     workspace_dir = Path(workspace_dir)
     watch_abs = watch_dir(trigger, workspace_dir)
+    for what, value in (
+        ("trigger name", trigger.name),
+        ("workspace_dir", str(workspace_dir)),
+        ("watch directory", str(watch_abs)),
+        ("cairn_bin", cairn_bin),
+    ):
+        _assert_render_safe(what, value)
     plist: dict[str, Any] = {
         "Label": trigger_launchd_label(trigger.name),
         "ProgramArguments": _trigger_argv(trigger, workspace_dir, cairn_bin),
@@ -448,7 +510,11 @@ def render_trigger_systemd(
 
     ``DirectoryNotEmpty=<abs watch dir>`` keeps re-firing while files remain in the watch
     dir — the drain-the-inbox semantics TRIGGERS-PLAN.md §3 wants, unlike a one-shot
-    edge-triggered watch. ``ExecStart`` is the argv joined with shlex-style quoting (as
+    edge-triggered watch. Unlike ``render_trigger_launchd``'s ``ThrottleInterval``, no
+    analogous re-fire floor is set here: the repeated firing while the watch dir stays
+    non-empty IS the wanted drain behavior, not self-triggered noise to suppress, so
+    throttling it would fight the design rather than protect it. ``ExecStart`` is the
+    argv joined with shlex-style quoting (as
     schedkit's host-command line building does for cron) because systemd word-splits
     ``ExecStart=`` like a shell command line: an unquoted workspace path containing a
     space would otherwise silently truncate the argv. ``[Install] WantedBy=default.target``
@@ -458,6 +524,13 @@ def render_trigger_systemd(
     """
     workspace_dir = Path(workspace_dir)
     watch_abs = watch_dir(trigger, workspace_dir)
+    for what, value in (
+        ("trigger name", trigger.name),
+        ("workspace_dir", str(workspace_dir)),
+        ("watch directory", str(watch_abs)),
+        ("cairn_bin", cairn_bin),
+    ):
+        _assert_render_safe(what, value)
     _, service_name = trigger_systemd_unit_names(trigger.name)
     argv = _trigger_argv(trigger, workspace_dir, cairn_bin)
     path_unit = (

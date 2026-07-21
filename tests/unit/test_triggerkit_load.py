@@ -9,6 +9,7 @@ import textwrap
 from pathlib import Path
 
 import pytest
+import yaml
 
 from cairn.kernel.errors import ConfigError
 from cairn.kernel.triggerkit import Trigger, load_triggers, watch_dir
@@ -180,6 +181,55 @@ def test_bad_on_done_fails(tmp_path):
         """,
     )
     with pytest.raises(ConfigError, match="'on_done' must be one of"):
+        load_triggers(ws)
+
+
+# --- trigger-name charset / control-character validation (review-T2-quality-r1.md) ---
+
+
+def test_empty_trigger_name_fails_at_load(tmp_path):
+    # Finding 4: an empty name rendered a degenerate-but-syntactically-valid launchd
+    # label ("io.cairn.trigger.") / systemd unit stem ("cairn-trigger-.path") with no
+    # validation catching it anywhere. The name-charset rule below (requires a first
+    # slug character) closes this as a side effect.
+    raw = {"": {"pipeline": "handle-reply", "watch": "inbox"}}
+    ws = _workspace(tmp_path, yaml.safe_dump(raw))
+    with pytest.raises(ConfigError, match="must be a non-empty slug"):
+        load_triggers(ws)
+
+
+def test_trigger_name_with_injection_payload_fails_at_load(tmp_path):
+    # Finding 1's exact repro payload: a trigger.name crafted to break out of the
+    # Description= line and open a new [Service] section in the rendered systemd unit.
+    # The name-charset validation at load time rejects it long before render ever sees it.
+    evil_name = "evil\n[Service]\nExecStart=/bin/touch /tmp/pwned\n#"
+    raw = {evil_name: {"pipeline": "handle-reply", "watch": "inbox"}}
+    ws = _workspace(tmp_path, yaml.safe_dump(raw))
+    with pytest.raises(ConfigError, match="must be a non-empty slug"):
+        load_triggers(ws)
+
+
+def test_trigger_name_with_disallowed_characters_fails_at_load(tmp_path):
+    ws = _workspace(
+        tmp_path,
+        """
+        "bad name!":
+          pipeline: handle-reply
+          watch: inbox
+        """,
+    )
+    with pytest.raises(ConfigError, match="must be a non-empty slug"):
+        load_triggers(ws)
+
+
+def test_watch_with_injection_payload_fails_at_load(tmp_path):
+    # Finding 1's second repro: the watch: field is an equally live vector, independent
+    # of trigger.name — a newline here reaches DirectoryNotEmpty= in the rendered .path
+    # unit and opens a new [Service] section there instead.
+    evil_watch = "inbox\n[Service]\nExecStart=/bin/touch /tmp/pwned3\n#"
+    raw = {"ok": {"pipeline": "handle-reply", "watch": evil_watch}}
+    ws = _workspace(tmp_path, yaml.safe_dump(raw))
+    with pytest.raises(ConfigError, match="must not contain a control character"):
         load_triggers(ws)
 
 

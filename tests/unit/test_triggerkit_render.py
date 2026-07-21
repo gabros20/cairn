@@ -9,6 +9,9 @@ from __future__ import annotations
 import plistlib
 from pathlib import Path
 
+import pytest
+
+from cairn.kernel.errors import ConfigError
 from cairn.kernel.triggerkit import (
     Trigger,
     render_trigger_launchd,
@@ -133,3 +136,76 @@ def test_render_trigger_launchd_handles_workspace_with_spaces_and_non_ascii():
     # word-splitting risk, so the raw (unquoted) path is the correct rendering
     assert doc["ProgramArguments"][-1] == str(ws)
     assert doc["WatchPaths"] == [str(ws / "inbox/ingest")]
+
+
+# --- render-time control-character belt (review-T2-quality-r1.md Finding 1) ----------
+#
+# load_triggers/_parse_trigger validates trigger.name (charset) and watch (control
+# chars) before a Trigger is ever constructed via the normal load path (see
+# test_triggerkit_load.py). These tests prove the SECOND, independent layer: T1's
+# Trigger dataclass is a public type nothing stops constructing directly (bypassing
+# load), and workspace_dir/cairn_bin are CLI arguments load-time validation can never
+# see at all — render_trigger_systemd/_launchd must reject a control character in any
+# interpolated value themselves, before formatting any unit text, or the reviewer's
+# exact repro (a value containing "\n[Service]") reaches the returned string.
+
+
+def test_render_trigger_systemd_rejects_injection_payload_in_name_bypassing_load():
+    evil_name = "evil\n[Service]\nExecStart=/bin/touch /tmp/pwned\n#"
+    trig = Trigger(name=evil_name, pipeline="p", watch="inbox")
+    with pytest.raises(ConfigError, match="trigger name"):
+        render_trigger_systemd(trig, WS, "cairn")
+
+
+def test_render_trigger_systemd_rejects_injection_payload_in_watch_bypassing_load():
+    evil_watch = "inbox\n[Service]\nExecStart=/bin/touch /tmp/pwned3\n#"
+    trig = Trigger(name="ok", pipeline="p", watch=evil_watch)
+    with pytest.raises(ConfigError, match="watch directory"):
+        render_trigger_systemd(trig, WS, "cairn")
+
+
+def test_render_trigger_systemd_rejects_injection_payload_in_workspace_dir():
+    # workspace_dir comes from the CLI, never through triggers.yaml — load-time
+    # validation structurally cannot cover this vector; only the render-side belt does.
+    trig = _trigger()
+    evil_ws = Path("/ws/acme\n[Service]\nExecStart=/bin/touch /tmp/pwned\n#")
+    with pytest.raises(ConfigError, match="workspace_dir"):
+        render_trigger_systemd(trig, evil_ws, "cairn")
+
+
+def test_render_trigger_systemd_rejects_injection_payload_in_cairn_bin():
+    trig = _trigger()
+    with pytest.raises(ConfigError, match="cairn_bin"):
+        render_trigger_systemd(trig, WS, "cairn\n[Service]\nExecStart=/bin/touch /tmp/pwned\n#")
+
+
+def test_render_trigger_systemd_injection_attempts_never_produce_rendered_text():
+    # Positive proof, not just "it raises": the exception fires before path_unit/
+    # service_unit are ever built, so no injected "[Service]" text is ever returned to a
+    # caller for any of the vectors above.
+    evil_name = "evil\n[Service]\nExecStart=/bin/touch /tmp/pwned\n#"
+    trig = Trigger(name=evil_name, pipeline="p", watch="inbox")
+    try:
+        render_trigger_systemd(trig, WS, "cairn")
+        raised = False
+    except ConfigError as exc:
+        raised = True
+        assert "[Service]\nExecStart=/bin/touch" not in str(exc)
+    assert raised
+
+
+def test_render_trigger_launchd_rejects_injection_payload_in_workspace_dir():
+    # Symmetry of guarantees per the brief: plistlib already XML-escapes a control
+    # character safely, but the belt is explicit here rather than left implicit in a
+    # third-party serializer's behavior.
+    trig = _trigger()
+    evil_ws = Path("/ws/acme\n[Service]\nExecStart=/bin/touch /tmp/pwned\n#")
+    with pytest.raises(ConfigError, match="workspace_dir"):
+        render_trigger_launchd(trig, evil_ws, "cairn")
+
+
+def test_render_trigger_launchd_rejects_injection_payload_in_name_bypassing_load():
+    evil_name = "evil\n[Service]\nExecStart=/bin/touch /tmp/pwned\n#"
+    trig = Trigger(name=evil_name, pipeline="p", watch="inbox")
+    with pytest.raises(ConfigError, match="trigger name"):
+        render_trigger_launchd(trig, WS, "cairn")
