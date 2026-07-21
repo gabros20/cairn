@@ -121,12 +121,12 @@ def agent_step(
     )
 
 
-def run_step(step_id: str, command: str, *, produces=(), needs=()) -> StepNode:
+def run_step(step_id: str, command: str, *, produces=(), needs=(), cursor=None) -> StepNode:
     return StepNode(
         id=step_id, kind="run", agent=None, command=command, args={},
         needs=tuple(needs), needs_optional=(), produces=tuple(produces),
         when_runtime=None, timeout_s=1800, retry=(0, False), skippable=False,
-        executor=None, tier=None, effort=None, env=(), network=False,
+        executor=None, tier=None, effort=None, env=(), network=False, cursor=cursor,
     )
 
 
@@ -1243,6 +1243,113 @@ def test_run_command_nonzero_exit_fails_even_when_produces_validate(ws: Path, tm
 
     assert _walk(ws, plan, run_dir, {"shell": ShellExecutor()}) == ExitCode.GATE_FAILED
     assert (run_dir / "out.txt").read_text() == "ok"  # the produce IS valid — exit code still fails it
+
+
+# --------------------------------------------------------------------------- #
+# 13b. cursor: — the persistent-watermark option on run: steps (TRIGGERS-PLAN.md §4).
+# --------------------------------------------------------------------------- #
+
+_CURSOR_PATH = "state/resend-cursor.json"
+
+
+def _cursor_cmd(candidate: str | None) -> str:
+    """A run command that records what `{cursor.value}` rendered to `seen.txt`, then
+    (if `candidate` is given) writes it to `{cursor.next}`, and always satisfies `a`."""
+    write_next = f"printf '%s' '{candidate}' > '{{cursor.next}}' && " if candidate is not None else ""
+    return f"printf '%s' '{{cursor.value}}' > seen.txt && {write_next}printf ok > '{{artifact:a}}'"
+
+
+def test_cursor_first_run_renders_empty_value_and_commits_on_valid_produces(ws: Path, tmp_path: Path) -> None:
+    art = ArtifactDecl("a", "a.txt", validator=_nonempty(ws))
+    step = run_step("poll", _cursor_cmd("v1"), produces=["a"], cursor=_CURSOR_PATH)
+    plan = make_plan([step], {"a": art})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    assert _walk(ws, plan, run_dir, {"shell": ShellExecutor()}) == ExitCode.OK
+    assert (run_dir / "seen.txt").read_text() == ""  # {cursor.value} on a never-committed cursor is ""
+
+    doc = json.loads((ws / _CURSOR_PATH).read_text(encoding="utf-8"))
+    assert doc["value"] == "v1"
+    assert "updated_at" in doc
+
+    commits = [e for e in read_trail(run_dir) if e["event"] == "cursor-commit"]
+    assert len(commits) == 1
+    assert commits[0]["node"] == "poll"
+    assert commits[0]["data"] == {"path": _CURSOR_PATH, "value": "v1"}
+
+
+def test_cursor_second_run_renders_committed_value(ws: Path, tmp_path: Path) -> None:
+    art = ArtifactDecl("a", "a.txt", validator=_nonempty(ws))
+    step1 = run_step("poll", _cursor_cmd("v1"), produces=["a"], cursor=_CURSOR_PATH)
+    plan1 = make_plan([step1], {"a": art})
+    run1 = bootstrap_run(ws, plan1, now=NOW, run_dir=tmp_path / "runs" / "r1")
+    assert _walk(ws, plan1, run1, {"shell": ShellExecutor()}) == ExitCode.OK
+
+    step2 = run_step("poll", _cursor_cmd("v2"), produces=["a"], cursor=_CURSOR_PATH)
+    plan2 = make_plan([step2], {"a": art})
+    run2 = bootstrap_run(ws, plan2, now=NOW, run_dir=tmp_path / "runs" / "r2")
+    assert _walk(ws, plan2, run2, {"shell": ShellExecutor()}) == ExitCode.OK
+
+    assert (run2 / "seen.txt").read_text() == "v1"  # committed by run1, read fresh by run2
+    assert json.loads((ws / _CURSOR_PATH).read_text(encoding="utf-8"))["value"] == "v2"
+
+
+def test_cursor_does_not_advance_when_produces_fail_validation(ws: Path, tmp_path: Path) -> None:
+    art = ArtifactDecl("a", "a.txt", validator=_nonempty(ws))
+    # Writes a candidate to {cursor.next} but leaves `a.txt` EMPTY — nonempty validator fails it.
+    cmd = "printf '%s' 'v1' > '{cursor.next}' && : > '{artifact:a}'"
+    step = run_step("poll", cmd, produces=["a"], cursor=_CURSOR_PATH)
+    plan = make_plan([step], {"a": art})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    assert _walk(ws, plan, run_dir, {"shell": ShellExecutor()}) == ExitCode.GATE_FAILED
+    assert not (ws / _CURSOR_PATH).exists()  # a failed poll must re-fetch, never advance
+    assert not any(e["event"] == "cursor-commit" for e in read_trail(run_dir))
+
+
+def test_cursor_does_not_advance_when_step_writes_no_scratch(ws: Path, tmp_path: Path) -> None:
+    art = ArtifactDecl("a", "a.txt", validator=_nonempty(ws))
+    step = run_step("poll", _cursor_cmd(None), produces=["a"], cursor=_CURSOR_PATH)  # never touches {cursor.next}
+    plan = make_plan([step], {"a": art})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    assert _walk(ws, plan, run_dir, {"shell": ShellExecutor()}) == ExitCode.OK
+    assert not (ws / _CURSOR_PATH).exists()
+    assert not any(e["event"] == "cursor-commit" for e in read_trail(run_dir))
+
+
+def test_cursor_unchanged_value_does_not_rewrite_or_re_emit(ws: Path, tmp_path: Path) -> None:
+    art = ArtifactDecl("a", "a.txt", validator=_nonempty(ws))
+    step1 = run_step("poll", _cursor_cmd("v1"), produces=["a"], cursor=_CURSOR_PATH)
+    plan1 = make_plan([step1], {"a": art})
+    run1 = bootstrap_run(ws, plan1, now=NOW, run_dir=tmp_path / "runs" / "r1")
+    assert _walk(ws, plan1, run1, {"shell": ShellExecutor()}) == ExitCode.OK
+    mtime_after_first = (ws / _CURSOR_PATH).stat().st_mtime_ns
+
+    # Same candidate "v1" again, from a second run — the watermark is already "v1".
+    step2 = run_step("poll", _cursor_cmd("v1"), produces=["a"], cursor=_CURSOR_PATH)
+    plan2 = make_plan([step2], {"a": art})
+    run2 = bootstrap_run(ws, plan2, now=NOW, run_dir=tmp_path / "runs" / "r2")
+    assert _walk(ws, plan2, run2, {"shell": ShellExecutor()}) == ExitCode.OK
+
+    assert (ws / _CURSOR_PATH).stat().st_mtime_ns == mtime_after_first  # no rewrite
+    all_commits = [
+        e for run_dir in (run1, run2) for e in read_trail(run_dir) if e["event"] == "cursor-commit"
+    ]
+    assert len(all_commits) == 1  # only run1's commit — run2's unchanged value is a no-op
+
+
+def test_cursor_placeholder_on_cursorless_step_fails_loud_naming_the_step(ws: Path, tmp_path: Path) -> None:
+    art = ArtifactDecl("a", "a.txt", validator=_nonempty(ws))
+    cmd = "printf '%s' '{cursor.value}' > seen.txt && printf ok > '{artifact:a}'"
+    step = run_step("poll", cmd, produces=["a"])  # no cursor: declared
+    plan = make_plan([step], {"a": art})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    assert _walk(ws, plan, run_dir, {"shell": ShellExecutor()}) == ExitCode.CONFIG
+    halt = next(e for e in read_trail(run_dir) if e["event"] == "run-halt")
+    assert halt["node"] == "poll"
+    assert "cursor" in halt["data"]["reason"]
 
 
 # --------------------------------------------------------------------------- #

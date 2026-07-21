@@ -8,6 +8,7 @@ One syntax, used by ``run_id:``, ``artifact.path:``, ``args:`` values, and
   does this template need?), without resolving anything.
 
     VALUE      {params.<name>} {dims.<key>} {pipeline} {date} {datetime} {cycle}
+               {cursor.value} {cursor.next}
     REFERENCE  {artifact:<name>} {gate:<name>} {run_dir}
     HELPERS    {slug(<value>)} {dash(<value>)} {short(<value>, n)}
 
@@ -19,6 +20,10 @@ testability. ``{cycle}`` is only legal when a cycle is bound. Reference
 resolvers may be ``None`` at plan time, in which case using such a placeholder
 raises; and ``{artifact:…}`` is structurally illegal inside an artifact ``path``
 template (``artifact_refs_allowed=False``) because paths cannot depend on paths.
+``{cursor.value}`` / ``{cursor.next}`` are a dotted VALUE root exactly like
+``params.``/``dims.`` — a plain 2-key lookup, no new grammar — but the table
+(``ctx.cursor``) is ``None`` on any step without a ``cursor:`` option, and
+looking either up then raises (kernel/walk.py's `cursor:` primitive, §4).
 """
 
 from __future__ import annotations
@@ -69,6 +74,7 @@ class TemplateContext:
     gate: Callable[[str], str] | None = None       # name -> recorded choice value
     run_dir: str | None = None
     artifact_refs_allowed: bool = True  # False inside an artifact.path template
+    cursor: Mapping[str, str] | None = None  # {"value": ..., "next": ...} — only on a cursor: step
 
 
 # --- render ------------------------------------------------------------------
@@ -107,6 +113,13 @@ def _render_value(body: str, ctx: TemplateContext) -> str:
         return _lookup(ctx.params, body[len("params."):], body)
     if body.startswith("dims."):
         return _lookup(ctx.dims, body[len("dims."):], body)
+    if body.startswith("cursor."):
+        if ctx.cursor is None:
+            raise TemplateError(
+                f"{{{body}}}: this step has no cursor: option (add cursor: <path> to use "
+                "{cursor.value}/{cursor.next})"
+            )
+        return _lookup(ctx.cursor, body[len("cursor."):], body)
     raise TemplateError(f"unknown placeholder {{{body}}}")
 
 

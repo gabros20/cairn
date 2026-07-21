@@ -1269,3 +1269,48 @@ def test_unconditional_gate_consumed_unconditionally_is_untouched(tmp_path):
     )
     p = _plan_p(tmp_path, steps)  # no when: on the gate → nothing to prove
     assert not any("conditional gate" in w.message for w in p.warnings)
+
+
+# --------------------------------------------------------------------------- #
+# cursor: — the persistent-watermark option on run: steps (TRIGGERS-PLAN.md §4).
+# --------------------------------------------------------------------------- #
+
+
+def test_cursor_on_run_step_parses(tmp_path):
+    steps = "  - { id: one, run: 'echo', cursor: state/resend-cursor.json, produces: [a] }\n"
+    p = _plan_p(tmp_path, steps)
+    assert _node(p, "one").cursor == "state/resend-cursor.json"
+
+
+def test_cursor_absent_by_default(tmp_path):
+    steps = "  - { id: one, run: 'echo', produces: [a] }\n"
+    p = _plan_p(tmp_path, steps)
+    assert _node(p, "one").cursor is None
+
+
+def test_cursor_on_agent_step_is_a_config_error(tmp_path):
+    steps = "  - { id: one, agent: worker, cursor: state/x.json, produces: [a] }\n"
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps, agents={"worker": "tier: balanced\ntools: { allow: [read] }\n"})
+    assert "one" in str(exc.value) and "cursor" in str(exc.value)
+
+
+def test_cursor_on_manual_step_is_a_config_error(tmp_path):
+    steps = "  - { id: one, manual: 'do it', cursor: state/x.json, produces: [a] }\n"
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    assert "one" in str(exc.value) and "cursor" in str(exc.value)
+
+
+def test_cursor_absolute_path_is_a_config_error(tmp_path):
+    steps = "  - { id: one, run: 'echo', cursor: /etc/cursor.json, produces: [a] }\n"
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    assert "one" in str(exc.value) and "escapes the workspace" in str(exc.value)
+
+
+def test_cursor_dotdot_path_is_a_config_error(tmp_path):
+    steps = "  - { id: one, run: 'echo', cursor: '../cursor.json', produces: [a] }\n"
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    assert "one" in str(exc.value) and "escapes the workspace" in str(exc.value)

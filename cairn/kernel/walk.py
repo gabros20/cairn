@@ -36,6 +36,7 @@ Stdlib + pinned kernel modules only.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -121,6 +122,53 @@ def _tail_text(path: Path, max_bytes: int) -> str:
         size = f.seek(0, os.SEEK_END)
         f.seek(max(0, size - max_bytes))
         return f.read().decode("utf-8", errors="replace")
+
+
+# --------------------------------------------------------------------------- #
+# cursor: primitive helpers (TRIGGERS-PLAN.md §4) — module-level, no `self` needed.
+# --------------------------------------------------------------------------- #
+
+
+@contextmanager
+def _cursor_lock(cursor_path: Path) -> Iterator[None]:
+    """flock on a companion ``<cursor>.lock`` file — mirrors ``runstate.run_lock`` (a
+    DEDICATED lock file, never the state file itself, so acquiring the lock never
+    touches/truncates already-committed content) — but BLOCKING (``LOCK_EX``, no
+    ``LOCK_NB``): two concurrently *scheduled* polls (§4) must serialize their commit
+    and both eventually succeed, not have the loser error out the way a second
+    ``cairn resume`` does against a run's advisory lock.
+    """
+    cursor_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = cursor_path.with_name(cursor_path.name + ".lock")
+    lock_path.touch(exist_ok=True)
+    fh = lock_path.open("r+", encoding="utf-8")
+    try:
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
+
+
+def _atomic_write_cursor(path: Path, doc: dict) -> None:
+    """tmp + fsync + rename + dir-fsync — mirrors ``runstate._atomic_write`` (``run.json``
+    is the kernel's other on-disk state authority). The cursor file deserves the same
+    durability: an un-fsynced tmp lost to a crash mid-rename would silently re-widen the
+    next poll's window, defeating the entire point of a persisted watermark.
+    """
+    tmp = path.with_name(path.name + ".tmp")
+    with tmp.open("w", encoding="utf-8") as fh:
+        fh.write(json.dumps(doc, indent=2, ensure_ascii=False))
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.replace(tmp, path)
+    dir_fd = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(dir_fd)
+    finally:
+        os.close(dir_fd)
 
 
 # --------------------------------------------------------------------------- #
@@ -518,7 +566,7 @@ class _Walk:
             model, effort = "shell", None
 
             def make_prompt(_attempt: int, _reasons: list[str]) -> str:
-                return self._render_command(step.command or "", cycle, step.id)
+                return self._render_command(step.command or "", cycle, step)
         else:  # agent
             exec_name, model, effort = self.plan.resolved_models[step.id]
             executor = self.executors.get(exec_name)
@@ -624,6 +672,12 @@ class _Walk:
                 validator_reasons = validator_reasons + [f"command exited with code {result.exit_code}"]
 
             if ok:
+                # `ok` here means _validate_produces passed AND exit_code == 0 (a nonzero
+                # exit forced ok=False above unless it already _Halt'd on the auth path) —
+                # exactly the "step succeeded" gate the cursor commit must wait for (§4: a
+                # failed/halted poll must re-fetch, never silently advance the watermark).
+                if step.cursor:
+                    self._commit_cursor(step, cycle)
                 data: dict[str, Any] = {
                     "artifacts": self._produced_paths(step, cycle),
                     "duration_s": result.duration_s,
@@ -654,7 +708,7 @@ class _Walk:
             raise _Halt(ExitCode.GATE_FAILED, step.id, "artifact validation failed", validator_reasons)
 
     def _run_manual(self, step: StepNode, cycle: int | None) -> None:
-        rendered = self._render_command(step.command or "", cycle, step.id)
+        rendered = self._render_command(step.command or "", cycle, step)
         prompt_path = self._log_path(step.id, "prompt.md", 1, cycle)
         prompt_path.parent.mkdir(parents=True, exist_ok=True)
         prompt_path.write_text(rendered, encoding="utf-8")
@@ -961,8 +1015,8 @@ class _Walk:
 
     # -- lenient command rendering (API §2.8) ------------------------------- #
 
-    def _render_command(self, command: str, cycle: int | None, node_id: str) -> str:
-        ctx = self._command_context(cycle)
+    def _render_command(self, command: str, cycle: int | None, step: StepNode) -> str:
+        ctx = self._command_context(cycle, step)
 
         def substitute(match: re.Match) -> str:
             body = match.group(1).strip()
@@ -971,11 +1025,11 @@ class _Walk:
             try:
                 return render(match.group(0), ctx)
             except TemplateError as exc:
-                raise _Halt(ExitCode.CONFIG, node_id, f"command placeholder {{{body}}}: {exc}") from exc
+                raise _Halt(ExitCode.CONFIG, step.id, f"command placeholder {{{body}}}: {exc}") from exc
 
         return _PLACEHOLDER.sub(substitute, command)
 
-    def _command_context(self, cycle: int | None) -> TemplateContext:
+    def _command_context(self, cycle: int | None, step: StepNode) -> TemplateContext:
         def artifact(name: str) -> str:
             decl = self.plan.artifacts.get(name)
             if decl is None:
@@ -998,6 +1052,17 @@ class _Walk:
             except (GateUnanswered, GateTampered) as exc:
                 raise KeyError(name) from exc
 
+        # cursor.value/cursor.next only resolve on a step that actually declared `cursor:`
+        # (plan.py._parse_cursor already restricts that to run: steps) — None elsewhere, so
+        # template.py's dotted-root lookup raises TemplateError and this step's placeholder
+        # error names it (via the _Halt above), never silently renders "".
+        cursor = None
+        if step.cursor:
+            cursor = {
+                "value": self._cursor_value(step.cursor),
+                "next": str(self._cursor_scratch_path(step.id)),
+            }
+
         return TemplateContext(
             params=self.plan.params,
             dims=self.plan.dims,
@@ -1007,6 +1072,7 @@ class _Walk:
             artifact=artifact,
             gate=gate,
             run_dir=str(self.run_dir),
+            cursor=cursor,
         )
 
     @staticmethod
@@ -1020,7 +1086,67 @@ class _Walk:
             return body.split(":", 1)[0].strip() in ("artifact", "gate")
         if body in _VALUE_KEYWORDS:
             return True
-        return body.startswith("params.") or body.startswith("dims.")
+        return body.startswith("params.") or body.startswith("dims.") or body.startswith("cursor.")
+
+    # -- cursor: primitive (TRIGGERS-PLAN.md §4) ----------------------------- #
+
+    def _cursor_scratch_path(self, step_id: str) -> Path:
+        """Absolute per-step scratch path ``{cursor.next}`` renders to. Lives under the
+        run's ``.cairn/`` (already created by ``_write_step_return_schema`` before any
+        node dispatches), so a step's write here never needs its own mkdir."""
+        return self.run_dir / ".cairn" / f"cursor-next-{step_id}"
+
+    def _cursor_value(self, cursor: str) -> str:
+        """The committed watermark for a ``cursor:`` step — ``""`` when the file is
+        missing or unreadable (§4: the first-ever poll has no watermark yet; that must
+        render as empty, never raise)."""
+        path = self.workspace_dir / cursor
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+            return ""
+        value = doc.get("value") if isinstance(doc, dict) else None
+        return value if isinstance(value, str) else ""
+
+    def _commit_cursor(self, step: StepNode, cycle: int | None) -> None:
+        """Commit ``{cursor.next}``'s scratch write to the step's watermark file. Called
+        only from ``_execute_step``'s ``if ok:`` branch — i.e. after ``_validate_produces``
+        passed AND ``exit_code == 0`` — so a failed/halted/still-retrying step never
+        advances the watermark (§4: a failed poll must re-fetch its window, not skip it).
+
+        WHY (global constraint): this is the one deliberate exception to "a run writes
+        only inside its own run dir" — ``step.cursor`` resolves under the WORKSPACE root
+        (plan-time validated absolute/``..``-free by ``plan._parse_cursor``), because the
+        watermark is cross-run state by design and would be meaningless scoped to one run.
+        """
+        scratch = self._cursor_scratch_path(step.id)
+        if not scratch.is_file():
+            return  # no scratch write this attempt → no advance, no error
+        candidate = scratch.read_text(encoding="utf-8").strip()
+        if not candidate:
+            return  # empty scratch → no advance, no error
+
+        cursor_path = self.workspace_dir / step.cursor
+        with _cursor_lock(cursor_path):
+            current = None
+            if cursor_path.is_file():
+                try:
+                    current = json.loads(cursor_path.read_text(encoding="utf-8")).get("value")
+                except (OSError, json.JSONDecodeError):
+                    current = None  # unreadable committed file — treat as "no prior value"
+            if current == candidate:
+                return  # unchanged watermark — no rewrite, no event (§4)
+
+            # REAL transition time, not self.now — mirrors _run_gate's gate-commit stamp
+            # just above (the resolve_gate call): `updated_at` records when the kernel
+            # actually committed, an event, not a rendered/deterministic value, so it is
+            # exempt from the "clock is injected" rule that governs path/template `now`.
+            doc = {"value": candidate, "updated_at": format_at(datetime.now(timezone.utc))}
+            _atomic_write_cursor(cursor_path, doc)
+
+        self._emit(
+            "cursor-commit", node=step.id, cycle=cycle, data={"path": step.cursor, "value": candidate}
+        )
 
     # -- expression evaluation (runtime resolver) --------------------------- #
 

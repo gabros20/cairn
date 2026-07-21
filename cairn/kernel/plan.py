@@ -95,6 +95,7 @@ class StepNode:
     effort: str | None
     env: tuple[str, ...]
     network: bool
+    cursor: str | None = None  # workspace-relative watermark path — run: steps only (§4)
 
 
 @dataclass(frozen=True)
@@ -614,7 +615,7 @@ def _scan_check(text: str, *, strict: bool, allow_cycle: bool, allow_refs: bool,
 
 _STEP_KEYS = {
     "id", "agent", "run", "manual", "args", "needs", "needs_optional", "produces",
-    "when", "unless", "timeout", "retry", "executor", "skippable",
+    "when", "unless", "timeout", "retry", "executor", "skippable", "cursor",
 }
 _GATE_KEYS = {"gate", "when", "unless", "reads", "ask", "options", "default"}
 _PARALLEL_KEYS = {"parallel", "on_fail", "when", "unless", "steps"}
@@ -651,6 +652,30 @@ def _parse_timeout(raw: dict, ctx: _Ctx) -> int:
         return parse_duration(str(raw["timeout"]))
     except ValueError as exc:
         _err(f"step {raw.get('id')!r}: timeout: {exc}", ctx.file)
+
+
+def _parse_cursor(raw: dict, ctx: _Ctx, sid: str, kind: str) -> str | None:
+    """``cursor: <workspace-relative path>`` — run: steps only (TRIGGERS-PLAN.md §4).
+
+    Rejected here, at plan time, so a misplaced ``cursor:`` never reaches the walker: an
+    ``agent:``/``manual:`` step has no shell command to read ``{cursor.value}``/write
+    ``{cursor.next}`` from, and the five-kinds contract forbids inventing a sixth kind to
+    carry it. Path shape mirrors ``artifacts.resolve_path``'s absolute/``..`` messages —
+    same escape, same wording — since both guard the identical workspace/run-dir boundary.
+    """
+    cursor = raw.get("cursor")
+    if cursor is None:
+        return None
+    if kind != "run":
+        _err(f"step {sid!r}: cursor: is only allowed on run: steps (found on {kind}:)", ctx.file)
+    if not isinstance(cursor, str) or not cursor:
+        _err(f"step {sid!r}: cursor must be a non-empty string", ctx.file)
+    candidate = Path(cursor)
+    if candidate.is_absolute():
+        _err(f"step {sid!r}: cursor path escapes the workspace (absolute): {cursor}", ctx.file)
+    if ".." in candidate.parts:
+        _err(f"step {sid!r}: cursor path escapes the workspace (..): {cursor}", ctx.file)
+    return cursor
 
 
 def _parse_retry(raw: dict, ctx: _Ctx) -> tuple[int, bool]:
@@ -714,6 +739,7 @@ def _parse_step(raw: dict, ctx: _Ctx, in_loop: bool, when_runtime: Expr | None) 
         effort=agent.effort if agent else None,
         env=agent.env if agent else (),
         network=agent.network if agent else False,
+        cursor=_parse_cursor(raw, ctx, sid, kind),
     )
 
 
