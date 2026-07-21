@@ -5,7 +5,9 @@ manage a queue — the host already has a battle-tested scheduler (cron / launch
 cairn's job is to make itself *perfectly schedulable*: declared schedules in the workspace,
 one-command installation into the host, and idempotent invocations that a timer can fire blindly.
 Lineage: `certbot renew`, `restic` + systemd timers, terraform-in-CI — the tool is
-schedule-*ready*; the platform schedules.
+schedule-*ready*; the platform schedules. For runs fired by an inbound event instead of
+the clock — a dropped file, a webhook — see [TRIGGERS.md](TRIGGERS.md), the event-side
+complement: `schedule` : cron/launchd timers :: `trigger` : WatchPaths / systemd path-units.
 
 > **Status: LIVE — built and tested.** `schedules.yaml`, the `cairn schedule`
 > install/list/run/uninstall verb, all three host backends (cron/launchd/systemd installers +

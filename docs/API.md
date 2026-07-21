@@ -597,6 +597,15 @@ cairn gc [--keep-days N] [--keep-last M] [--artifacts-only] [--include-needs-hum
 cairn schedule install|list|run <name>|uninstall [--backend cron|launchd|systemd]
            [--launchd-dir P] [--systemd-dir P]  # sync schedules.yaml → host scheduler; the installed
                                                 # entry always calls `cairn schedule run <name>` (SCHEDULING.md)
+cairn trigger sync|list|remove <name>|run <name> [--backend cron|launchd|systemd]
+           [--launchd-dir P] [--systemd-dir P] [--workspace .] [--json]
+                                                # sync triggers.yaml → host watcher (launchd WatchPaths /
+                                                # systemd .path units); cron always refuses — no file-watch
+                                                # facility (documented schedules.yaml poll fallback,
+                                                # TRIGGERS.md §3). `run <name>` drains one trigger's inbox
+                                                # now — also what the installed host unit calls when it
+                                                # fires; its exit code covers claim/spawn hazards, not just
+                                                # a failed child (TRIGGERS.md §2)
 cairn new workspace|pipeline|agent|skill|validator <name>
 ```
 

@@ -263,6 +263,7 @@ requires a platform; with it, `tail -f` is the platform.
 | `cairn test [suite] [--update]` · `cairn test record <run-dir>` | the offline L1 suites (validators/guards/pipelines/envelopes) + harvest a real run into fixtures (`TESTING.md`). |
 | `cairn batch <pipeline> --params-file sites.jsonl -j 8` | outer process pool of `cairn run --headless`s — batch is *not* a kernel concept, just runs in parallel dirs. |
 | `cairn learnings [--since] [--tag]` · `cairn gc [--apply]` · `cairn schedule install\|list\|run\|uninstall` | aggregate `learn` events across runs · retention (dry-run unless `--apply`) · sync `schedules.yaml` → host scheduler (`SCHEDULING.md`). |
+| `cairn trigger sync\|list\|remove\|run` | sync `triggers.yaml` → host watcher (launchd `WatchPaths` / systemd `.path`); `run <name>` drains one trigger's inbox, at-most-once, via claim/consume (`TRIGGERS.md`). |
 | `cairn new workspace\|pipeline\|agent\|skill\|validator <name>` | scaffolding. |
 
 ---

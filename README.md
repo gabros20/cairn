@@ -174,6 +174,7 @@ Every verb from `cairn --help`:
 | `cairn learnings` | Aggregate `learn` events across all runs. |
 | `cairn gc` | Retention over the runs root (dry-run unless `--apply`). |
 | `cairn schedule <install\|list\|run\|uninstall>` | Sync `schedules.yaml` into the host scheduler (cron/launchd/systemd). |
+| `cairn trigger <sync\|list\|remove\|run>` | Sync `triggers.yaml` into the host watcher (launchd/systemd); `run <name>` drains one trigger's inbox now. |
 
 ## Executors
 

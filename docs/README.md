@@ -29,11 +29,12 @@ The docs are organised by the [Diátaxis](https://diataxis.fr) framework — eve
 | **[OBSERVABILITY.md](OBSERVABILITY.md)** | How-to + Explanation | *How do I watch a run — the trail, webhooks, `cairn ps`, OTel?* |
 | **[SECURITY.md](SECURITY.md)** | How-to + Explanation | *How do I handle secrets, untrusted content, blast radius, and budgets?* |
 | **[SCHEDULING.md](SCHEDULING.md)** | How-to + Explanation | *How do I run a pipeline on a schedule without a daemon?* |
+| **[TRIGGERS.md](TRIGGERS.md)** | How-to + Explanation | *How do I fire a pipeline from an inbound event — a dropped file, a webhook, a poll cursor?* |
 | **[TOOLING-AND-GROWTH.md](TOOLING-AND-GROWTH.md)** | How-to + Explanation | *How do external tools enter a pipeline, and how does a workspace mature?* |
 | **[DISTRIBUTION.md](DISTRIBUTION.md)** | How-to + Explanation | *How is cairn packaged, versioned, and embedded in a coding agent?* |
 | **[RELEASING.md](RELEASING.md)** | How-to | *How do we cut a release?* |
 | **[IMPLEMENTATION-PLAN.md](IMPLEMENTATION-PLAN.md)** | Historical record | *In what order was cairn built, and against what verifications?* |
-| **[TRIGGERS-PLAN.md](TRIGGERS-PLAN.md)** | Plan (not built) | *How will event triggers — inbox file-watch + poll cursors — work? (issue #3)* |
+| **[TRIGGERS-PLAN.md](TRIGGERS-PLAN.md)** | Historical record | *Why were event triggers — inbox file-watch + poll cursors — designed this way? (issue #3)* |
 
 The "How-to + Explanation" pages are labelled honestly: each opens by explaining a subsystem, then gives
 the concrete recipes for operating it. If you want only the recipe, skip to that page's task sections.

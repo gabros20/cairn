@@ -19,6 +19,24 @@ $ cairn trail runs/hello-<...>     # replay what happened, step by step
 `cairn plan` is your typecheck — run it after every edit. When you add an agent step later, it also
 checks that the agent, its skills, and its artifacts all exist before anything runs.
 
+## Firing from an event instead of typing the command
+
+Nothing ships by default — `cairn run hello` above is you, at the keyboard. When a pipeline should
+run because a file landed (a script's output, a webhook bridge's payload) rather than because you
+typed a command, add a `triggers.yaml` at the workspace root and sync it into the host watcher:
+
+```yaml
+# triggers.yaml (none shipped by default — uncomment and adapt)
+# handle-reply:
+#   pipeline: hello
+#   watch: inbox/replies/          # workspace-relative; one run per new file
+# cairn trigger sync --backend launchd   # or systemd; cron cannot host a file watch
+```
+
+Full reference — the claim/consume at-most-once semantics, the `cursor:` poll-source primitive for
+providers that only answer polls, and the webhook-bridge pattern — is `docs/TRIGGERS.md` in the cairn
+repo (`docs/SCHEDULING.md` for the clock-driven sibling, `schedules.yaml`).
+
 ## What's here
 
 | Path | What it is |

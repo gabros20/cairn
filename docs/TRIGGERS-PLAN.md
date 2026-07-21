@@ -1,7 +1,12 @@
 # Event triggers — implementation plan (issue #3)
 
-> **Status: PLAN — not built.** The design for `triggers.yaml`, the `cairn trigger` verb,
-> and the poll-source cursor primitive. The event-side complement to `cairn schedule`:
+> **Status: LIVE — built and tested; superseded by [docs/TRIGGERS.md](TRIGGERS.md) as the
+> reference.** This file is the historical design record — the reasoning behind
+> `triggers.yaml`, the `cairn trigger` verb, and the poll-source cursor primitive, kept
+> for context on decisions made along the way. For current behavior, exact CLI syntax,
+> and what actually shipped, read TRIGGERS.md; where the two disagree, TRIGGERS.md is
+> right (a handful of sketches below were revised during the build — noted inline where
+> it matters). The event-side complement to `cairn schedule`:
 > `schedule` : cron/launchd timers :: `trigger` : WatchPaths / systemd path-units.
 > Origin: gabros20/cairn#3 (prospect-factory PRD evaluation — everything mapped onto
 > existing primitives except inbound events).
@@ -27,7 +32,9 @@ handle-reply:
   # optional:
   glob: "*.json"                  # default "*" (dotfiles and subdirs always ignored)
   on_done: done                   # done → move to <watch>/.done/ (default) | delete
-  on_fail: failed                 # move to <watch>/.failed/ (always move — never retry-loop a poison file)
+  # NOTE (as shipped): there is no on_fail: key. A failed run's claim always moves to
+  # <watch>/.failed/, unconditionally — never retry-loop a poison file, and never a knob
+  # to configure away (run.md decision 1; see TRIGGERS.md §1).
 ```
 
 Parse/validate mirrors `schedkit.load_schedules`: typed `Trigger` dataclass, loud
@@ -98,9 +105,10 @@ Contract:
   ⇒ inbox → run at-most-once via §2 claims).
 - Cursor files live under workspace `state/` by convention, are plain JSON, and are
   `flock`ed during commit (two concurrent scheduled polls can't interleave).
-- `cairn plan` validates the path (workspace-relative, no escape) and warns when a
-  `cursor:` step isn't reachable from any schedule/trigger (a cursor with no clock or
-  event feeding it is usually a mistake).
+- `cairn plan` validates the path (workspace-relative, no escape). (As shipped: the
+  advisory sketched here — warning when a `cursor:` step isn't reachable from any
+  schedule/trigger — was deliberately dropped, run.md decision 6; `cairn plan` performs
+  no reachability check today. A possible future addition, not current behavior.)
 
 Paired with `schedules.yaml` (`*/5 * * * *` poll) this covers most "webhook" needs with
 zero public surface — and upgrades to §3 triggers when the provider can push.
