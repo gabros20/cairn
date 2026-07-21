@@ -141,12 +141,12 @@ def test_pipeline_shape_matches_the_docs_sketch(ws: Path) -> None:
     doc = yaml.safe_load((ws / PIPELINE).read_text(encoding="utf-8"))
     assert doc["pipeline"] == "self-improve"
     # aggregate: a run: step over `cairn learnings`, honoring the since/tag params.
-    agg = next(n for n in doc["steps"] if n.get("id") == "aggregate")
+    agg = next(n for n in doc["steps"] if n.get("step", n.get("id")) == "aggregate")
     assert "cairn learnings" in agg["run"]
     assert "{params.since}" in agg["run"] and "{params.tag}" in agg["run"]
     assert "{artifact:learnings-snapshot}" in agg["run"]
     # curate: an agent step producing the typed proposals artifact.
-    curate = next(n for n in doc["steps"] if n.get("id") == "curate")
+    curate = next(n for n in doc["steps"] if n.get("step", n.get("id")) == "curate")
     assert curate["agent"] == "curator"
     assert curate["produces"] == ["proposals"]
     arts = doc["artifacts"]
@@ -159,7 +159,7 @@ def test_pipeline_shape_matches_the_docs_sketch(ws: Path) -> None:
     assert gate["default"] == "no"
     assert set(gate["options"]) == {"yes", "no"}
     # open-pr: runs ONLY on an explicit yes.
-    opr = next(n for n in doc["steps"] if n.get("id") == "open-pr")
+    opr = next(n for n in doc["steps"] if n.get("step", n.get("id")) == "open-pr")
     assert opr["when"] == "gates.approve.choice == 'yes'"
     assert SCRIPT in opr["run"]
 

@@ -222,7 +222,7 @@ artifacts:
     validator: validators/nonempty.py       # ← validated by a Python check
 
 steps:
-  - id: greet                               # a run: step — deterministic, no model
+  - step: greet                             # a run: step — deterministic, no model
     run: >-
       python3 -c "import json, sys;
       json.dump({'name': sys.argv[1], 'pipeline': sys.argv[2]}, open(sys.argv[3], 'w'))"
@@ -235,7 +235,7 @@ steps:
     options: { friendly: "Warm and casual", formal: "Polished and professional" }
     default: friendly                       # headless runs resolve to this
 
-  - id: compose
+  - step: compose
     run: >-
       python3 -c "…g['name']…"              # consumes {gate:tone} + {artifact:greeting}
     needs: [greeting, tone]
@@ -290,7 +290,7 @@ coding-agent CLI. The scaffold has this queued up: the last, commented node in `
 **agent step**.
 
 ```yaml
-  # - id: elaborate
+  # - step: elaborate
   #   agent: assistant               # → agents/assistant.yaml (tier + skills + tools)
   #   args: { tone: "{gate:tone}" }  # exposed to the agent envelope as {{args.tone}}
   #   needs: [message]

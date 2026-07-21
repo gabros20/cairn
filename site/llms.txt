@@ -2,7 +2,7 @@
 
 > Artifact-native pipeline orchestrator over coding-agent CLIs (Claude Code, Codex, Grok, Cursor, OpenCode, Hermes, Kimi, Antigravity). Python ≥3.11, two dependencies (pyyaml + jsonschema). Every step of a pipeline leaves a typed, validated artifact on disk; the trail of artifacts IS the execution state. No database, no checkpointer, no daemon — the filesystem is the state machine.
 
-Key facts: pipelines are declarative YAML with exactly five node kinds (step, gate, parallel, loop, manual); agent steps delegate to a swappable executor CLI as a fresh headless subprocess; deterministic `run:` steps and agentic `agent:` steps share one contract (`needs`/`produces`, validator-gated) in one dependency graph; `cairn plan` statically verifies everything before a token is spent; `cairn resume` re-walks a run directory to the last valid artifact; every event appends to `trail.jsonl`. Install: `uv tool install cairn-pipelines` (PyPI distribution `cairn-pipelines`; command and import package are both `cairn`).
+Key facts: pipelines are declarative YAML with exactly four node shapes (step, gate, parallel, loop) — steps come in three actors (machine `run:`, model `agent:`, human `manual:`); agent steps delegate to a swappable executor CLI as a fresh headless subprocess; deterministic `run:` steps and agentic `agent:` steps share one contract (`needs`/`produces`, validator-gated) in one dependency graph; `cairn plan` statically verifies everything before a token is spent; `cairn resume` re-walks a run directory to the last valid artifact; every event appends to `trail.jsonl`. Install: `uv tool install cairn-pipelines` (PyPI distribution `cairn-pipelines`; command and import package are both `cairn`).
 
 All links below are raw markdown — fetch them directly.
 

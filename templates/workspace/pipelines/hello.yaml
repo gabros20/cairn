@@ -1,6 +1,7 @@
 # hello — the day-0 pipeline. Plans AND runs offline, with zero auth, using only
 # run: steps and one gate. `cairn run hello` works the moment the workspace
 # exists. Grow it by uncommenting the agent: step at the bottom.
+# every node = shape: name — shapes: step / gate / parallel / loop; step actors: run / agent / manual
 # Reference: docs/API.md §2.
 
 pipeline: hello
@@ -23,7 +24,7 @@ steps:
   # 1. run: — deterministic, no model, no auth. Writes the greeting artifact.
   #    {params.name}/{pipeline} are VALUE placeholders; {artifact:greeting} is a
   #    REFERENCE placeholder resolving to the artifact's absolute path (§2.8).
-  - id: greet
+  - step: greet
     run: >-
       python3 -c "import json, sys;
       json.dump({'name': sys.argv[1], 'pipeline': sys.argv[2]}, open(sys.argv[3], 'w'))"
@@ -42,7 +43,7 @@ steps:
 
   # 3. run: — consumes the gate choice ({gate:tone}), the first artifact
   #    ({artifact:greeting}), and writes the message artifact.
-  - id: compose
+  - step: compose
     run: >-
       python3 -c "import json;
       g = json.load(open('{artifact:greeting}'));
@@ -58,7 +59,7 @@ steps:
   # uncomment this node. `cairn plan hello` typechecks it — dataflow, agent,
   # skills — before any run.
   #
-  # - id: elaborate
+  # - step: elaborate
   #   agent: assistant               # → agents/assistant.yaml (tier + skills + tools)
   #   args: { tone: "{gate:tone}" }  # exposed to the agent envelope as {{args.tone}}
   #   needs: [message]

@@ -4,6 +4,8 @@
 # pipeline reads and is yours to customize (skills/self-improve-curator/SKILL.md,
 # schemas/self-improve-proposals.json, scripts/self-improve-open-pr.py).
 #
+# every node = shape: name — shapes: step / gate / parallel / loop; step actors: run / agent / manual
+#
 #   aggregate   run:    `cairn learnings [--since] [--tag]` → learnings-snapshot.txt
 #   curate      agent:  judge the snapshot against the doctrine → proposals.json
 #   approve     gate:   a HUMAN decides; the headless default is "no"
@@ -49,7 +51,7 @@ steps:
   #    Flags are passed only when the params are non-empty; `cairn learnings` resolves
   #    its workspace from the cwd, so we cd to $CAIRN_WORKSPACE (the walker exports it;
   #    the artifact reference below renders to an absolute path, so cd is safe).
-  - id: aggregate
+  - step: aggregate
     run: >-
       out="{artifact:learnings-snapshot}"; since="{params.since}"; tag="{params.tag}";
       cd "$CAIRN_WORKSPACE" || exit 1; set --;
@@ -62,7 +64,7 @@ steps:
   #    default; promote only recurring/high-value learnings; name the exact file and a
   #    mechanical edit) lives in skills/self-improve-curator/SKILL.md — customize THAT,
   #    not this step. The agent writes proposals.json and nothing else.
-  - id: curate
+  - step: curate
     agent: curator
     needs: [learnings-snapshot]
     produces: [proposals]
@@ -87,7 +89,7 @@ steps:
   #    declared in cairn.toml [tools.gh] with needed_by = ["open-pr"]: `cairn plan`
   #    flags the scoped requirement and `cairn run` hard-stops before minting anything
   #    when the check fails on this machine.
-  - id: open-pr
+  - step: open-pr
     when: "gates.approve.choice == 'yes'"
     run: >-
       python3 "$CAIRN_WORKSPACE/scripts/self-improve-open-pr.py"

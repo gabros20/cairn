@@ -23,7 +23,6 @@ graph TD
   PIPE --> GATE[Gate]
   PIPE --> PAR[Parallel]
   PIPE --> LOOP[Loop]
-  PIPE --> MAN[Manual]
 
   STEP -->|delegates to| AG
   STEP -.->|inlines| SK
@@ -39,7 +38,7 @@ graph TD
   RUN --> ART
 ```
 
-Read it as sentences: a *pipeline* orders *steps* (and four other node kinds); a *step* delegates to
+Read it as sentences: a *pipeline* orders *steps* (and three other node shapes); a *step* delegates to
 an *agent*, which binds an *executor* only at invocation; a step *produces* *artifacts* that are
 *done* exactly when their *validator* passes; a *gate* writes its decision as an artifact too; a
 *guard* wraps a step's commands; an *executor* runs as one fresh process inside a *run dir* whose
@@ -72,14 +71,15 @@ whole pipeline system. **Without it:** paths and configs scatter per-CLI (exactl
 
 ## 2. Pipeline
 
-**Is:** a declarative *trail* — an ordered list of nodes with exactly five kinds: **step**, **gate**,
-**parallel**, **loop**, **manual**. Not a general DAG: order is explicit; the dependency graph is
-*declared* through artifact `needs`/`produces` and **cross-checked** against the order at plan time
-(a step consuming an artifact no earlier node produces is a config error before anything runs).
+**Is:** a declarative *trail* — an ordered list of nodes with exactly four shapes: **step**, **gate**,
+**parallel**, **loop** — and steps come in three actors: machine (`run:`), model (`agent:`), human
+(`manual:`). Not a general DAG: order is explicit; the dependency graph is *declared* through artifact
+`needs`/`produces` and **cross-checked** against the order at plan time (a step consuming an artifact
+no earlier node produces is a config error before anything runs).
 
 **Why "DAG in our terms":** analysis of the real pipeline cairn was distilled from showed the topology
-is a sequence with three local deviations (a mid-phase gate, one concurrent pair, one bounded loop). Five
-node kinds cover it with room to spare; generic edge-lists would buy nothing and cost static
+is a sequence with three local deviations (a mid-phase gate, one concurrent pair, one bounded loop). Four
+node shapes cover it with room to spare; generic edge-lists would buy nothing and cost static
 verifiability. Order-explicit + dataflow-checked is strictly more auditable than order-inferred.
 
 **Without it:** orchestration lives in prose (skill instructions) and gets re-implemented per
@@ -87,10 +87,11 @@ harness — today's exact disease.
 
 ## 3. Step
 
-**Is:** one unit of delegation with a contract:
+**Is:** one unit of delegation with a contract (`id:` still parses — a permanent legacy spelling for
+`step:` — but `step:` is canonical):
 
 ```yaml
-- id: capture
+- step: capture
   agent: site-extractor        # WHO (an agent declaration)
   args: { step: capture }      # parameterizes the skill/prompt
   needs: [discovery, scope]    # reads these artifacts (validated present before start)
@@ -99,7 +100,7 @@ harness — today's exact disease.
   retry: { attempts: 1, feedback: true } # optional; validator reasons fed into the retry prompt
 ```
 
-Three execution kinds, one contract shape:
+Three step actors, one contract shape:
 - `agent:` — one fresh headless CLI process (the normal case).
 - `run:` — a deterministic script (`run: python scripts/discover_urls.py --select …`). **No LLM.**
   Same needs/produces/validation. This unifies Make-style mechanical steps and agentic steps under

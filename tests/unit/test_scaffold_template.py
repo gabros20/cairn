@@ -121,7 +121,7 @@ def test_hello_pipeline_shape():
     assert kinds.count("run") >= 2
     assert "agent" not in kinds, "no live agent: step — the day-0 pipeline must run auth-free"
     # The second run: step wires the gate choice + the first artifact together.
-    compose = next(n for n in doc["steps"] if n.get("id") == "compose")
+    compose = next(n for n in doc["steps"] if n.get("step", n.get("id")) == "compose")
     assert "{gate:tone}" in compose["run"]
     assert "{artifact:greeting}" in compose["run"]
     assert set(compose["needs"]) == {"greeting", "tone"}

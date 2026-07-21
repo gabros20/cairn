@@ -7,8 +7,8 @@ is built out incrementally — the lifecycle brease-factory actually lived, with
 
 ## 1. There is no "tool" object — on purpose
 
-The kernel has five node kinds and zero tool abstractions. A tool is **four small declarations in
-places that already exist**, each with exactly one job:
+The kernel has four node shapes (steps come in three actors) and zero tool abstractions. A tool is
+**four small declarations in places that already exist**, each with exactly one job:
 
 | Declaration | Job | Lives in |
 |---|---|---|
@@ -103,13 +103,13 @@ requires judgment, it's an `agent:` step with the skill.**
 
 ```yaml
 # deterministic — no model, same contracts
-- id: deploy-vercel
+- step: deploy-vercel
   run: "vercel deploy --prod --yes --cwd {artifact:frontend}"
   needs: [frontend, qa-report]
   produces: [deploy-report]
 
 # agentic — the model decides how to drive it
-- id: capture
+- step: capture
   agent: site-extractor           # agent has skills:[crawl4ai], bash: allowlist.yaml#capture
   needs: [discovery, selected-urls]
   produces: [site-map, design-signals]
@@ -129,7 +129,7 @@ until it is ready, does the step's real work against it, and tears it down — s
 long as that step's process:
 
 ```yaml
-- id: verify-demo
+- step: verify-demo
   run: "scripts/serve-verify.sh {artifact:frontend}"   # boots the server, waits ready,
   needs: [frontend]                                    # runs the checks, kills it on exit
   produces: [qa-report]

@@ -149,7 +149,7 @@ The piece a pure inbox-watch can't cover: a provider with no push mechanism, onl
 that step a kernel-managed watermark that outlives any single run:
 
 ```yaml
-- id: poll-resend
+- step: poll-resend
   run: "scripts/poll-resend {cursor.value} {cursor.next} inbox/replies/"
   cursor: state/resend-cursor.json     # workspace-relative; validated at plan time
                                         # (no absolute path, no `..` escape; run: steps only —

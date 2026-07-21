@@ -89,10 +89,10 @@ flowchart LR
 ```
 
 The orchestrator is deterministic code; only the *inside* of a step is model-driven. Pipelines use
-exactly five node kinds — **step** (a delegation), **gate** (a human decision, written to disk as an
-artifact), **parallel** (a concurrent group), **loop** (a bounded review⇄revise cycle), and
-**manual** (a checkable by-hand step). See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the
-full execution semantics.
+exactly four node shapes — **step** (a delegation, in one of three actors: machine `run:`, model
+`agent:`, human `manual:`), **gate** (a human decision, written to disk as an artifact), **parallel**
+(a concurrent group), and **loop** (a bounded review⇄revise cycle). See
+[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full execution semantics.
 
 ### A scaffolded workspace
 

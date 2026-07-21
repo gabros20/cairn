@@ -276,7 +276,7 @@
         </div>
 
         <div class="node-kinds reveal">
-          <h3 class="t-subheading node-kinds__heading">Exactly five node kinds — nothing else in the kernel.</h3>
+          <h3 class="t-subheading node-kinds__heading">Four node shapes, three step actors — nothing else in the kernel.</h3>
           <div class="node-kinds__grid">
             <div class="node-kinds__item">
               <svg class="node-kinds__glyph" viewBox="0 0 48 48" aria-hidden="true"><path class="gs gs--fill" d="M8 32 L40.5 30 L37 19 L12.5 20.5 Z"></path></svg>
@@ -315,8 +315,8 @@
                 <path class="gs" d="M8 33 L40.5 31 L37 20 L12.5 21.5 Z"></path>
                 <path class="ga ga--check" d="M18.5 26 L22.5 29.5 L30.5 21"></path>
               </svg>
-              <span class="node-kinds__id t-mono-sm">manual</span>
-              <p class="node-kinds__desc">Instructions printed to the operator, wait for confirmation, then validate.</p>
+              <span class="node-kinds__id t-mono-sm">run · agent · manual</span>
+              <p class="node-kinds__desc">Not a fifth shape — the three step actors: machine (<code class="t-mono-sm">run:</code>), model (<code class="t-mono-sm">agent:</code>), human (<code class="t-mono-sm">manual:</code>, printed to the operator and validated on confirmation). One contract shape regardless of which.</p>
             </div>
           </div>
         </div>
@@ -375,7 +375,7 @@
           <div class="terminal-panel">
             <div class="terminal-panel__bar"><span class="terminal-panel__dot"></span>deterministic — no model</div>
             <div class="terminal-panel__body">
-<pre class="yaml">- <span class="y-key">id:</span> select-urls
+<pre class="yaml">- <span class="y-key">step:</span> select-urls
   <span class="y-key">run:</span> <span class="y-str">"uv run python skills/crawl4ai/scripts/discover_urls.py
          --select {gate:scope} --pages {params.pages}
          --out {artifact:selected-urls}"</span>
@@ -386,7 +386,7 @@
           <div class="terminal-panel">
             <div class="terminal-panel__bar"><span class="terminal-panel__dot"></span>agentic — the model decides how</div>
             <div class="terminal-panel__body">
-<pre class="yaml">- <span class="y-key">id:</span> capture
+<pre class="yaml">- <span class="y-key">step:</span> capture
   <span class="y-key">agent:</span> site-extractor          <span class="y-com"># skills:[crawl4ai], bash: allowlist.yaml#capture</span>
   <span class="y-key">needs:</span> [discovery, selected-urls]
   <span class="y-key">produces:</span> [site-map, design-signals]
@@ -451,7 +451,7 @@
               <div class="terminal-panel__bar"><span class="terminal-panel__dot"></span>pipelines/brease-rebuild.yaml (trimmed)</div>
               <div class="terminal-panel__body">
 <pre class="yaml"><span class="y-key">steps:</span>
-  - <span class="y-key">id:</span> discover
+  - <span class="y-key">step:</span> discover
     <span class="y-key">agent:</span> site-extractor
     <span class="y-key">produces:</span> [discovery]
 
@@ -461,7 +461,7 @@
     <span class="y-key">options:</span> { recommended: <span class="y-str">"nav-linked core pages"</span>, all: <span class="y-str">"everything"</span>, core: <span class="y-str">"home only"</span> }
     <span class="y-key">default:</span> all
 
-  - <span class="y-key">id:</span> select-urls                   <span class="y-com"># deterministic — no model needed</span>
+  - <span class="y-key">step:</span> select-urls                   <span class="y-com"># deterministic — no model needed</span>
     <span class="y-key">run:</span> <span class="y-str">"uv run python skills/crawl4ai/scripts/discover_urls.py
            --select {gate:scope} --out {artifact:selected-urls}"</span>
     <span class="y-key">needs:</span> [discovery]
@@ -469,10 +469,10 @@
 
   - <span class="y-key">parallel:</span> blueprint               <span class="y-com"># concurrent pair, disjoint produces</span>
     <span class="y-key">steps:</span>
-      - <span class="y-key">id:</span> architect
+      - <span class="y-key">step:</span> architect
         <span class="y-key">agent:</span> blueprint-architect
         <span class="y-key">produces:</span> [blueprints]
-      - <span class="y-key">id:</span> design-author
+      - <span class="y-key">step:</span> design-author
         <span class="y-key">agent:</span> design-director
         <span class="y-key">produces:</span> [design-md]
 
@@ -481,15 +481,15 @@
     <span class="y-key">max:</span> { interactive: 3, headless: 2 }
     <span class="y-key">until:</span> artifacts.art-review.verdict == <span class="y-pass">'approve'</span>
     <span class="y-key">body:</span>
-      - <span class="y-key">id:</span> review
+      - <span class="y-key">step:</span> review
         <span class="y-key">agent:</span> design-director
         <span class="y-key">produces:</span> [art-review]
         <span class="y-key">executor:</span> claude              <span class="y-com"># judgment stays on the strongest reviewer</span>
-      - <span class="y-key">id:</span> revise
+      - <span class="y-key">step:</span> revise
         <span class="y-key">agent:</span> frontend-builder
         <span class="y-key">produces:</span> [frontend]
 
-  - <span class="y-key">id:</span> deploy                        <span class="y-com"># deterministic, gated on the QA verdict</span>
+  - <span class="y-key">step:</span> deploy                        <span class="y-com"># deterministic, gated on the QA verdict</span>
     <span class="y-key">when:</span> params.deploy == 'on' &amp;&amp; artifacts.qa-report.verdict == <span class="y-pass">'GO'</span>
     <span class="y-key">agent:</span> deployer
     <span class="y-key">needs:</span> [frontend, qa-report]
@@ -504,11 +504,11 @@
               <div class="terminal-panel__bar"><span class="terminal-panel__dot"></span>templates/workspace/pipelines/self-improve.yaml</div>
               <div class="terminal-panel__body">
 <pre class="yaml"><span class="y-key">steps:</span>
-  - <span class="y-key">id:</span> aggregate                     <span class="y-com"># deterministic, zero tokens</span>
+  - <span class="y-key">step:</span> aggregate                     <span class="y-com"># deterministic, zero tokens</span>
     <span class="y-key">run:</span> <span class="y-str">'cd "$CAIRN_WORKSPACE" && cairn learnings > "{artifact:learnings-snapshot}"'</span>
     <span class="y-key">produces:</span> [learnings-snapshot]
 
-  - <span class="y-key">id:</span> curate                        <span class="y-com"># judgment → an agent step</span>
+  - <span class="y-key">step:</span> curate                        <span class="y-com"># judgment → an agent step</span>
     <span class="y-key">agent:</span> curator
     <span class="y-key">needs:</span> [learnings-snapshot]
     <span class="y-key">produces:</span> [proposals]
@@ -521,7 +521,7 @@
       <span class="y-str">"no"</span>:  <span class="y-str">"Stop here — keep the proposals as a run record, change nothing"</span>
     <span class="y-key">default:</span> <span class="y-str">"no"</span>
 
-  - <span class="y-key">id:</span> open-pr                       <span class="y-com"># deterministic: branch + PR, never a direct commit</span>
+  - <span class="y-key">step:</span> open-pr                       <span class="y-com"># deterministic: branch + PR, never a direct commit</span>
     <span class="y-key">when:</span> <span class="y-str">"gates.approve.choice == 'yes'"</span>
     <span class="y-key">run:</span> <span class="y-str">'python3 "$CAIRN_WORKSPACE/scripts/self-improve-open-pr.py"
            "{artifact:proposals}" "{artifact:pr-record}"'</span>
@@ -545,13 +545,13 @@
 
 <span class="y-com"># pipelines/poll-events.yaml — the pull half: scheduled poll with a kernel-managed cursor</span>
 <span class="y-key">steps:</span>
-  - <span class="y-key">id:</span> poll                          <span class="y-com"># deterministic; {cursor.value} = last watermark</span>
+  - <span class="y-key">step:</span> poll                          <span class="y-com"># deterministic; {cursor.value} = last watermark</span>
     <span class="y-key">run:</span> <span class="y-str">"scripts/poll-provider --since {cursor.value}
            --write-cursor {cursor.next} --emit inbox/replies/"</span>
     <span class="y-key">cursor:</span> state/provider-cursor.json <span class="y-com"># commits ONLY after produces validate</span>
     <span class="y-key">produces:</span> [poll-report]
 
-  - <span class="y-key">id:</span> triage                        <span class="y-com"># judgment on each event → an agent step</span>
+  - <span class="y-key">step:</span> triage                        <span class="y-com"># judgment on each event → an agent step</span>
     <span class="y-key">agent:</span> reply-triager
     <span class="y-key">needs:</span> [poll-report]
     <span class="y-key">produces:</span> [triage]
@@ -575,7 +575,7 @@
   message:  { path: message.txt,  validator: validators/nonempty.py }
 
 <span class="y-key">steps:</span>
-  - <span class="y-key">id:</span> greet                         <span class="y-com"># run: — deterministic, no auth</span>
+  - <span class="y-key">step:</span> greet                         <span class="y-com"># run: — deterministic, no auth</span>
     <span class="y-key">run:</span> <span class="y-str">&gt;-
       python3 -c "import json,sys;
       json.dump({'name': sys.argv[1]}, open(sys.argv[2],'w'))"
@@ -588,7 +588,7 @@
     <span class="y-key">options:</span> { friendly: <span class="y-str">"Warm and casual"</span>, formal: <span class="y-str">"Polished and professional"</span> }
     <span class="y-key">default:</span> friendly
 
-  - <span class="y-key">id:</span> compose
+  - <span class="y-key">step:</span> compose
     <span class="y-key">run:</span> <span class="y-str">&gt;-
       python3 -c "import json;
       g=json.load(open('{artifact:greeting}'));

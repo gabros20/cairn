@@ -117,7 +117,7 @@ system.
 ```yaml
 # pipelines/brease-rebuild.yaml (excerpt — full version in EXAMPLE-BREASE-REBUILD.md)
 steps:
-  - id: discover
+  - step: discover
     agent: site-extractor
     produces: [discovery]
 
@@ -125,23 +125,23 @@ steps:
     reads: [discovery]
     default: all                     # headless runs resolve from defaults
 
-  - id: capture
+  - step: capture
     agent: site-extractor
     needs: [discovery, scope]
     produces: [site-map, design-signals]
 
   - parallel: blueprint              # concurrent pair, disjoint outputs
     steps:
-      - { id: architect,     agent: blueprint-architect, needs: [mode-plan], produces: [blueprints] }
-      - { id: design-author, agent: design-director,     needs: [mode-plan], produces: [design-md] }
+      - { step: architect,     agent: blueprint-architect, needs: [mode-plan], produces: [blueprints] }
+      - { step: design-author, agent: design-director,     needs: [mode-plan], produces: [design-md] }
 
   - loop: art-review                 # bounded review⇄revise cycle
     min: 1
     max: { interactive: 3, headless: 2 }
     until: artifacts.art-review.verdict == 'approve'
     body:
-      - { id: review, agent: design-director, produces: [art-review] }
-      - { id: revise, agent: frontend-builder, unless: artifacts.art-review.verdict == 'approve' }
+      - { step: review, agent: design-director, produces: [art-review] }
+      - { step: revise, agent: frontend-builder, unless: artifacts.art-review.verdict == 'approve' }
 ```
 
 ```console
@@ -233,7 +233,8 @@ an external driver + a small CLI adapter + a portable core. cairn is that answer
 - the driver became the cairn **kernel walker**;
 - the adapter's five operations became the cairn **Executor protocol**;
 - the port's pipeline + agent files became cairn's **pipeline + agent files**, generalized;
-- its control-flow shapes became cairn's **five node kinds** (step, gate, parallel, loop, manual);
+- its control-flow shapes became cairn's **four node shapes** (step, gate, parallel, loop — steps in
+  three actors: run, agent, manual);
 - its enforcement design became cairn's **guard engine**, with the same defense-in-depth.
 
 The deliverable changed from a one-off port into a reusable framework — with the original pipeline as

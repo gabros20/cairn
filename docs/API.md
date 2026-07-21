@@ -152,8 +152,12 @@ required), `describe` (copied into agent envelopes).
 
 ### 2.3 Step node
 
+Every step names itself with the canonical `step:` key. `id:` still parses — a **permanent** legacy
+alias, no deprecation warning, never removed — but `step:` and `id:` may not both appear on one entry
+(name given twice ⇒ `ConfigError`).
+
 ```yaml
-- id: capture                    # unique; trail + logs key
+- step: capture                  # unique; trail + logs key (id: also accepted — legacy alias)
   agent: site-extractor          # XOR run: | manual:
   args: { step: capture }        # exposed to envelope + skill as {{args.*}}
   needs: [discovery, scope]      # artifact names (gate names are artifacts too)
@@ -168,7 +172,7 @@ required), `describe` (copied into agent envelopes).
 
 `run:` steps — deterministic, no agent, no envelope:
 ```yaml
-- id: select-urls
+- step: select-urls
   run: "uv run python skills/crawl4ai/scripts/discover_urls.py --select {gate:scope} --pages {params.pages} --out {artifact:selected-urls}"
   needs: [discovery, scope]
   produces: [selected-urls]
@@ -179,7 +183,7 @@ same timeout/log/trail treatment.
 
 `manual:` steps:
 ```yaml
-- id: brease-auth
+- step: brease-auth
   manual: "Run `brease login` and `brease use {param:brease_site}` in another terminal."
   produces: [brease-context]     # e.g. .brease/context.json existence+validator
 ```
@@ -211,7 +215,7 @@ so consumers need no guard at all.
 ```yaml
 - parallel: blueprint
   on_fail: wait_all              # | fast
-  steps: [ {id: architect, ...}, {id: design-author, ...} ]   # disjoint produces (plan-checked)
+  steps: [ {step: architect, ...}, {step: design-author, ...} ]   # disjoint produces (plan-checked)
 ```
 
 ### 2.6 Loop node
@@ -224,8 +228,8 @@ so consumers need no guard at all.
   until: artifacts.art-review.verdict == 'approve'   # evaluated after each cycle ≥ min
   on_cap: continue               # | halt
   body:
-    - { id: review, agent: design-director, args: {job: review}, needs: [frontend, design-md], produces: [art-review] }
-    - { id: revise, agent: frontend-builder, args: {revision: on}, needs: [art-review], produces: [frontend],
+    - { step: review, agent: design-director, args: {job: review}, needs: [frontend, design-md], produces: [art-review] }
+    - { step: revise, agent: frontend-builder, args: {revision: on}, needs: [art-review], produces: [frontend],
         unless: artifacts.art-review.verdict == 'approve' }
 ```
 `{cycle}` is bound in body artifact paths, args, and expressions. Loop bodies may re-`produce` an

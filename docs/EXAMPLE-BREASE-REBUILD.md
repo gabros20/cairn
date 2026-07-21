@@ -76,7 +76,7 @@ guards:
 
 steps:
   # ---------- P0 CAPTURE: discover ▸ gate ▸ select ▸ capture ----------
-  - id: discover
+  - step: discover
     agent: site-extractor
     args: { step: discover }
     produces: [discovery]
@@ -91,12 +91,12 @@ steps:
       core: "home + core pages only"
     default: all
 
-  - id: select-urls                              # deterministic — no model needed
+  - step: select-urls                              # deterministic — no model needed
     run: "uv run python skills/crawl4ai/scripts/discover_urls.py --select {gate:scope} --pages {params.pages} --out {artifact:selected-urls}"
     needs: [discovery]
     produces: [selected-urls]
 
-  - id: capture
+  - step: capture
     agent: site-extractor
     args: { step: capture }
     needs: [discovery, selected-urls]
@@ -104,12 +104,12 @@ steps:
     timeout: 60m
 
   # ---------- P1 AUDIT · P1.5 STRATEGY (reimagine only) ----------
-  - id: audit
+  - step: audit
     agent: site-auditor
     needs: [site-map, design-signals]
     produces: [mode-plan]
 
-  - id: strategy
+  - step: strategy
     when: dims.content == 'rewrite'
     agent: strategist
     needs: [mode-plan, site-map]
@@ -118,12 +118,12 @@ steps:
   # ---------- P2 BLUEPRINT: concurrent pair ----------
   - parallel: blueprint
     steps:
-      - id: architect
+      - step: architect
         agent: blueprint-architect
         needs: [mode-plan, site-map]             # + strategy-brief when it exists:
         needs_optional: [strategy-brief]
         produces: [blueprints]
-      - id: design-author
+      - step: design-author
         agent: design-director
         args: { job: author }
         needs: [mode-plan, design-signals]
@@ -131,7 +131,7 @@ steps:
         produces: [design-md]
 
   # ---------- P2.5 ASSETS (self-skips on no gap) ----------
-  - id: assets
+  - step: assets
     agent: asset-generator
     args: { budget: "{params.asset_budget}" }
     needs: [blueprints, design-md, site-map]
@@ -139,12 +139,12 @@ steps:
     skippable: true
 
   # ---------- P3 BREASE CMS (brease=on only; mutation gate first) ----------
-  - id: brease-auth
+  - step: brease-auth
     when: params.brease == 'on'
     manual: "Ensure the brease CLI is authenticated for THIS run: `cd {run_dir} && brease login && brease use` (target: {params.url})."
     produces: [brease-context]
 
-  - id: model-cms
+  - step: model-cms
     when: params.brease == 'on'
     agent: modeler
     needs: [blueprints]
@@ -157,7 +157,7 @@ steps:
     options: { "yes": "populate the CMS", "no": "halt here" }   # quote! bare yes/no are YAML booleans
     default: "no"                                 # headless NEVER auto-mutates a CMS
 
-  - id: populate
+  - step: populate
     when: params.brease == 'on' && gates.populate-approval.choice == 'yes'
     agent: populator
     needs: [brease-config, blueprints, asset-manifest, brease-context]
@@ -165,7 +165,7 @@ steps:
     retry: { attempts: 0 }                        # CMS mutation: never blind-retry
 
   # ---------- P4 FRONTEND ----------
-  - id: build
+  - step: build
     agent: frontend-builder
     needs: [blueprints, design-md]
     needs_optional: [asset-manifest, content-map]
@@ -180,13 +180,13 @@ steps:
     until: artifacts.art-review.verdict == 'approve'
     on_cap: continue
     body:
-      - id: review
+      - step: review
         agent: design-director
         args: { job: review, cycle: "{cycle}" }
         needs: [frontend, design-md]
         produces: [art-review]
         executor: claude                          # judgment stays on the strongest reviewer
-      - id: revise
+      - step: revise
         agent: frontend-builder
         args: { revision: "on", cycle: "{cycle}" }
         needs: [art-review, design-md]
@@ -194,12 +194,12 @@ steps:
         unless: artifacts.art-review.verdict == 'approve'
 
   # ---------- P5 QA · P6 DEPLOY ----------
-  - id: qa
+  - step: qa
     agent: qa-validator
     needs: [frontend, blueprints, design-md]
     produces: [qa-report]
 
-  - id: deploy
+  - step: deploy
     when: params.deploy == 'on' && artifacts.qa-report.verdict == 'GO'
     agent: deployer
     needs: [frontend, qa-report]
