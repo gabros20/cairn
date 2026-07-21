@@ -1314,3 +1314,87 @@ def test_cursor_dotdot_path_is_a_config_error(tmp_path):
     with pytest.raises(ConfigError) as exc:
         _plan_p(tmp_path, steps)
     assert "one" in str(exc.value) and "escapes the workspace" in str(exc.value)
+
+
+# --------------------------------------------------------------------------- #
+# step: — the canonical node shape key (id: stays a permanent silent alias).
+# --------------------------------------------------------------------------- #
+
+
+def test_step_and_id_spellings_parse_to_identical_plans(tmp_path):
+    steps_id = "  - { id: one, run: 'echo', produces: [a] }\n  - { id: two, run: 'echo', needs: [a], produces: [b] }\n"
+    steps_step = "  - { step: one, run: 'echo', produces: [a] }\n  - { step: two, run: 'echo', needs: [a], produces: [b] }\n"
+    p_id = _plan_p(tmp_path / "id", steps_id)
+    p_step = _plan_p(tmp_path / "step", steps_step)
+    assert p_id.nodes == p_step.nodes
+
+
+def test_step_spelling_works_nested_in_parallel_steps(tmp_path):
+    steps = (
+        "  - parallel: par\n"
+        "    steps:\n"
+        "      - { step: one, run: 'echo', produces: [a] }\n"
+        "      - { step: two, run: 'echo', produces: [b] }\n"
+    )
+    p = _plan_p(tmp_path, steps)
+    par = p.nodes[0]
+    assert isinstance(par, ParallelNode)
+    assert _ids(par.steps) == ["one", "two"]
+
+
+def test_step_spelling_works_nested_in_loop_body(tmp_path):
+    # the loop body's produced artifact must vary by {cycle} (plan-time loop-progress
+    # check) — a bespoke pipeline text, since _HEADER's a/b artifacts have fixed paths.
+    yaml_text = (
+        "pipeline: p\nversion: 1\nrun_id: \"p-{date}\"\n"
+        "artifacts:\n  a: { path: \"a-{cycle}.json\", schema: schemas/s.json }\n"
+        "steps:\n"
+        "  - loop: lp\n"
+        "    body:\n"
+        "      - { step: one, run: 'echo', produces: [a] }\n"
+    )
+    ws = _write_ws(tmp_path, yaml_text)
+    p = plan(ws, "p", {}, now=NOW)
+    loop = p.nodes[0]
+    assert isinstance(loop, LoopNode)
+    assert _ids(loop.body) == ["one"]
+
+
+def test_step_and_id_both_present_is_a_config_error(tmp_path):
+    steps = "  - { step: one, id: one, run: 'echo', produces: [a] }\n"
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    msg = str(exc.value)
+    assert "'one'" in msg and "given twice" in msg
+
+
+def test_node_with_no_shape_key_is_a_teaching_config_error(tmp_path):
+    steps = "  - { run: 'echo', produces: [a] }\n"
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    msg = str(exc.value)
+    assert "step:" in msg and "gate:" in msg and "parallel:" in msg and "loop:" in msg
+    assert "id:" in msg  # names the legacy alias too
+
+
+def test_missing_step_name_error_mentions_the_canonical_spelling(tmp_path):
+    steps = "  - { step: '', run: 'echo', produces: [a] }\n"
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    assert "step: <name>" in str(exc.value)
+
+
+def test_unknown_key_teaching_hint_names_the_owning_shape(tmp_path):
+    steps = "  - { gate: g, options: { a: 'A' }, default: a, produces: [x] }\n"
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    msg = str(exc.value)
+    assert "'produces' is a step key" in msg and "did you mean a step?" in msg
+
+
+def test_unknown_key_gets_no_hint_when_no_shape_owns_it(tmp_path):
+    steps = "  - { gate: g, options: { a: 'A' }, default: a, bogus: 1 }\n"
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    msg = str(exc.value)
+    assert "bogus" in msg and "did you mean" not in msg

@@ -235,6 +235,36 @@ def test_hello_pipeline_runs_end_to_end_headless(tmp_path: Path) -> None:
     assert load_run(run_dir)["status"] == "done"
 
 
+def test_step_spelling_pipeline_runs_end_to_end_headless(tmp_path: Path) -> None:
+    """The hello pipeline, entirely respelled with the canonical step: key, plans and runs
+    to done through the real shell executor — mirrors the id: version above end to end,
+    not just at parse time."""
+    ws = tmp_path / "ws"
+    shutil.copytree(REPO / "templates/workspace", ws)
+    toml = (ws / "cairn.toml").read_text().replace("{{WORKSPACE_NAME}}", "hello-ws")
+    (ws / "cairn.toml").write_text(toml)
+    hello_yaml = (ws / "pipelines/hello.yaml").read_text()
+    hello_yaml = hello_yaml.replace("- id: greet", "- step: greet").replace("- id: compose", "- step: compose")
+    active_lines = [ln for ln in hello_yaml.splitlines() if not ln.strip().startswith("#")]
+    assert not any("- id:" in ln for ln in active_lines)  # every live step was respelled
+    (ws / "pipelines/hello.yaml").write_text(hello_yaml)
+
+    plan = build_plan(ws, "hello", {}, now=NOW)
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    code = walk(
+        plan, run_dir,
+        workspace_dir=ws, config=load_config(ws),
+        executors={"shell": ShellExecutor()},
+        composer=make_composer(workspace_dir=ws, config=load_config(ws), now=NOW),
+        interactive=False, gate_presets={"tone": "friendly"}, now=NOW,
+    )
+
+    assert code == ExitCode.OK
+    assert json.loads((run_dir / "greeting.json").read_text())["name"] == "world"
+    assert (run_dir / "message.txt").read_text().strip() == "Friendly hello, world!"
+
+
 # --------------------------------------------------------------------------- #
 # 2. Resume — the artifact done-predicate.
 # --------------------------------------------------------------------------- #

@@ -614,32 +614,58 @@ def _scan_check(text: str, *, strict: bool, allow_cycle: bool, allow_refs: bool,
 # --------------------------------------------------------------------------- #
 
 _STEP_KEYS = {
-    "id", "agent", "run", "manual", "args", "needs", "needs_optional", "produces",
+    "id", "step", "agent", "run", "manual", "args", "needs", "needs_optional", "produces",
     "when", "unless", "timeout", "retry", "executor", "skippable", "cursor",
 }
 _GATE_KEYS = {"gate", "when", "unless", "reads", "ask", "options", "default"}
 _PARALLEL_KEYS = {"parallel", "on_fail", "when", "unless", "steps"}
 _LOOP_KEYS = {"loop", "when", "unless", "min", "max", "until", "on_cap", "body"}
 
+# key -> owning shape, for keys owned by exactly one shape (used as a teaching hint on an
+# unknown-key error). A key shared by several shapes (when/unless...) is ambiguous — no hint.
+_SHAPE_KEY_SETS = {"step": _STEP_KEYS, "gate": _GATE_KEYS, "parallel": _PARALLEL_KEYS, "loop": _LOOP_KEYS}
+_KEY_OWNERS: dict[str, list[str]] = {}
+for _shape, _keys in _SHAPE_KEY_SETS.items():
+    for _key in _keys:
+        _KEY_OWNERS.setdefault(_key, []).append(_shape)
+_KEY_OWNER = {k: v[0] for k, v in _KEY_OWNERS.items() if len(v) == 1}
+del _shape, _keys, _key, _KEY_OWNERS
+
+
+def _step_ident(raw: dict) -> Any:
+    """A step's name: ``step:`` (canonical) if present, else ``id:`` (permanent legacy alias).
+
+    The one place a step name is read from raw YAML — every other site calls this instead of
+    ``raw.get("id")`` so the two spellings stay interchangeable everywhere a name is used."""
+    return raw.get("step", raw.get("id"))
+
 
 def _reject_unknown(raw: dict, known: set[str], label: str, ctx: _Ctx) -> None:
     unknown = [k for k in raw if k not in known]
     if unknown:
-        _err(f"{label}: unknown key(s) {unknown} (valid: {sorted(known)})", ctx.file)
+        hints = [f"{k!r} is a {_KEY_OWNER[k]} key; did you mean a {_KEY_OWNER[k]}?" for k in unknown if k in _KEY_OWNER]
+        hint = f" — {'; '.join(hints)}" if hints else ""
+        _err(f"{label}: unknown key(s) {unknown} (valid: {sorted(known)}){hint}", ctx.file)
 
 
-def _classify(raw: dict) -> str:
+def _classify(raw: dict, ctx: _Ctx) -> str:
     if "gate" in raw:
         return "gate"
     if "parallel" in raw:
         return "parallel"
     if "loop" in raw:
         return "loop"
-    return "step"
+    if "step" in raw or "id" in raw:
+        return "step"
+    _err(
+        "node has no shape key — every node starts with step:/gate:/parallel:/loop: "
+        "(value = its name; legacy id: also marks a step)",
+        ctx.file,
+    )
 
 
 def _node_label(raw: dict, kind: str) -> str:
-    ident = raw.get({"step": "id", "gate": "gate", "parallel": "parallel", "loop": "loop"}[kind])
+    ident = _step_ident(raw) if kind == "step" else raw.get({"gate": "gate", "parallel": "parallel", "loop": "loop"}[kind])
     return f"{kind} {ident!r}"
 
 
@@ -651,7 +677,7 @@ def _parse_timeout(raw: dict, ctx: _Ctx) -> int:
     try:
         return parse_duration(str(raw["timeout"]))
     except ValueError as exc:
-        _err(f"step {raw.get('id')!r}: timeout: {exc}", ctx.file)
+        _err(f"step {_step_ident(raw)!r}: timeout: {exc}", ctx.file)
 
 
 def _parse_cursor(raw: dict, ctx: _Ctx, sid: str, kind: str) -> str | None:
@@ -681,17 +707,23 @@ def _parse_cursor(raw: dict, ctx: _Ctx, sid: str, kind: str) -> str | None:
 def _parse_retry(raw: dict, ctx: _Ctx) -> tuple[int, bool]:
     r = raw.get("retry", {}) or {}
     if not isinstance(r, dict):
-        _err(f"step {raw.get('id')!r}: retry must be a mapping", ctx.file)
+        _err(f"step {_step_ident(raw)!r}: retry must be a mapping", ctx.file)
     attempts = r.get("attempts", 0)
     if isinstance(attempts, bool) or not isinstance(attempts, int) or attempts < 0:
-        _err(f"step {raw.get('id')!r}: retry.attempts must be a non-negative integer", ctx.file)
+        _err(f"step {_step_ident(raw)!r}: retry.attempts must be a non-negative integer", ctx.file)
     return attempts, bool(r.get("feedback", False))
 
 
 def _parse_step(raw: dict, ctx: _Ctx, in_loop: bool, when_runtime: Expr | None) -> StepNode:
-    sid = raw.get("id")
+    if "step" in raw and "id" in raw:
+        _err(
+            f"step {raw.get('step')!r}: the name is given twice — "
+            "use step: (canonical) or id: (legacy), not both",
+            ctx.file,
+        )
+    sid = _step_ident(raw)
     if not isinstance(sid, str) or not sid:
-        _err("a step needs a non-empty string 'id'", ctx.file)
+        _err("a step needs a non-empty string name — step: <name> (canonical) or id: <name> (legacy)", ctx.file)
     _reject_unknown(raw, _STEP_KEYS, f"step {sid!r}", ctx)
 
     kinds = [k for k in ("agent", "run", "manual") if k in raw]
@@ -815,10 +847,10 @@ def _build(raw_nodes: list, ctx: _Ctx, in_loop: bool) -> tuple[list[Node], list[
     for raw in raw_nodes:
         if not isinstance(raw, dict):
             _err(f"each node must be a mapping, got {raw!r}", ctx.file)
-        kind = _classify(raw)
+        kind = _classify(raw, ctx)
         label = _node_label(raw, kind)
         decision, when_runtime, reason = _expand_condition(raw, label, ctx)
-        ident = raw.get({"step": "id", "gate": "gate", "parallel": "parallel", "loop": "loop"}[kind])
+        ident = _step_ident(raw) if kind == "step" else raw.get({"gate": "gate", "parallel": "parallel", "loop": "loop"}[kind])
         if decision == "drop":
             skips.append(PlanSkip(node=str(ident), kind=kind, reason=reason or ""))
             continue
@@ -863,7 +895,7 @@ def _gather(raw_nodes: list) -> tuple[dict[str, list[str]], set[str]]:
                 visit(child)
         else:
             for name in rn.get("produces", []) or []:
-                producers.setdefault(name, []).append(str(rn.get("id")))
+                producers.setdefault(name, []).append(str(_step_ident(rn)))
 
     for rn in raw_nodes:
         visit(rn)
@@ -1126,7 +1158,7 @@ def _lint_conditional_gates(raw_nodes: list, ctx: _Ctx) -> None:
             return
         own = rn.get("when")
         guards = ancestors + ((own,) if isinstance(own, str) and own.strip() else ())
-        label = _node_label(rn, _classify(rn))
+        label = _node_label(rn, _classify(rn, ctx))
         for gate in sorted(_gates_consumed(rn)):
             cond = gate_whens.get(gate)
             if cond is None:
@@ -1503,7 +1535,7 @@ def _collect_raw_step_ids(raw_nodes: Any, into: set[str]) -> None:
         elif "loop" in rn:
             _collect_raw_step_ids(rn.get("body", []) or [], into)
         elif "gate" not in rn:
-            sid = rn.get("id")
+            sid = _step_ident(rn)
             if isinstance(sid, str) and sid:
                 into.add(sid)
 
