@@ -290,6 +290,28 @@ def test_run_dir_resume_entrance_guards_before_tool_preflight(hello_ws, monkeypa
     assert not sentinel.exists()  # ...and the tool check never ran
 
 
+def test_run_resume_version_advisory_reaches_stderr_before_preflight_refusal(
+    hello_ws, monkeypatch, capsys
+):
+    # T4 r2: cross-minor version drift is advisory; if tool preflight then refuses,
+    # the advisory must still hit stderr *before* the refusal text (pre-refactor order).
+    monkeypatch.chdir(hello_ws)
+    rd = hello_ws / "r"
+    assert main(["run", "hello", "--headless", "--run-dir", str(rd)]) == int(ExitCode.OK)
+    doc = json.loads((rd / "run.json").read_text())
+    doc["cairn_version"] = "0.4.0"  # same major, older minor → warn, not refuse
+    (rd / "run.json").write_text(json.dumps(doc, indent=2), encoding="utf-8")
+    _add_tool(hello_ws, '\n[tools.needsit]\ncheck = "false"\nneeded_by = ["greet"]\n')
+    capsys.readouterr()
+    rc = main(["run", "hello", "--headless", "--run-dir", str(rd)])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "version drift" in err and "0.4.0" in err
+    assert "needsit" in err
+    # Advisory first, refusal second (old inline print order).
+    assert err.index("version drift") < err.index("needsit")
+
+
 def test_resume_rechecks_scoped_tool_that_vanished(hello_ws, monkeypatch, capsys):
     # A tool can vanish between sessions and the in-range steps still need it: `cairn resume`
     # re-runs the range-scoped tool checks and refuses if one now fails (my resume ruling: yes,

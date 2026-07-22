@@ -454,7 +454,8 @@ def _print_walk_result(code: ExitCode, run_dir: Path) -> None:
 
 
 def _print_refusal(r: Refusal) -> int:
-    """Adapter: print a runctl Refusal to stderr and return its exit code."""
+    """Adapter: print advisories then Refusal.message (old inline order) to stderr."""
+    _print_advisories(r.advisories)
     print(r.message, file=sys.stderr)
     return int(r.code)
 

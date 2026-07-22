@@ -246,6 +246,74 @@ def test_resolve_run_run_dir_existing_drift_refuses(hello_ws):
     assert f"cairn resume {rd.resolve()} --force" in (result.remedy or "")
 
 
+def test_resolve_run_resume_advisories_survive_preflight_refusal(hello_ws, capsys):
+    # Cross-minor version drift is advisory-only; a subsequent tool preflight
+    # refusal must still carry that advisory on the TOOLS Refusal (T4 r2 / D7).
+    from dataclasses import replace
+
+    from cairn.kernel.plan import ToolRequirement
+
+    rd = _minted_run(hello_ws)
+    update_run(rd, lambda doc: doc.update({"cairn_version": "0.4.0"}))
+    p = replace(
+        _plan(hello_ws),
+        tool_requirements=(
+            ToolRequirement(
+                tool="needsit",
+                check="false",
+                targets=("greet",),
+                install=None,
+            ),
+        ),
+    )
+    result = resolve_run(
+        hello_ws,
+        p,
+        now=_now(),
+        pipeline_hash=_phash(hello_ws, "hello"),
+        run_dir=rd,
+    )
+    assert isinstance(result, Refusal)
+    assert result.kind == RefusalKind.TOOLS
+    assert "needsit" in result.message
+    assert len(result.advisories) == 1
+    advisory = result.advisories[0]
+    assert "0.4.0" in advisory and "version drift" in advisory
+    assert capsys.readouterr().err == ""  # library still silent
+
+
+def test_resolve_run_idempotent_incomplete_advisories_survive_preflight_refusal(hello_ws):
+    # Same carry-through on the --idempotent incomplete-match resume branch.
+    from dataclasses import replace
+
+    from cairn.kernel.plan import ToolRequirement
+
+    p0 = _plan(hello_ws)
+    ph = _phash(hello_ws, "hello")
+    first = resolve_run(
+        hello_ws, p0, now=_now(), pipeline_hash=ph, runs_root=hello_ws / "runs"
+    )
+    assert isinstance(first, Minted)
+    update_run(first.run_dir, lambda doc: doc.update({"cairn_version": "0.4.0"}))
+    p = replace(
+        p0,
+        tool_requirements=(
+            ToolRequirement(tool="needsit", check="false", targets=("greet",), install=None),
+        ),
+    )
+    result = resolve_run(
+        hello_ws,
+        p,
+        now=_now(),
+        pipeline_hash=ph,
+        runs_root=hello_ws / "runs",
+        idempotent=True,
+    )
+    assert isinstance(result, Refusal)
+    assert result.kind == RefusalKind.TOOLS
+    assert any("version drift" in a and "0.4.0" in a for a in result.advisories)
+
+
 def test_resolve_run_idempotent_complete_is_already_done(hello_ws):
     p = _plan(hello_ws)
     ph = _phash(hello_ws, "hello")

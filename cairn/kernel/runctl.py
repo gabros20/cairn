@@ -11,7 +11,7 @@ codes and stderr side effects at the core — the CLI owns presentation (prints
 from __future__ import annotations
 
 import shutil
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 from pathlib import Path
@@ -54,14 +54,17 @@ class Refusal:
     ``message`` is the full stderr text (verbatim, including any remedy sentence).
     ``kind`` discriminates the four refusal paths for library consumers.
     ``remedy`` is the structured escape-hatch fragment when one exists (e.g. the
-    ``cairn resume <dir> --force`` guidance), else None — for library consumers;
-    the CLI prints ``message`` alone so output stays byte-identical.
+    ``cairn resume <dir> --force`` guidance), else None — for library consumers.
+    ``advisories`` carries any guard warnings already collected before this
+    refusal (e.g. version-drift advisory then tool preflight fails) so the CLI
+    can print them first — matching the pre-refactor inline order.
     """
 
     code: ExitCode
     message: str
     kind: RefusalKind
     remedy: str | None = None
+    advisories: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -374,7 +377,8 @@ def resolve_run(
             return result
         refused = preflight_tools(plan)
         if refused is not None:
-            return refused
+            # Carry guard advisories through — preflight must not drop them (D7).
+            return replace(refused, advisories=result.advisories)
         return result
 
     # No --run-dir: optional idempotent match, else fresh mint under runs_root.
@@ -397,7 +401,7 @@ def resolve_run(
             return result
         refused = preflight_tools(plan)
         if refused is not None:
-            return refused
+            return replace(refused, advisories=result.advisories)
         return result
     return mint_new(
         ws,
