@@ -772,6 +772,7 @@ def test_in_walk_gate_decision_records_real_time_not_frozen_now(ws: Path, tmp_pa
 
 
 def test_gate_headless_without_default_halts_needs_human(ws: Path, tmp_path: Path) -> None:
+    """W1b: defaultless gate under headless → exit 6 + gate-pending (gatekit park path)."""
     gate = GateNode(name="tone", reads=(), ask="?", options=(("a", "A"),), default="", when_runtime=None)
     plan = make_plan([gate], {})
     run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
@@ -779,6 +780,8 @@ def test_gate_headless_without_default_halts_needs_human(ws: Path, tmp_path: Pat
     assert _walk(ws, plan, run_dir, {}) == ExitCode.NEEDS_HUMAN
     events = [e["event"] for e in read_trail(run_dir)]
     assert "gate-pending" in events and events[-1] == "run-halt"
+    halt = next(e for e in read_trail(run_dir) if e["event"] == "run-halt")
+    assert halt["data"]["exit_code"] == int(ExitCode.NEEDS_HUMAN)
 
 
 def test_gate_tty_reprompts_then_records(ws: Path, tmp_path: Path, monkeypatch) -> None:
@@ -1524,12 +1527,13 @@ def test_agent_step_absent_binary_halts_executor_not_traceback(ws: Path, tmp_pat
     assert halt["data"]["exit_code"] == int(ExitCode.EXECUTOR)
 
 
-def test_agent_nonzero_exit_with_auth_signature_halts_executor_and_skips_retries(
+def test_agent_nonzero_exit_with_auth_signature_halts_blocked_and_skips_retries(
     ws: Path, tmp_path: Path
 ) -> None:
-    """codex-F7/grok-F11/claude-F3: an agent CLI that exits non-zero with an auth/executor
-    signature in its output is a step-fail → run-halt at exit 4 — even with a would-be-valid
-    artifact — and burns none of the retry budget (retrying auth failure is pure waste)."""
+    """codex-F7/grok-F11/claude-F3 + W1c: an agent CLI that exits non-zero with an
+    auth/environment signature in its output is a step-fail → run-halt at BLOCKED(9) —
+    even with a would-be-valid artifact — and burns none of the retry budget (retrying
+    auth failure is pure waste). Plan-mandated taxonomy change: was EXECUTOR(4)."""
     arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
     plan = make_plan([agent_step("s", produces=["a"], retry=(2, True))], arts, resolved_models=models_for("s"))
 
@@ -1541,11 +1545,13 @@ def test_agent_nonzero_exit_with_auth_signature_halts_executor_and_skips_retries
 
     run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
     ex = FakeExecutor(on_invoke)
-    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.EXECUTOR
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.BLOCKED
     assert len(ex.invocations) == 1  # retry budget (2) untouched — auth failure isn't retried
     events = [e["event"] for e in read_trail(run_dir)]
     assert "step-fail" in events
     assert events[-1] == "run-halt"
+    halt = next(e for e in read_trail(run_dir) if e["event"] == "run-halt")
+    assert halt["data"]["exit_code"] == int(ExitCode.BLOCKED)
 
 
 def test_agent_nonzero_exit_without_auth_signature_still_retries(ws: Path, tmp_path: Path) -> None:

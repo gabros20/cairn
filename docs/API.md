@@ -198,17 +198,23 @@ same timeout/log/trail treatment.
     recommended: "nav-linked home/core/product pages"
     all:         "everything discovered"
     core:        "home + core only"
-  default: all                   # headless resolution; also `cairn run --gate scope=all`
+  default: all                   # optional: headless resolution; also `cairn run --gate scope=all`
 ```
-Decision lands at `gates/scope.json` `{ "choice": "...", "by": "tty|default|flag", "at": ... }` and
+Decision lands at `gates/scope.json` `{ "choice": "...", "by": "tty|default|flag|external", "at": ... }` and
 is referenced in `needs:` by gate name.
+
+`default:` is **optional**. Present → headless resolves to it (`by:"default"`). Absent →
+interactive still prompts; headless emits `gate-pending` and exits 6 (needs-human) until
+answered via `cairn gate <run> <name>=<choice>` then `cairn resume`. A defaultless gate on a
+pipeline referenced by `schedules.yaml` is a plan-time **warning** (the schedule will park
+until a human answers; `cairn inbox` is the coming drain surface).
 
 A gate *may* carry a `when:`, but then it is inactive whenever that condition is false — so every
 consumer of `{gate:X}`/`gates.X` must be guarded by the **same** condition, or it breaks at runtime.
 The planner enforces this: an unguarded consumer of a conditional gate is a plan error, and a
 consumer whose guard can't be shown to include the gate's condition is a plan warning. Prefer an
-**unconditional** gate with a `default:` (as above) — it always resolves (headless → the default),
-so consumers need no guard at all.
+**unconditional** gate with a `default:` (as above) when headless must always resolve without
+parking — consumers then need no guard at all.
 
 ### 2.5 Parallel node
 

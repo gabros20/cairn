@@ -1398,3 +1398,79 @@ def test_unknown_key_gets_no_hint_when_no_shape_owns_it(tmp_path):
         _plan_p(tmp_path, steps)
     msg = str(exc.value)
     assert "bogus" in msg and "did you mean" not in msg
+
+
+# --------------------------------------------------------------------------- #
+# W1b — defaultless gates (optional default:; schedule teaching lint)
+# --------------------------------------------------------------------------- #
+
+
+def test_defaultless_gate_parses_with_empty_default(tmp_path):
+    """W1b: omitting default: is accepted; GateNode.default is \"\" (gatekit falsy path)."""
+    steps = "  - { gate: g, options: { a: 'A', b: 'B' }, ask: 'pick?' }\n"
+    p = _plan_p(tmp_path, steps)
+    g = _node(p, "g")
+    assert isinstance(g, GateNode)
+    assert g.default == ""
+    assert g.options == (("a", "A"), ("b", "B"))
+    assert not any("no default" in w.message for w in p.warnings)
+
+
+def test_gate_with_default_unchanged(tmp_path):
+    steps = "  - { gate: g, options: { a: 'A', b: 'B' }, default: b }\n"
+    p = _plan_p(tmp_path, steps)
+    g = _node(p, "g")
+    assert isinstance(g, GateNode) and g.default == "b"
+
+
+def test_gate_bad_default_still_errors(tmp_path):
+    steps = "  - { gate: g, options: { a: 'A' }, default: nope }\n"
+    with pytest.raises(ConfigError, match="is not one of the options"):
+        _plan_p(tmp_path, steps)
+
+
+def test_defaultless_gate_schedule_referenced_teaching_lint(tmp_path):
+    """Defaultless gate + schedules.yaml naming this pipeline → warning naming the gate."""
+    steps = "  - { gate: approve, options: { yes: 'Y', no: 'N' }, ask: 'ok?' }\n"
+    ws = _write_ws(
+        tmp_path,
+        _HEADER + steps,
+        extra={
+            "schedules.yaml": (
+                "nightly:\n"
+                "  cron: '0 2 * * *'\n"
+                "  run: [run, p, --headless]\n"
+            ),
+        },
+    )
+    p = plan(ws, "p", {}, now=NOW)
+    msgs = [w.message for w in p.warnings if w.level == "warning"]
+    hit = [m for m in msgs if "approve" in m and "schedules.yaml" in m]
+    assert hit, f"expected schedule teaching lint; got: {msgs}"
+    assert "park" in hit[0].lower()
+    assert "inbox" in hit[0].lower()
+
+
+def test_defaultless_gate_no_schedule_no_teaching_lint(tmp_path):
+    """Defaultless gate with no schedules.yaml → no schedule-park warning."""
+    steps = "  - { gate: approve, options: { yes: 'Y', no: 'N' } }\n"
+    p = _plan_p(tmp_path, steps)
+    assert not any("schedules.yaml" in w.message for w in p.warnings)
+
+
+def test_gate_with_default_on_schedule_no_teaching_lint(tmp_path):
+    """A gate that HAS a default is fine on a scheduled pipeline — no park warning."""
+    steps = "  - { gate: approve, options: { yes: 'Y', no: 'N' }, default: no }\n"
+    ws = _write_ws(
+        tmp_path,
+        _HEADER + steps,
+        extra={
+            "schedules.yaml": (
+                "nightly:\n"
+                "  cron: '0 2 * * *'\n"
+                "  run: [run, p, --headless]\n"
+            ),
+        },
+    )
+    p = plan(ws, "p", {}, now=NOW)
+    assert not any("no default" in w.message for w in p.warnings)

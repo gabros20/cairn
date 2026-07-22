@@ -28,7 +28,7 @@ class ExitCode(IntEnum):
     OK = 0
     CONFIG = 2       # plan-time config error
     GATE_FAILED = 3  # artifact gate / validator failed
-    EXECUTOR = 4     # executor spawn/auth/crash
+    EXECUTOR = 4     # executor spawn/crash (auth/env classified failures are BLOCKED)
     TIMEOUT = 5
     NEEDS_HUMAN = 6  # halted at manual/gate in headless mode
     BUDGET = 7       # budget exceeded (docs/SECURITY.md §4)

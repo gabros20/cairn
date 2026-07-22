@@ -605,6 +605,33 @@ def test_run_trigger_waiting_park_exits_zero(tmp_path, monkeypatch):
     assert ptr["child_pid"] == 1  # FakeRunner default pid
 
 
+def test_run_trigger_blocked_exit_9_parks_in_waiting(tmp_path, monkeypatch):
+    """W1c wire e2e: child exit BLOCKED(9) → classify WAITING → retire parks in .waiting/.
+
+    T6's retire already routes waiting-class codes; this proves the drain end-to-end
+    for the auth/env taxonomy (was previously EXECUTOR(4) → .failed/).
+    """
+    ws = _workspace(tmp_path, TRIGGERS_ONE)
+    _stub_mint(monkeypatch, ws)
+    watch_abs = ws / "inbox" / "replies"
+    watch_abs.mkdir(parents=True)
+    (watch_abs / "auth.json").write_text("event payload", encoding="utf-8")
+
+    runner = FakeRunner(
+        {("cairn", "run"): RunResult(9, "blocked: not logged in\n", "fix auth then resume\n")}
+    )
+    code = run_trigger("handle-reply", ws, runner=runner, cairn_bin="cairn", now=NOW)
+
+    assert code == 0  # waiting park is not a drain failure
+    assert (watch_abs / ".waiting" / "auth.json").is_file()
+    assert not (watch_abs / ".failed" / "auth.json").exists()
+    from cairn.kernel.queue_ledger import read_pointer, pointer_path
+
+    ptr = read_pointer(pointer_path(watch_abs / ".waiting", "auth.json"))
+    assert ptr["outcome"] == "waiting"
+    assert ptr["exit_code"] == 9
+
+
 def test_run_trigger_stays_silent_when_no_buffers_given(tmp_path, monkeypatch):
     # waiting park exits 0 now; without out/err, streams are not re-emitted.
     ws = _workspace(tmp_path, TRIGGERS_ONE)

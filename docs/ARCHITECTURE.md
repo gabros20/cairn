@@ -122,11 +122,13 @@ stateDiagram-v2
 ### 3.2 `gate`
 Resolved decision at `gates/<name>.json`? → skip (this is what makes gates resumable and *never
 re-asked*). Otherwise: a `--gate name=choice` preset resolves it (`by:"flag"`); interactive →
-render question + artifact summary via the gate UI plugin (TTY default, `by:"tty"`); headless →
-write the declared `default` (`by:"default"`). A `default` is **mandatory at plan time** (a gate
-without one is a config error), so a headless run always resolves every gate and never blocks on
-one. Either way the decision file is written first, then the trail `gate-answered` event. **No
-model is ever mid-conversation during a gate** — gates live *between* processes.
+render question + artifact summary via the gate UI plugin (TTY default, `by:"tty"`); headless
+with a declared `default` → write it (`by:"default"`); headless **without** a `default` → emit
+`gate-pending` and halt needs-human (exit 6) so an operator can answer externally. `default:`
+is optional at plan time; a schedule-referenced defaultless gate is a plan-time teaching
+warning (the run will park until answered). Either way a resolved decision file is written
+first, then the trail `gate-answered` event. **No model is ever mid-conversation during a
+gate** — gates live *between* processes.
 
 ### 3.3 `parallel`
 `ThreadPoolExecutor(len(steps))` — each child step is its own OS process anyway; threads only
@@ -432,12 +434,12 @@ it as a tool. Composition happens above the pipeline, never inside a step.
 | 0 | run complete | — |
 | 2 | config error (plan-time) | fix workspace file named in the error |
 | 3 | artifact gate failed | read validator reasons → `cairn resume` |
-| 4 | executor failure (spawn/auth/crash); also: run-lock contention (run is held by PID …) | `cairn doctor`, then resume |
+| 4 | executor failure (spawn/crash); also: run-lock contention (run is held by PID …). Auth/env-classified CLI failures are **9**, not 4 | `cairn doctor`, then resume |
 | 5 | timeout | inspect `logs/<step>.log`, resume |
-| 6 | needs a human: a `manual:` step in headless mode, or an interactive gate whose TTY was closed/interrupted (headless gates can't reach here — their `default` is mandatory) | answer externally (`cairn gate <run> <name>=<choice>`) or preset (`--gate`), then resume — the operator-pattern hook for coding agents |
+| 6 | needs a human: a `manual:` step in headless mode, a headless gate with no `default:`, or an interactive gate whose TTY was closed/interrupted | answer externally (`cairn gate <run> <name>=<choice>`) or preset (`--gate`), then resume — the operator-pattern hook for coding agents |
 | 7 | budget exceeded (`SECURITY.md` §4) | raise the cap or accept the partial run, then resume |
 | 8 | capacity: halted waiting for an agent slot (waiting-class, resumable) | free a slot (or wait for one), then resume |
-| 9 | blocked: halted on auth/network/environment trouble (waiting-class, resumable) | fix the environment, then resume |
+| 9 | blocked: halted on auth/network/environment trouble classified from the executor log tail (waiting-class, resumable; parks the queue item, does not poison) | fix the environment (login/credentials/network), then resume |
 
 ## 10. Reproducibility
 

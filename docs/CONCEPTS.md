@@ -198,11 +198,15 @@ deterministic inlining:** each CLI's headless loader quirks become correctness b
   reads: [discovery]
   ask: "Which pages should we capture?"
   options: { recommended: "nav-linked core pages", all: "everything discovered", core: "home+core only" }
-  default: all          # what a headless run resolves to (unconditional gate → always resolves)
+  default: all          # optional: what a headless run resolves to when present
 ```
 
+`default:` may be omitted: interactive still asks; headless parks needs-human (exit 6) until
+answered externally. Prefer a declared default for unattended/scheduled pipelines.
+
 **Why decisions-as-artifacts:** replayable (`cairn resume` never re-asks answered gates), auditable
-(the run dir records who chose what), and headless-safe (defaults are declared, not improvised).
+(the run dir records who chose what), and headless-safe when a default is declared — or
+explicitly parkable when it is not.
 **Without it:** human input happens *inside* model context — unauditable, unresumable, and
 impossible for CLIs without an AskUserQuestion equivalent (i.e., all of them headless).
 

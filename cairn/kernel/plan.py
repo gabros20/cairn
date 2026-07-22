@@ -101,14 +101,15 @@ class StepNode:
 @dataclass(frozen=True)
 class GateNode:
     """A human decision point. ``options`` is an ordered tuple of ``(key, description)``;
-    ``default`` is the headless resolution (one of the option keys). The gate's ``name`` is
-    itself a consumable artifact once resolved (``gates/<name>.json``)."""
+    ``default`` is the optional headless resolution (one of the option keys, or ``""`` when
+    omitted — headless then parks needs-human). The gate's ``name`` is itself a consumable
+    artifact once resolved (``gates/<name>.json``)."""
 
     name: str
     reads: tuple[str, ...]
     ask: str
     options: tuple[tuple[str, str], ...]
-    default: str
+    default: str  # option key, or "" when YAML omits default: (gatekit falsy → GateNeedsHuman)
     when_runtime: Expr | None
 
 
@@ -781,17 +782,24 @@ def _parse_gate(raw: dict, ctx: _Ctx, when_runtime: Expr | None) -> GateNode:
     opts_raw = raw.get("options", {}) or {}
     if not isinstance(opts_raw, dict) or not opts_raw:
         _err(f"gate {name!r} needs a non-empty 'options' mapping", ctx.file)
+    # default: is optional (W1b). Present → must be one of options. Absent → "" so gatekit's
+    # falsy-default path raises GateNeedsHuman (exit 6) under headless.
     default = raw.get("default")
     if default is None:
-        _err(f"gate {name!r} needs a 'default'", ctx.file)
-    if default not in opts_raw:
-        _err(f"gate {name!r}: default {default!r} is not one of the options {list(opts_raw)}", ctx.file)
+        default_s = ""
+    else:
+        if default not in opts_raw:
+            _err(
+                f"gate {name!r}: default {default!r} is not one of the options {list(opts_raw)}",
+                ctx.file,
+            )
+        default_s = str(default)
     return GateNode(
         name=name,
         reads=tuple(raw.get("reads", []) or []),
         ask=str(raw.get("ask", "")),
         options=tuple((k, str(v)) for k, v in opts_raw.items()),
-        default=str(default),
+        default=default_s,
         when_runtime=when_runtime,
     )
 
@@ -1509,6 +1517,74 @@ def _emit(
 # --------------------------------------------------------------------------- #
 
 
+def _pipelines_referenced_by_schedules(workspace_dir: Path) -> set[str]:
+    """Pipeline names named by schedules.yaml ``run``/``batch`` entries (best-effort).
+
+    Soft parse only: missing/malformed schedules.yaml yields an empty set so a broken
+    schedule file never fails an unrelated plan. Full validation lives in schedkit.
+    """
+    path = workspace_dir / "schedules.yaml"
+    if not path.is_file():
+        return set()
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return set()
+    if not isinstance(raw, dict):
+        return set()
+    names: set[str] = set()
+    for entry in raw.values():
+        if not isinstance(entry, dict):
+            continue
+        run = entry.get("run")
+        if not isinstance(run, list) or len(run) < 2:
+            continue
+        verb, first = run[0], run[1]
+        if verb in ("run", "batch") and isinstance(first, str) and not first.startswith("-"):
+            names.add(first)
+    return names
+
+
+def _iter_gates(nodes: list[Node] | tuple[Node, ...]):
+    """Yield every GateNode in the tree (top-level, parallel children, loop body)."""
+    for node in nodes:
+        if isinstance(node, GateNode):
+            yield node
+        elif isinstance(node, ParallelNode):
+            yield from _iter_gates(node.steps)
+        elif isinstance(node, LoopNode):
+            yield from _iter_gates(node.body)
+
+
+def _lint_defaultless_scheduled_gates(
+    nodes: list[Node],
+    *,
+    pipeline_name: str,
+    workspace_dir: Path,
+    warnings: list[Finding],
+) -> None:
+    """Warn when a defaultless gate sits on a schedule-referenced pipeline (W1b teaching).
+
+    Headless scheduled runs park at such gates until a human answers; the inbox surface
+    is not shipped yet, so the warning names the gate and states the park fact.
+    """
+    defaultless = [g for g in _iter_gates(nodes) if not g.default]
+    if not defaultless:
+        return
+    if pipeline_name not in _pipelines_referenced_by_schedules(workspace_dir):
+        return
+    for gate in defaultless:
+        warnings.append(
+            Finding(
+                "warning",
+                f"gate {gate.name!r} has no default and pipeline {pipeline_name!r} is "
+                f"referenced by schedules.yaml — a scheduled (headless) run will park "
+                f"until a human answers (cairn inbox is coming; until then: "
+                f"`cairn gate <run> {gate.name}=<choice>` then `cairn resume`)",
+            )
+        )
+
+
 def _flatten_step_ids(nodes: tuple[Node, ...] | list[Node]) -> set[str]:
     """Every StepNode id in ``nodes``, descending into parallel/loop children."""
     out: set[str] = set()
@@ -1706,6 +1782,9 @@ def plan(
     active, skips = _build(raw_steps, ctx, in_loop=False)
     _verify_dataflow(active, producers, ctx, artifact_decls)
     _lint_conditional_gates(raw_steps, ctx)
+    _lint_defaultless_scheduled_gates(
+        active, pipeline_name=pipeline_name, workspace_dir=workspace_dir, warnings=warnings
+    )
 
     for name in artifact_decls:
         if name not in producers:

@@ -107,12 +107,13 @@ _PLACEHOLDER = re.compile(r"\{([^{}]*)\}")
 _HELPER_CALL = re.compile(r"(\w+)\((.*)\)")
 _VALUE_KEYWORDS = frozenset({"pipeline", "date", "datetime", "cycle"})
 
-# A real auth/executor failure is terminal: the vendor CLI prints the error and exits, so the
-# signal sits in the last handful of lines, not mid-transcript. Classifying from the whole log
-# would false-positive on a legitimate (possibly long) coding step whose output happens to
-# contain a broad sign ("please run", "authentication", "/login", "log in to") — or whose task
-# IS auth/login work — and costs an unbounded read on a large agent log. 8 KiB comfortably
-# covers a vendor CLI's closing error block.
+# A real auth/environment failure is terminal (BLOCKED/9, not EXECUTOR/4): the vendor CLI
+# prints the error and exits, so the signal sits in the last handful of lines, not mid-
+# transcript. Classifying from the whole log would false-positive on a legitimate (possibly
+# long) coding step whose output happens to contain a broad sign ("please run",
+# "authentication", "/login", "log in to") — or whose task IS auth/login work — and costs an
+# unbounded read on a large agent log. 8 KiB comfortably covers a vendor CLI's closing error
+# block. Spawn/crash failures without this signature stay EXECUTOR(4).
 _AUTH_TAIL_BYTES = 8192
 
 
@@ -675,10 +676,12 @@ class _Walk:
                 # A non-zero exit is checked for every step kind now (codex-F7/grok-F11/
                 # claude-F3) — an agent CLI that fails auth/API but happens to leave a
                 # valid-looking artifact must not be recorded step-done. Split by shape:
-                # an auth/executor signature in the output TAIL is exit 4, not a content
-                # problem — retrying it just re-invokes a CLI that cannot succeed, so halt
-                # immediately and skip whatever retry budget remains. Everything else is a
-                # genuine content failure and keeps the existing retry-with-feedback path.
+                # an auth/environment signature in the output TAIL is BLOCKED(9), not a
+                # content problem and not a hard executor crash — retrying it just
+                # re-invokes a CLI that cannot succeed, so halt immediately (waiting-class
+                # park) and skip whatever retry budget remains. Spawn/crash without this
+                # signature stay EXECUTOR(4). Everything else is a genuine content failure
+                # and keeps the existing retry-with-feedback path.
                 tail_text = _tail_text(log_path, _AUTH_TAIL_BYTES)
                 if _looks_like_auth_failure(tail_text, result.exit_code):
                     self._emit(
@@ -686,12 +689,12 @@ class _Walk:
                         node=step.id,
                         attempt=attempt,
                         cycle=cycle,
-                        data={"error": f"command exited with code {result.exit_code} (executor/auth failure)"},
+                        data={"error": f"command exited with code {result.exit_code} (auth/environment failure)"},
                     )
                     raise _Halt(
-                        ExitCode.EXECUTOR,
+                        ExitCode.BLOCKED,
                         step.id,
-                        f"executor failure: command exited with code {result.exit_code}",
+                        f"blocked: command exited with code {result.exit_code} (auth/environment)",
                     )
                 ok = False
                 validator_reasons = validator_reasons + [f"command exited with code {result.exit_code}"]
