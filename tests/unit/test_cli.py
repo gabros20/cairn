@@ -1296,7 +1296,7 @@ def test_batch_aggregates_child_failure_exit(hello_ws, monkeypatch, capsys):
 def test_batch_summary_renders_failed_stderr_tail(hello_ws, monkeypatch, capsys):
     # The batch summary prints the failed child's stderr tail as an indented block; a long
     # tail is truncated with a pointer at the run dir's logs.
-    from cairn.kernel.batchkit import BatchResult, RunOutcome
+    from cairn.kernel.batchkit import BatchResult, ChildOutcome
 
     monkeypatch.chdir(hello_ws)
     pf = hello_ws / "s.jsonl"
@@ -1306,7 +1306,7 @@ def test_batch_summary_renders_failed_stderr_tail(hello_ws, monkeypatch, capsys)
     fake = BatchResult(
         pipeline="hello",
         outcomes=(
-            RunOutcome(
+            ChildOutcome(
                 index=0,
                 params={"name": "Ada"},
                 run_dir=Path("/runs/ada"),

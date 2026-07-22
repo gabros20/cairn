@@ -41,12 +41,12 @@ DEFAULT_JOBS = 4
 # batch never pipes stdin; proc.py documents the two-shapes-one-implementation split.
 # stdout/stderr are kept SEPARATE (not merged): the ``→ run_dir`` marker lands on stdout for a
 # success but on stderr for a failure/awaiting-human (cli.py), so parse_run_dir sees both, while
-# the failure tail (RunOutcome.error) is drawn from stderr alone.
+# the failure tail (ChildOutcome.error) is drawn from stderr alone.
 Spawn = Callable[[list[str], Path], "tuple[int, str, str]"]
 Clock = Callable[[], float]
 
-# Bounds on the failed-child stderr tail retained in RunOutcome.error. A runaway child can flood
-# megabytes to stderr; subprocess buffers that transiently, but every RunOutcome lives for the
+# Bounds on the failed-child stderr tail retained in ChildOutcome.error. A runaway child can flood
+# megabytes to stderr; subprocess buffers that transiently, but every ChildOutcome lives for the
 # whole batch (one per line, all held at once), so we keep only a small legible TAIL — the end,
 # where the actual failure (gate reason / config / executor error) is — never the whole stream.
 _ERROR_TAIL_MAX_LINES = 20
@@ -59,7 +59,7 @@ _ERROR_TAIL_MAX_CHARS = 2000  # str characters (not bytes) — a simple cap that
 
 
 @dataclass(frozen=True)
-class RunOutcome:
+class ChildOutcome:
     """One child run's result. ``index`` is the 0-based input line order (summary is sorted
     by it, never by completion order). ``run_dir`` is parsed from the child's terminal
     marker line; None if the child printed none (e.g. it crashed before bootstrapping).
@@ -87,7 +87,7 @@ class BatchResult:
     aggregate rule (see :func:`aggregate_exit_code`)."""
 
     pipeline: str
-    outcomes: tuple[RunOutcome, ...]
+    outcomes: tuple[ChildOutcome, ...]
     exit_code: int
 
     @property
@@ -99,7 +99,7 @@ class BatchResult:
         return len(self.outcomes)
 
     @property
-    def failed(self) -> tuple[RunOutcome, ...]:
+    def failed(self) -> tuple[ChildOutcome, ...]:
         return tuple(o for o in self.outcomes if not o.ok)
 
 
@@ -190,7 +190,7 @@ def _error_tail(stderr: str) -> str | None:
 
     Keeps the LAST ``_ERROR_TAIL_MAX_LINES`` lines then caps to ``_ERROR_TAIL_MAX_CHARS``
     characters (from the end) — the end is where the actual failure surfaces, and the cap keeps
-    a runaway child from ballooning the RunOutcome held for the whole batch."""
+    a runaway child from ballooning the ChildOutcome held for the whole batch."""
     text = stderr.strip()
     if not text:
         return None
@@ -271,7 +271,7 @@ def run_batch(
 
     param_sets = load_param_sets(params_file)  # eager: bad JSONL fails before any spawn
 
-    def one(index: int, params: dict) -> RunOutcome:
+    def one(index: int, params: dict) -> ChildOutcome:
         argv = build_run_argv(pipeline, params, gate_presets, extra_args)
         start = clock()
         try:
@@ -279,7 +279,7 @@ def run_batch(
         except Exception as exc:  # noqa: BLE001 — crash containment IS the failure policy:
             # a spawn that raises (missing interpreter, bad cwd, OS error) becomes a failed
             # outcome, never a fleet abort — siblings keep running.
-            return RunOutcome(
+            return ChildOutcome(
                 index=index,
                 params=params,
                 run_dir=None,
@@ -291,7 +291,7 @@ def run_batch(
         # Marker can be on EITHER stream (stdout for success, stderr for failure/awaiting-human),
         # so parse over both; the failure tail is drawn from stderr alone, only when the child failed.
         combined = stdout + "\n" + stderr
-        return RunOutcome(
+        return ChildOutcome(
             index=index,
             params=params,
             run_dir=parse_run_dir(combined),
@@ -300,7 +300,7 @@ def run_batch(
             error=_error_tail(stderr) if code != 0 else None,
         )
 
-    results: dict[int, RunOutcome] = {}
+    results: dict[int, ChildOutcome] = {}
     done = 0
     total = len(param_sets)
     with ThreadPoolExecutor(max_workers=jobs) as pool:
@@ -316,7 +316,7 @@ def run_batch(
     return BatchResult(pipeline=pipeline, outcomes=outcomes, exit_code=exit_code)
 
 
-def _progress(out: TextIO, done: int, total: int, o: RunOutcome) -> None:
+def _progress(out: TextIO, done: int, total: int, o: ChildOutcome) -> None:
     rd = o.run_dir.name if o.run_dir is not None else "?"
     # ONE line per completion (pinned): compact a multi-line error tail to a one-line preview;
     # the full tail is rendered in the CLI's end-of-batch summary block.

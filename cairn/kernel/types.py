@@ -44,6 +44,15 @@ class OutcomeClass(str, Enum):
     FAILED = "failed"
 
 
+# ExitCode members that classify as WAITING → their waiting_kind (doctrine D8).
+# Single source of truth: add a waiting-class code here when ExitCode grows.
+_WAITING_KINDS: dict[int, Literal["needs_human", "capacity", "blocked"]] = {
+    ExitCode.NEEDS_HUMAN: "needs_human",
+    ExitCode.CAPACITY: "capacity",
+    ExitCode.BLOCKED: "blocked",
+}
+
+
 @dataclass(frozen=True)
 class RunOutcome:
     """Classified process outcome (doctrine D8 — docs/FACTORY-PLAN.md).
@@ -51,8 +60,19 @@ class RunOutcome:
     Waiting-class outcomes carry a ``waiting_kind``; DONE and FAILED leave it None.
     """
 
-    cls: OutcomeClass
+    outcome: OutcomeClass
     waiting_kind: Literal["needs_human", "capacity", "blocked"] | None = None
+
+    def __post_init__(self) -> None:
+        waiting = self.outcome is OutcomeClass.WAITING
+        has_kind = self.waiting_kind is not None
+        if waiting and not has_kind:
+            raise ValueError("RunOutcome WAITING requires a waiting_kind")
+        if not waiting and has_kind:
+            raise ValueError(
+                f"RunOutcome {self.outcome.value} requires waiting_kind=None, "
+                f"got {self.waiting_kind!r}"
+            )
 
 
 def classify_exit(code: int) -> RunOutcome:
@@ -63,14 +83,11 @@ def classify_exit(code: int) -> RunOutcome:
     unknown codes never look like waiting.
     """
     if code == ExitCode.OK:
-        return RunOutcome(cls=OutcomeClass.DONE)
-    if code == ExitCode.NEEDS_HUMAN:
-        return RunOutcome(cls=OutcomeClass.WAITING, waiting_kind="needs_human")
-    if code == ExitCode.CAPACITY:
-        return RunOutcome(cls=OutcomeClass.WAITING, waiting_kind="capacity")
-    if code == ExitCode.BLOCKED:
-        return RunOutcome(cls=OutcomeClass.WAITING, waiting_kind="blocked")
-    return RunOutcome(cls=OutcomeClass.FAILED)
+        return RunOutcome(outcome=OutcomeClass.DONE)
+    kind = _WAITING_KINDS.get(code)
+    if kind is not None:
+        return RunOutcome(outcome=OutcomeClass.WAITING, waiting_kind=kind)
+    return RunOutcome(outcome=OutcomeClass.FAILED)
 
 
 @dataclass(frozen=True)

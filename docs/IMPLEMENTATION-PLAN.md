@@ -80,7 +80,7 @@ only ever debugged one new thing at a time.
   pass `None` today, the schema is the deliverable); the webhook trail sink (`[sinks.webhook]` tee
   — jsonl stays the byte-identical synchronous authority — OBSERVABILITY §2); kernel-side secret
   redaction live per SECURITY §1.3; batch failures naming their reason (bounded stderr tail in
-  `RunOutcome.error` + the batch summary); cross-version resume gates per DISTRIBUTION §3 + a
+  `ChildOutcome.error` + the batch summary); cross-version resume gates per DISTRIBUTION §3 + a
   doctor `requires` line; range-scoped tool enforcement at plan (warn) and run/resume (hard-stop
   before minting) per TOOLING §2; and one aware-UTC clock behind every persisted timestamp
   (`{date}` buckets by UTC day). The `v0.1.0` tag is cut. Internal seam unification

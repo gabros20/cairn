@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 
+import pytest
+
 from cairn.kernel.types import (
     EFFORTS,
     TIERS,
@@ -14,6 +16,7 @@ from cairn.kernel.types import (
     OutcomeClass,
     Result,
     RunOutcome,
+    _WAITING_KINDS,
     classify_exit,
 )
 
@@ -63,37 +66,64 @@ def test_exit_codes_capacity_and_blocked():
 
 def test_classify_exit_done():
     o = classify_exit(0)
-    assert o == RunOutcome(cls=OutcomeClass.DONE)
+    assert o == RunOutcome(outcome=OutcomeClass.DONE)
     assert o.waiting_kind is None
 
 
 def test_classify_exit_waiting_kinds():
     assert classify_exit(6) == RunOutcome(
-        cls=OutcomeClass.WAITING, waiting_kind="needs_human"
+        outcome=OutcomeClass.WAITING, waiting_kind="needs_human"
     )
     assert classify_exit(8) == RunOutcome(
-        cls=OutcomeClass.WAITING, waiting_kind="capacity"
+        outcome=OutcomeClass.WAITING, waiting_kind="capacity"
     )
     assert classify_exit(9) == RunOutcome(
-        cls=OutcomeClass.WAITING, waiting_kind="blocked"
+        outcome=OutcomeClass.WAITING, waiting_kind="blocked"
     )
 
 
 def test_classify_exit_failed_known_unknown_and_negative():
     # Known failure (4), unknown positive (77), signal death (-9) — all FAILED.
-    assert classify_exit(4) == RunOutcome(cls=OutcomeClass.FAILED)
-    assert classify_exit(77) == RunOutcome(cls=OutcomeClass.FAILED)
-    assert classify_exit(-9) == RunOutcome(cls=OutcomeClass.FAILED)
+    assert classify_exit(4) == RunOutcome(outcome=OutcomeClass.FAILED)
+    assert classify_exit(77) == RunOutcome(outcome=OutcomeClass.FAILED)
+    assert classify_exit(-9) == RunOutcome(outcome=OutcomeClass.FAILED)
     assert classify_exit(4).waiting_kind is None
 
 
 def test_run_outcome_frozen_and_equality():
-    a = RunOutcome(cls=OutcomeClass.WAITING, waiting_kind="capacity")
-    b = RunOutcome(cls=OutcomeClass.WAITING, waiting_kind="capacity")
+    a = RunOutcome(outcome=OutcomeClass.WAITING, waiting_kind="capacity")
+    b = RunOutcome(outcome=OutcomeClass.WAITING, waiting_kind="capacity")
     assert a == b
     try:
-        a.cls = OutcomeClass.DONE  # type: ignore[misc]
+        a.outcome = OutcomeClass.DONE  # type: ignore[misc]
         raise AssertionError("expected FrozenInstanceError")
     except dataclasses.FrozenInstanceError:
         pass
 
+
+def test_run_outcome_rejects_waiting_without_kind():
+    with pytest.raises(ValueError, match="WAITING requires a waiting_kind"):
+        RunOutcome(outcome=OutcomeClass.WAITING, waiting_kind=None)
+
+
+def test_run_outcome_rejects_kind_on_non_waiting():
+    with pytest.raises(ValueError, match="waiting_kind=None"):
+        RunOutcome(outcome=OutcomeClass.DONE, waiting_kind="capacity")
+    with pytest.raises(ValueError, match="waiting_kind=None"):
+        RunOutcome(outcome=OutcomeClass.FAILED, waiting_kind="blocked")
+
+
+def test_waiting_kinds_map_covers_waiting_exit_codes():
+    # D8 waiting-class ExitCode members must all appear in _WAITING_KINDS.
+    expected = {ExitCode.NEEDS_HUMAN, ExitCode.CAPACITY, ExitCode.BLOCKED}
+    assert set(_WAITING_KINDS) == {int(c) for c in expected}
+    for code in ExitCode:
+        o = classify_exit(int(code))
+        if code in expected:
+            assert o.outcome is OutcomeClass.WAITING
+            assert o.waiting_kind == _WAITING_KINDS[int(code)]
+        elif code is ExitCode.OK:
+            assert o.outcome is OutcomeClass.DONE
+        else:
+            assert o.outcome is OutcomeClass.FAILED
+            assert o.waiting_kind is None

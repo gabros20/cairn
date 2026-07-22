@@ -244,13 +244,13 @@ def test_spawn_exception_becomes_failed_outcome_not_batch_abort(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Failed-child stderr tail — the failure reason survives into RunOutcome.error.
+# Failed-child stderr tail — the failure reason survives into ChildOutcome.error.
 # --------------------------------------------------------------------------- #
 
 
 def test_failed_child_stderr_tail_lands_in_error(tmp_path):
     # A child that starts but exits non-zero: its stderr (the actual failure reason) is
-    # retained as a legible tail in RunOutcome.error — the marker is on stderr for failures.
+    # retained as a legible tail in ChildOutcome.error — the marker is on stderr for failures.
     pf = _write_jsonl(tmp_path / "s.jsonl", ['{"url": "a"}'])
 
     def spawn(argv, cwd):
@@ -282,7 +282,7 @@ def test_successful_child_keeps_error_none_even_with_stderr(tmp_path):
 
 
 def test_error_tail_is_bounded_for_a_runaway_child(tmp_path):
-    # A child that floods stderr must not balloon memory: RunOutcome.error keeps only a
+    # A child that floods stderr must not balloon memory: ChildOutcome.error keeps only a
     # bounded tail (last N lines, capped in size) — the END of the stream (where the real
     # failure is) survives; the head is dropped.
     pf = _write_jsonl(tmp_path / "s.jsonl", ['{"url": "a"}'])
