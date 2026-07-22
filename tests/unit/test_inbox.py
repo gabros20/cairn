@@ -229,6 +229,7 @@ def test_inbox_drift_card_refuses_without_force(hello_ws, monkeypatch, capsys):
     # Mutate pipeline so hash drifts.
     pfile = hello_ws / "pipelines" / "gateflow.yaml"
     pfile.write_text(pfile.read_text(encoding="utf-8") + "\n# drift\n", encoding="utf-8")
+    new_hash = "sha256:" + __import__("hashlib").sha256(pfile.read_bytes()).hexdigest()
 
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
     # First choice answers the gate; then drift force prompt gets "s" (leave parked).
@@ -242,32 +243,101 @@ def test_inbox_drift_card_refuses_without_force(hello_ws, monkeypatch, capsys):
     # Gate was answered but run stays parked (not done) because resume refused.
     assert (rd / "gates" / "tone.json").is_file()
     assert load_run(rd)["status"] != "done"
+    assert json.loads((rd / "gates" / "tone.json").read_text())["choice"] == "friendly"
 
-    # Force path: re-enter inbox (gate already answered → card still there as halted-6
-    # until resume succeeds). Actually after answer the gate is answered; on resume the
-    # walker skips the gate. Status still halted until successful resume.
-    # Re-list should still show the run as parked.
     capsys.readouterr()
     rc_list = main(["inbox", "--list"])
     listed = capsys.readouterr().out
     assert rc_list == int(ExitCode.OK)
     assert "gateflow" in listed
 
-    # Force resume via inbox: gate already answered so card kind is still gate/manual
-    # pending-less? Last gate-pending still exists; kind=gate but is_answered True.
-    # Answering again would fail overwrite — interactive path calls answer_gate again!
-    # Problem: after first answer, re-entering and choosing "friendly" again will refuse
-    # overwrite in answer_gate? answer_gate does NOT check is_answered — it overwrites
-    # the decision file. The `cairn gate` verb refuses overwrite; answer_gate itself
-    # rewrites. So a second "friendly" would re-answer then drift again.
-    #
-    # For force path: feed friendly + f
-    answers2 = iter(["friendly", "f"])
+    # Second visit: already-answered path (C1) — typed "formal" must NOT clobber "friendly".
+    # Force 'f' resumes and re-pins pipeline_hash.
+    answers2 = iter(["formal", "f"])
     monkeypatch.setattr("builtins.input", lambda _p="": next(answers2))
     capsys.readouterr()
     rc2 = main(["inbox"])
     assert rc2 == int(ExitCode.OK)
     assert load_run(rd)["status"] == "done"
+    assert json.loads((rd / "gates" / "tone.json").read_text())["choice"] == "friendly"
+    assert load_run(rd)["pipeline_hash"] == new_hash
+
+
+def test_inbox_does_not_clobber_already_answered_gate(hello_ws, monkeypatch, capsys):
+    """C1: already-answered choice=A; inbox attempt with B keeps A (no silent overwrite)."""
+    monkeypatch.chdir(hello_ws)
+    _write_gateflow(hello_ws)
+    assert main(["run", "gateflow", "--headless"]) == int(ExitCode.NEEDS_HUMAN)
+    rd = _run_dir(hello_ws, "gateflow")
+
+    assert main(["gate", str(rd), "tone=friendly"]) == int(ExitCode.OK)
+    before = json.loads((rd / "gates" / "tone.json").read_text(encoding="utf-8"))
+    assert before["choice"] == "friendly" and before["by"] == "external"
+    mac_before = before["mac"]
+
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    # Different choice B — must not clobber; resume proceeds on A.
+    monkeypatch.setattr("builtins.input", lambda _p="": "formal")
+    capsys.readouterr()
+    rc = main(["inbox"])
+    out = capsys.readouterr()
+    assert rc == int(ExitCode.OK)
+    assert "already answered" in out.out
+    after = json.loads((rd / "gates" / "tone.json").read_text(encoding="utf-8"))
+    assert after["choice"] == "friendly"
+    assert after["mac"] == mac_before
+    assert load_run(rd)["status"] == "done"
+
+
+def test_inbox_skips_when_run_lock_held(hello_ws, monkeypatch, capsys):
+    """C1: lock contention → skip card, do not block or corrupt the decision."""
+    from cairn.kernel.runstate import run_lock
+
+    monkeypatch.chdir(hello_ws)
+    _write_gateflow(hello_ws)
+    assert main(["run", "gateflow", "--headless"]) == int(ExitCode.NEEDS_HUMAN)
+    rd = _run_dir(hello_ws, "gateflow")
+
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr("builtins.input", lambda _p="": "friendly")
+    capsys.readouterr()
+    with run_lock(rd):
+        rc = main(["inbox"])
+        err = capsys.readouterr().err
+    assert rc == int(ExitCode.OK)
+    assert "run busy" in err
+    assert "skipping" in err
+    # Gate was never written under the held lock.
+    assert not (rd / "gates" / "tone.json").exists()
+    assert load_run(rd)["status"] != "done"
+
+
+def test_inbox_eof_aborts_whole_command(hello_ws, monkeypatch, capsys):
+    """I1: EOF at the card prompt aborts inbox cleanly (exit 0), does not skip-loop cards."""
+    monkeypatch.chdir(hello_ws)
+    _write_gateflow(hello_ws)
+    assert main(["run", "gateflow", "--headless"]) == int(ExitCode.NEEDS_HUMAN)
+    # A second parked run so a per-card skip would continue to card 2.
+    _write_manualflow(hello_ws)
+    assert main(["run", "manualflow", "--headless"]) == int(ExitCode.NEEDS_HUMAN)
+
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    call_count = {"n": 0}
+
+    def boom(_p=""):
+        call_count["n"] += 1
+        raise EOFError
+
+    monkeypatch.setattr("builtins.input", boom)
+    capsys.readouterr()
+    rc = main(["inbox"])
+    assert rc == int(ExitCode.OK)
+    # One prompt only — aborted, not walked to the second card.
+    assert call_count["n"] == 1
+    # Both runs still parked.
+    assert main(["inbox", "--list"]) == int(ExitCode.OK)
+    listed = capsys.readouterr().out
+    assert "gateflow" in listed and "manualflow" in listed
 
 
 def test_origin_recorded_on_run_flag(hello_ws, monkeypatch):

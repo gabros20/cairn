@@ -69,7 +69,7 @@ from cairn.kernel.runctl import (
     resume_existing,
     workspace_git_rev,
 )
-from cairn.kernel.runstate import load_run, update_run
+from cairn.kernel.runstate import LockHeldError, load_run, run_lock, update_run
 from cairn.kernel.schedkit import (
     diff_schedules,
     install as install_schedules,
@@ -78,7 +78,7 @@ from cairn.kernel.schedkit import (
     run_schedule,
     uninstall as uninstall_schedules,
 )
-from cairn.kernel.trail import derive_status, follow, last_trail_terminal, read_trail
+from cairn.kernel.trail import RunStatus, derive_status, follow, read_trail
 from cairn.kernel.trigger_host import load_triggers, watch_dir
 from cairn.kernel.triggerkit import (
     TriggerStatus,
@@ -1021,6 +1021,10 @@ def _age_secs(at: str | None) -> float:
 # --------------------------------------------------------------------------- #
 
 
+class _InboxAbort(Exception):
+    """EOF / Ctrl-C during an inbox prompt — abort the whole command (not per-card skip)."""
+
+
 @dataclasses.dataclass
 class _InboxCard:
     """One parked judgment the human may answer (or a non-answerable wait note)."""
@@ -1042,13 +1046,71 @@ class _InboxCard:
     at: str | None
 
 
-def _last_gate_pending(run_dir: Path) -> dict | None:
-    """The last ``gate-pending`` trail event (gate or manual park marker)."""
+@dataclasses.dataclass(frozen=True)
+class _InboxTrailView:
+    """Single-pass trail summary for inbox enumeration (status + terminal + pending)."""
+
+    status: RunStatus
+    term_kind: str  # done | halt | none
+    exit_code: int | None
+    last_pending: dict | None
+
+
+def _scan_trail_inbox(run_dir: Path, *, grace: int | None) -> _InboxTrailView:
+    """One trail read: derive_status + last_trail_terminal + last gate-pending.
+
+    Before (per run): up to 3 full ``read_trail`` scans. After: exactly 1.
+    """
     last: dict | None = None
+    term_kind = "none"
+    exit_code: int | None = None
+    last_pending: dict | None = None
     for ev in read_trail(run_dir):
-        if ev.get("event") == "gate-pending":
-            last = ev
-    return last
+        last = ev
+        event = ev.get("event")
+        if event == "run-done":
+            term_kind = "done"
+            exit_code = None
+        elif event == "run-halt":
+            term_kind = "halt"
+            data = ev.get("data") or {}
+            raw = data.get("exit_code")
+            try:
+                exit_code = int(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                exit_code = None
+        if event == "gate-pending":
+            last_pending = ev
+
+    # Same classification as trail.derive_status, without a second scan.
+    if last is None:
+        st = RunStatus(status="stale", last_event=None, node=None)
+    else:
+        node = last.get("node")
+        event = last.get("event")
+        if event == "gate-pending":
+            st = RunStatus(status="gate", last_event=last, node=node)
+        elif event == "run-halt":
+            st = RunStatus(status="halted", last_event=last, node=node)
+        elif event == "run-done":
+            st = RunStatus(status="done", last_event=last, node=node)
+        elif grace is not None:
+            try:
+                age_s = (datetime.now(timezone.utc) - datetime.fromisoformat(
+                    str(last["at"]).replace("Z", "+00:00")
+                )).total_seconds()
+            except (KeyError, ValueError, TypeError):
+                age_s = None
+            if age_s is not None and age_s > grace:
+                st = RunStatus(status="stale", last_event=last, node=node)
+            else:
+                st = RunStatus(status="running", last_event=last, node=node)
+        else:
+            st = RunStatus(status="running", last_event=last, node=node)
+
+    return _InboxTrailView(
+        status=st, term_kind=term_kind, exit_code=exit_code, last_pending=last_pending
+    )
 
 
 def _reads_for_gate(
@@ -1095,15 +1157,22 @@ def _reads_for_gate(
 
 
 def _card_from_run(
-    ws: Path, run_dir: Path, run_doc: dict, *, now: datetime, grace: int | None
+    ws: Path,
+    run_dir: Path,
+    run_doc: dict,
+    *,
+    now: datetime,
+    grace: int | None,
+    load_reads: bool = True,
 ) -> _InboxCard | None:
     """Build an inbox card for a run that needs human judgment, else None.
 
     Answerable: derive_status == ``gate``, or ``halted`` with last terminal exit 6.
     Capacity(8)/blocked(9) return a ``waiting_other`` card (listed, not answerable).
+    ``load_reads``: pipeline re-parse for gate reads[] — skip in --list (not rendered).
     """
-    st = derive_status(run_dir, heartbeat_grace_s=grace)
-    term_kind, exit_code = last_trail_terminal(run_dir)
+    view = _scan_trail_inbox(run_dir, grace=grace)
+    st = view.status
     origin = run_doc.get("origin") if isinstance(run_doc.get("origin"), str) else None
     run_id = str(run_doc.get("run_id") or run_dir.name)
     pipeline = str(run_doc.get("pipeline") or "?")
@@ -1112,8 +1181,8 @@ def _card_from_run(
     waiting_kind: str | None = None
     if st.status == "gate":
         answerable = True
-    elif st.status == "halted" and term_kind == "halt" and exit_code is not None:
-        outcome = classify_exit(exit_code)
+    elif st.status == "halted" and view.term_kind == "halt" and view.exit_code is not None:
+        outcome = classify_exit(view.exit_code)
         if outcome.waiting_kind == "needs_human":
             answerable = True
             waiting_kind = "needs_human"
@@ -1141,7 +1210,7 @@ def _card_from_run(
     if not answerable:
         return None
 
-    pending = _last_gate_pending(run_dir)
+    pending = view.last_pending
     data = (pending.get("data") or {}) if pending else {}
     node = str((pending or {}).get("node") or st.node or "-")
     at = (pending or st.last_event or {}).get("at")
@@ -1168,10 +1237,10 @@ def _card_from_run(
             at=at_s,
         )
 
-    # Gate: question/options on the pending event; reads from the plan.
+    # Gate: question/options on the pending event; reads only when rendered (interactive/json).
     question = str(data.get("question") or f"gate {node} needs a decision")
     options = [str(o) for o in (data.get("options") or [])]
-    reads = _reads_for_gate(ws, run_doc, node, run_dir, now)
+    reads = _reads_for_gate(ws, run_doc, node, run_dir, now) if load_reads else []
     return _InboxCard(
         run_dir=run_dir,
         run_id=run_id,
@@ -1192,7 +1261,12 @@ def _card_from_run(
 
 
 def _enumerate_inbox(
-    ws: Path, runs_root: Path, *, grace: int | None, now: datetime
+    ws: Path,
+    runs_root: Path,
+    *,
+    grace: int | None,
+    now: datetime,
+    load_reads: bool = True,
 ) -> tuple[list[_InboxCard], list[_InboxCard]]:
     """Walk runs_root; return (answerable oldest-first, waiting_other)."""
     answerable: list[_InboxCard] = []
@@ -1206,7 +1280,7 @@ def _enumerate_inbox(
             doc = load_run(d)
         except (OSError, ValueError, ConfigError):
             continue
-        card = _card_from_run(ws, d, doc, now=now, grace=grace)
+        card = _card_from_run(ws, d, doc, now=now, grace=grace, load_reads=load_reads)
         if card is None:
             continue
         if card.kind == "waiting_other":
@@ -1241,10 +1315,11 @@ def _render_card(card: _InboxCard) -> None:
 
 
 def _prompt(msg: str) -> str:
+    """Read a line; EOF / Ctrl-C abort the whole inbox (``s`` is the explicit skip)."""
     try:
         return input(msg).strip()
-    except (EOFError, KeyboardInterrupt):
-        return "s"
+    except (EOFError, KeyboardInterrupt) as exc:
+        raise _InboxAbort() from exc
 
 
 def _sweep_origin(ws: Path, origin: str | None) -> None:
@@ -1323,15 +1398,54 @@ def _inbox_resume_card(ws: Path, card: _InboxCard, *, force: bool, now: datetime
     return code
 
 
+def _recorded_gate_choice_repr(ws: Path, run_dir: Path, gate_name: str, *, now: datetime) -> str:
+    """Best-effort quoted choice for the already-answered note (never echo unverified)."""
+    try:
+        run_doc = load_run(run_dir)
+        params = {
+            k: _param_str(v) for k, v in (run_doc.get("params") or {}).items() if v is not None
+        }
+        p = build_plan(ws, run_doc["pipeline"], params, now=now)
+        gate = {g.name: g for g in _iter_gates(p.nodes)}.get(gate_name)
+        if gate is None:
+            return "recorded"
+        return repr(read_verified_choice(run_dir, gate))
+    except (OSError, ValueError, ConfigError, GateTampered, GateUnanswered, CairnError):
+        return "recorded"
+
+
 def _inbox_answer_and_resume(ws: Path, card: _InboxCard, choice: str, *, now: datetime) -> int:
-    """Answer a gate (or confirm a manual) then drive the shared resume path."""
-    if card.kind == "gate":
-        if choice not in card.options:
-            print(f"cairn: {choice!r} is not an option (options: {', '.join(card.options)})", file=sys.stderr)
-            return int(ExitCode.CONFIG)
-        answer_gate(card.run_dir, card.node, choice)
-        print(f"cairn: gate {card.node!r} answered {choice!r} (by external)")
-    # manual: human already produced; no answer_gate — validators own done on resume.
+    """Answer a gate (or confirm a manual) under the run lock, then shared resume.
+
+    C1: never clobber a signed decision; concurrent inbox/drain → skip this card.
+    Lock is held only for the answer phase (walk takes its own lock on resume).
+    """
+    try:
+        with run_lock(card.run_dir):
+            if card.kind == "gate":
+                if is_answered(card.run_dir, card.node):
+                    # Mirror _cmd_gate: never silent-overwrite. Resume on the recorded choice.
+                    recorded = _recorded_gate_choice_repr(ws, card.run_dir, card.node, now=now)
+                    print(
+                        f"cairn: inbox: gate {card.node!r} already answered ({recorded}) — resuming"
+                    )
+                else:
+                    if choice not in card.options:
+                        print(
+                            f"cairn: {choice!r} is not an option "
+                            f"(options: {', '.join(card.options)})",
+                            file=sys.stderr,
+                        )
+                        return int(ExitCode.CONFIG)
+                    answer_gate(card.run_dir, card.node, choice)
+                    print(f"cairn: gate {card.node!r} answered {choice!r} (by external)")
+            # manual: human already produced; no answer_gate — validators own done on resume.
+    except LockHeldError:
+        print(
+            f"cairn: inbox: run busy (a drain or another inbox is on it) — skipping {card.run_id}",
+            file=sys.stderr,
+        )
+        return int(ExitCode.OK)
     return _inbox_resume_card(ws, card, force=False, now=now)
 
 
@@ -1398,8 +1512,12 @@ def _cmd_inbox(args: argparse.Namespace) -> int:
         )
         return int(ExitCode.OK)
 
-    answerable, other = _enumerate_inbox(ws, runs_root, grace=grace, now=now)
+    # --list text does not render reads[] → skip pipeline parse; --json keeps reads.
     list_mode = bool(args.list or args.json or not sys.stdout.isatty())
+    load_reads = bool(args.json) or not list_mode
+    answerable, other = _enumerate_inbox(
+        ws, runs_root, grace=grace, now=now, load_reads=load_reads
+    )
 
     if list_mode:
         if args.json:
@@ -1463,44 +1581,58 @@ def _cmd_inbox(args: argparse.Namespace) -> int:
                 print(f"  {c.run_id}  {c.waiting_kind}  age={c.age}")
         return int(ExitCode.OK)
 
-    for card in answerable:
-        while True:
-            _render_card(card)
-            if card.kind == "manual":
-                raw = _prompt("ready? [Enter=resume / s=skip / o=open]: ")
-                if raw.lower() == "s" or raw.lower() == "skip":
+    try:
+        for card in answerable:
+            while True:
+                _render_card(card)
+                if card.kind == "manual":
+                    raw = _prompt("ready? [Enter=resume / s=skip / o=open]: ")
+                    low = raw.lower()
+                    if low in ("s", "skip"):
+                        print(f"cairn: inbox: skipped {card.run_id}")
+                        break
+                    if low in ("o", "open"):
+                        print(f"(manual instruction)\n{card.manual_text}")
+                        print(f"produces: {', '.join(card.produces) or '(none)'}")
+                        print(f"run dir: {card.run_dir}")
+                        continue
+                    # Enter or any other confirm → resume (human did the work).
+                    code = _inbox_answer_and_resume(ws, card, "", now=now)
+                    if code != int(ExitCode.OK):
+                        print(
+                            f"cairn: inbox: resume exited {code} → {card.run_dir}",
+                            file=sys.stderr,
+                        )
+                    break
+                # Gate card.
+                opt_hint = "/".join(card.options) if card.options else "?"
+                raw = _prompt(f"choice [{opt_hint}] (s=skip, o=open): ")
+                low = raw.lower()
+                if low in ("s", "skip"):
                     print(f"cairn: inbox: skipped {card.run_id}")
                     break
-                if raw.lower() == "o" or raw.lower() == "open":
-                    print(f"(manual instruction)\n{card.manual_text}")
-                    print(f"produces: {', '.join(card.produces) or '(none)'}")
-                    print(f"run dir: {card.run_dir}")
+                if low in ("o", "open"):
+                    if card.reads:
+                        for r in card.reads:
+                            print(f"  {r.get('name')}: {r.get('path') or '?'}")
+                    else:
+                        print("(no reads)")
                     continue
-                # Enter or any other confirm → resume (human did the work).
-                code = _inbox_answer_and_resume(ws, card, "", now=now)
+                # Already-answered gates resume without re-validating the typed choice
+                # (C1: clobber guard ignores B and keeps A). Fresh gates need a real option.
+                if not is_answered(card.run_dir, card.node) and card.options and raw not in card.options:
+                    print(f"{raw!r} is not one of {card.options} (or s/o)", file=sys.stderr)
+                    continue
+                code = _inbox_answer_and_resume(ws, card, raw, now=now)
                 if code != int(ExitCode.OK):
-                    print(f"cairn: inbox: resume exited {code} → {card.run_dir}", file=sys.stderr)
+                    print(
+                        f"cairn: inbox: resume exited {code} → {card.run_dir}",
+                        file=sys.stderr,
+                    )
                 break
-            # Gate card.
-            opt_hint = "/".join(card.options) if card.options else "?"
-            raw = _prompt(f"choice [{opt_hint}] (s=skip, o=open): ")
-            if raw.lower() in ("s", "skip"):
-                print(f"cairn: inbox: skipped {card.run_id}")
-                break
-            if raw.lower() in ("o", "open"):
-                if card.reads:
-                    for r in card.reads:
-                        print(f"  {r.get('name')}: {r.get('path') or '?'}")
-                else:
-                    print("(no reads)")
-                continue
-            if card.options and raw not in card.options:
-                print(f"{raw!r} is not one of {card.options} (or s/o)", file=sys.stderr)
-                continue
-            code = _inbox_answer_and_resume(ws, card, raw, now=now)
-            if code != int(ExitCode.OK):
-                print(f"cairn: inbox: resume exited {code} → {card.run_dir}", file=sys.stderr)
-            break
+    except _InboxAbort:
+        # Ctrl-C / EOF: clean exit 0 (same posture as trail --watch / --follow).
+        return int(ExitCode.OK)
     return int(ExitCode.OK)
 
 
