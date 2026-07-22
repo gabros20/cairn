@@ -13,7 +13,7 @@ from pathlib import Path
 import pytest
 
 from cairn.kernel.errors import CairnError, ConfigError
-from cairn.kernel.proc import RunResult
+from cairn.kernel.proc import RunResult, RunnerBase
 from cairn.kernel.triggerkit import (
     list_installed_triggers,
     remove_trigger,
@@ -63,17 +63,39 @@ _NON_UTF8_SERVICE_BYTES = b"ExecStart=\xff\xfe binary junk\n"
 _NON_UTF8_PATH_UNIT_BYTES = b"Unit=\xff\xfe binary junk\n"
 
 
-class FakeRunner:
+class _CannedHandle:
+    """Immediate ProcessHandle for test fakes — pid fixed, wait returns a canned RunResult."""
+
+    def __init__(self, result: RunResult, pid: int = 1):
+        self._result = result
+        self._pid = pid
+
+    @property
+    def pid(self) -> int:
+        return self._pid
+
+    def wait(self, timeout=None) -> RunResult:
+        return self._result
+
+    def poll(self) -> int | None:
+        return self._result.returncode
+
+    def terminate(self) -> None:
+        return None
+
+
+class FakeRunner(RunnerBase):
     """Records every argv/input/cwd; returns canned results keyed by the first two argv tokens."""
 
     def __init__(self, canned=None):
         self.calls: list[dict] = []
         self._canned = canned or {}
 
-    def run(self, argv, *, input=None, cwd=None) -> RunResult:
+    def spawn(self, argv, *, input=None, cwd=None) -> _CannedHandle:
         self.calls.append({"argv": list(argv), "input": input, "cwd": cwd})
         key = tuple(argv[:2])
-        return self._canned.get(key, RunResult(returncode=0, stdout="", stderr=""))
+        result = self._canned.get(key, RunResult(returncode=0, stdout="", stderr=""))
+        return _CannedHandle(result)
 
 
 def _workspace(tmp_path: Path, triggers_yaml: str, *, pipelines=("handle-reply",)) -> Path:
@@ -449,14 +471,14 @@ def test_run_trigger_drain_continues_past_a_failed_child(tmp_path):
     (watch_abs / "fail-me.json").write_text("x", encoding="utf-8")
     (watch_abs / "ok.json").write_text("y", encoding="utf-8")
 
-    class SelectiveRunner:
+    class SelectiveRunner(RunnerBase):
         def __init__(self):
             self.calls: list[dict] = []
 
-        def run(self, argv, *, input=None, cwd=None):
+        def spawn(self, argv, *, input=None, cwd=None):
             self.calls.append({"argv": list(argv), "cwd": cwd})
             ok = "fail-me" not in argv[-1]
-            return RunResult(returncode=0 if ok else 3)
+            return _CannedHandle(RunResult(returncode=0 if ok else 3))
 
     runner = SelectiveRunner()
     code = run_trigger("handle-reply", ws, runner=runner, cairn_bin="cairn", now=NOW)
@@ -594,8 +616,8 @@ def test_run_trigger_runner_hazard_after_claim_writes_a_stuck_claim_diagnostic_t
     watch_abs.mkdir(parents=True)
     (watch_abs / "bad.json").write_text("x", encoding="utf-8")
 
-    class FlakyRunner:
-        def run(self, argv, *, input=None, cwd=None):
+    class FlakyRunner(RunnerBase):
+        def spawn(self, argv, *, input=None, cwd=None):
             raise FileNotFoundError("cairn_bin not found on PATH (simulated)")
 
     err = io.StringIO()
@@ -624,15 +646,15 @@ def test_run_trigger_runner_hazard_after_claim_leaves_a_stuck_claim_but_continue
     (watch_abs / "bad.json").write_text("x", encoding="utf-8")
     (watch_abs / "good.json").write_text("y", encoding="utf-8")
 
-    class FlakyRunner:
+    class FlakyRunner(RunnerBase):
         def __init__(self):
             self.calls: list[dict] = []
 
-        def run(self, argv, *, input=None, cwd=None):
+        def spawn(self, argv, *, input=None, cwd=None):
             self.calls.append({"argv": list(argv), "cwd": cwd})
             if "bad.json" in argv[-1]:
                 raise FileNotFoundError("cairn_bin not found on PATH (simulated)")
-            return RunResult(returncode=0, stdout="", stderr="")
+            return _CannedHandle(RunResult(returncode=0, stdout="", stderr=""))
 
     runner = FlakyRunner()
     code = run_trigger("handle-reply", ws, runner=runner, cairn_bin="cairn", now=NOW)

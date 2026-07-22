@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from cairn.kernel.errors import ConfigError
+from cairn.kernel.proc import RunnerBase
 from cairn.kernel.schedkit import (
     InstalledEntry,
     RunResult,
@@ -30,17 +31,39 @@ def _sched(cron="0 3 * * 1", name="weekly", run=("run", "brease-rebrand", "--hea
     return Schedule(name=name, cron=cron, run=tuple(run))
 
 
-class FakeRunner:
+class _CannedHandle:
+    """Immediate ProcessHandle for test fakes — pid fixed, wait returns a canned RunResult."""
+
+    def __init__(self, result: RunResult, pid: int = 1):
+        self._result = result
+        self._pid = pid
+
+    @property
+    def pid(self) -> int:
+        return self._pid
+
+    def wait(self, timeout=None) -> RunResult:
+        return self._result
+
+    def poll(self) -> int | None:
+        return self._result.returncode
+
+    def terminate(self) -> None:
+        return None
+
+
+class FakeRunner(RunnerBase):
     """Records every argv/input/cwd; returns canned results keyed by the first two argv tokens."""
 
     def __init__(self, canned=None):
         self.calls: list[dict] = []
         self._canned = canned or {}
 
-    def run(self, argv, *, input=None, cwd=None) -> RunResult:
+    def spawn(self, argv, *, input=None, cwd=None) -> _CannedHandle:
         self.calls.append({"argv": list(argv), "input": input, "cwd": cwd})
         key = tuple(argv[:2])
-        return self._canned.get(key, RunResult(returncode=0, stdout="", stderr=""))
+        result = self._canned.get(key, RunResult(returncode=0, stdout="", stderr=""))
+        return _CannedHandle(result)
 
 
 # --- cron install/uninstall -------------------------------------------------
@@ -66,10 +89,10 @@ def test_uninstall_cron_strips_only_managed_block():
     installed_input = {}
 
     class R(FakeRunner):
-        def run(self, argv, *, input=None, cwd=None):
+        def spawn(self, argv, *, input=None, cwd=None):
             if argv == ["crontab", "-"]:
                 installed_input["text"] = input
-            return super().run(argv, input=input, cwd=cwd)
+            return super().spawn(argv, input=input, cwd=cwd)
 
     runner = R({("crontab", "-l"): RunResult(0, "")})
     install({"weekly": _sched()}, "cron", workspace_dir=WS, runner=runner)

@@ -1596,9 +1596,34 @@ def test_gc_apply_deletes_selected_run(hello_ws, monkeypatch, capsys):
 # --------------------------------------------------------------------------- #
 
 
+class _CannedHandle:
+    """Immediate ProcessHandle for test fakes — pid fixed, wait returns a canned RunResult."""
+
+    def __init__(self, result, pid: int = 1):
+        self._result = result
+        self._pid = pid
+
+    @property
+    def pid(self) -> int:
+        return self._pid
+
+    def wait(self, timeout=None):
+        return self._result
+
+    def poll(self):
+        return self._result.returncode
+
+    def terminate(self) -> None:
+        return None
+
+
 class _FakeRunner:
     """Records every host invocation and returns canned results — the schedkit effect seam,
-    substituted so no test touches the real crontab / launchctl / systemctl."""
+    substituted so no test touches the real crontab / launchctl / systemctl.
+
+    Implements spawn() (Runner primitive); run() is spawn().wait() so production call sites
+    that still invoke run() behave identically.
+    """
 
     def __init__(self, returncode: int = 0, crontab: str = "", stdout: str = "", stderr: str = ""):
         self.returncode = returncode
@@ -1607,13 +1632,18 @@ class _FakeRunner:
         self._stdout = stdout
         self._stderr = stderr
 
-    def run(self, argv, *, input=None, cwd=None):
+    def spawn(self, argv, *, input=None, cwd=None):
         from cairn.kernel.schedkit import RunResult
 
         self.calls.append({"argv": list(argv), "input": input, "cwd": cwd})
         if list(argv[:2]) == ["crontab", "-l"]:
-            return RunResult(0 if self._crontab else 1, self._crontab, "")
-        return RunResult(self.returncode, self._stdout, self._stderr)
+            result = RunResult(0 if self._crontab else 1, self._crontab, "")
+        else:
+            result = RunResult(self.returncode, self._stdout, self._stderr)
+        return _CannedHandle(result)
+
+    def run(self, argv, *, input=None, cwd=None):
+        return self.spawn(argv, input=input, cwd=cwd).wait()
 
 
 def _write_schedules(ws: Path) -> None:
@@ -1691,8 +1721,11 @@ def test_schedule_run_missing_cairn_binary_is_clean_config_error(hello_ws, monke
     _write_schedules(hello_ws)
 
     class MissingBinaryRunner:
-        def run(self, argv, *, input=None, cwd=None):
+        def spawn(self, argv, *, input=None, cwd=None):
             raise FileNotFoundError(2, "No such file or directory", argv[0])
+
+        def run(self, argv, *, input=None, cwd=None):
+            return self.spawn(argv, input=input, cwd=cwd).wait()
 
     _inject_runner(monkeypatch, MissingBinaryRunner())
     monkeypatch.chdir(hello_ws)
