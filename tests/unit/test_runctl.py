@@ -19,6 +19,7 @@ from cairn.kernel.runctl import (
     AlreadyDone,
     Minted,
     Refusal,
+    RefusalKind,
     Resumable,
     mint_new,
     preflight_tools,
@@ -68,6 +69,7 @@ def test_resume_existing_unreadable_run_json_is_config_refusal(hello_ws, tmp_pat
     )
     assert isinstance(result, Refusal)
     assert result.code == ExitCode.CONFIG
+    assert result.kind == RefusalKind.UNREADABLE_RUN
     assert "cannot read" in result.message and "run.json" in result.message
     assert "records no cairn version" not in result.message
 
@@ -80,13 +82,14 @@ def test_resume_existing_pipeline_drift_refuses_with_force_remedy(hello_ws):
     result = resume_existing(rd, ws=hello_ws, phash=ph, pipeline="hello", force=False)
     assert isinstance(result, Refusal)
     assert result.code == ExitCode.CONFIG
+    assert result.kind == RefusalKind.DRIFT
     assert "hash drift" in result.message
     assert result.remedy is not None
     assert f"cairn resume {rd} --force" in result.remedy
     assert result.remedy in result.message  # full stderr text embeds the remedy
 
 
-def test_resume_existing_pipeline_drift_force_warns_and_proceeds(hello_ws, capsys):
+def test_resume_existing_pipeline_drift_force_returns_advisory_no_print(hello_ws, capsys):
     rd = _minted_run(hello_ws)
     pfile = hello_ws / "pipelines" / "hello.yaml"
     pfile.write_text(pfile.read_text() + "\n# drift\n", encoding="utf-8")
@@ -94,8 +97,9 @@ def test_resume_existing_pipeline_drift_force_warns_and_proceeds(hello_ws, capsy
     result = resume_existing(rd, ws=hello_ws, phash=ph, pipeline="hello", force=True)
     assert isinstance(result, Resumable)
     assert result.run_dir == rd
-    err = capsys.readouterr().err
-    assert "warning" in err and "pipeline-hash drift" in err and "--force" in err
+    assert len(result.advisories) == 1
+    assert "pipeline-hash drift" in result.advisories[0] and "--force" in result.advisories[0]
+    assert capsys.readouterr().err == ""  # library never writes stderr
 
 
 def test_resume_existing_cross_major_version_refuses(hello_ws):
@@ -105,19 +109,20 @@ def test_resume_existing_cross_major_version_refuses(hello_ws):
     result = resume_existing(rd, ws=hello_ws, phash=ph, pipeline="hello", force=False)
     assert isinstance(result, Refusal)
     assert result.code == ExitCode.CONFIG
+    assert result.kind == RefusalKind.VERSION
     assert "9.0.0" in result.message and cairn.__version__ in result.message
     assert result.remedy is not None
     assert f"cairn resume {rd} --force" in result.remedy
 
 
-def test_resume_existing_cross_major_force_proceeds(hello_ws, capsys):
+def test_resume_existing_cross_major_force_returns_advisory_no_print(hello_ws, capsys):
     rd = _minted_run(hello_ws)
     update_run(rd, lambda doc: doc.update({"cairn_version": "9.0.0"}))
     ph = _phash(hello_ws, "hello")
     result = resume_existing(rd, ws=hello_ws, phash=ph, pipeline="hello", force=True)
     assert isinstance(result, Resumable)
-    err = capsys.readouterr().err
-    assert "--force" in err and "version drift" in err
+    assert any("--force" in a and "version drift" in a for a in result.advisories)
+    assert capsys.readouterr().err == ""  # library never writes stderr
 
 
 def test_resume_existing_clean_path_returns_resumable(hello_ws, capsys):
@@ -127,6 +132,7 @@ def test_resume_existing_clean_path_returns_resumable(hello_ws, capsys):
     assert isinstance(result, Resumable)
     assert result.run_dir == rd
     assert result.run_doc["pipeline"] == "hello"
+    assert result.advisories == ()
     assert capsys.readouterr().err == ""  # silent when versions/hashes match
 
 
@@ -157,6 +163,7 @@ def test_mint_new_preflight_refusal_mints_nothing(hello_ws):
     )
     assert isinstance(result, Refusal)
     assert result.code == ExitCode.CONFIG
+    assert result.kind == RefusalKind.TOOLS
     assert "needsit" in result.message and "greet" in result.message
     assert "brew install needsit" in result.message
     assert "cairn doctor" in result.message
@@ -234,6 +241,7 @@ def test_resolve_run_run_dir_existing_drift_refuses(hello_ws):
         run_dir=rd,
     )
     assert isinstance(result, Refusal)
+    assert result.kind == RefusalKind.DRIFT
     assert "hash drift" in result.message
     assert f"cairn resume {rd.resolve()} --force" in (result.remedy or "")
 

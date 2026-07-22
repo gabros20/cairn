@@ -2,18 +2,18 @@
 
 Extracts the entrance logic that lived in ``cli.py`` (guard sequence, tool preflight,
 mint-vs-resume resolution) so CLI, the future queue drain, and ``cairn inbox`` can all
-call the same paths as functions. Typed refusals replace printed exit codes at the
-core; advisory warnings (force-override, version drift, reproducibility) still write
-to stderr in the exact wording the CLI printed before — behavior is byte-identical
+call the same paths as functions. Typed refusals and advisories replace printed exit
+codes and stderr side effects at the core — the CLI owns presentation (prints
+``Refusal.message`` / ``advisories``). Behavior is byte-identical at the CLI boundary
 (D7). No factory features; no second copy of the guards (D10).
 """
 
 from __future__ import annotations
 
 import shutil
-import sys
 from dataclasses import dataclass
 from datetime import datetime
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -34,11 +34,25 @@ from cairn.kernel.walk import bootstrap_run
 # --------------------------------------------------------------------------- #
 
 
+class RefusalKind(str, Enum):
+    """Why an entrance refused — discriminant for inbox cards / drain routing.
+
+    All four kinds map to ``ExitCode.CONFIG`` today; ``kind`` is what callers
+    switch on (not message substring matching).
+    """
+
+    TOOLS = "tools"
+    DRIFT = "drift"
+    VERSION = "version"
+    UNREADABLE_RUN = "unreadable_run"
+
+
 @dataclass(frozen=True)
 class Refusal:
     """A hard stop: the entrance will not mint or resume.
 
     ``message`` is the full stderr text (verbatim, including any remedy sentence).
+    ``kind`` discriminates the four refusal paths for library consumers.
     ``remedy`` is the structured escape-hatch fragment when one exists (e.g. the
     ``cairn resume <dir> --force`` guidance), else None — for library consumers;
     the CLI prints ``message`` alone so output stays byte-identical.
@@ -46,6 +60,7 @@ class Refusal:
 
     code: ExitCode
     message: str
+    kind: RefusalKind
     remedy: str | None = None
 
 
@@ -54,14 +69,21 @@ class Minted:
     """A fresh run dir was created (``bootstrap_run`` succeeded after preflight)."""
 
     run_dir: Path
+    advisories: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class Resumable:
-    """An existing run dir passed the resume guards (drift → version → repro)."""
+    """An existing run dir passed the resume guards (drift → version → repro).
+
+    ``advisories`` are stderr warning lines (force-override, version drift,
+    reproducibility) collected in print order — the CLI prints each; runctl
+    never writes to stderr.
+    """
 
     run_dir: Path
     run_doc: dict[str, Any]
+    advisories: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -97,6 +119,7 @@ def preflight_tools(p: Plan) -> Refusal | None:
     return Refusal(
         code=ExitCode.CONFIG,
         message="\n".join(lines),
+        kind=RefusalKind.TOOLS,
         remedy="run `cairn doctor` to verify tooling, then re-run.",
     )
 
@@ -113,10 +136,13 @@ def _pipeline_drift_guard(
     run_dir: Path,
     *,
     force: bool,
-) -> Refusal | None:
-    """Pipeline-hash drift: refuse unless ``force``; warn on override."""
+) -> Refusal | tuple[str, ...]:
+    """Pipeline-hash drift: refuse unless ``force``; advisory on override.
+
+    Returns a :class:`Refusal`, or a (possibly empty) tuple of advisory lines.
+    """
     if not recorded or recorded in ("sha256:unknown", current_hash):
-        return None
+        return ()
     if not force:
         remedy = (
             f"Run `cairn resume {run_dir} --force` to resume against the current file."
@@ -127,38 +153,33 @@ def _pipeline_drift_guard(
                 f"cairn: pipeline {pipeline!r} has changed since this run was planned "
                 f"(hash drift). {remedy}"
             ),
+            kind=RefusalKind.DRIFT,
             remedy=remedy,
         )
-    print(
+    return (
         f"cairn: warning — resuming across pipeline-hash drift (--force) for {pipeline!r}",
-        file=sys.stderr,
     )
-    return None
 
 
 def _version_compat_guard(
     recorded: str | None, run_dir: Path, *, force: bool
-) -> Refusal | None:
+) -> Refusal | tuple[str, ...]:
     """Cross-version resume gate (docs/DISTRIBUTION.md §3). Cross-major refuses
-    without ``--force``; cross-minor / unrecorded warn and proceed."""
+    without ``--force``; cross-minor / unrecorded yield an advisory and proceed."""
     installed = installed_version()
     verdict = version_compat(recorded, installed)
     if verdict == "ok":
-        return None
+        return ()
     if verdict == "warn":
         if recorded:
-            print(
+            return (
                 f"cairn: warning — resuming a run created by cairn {recorded} on cairn "
                 f"{installed} (version drift)",
-                file=sys.stderr,
             )
-        else:
-            print(
-                f"cairn: warning — this run dir records no cairn version; resuming on cairn "
-                f"{installed}",
-                file=sys.stderr,
-            )
-        return None
+        return (
+            f"cairn: warning — this run dir records no cairn version; resuming on cairn "
+            f"{installed}",
+        )
     # verdict == "refuse" — cross-major.
     if not force:
         remedy = (
@@ -170,14 +191,13 @@ def _version_compat_guard(
                 f"cairn: this run was created by cairn {recorded} but cairn {installed} is "
                 f"installed (major-version drift). {remedy}"
             ),
+            kind=RefusalKind.VERSION,
             remedy=remedy,
         )
-    print(
+    return (
         f"cairn: warning — resuming across cairn-version drift (--force): "
         f"run {recorded} vs installed {installed}",
-        file=sys.stderr,
     )
-    return None
 
 
 def workspace_git_rev(ws: Path) -> dict[str, Any] | None:
@@ -201,13 +221,14 @@ def workspace_git_rev(ws: Path) -> dict[str, Any] | None:
     return {"rev": head.stdout.strip(), "dirty": dirty}
 
 
-def _reproducibility_drift_guard(recorded: dict, ws: Path) -> None:
-    """Warn — never refuse — when an executor version or workspace git rev drifted.
+def _reproducibility_drift_guard(recorded: dict, ws: Path) -> tuple[str, ...]:
+    """Collect advisories when an executor version or workspace git rev drifted.
 
     Probe failures are silent (the tool hard-stop / doctor own "can this run");
     this only speaks when a probe succeeds with a disagreeing value. Only
     ``git_rev`` is compared — ``git_dirty`` alone is never warned on.
     """
+    advisories: list[str] = []
     recorded_versions = (recorded.get("executors") or {}).get("versions") or {}
     for name, old in sorted(recorded_versions.items()):
         if not old or shutil.which(name) is None:
@@ -217,21 +238,20 @@ def _reproducibility_drift_guard(recorded: dict, ws: Path) -> None:
         except (OSError, CairnError):
             continue
         if code == 0 and current and current != old:
-            print(
+            advisories.append(
                 f"cairn: warning — executor {name!r} reports {current!r} at resume, "
-                f"recorded {old!r} at mint (version drift)",
-                file=sys.stderr,
+                f"recorded {old!r} at mint (version drift)"
             )
 
     recorded_git = recorded.get("git_rev")
     if recorded_git:
         current = workspace_git_rev(ws)
         if current is not None and current["rev"] != recorded_git:
-            print(
+            advisories.append(
                 f"cairn: warning — workspace is at git {current['rev']} at resume, "
-                f"recorded {recorded_git} at mint (workspace drift)",
-                file=sys.stderr,
+                f"recorded {recorded_git} at mint (workspace drift)"
             )
+    return tuple(advisories)
 
 
 def resume_existing(
@@ -246,7 +266,8 @@ def resume_existing(
 
     Order and wording match the former ``cli._resume_guards`` / ``cairn resume``
     gate sequence exactly. Does not preflight tools (caller has the Plan) and
-    does not re-pin on ``force`` (CLI owns the repin side effect).
+    does not re-pin on ``force`` (CLI owns the repin side effect). Never writes
+    to stderr — advisories ride on :class:`Resumable`.
     """
     run_dir = Path(run_dir)
     try:
@@ -255,17 +276,21 @@ def resume_existing(
         return Refusal(
             code=ExitCode.CONFIG,
             message=f"cairn: cannot read {run_dir}/run.json: {exc}",
+            kind=RefusalKind.UNREADABLE_RUN,
         )
-    refused = _pipeline_drift_guard(
+    advisories: list[str] = []
+    drift = _pipeline_drift_guard(
         recorded.get("pipeline_hash"), phash, pipeline, run_dir, force=force
     )
-    if refused is not None:
-        return refused
-    refused = _version_compat_guard(recorded.get("cairn_version"), run_dir, force=force)
-    if refused is not None:
-        return refused
-    _reproducibility_drift_guard(recorded, ws)
-    return Resumable(run_dir=run_dir, run_doc=recorded)
+    if isinstance(drift, Refusal):
+        return drift
+    advisories.extend(drift)
+    version = _version_compat_guard(recorded.get("cairn_version"), run_dir, force=force)
+    if isinstance(version, Refusal):
+        return version
+    advisories.extend(version)
+    advisories.extend(_reproducibility_drift_guard(recorded, ws))
+    return Resumable(run_dir=run_dir, run_doc=recorded, advisories=tuple(advisories))
 
 
 # --------------------------------------------------------------------------- #
@@ -320,10 +345,10 @@ def resolve_run(
 ) -> Minted | Resumable | AlreadyDone | Refusal:
     """The ``cairn run`` entrance decision tree: --run-dir / --idempotent / fresh.
 
-    Returns a typed result; never prints success lines (AlreadyDone is silent
-    here — the CLI prints ``already done →``). Refuse paths carry full messages.
-    Resume paths always force=False (``cairn run`` has no --force); preflight
-    runs after guards and before returning Resumable, matching the old order.
+    Returns a typed result; never prints (AlreadyDone is silent here — the CLI
+    prints ``already done →``). Refuse paths carry full messages. Resume paths
+    always force=False (``cairn run`` has no --force); preflight runs after
+    guards and before returning Resumable, matching the old order.
     """
     if run_dir is not None:
         run_dir = Path(run_dir).resolve()

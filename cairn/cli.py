@@ -60,6 +60,7 @@ from cairn.kernel.runctl import (
     AlreadyDone,
     Minted,
     Refusal,
+    Resumable,
     preflight_tools,
     resolve_run,
     resume_existing,
@@ -458,6 +459,12 @@ def _print_refusal(r: Refusal) -> int:
     return int(r.code)
 
 
+def _print_advisories(lines: tuple[str, ...]) -> None:
+    """Adapter: print runctl advisories to stderr in collected order (CLI owns presentation)."""
+    for line in lines:
+        print(line, file=sys.stderr)
+
+
 def _cmd_run(args: argparse.Namespace) -> int:
     ws = _workspace(args)
     now = _now()
@@ -498,10 +505,13 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     run_dir = outcome.run_dir
     if isinstance(outcome, Minted):
+        _print_advisories(outcome.advisories)
         # Record the actual executor routing so `cairn resume` reconstructs the same fleet
         # (mixed --executor / --step-executor) instead of silently falling back to defaults.
         global_default = (None if stub_mode else args.executor) or config.workspace.default_executor or ""
         _record_executor_routing(run_dir, now, global_default, _kv(args.step_executor), p.resolved_models, ws)
+    elif isinstance(outcome, Resumable):
+        _print_advisories(outcome.advisories)
 
     interactive = (not args.headless) and sys.stdin.isatty()
     try:
@@ -616,6 +626,9 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     )
     if isinstance(outcome, Refusal):
         return _print_refusal(outcome)
+    # Advisories (force-override / version / repro) print here — same position as the
+    # former in-guard stderr writes, before --force re-pin.
+    _print_advisories(outcome.advisories)
     run_doc = outcome.run_doc
     if args.force:
         _repin_manifest(run_dir, run_doc, phash)

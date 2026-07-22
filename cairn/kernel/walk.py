@@ -1189,7 +1189,7 @@ class _Walk:
         # signal is functionally write-only, though: `_print_walk_result` only prints
         # "run complete" on OK, and `trail --watch` never renders event data — so the
         # operator-visible half is a stderr line in the codebase's established warning
-        # voice (cli.py's `_reproducibility_drift_guard`, "cairn: warning — ..."), the one
+        # voice (runctl's reproducibility advisories, "cairn: warning — ..."), the one
         # channel that reaches both an interactive terminal and a headless scheduler's
         # captured logs. The trail's `cursor_warning` field stays too, for programmatic
         # `cairn trail` consumers — this adds the human-facing half, it doesn't replace it.
