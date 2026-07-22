@@ -782,6 +782,15 @@ def _parse_gate(raw: dict, ctx: _Ctx, when_runtime: Expr | None) -> GateNode:
     opts_raw = raw.get("options", {}) or {}
     if not isinstance(opts_raw, dict) or not opts_raw:
         _err(f"gate {name!r} needs a non-empty 'options' mapping", ctx.file)
+    # Option keys must be non-empty: "" is reserved as the internal "no default authored"
+    # sentinel (W1b / gatekit falsy path). An empty option key would make default: "" and
+    # an omitted default indistinguishable — reject at plan time (T7 r1 I1).
+    if "" in opts_raw:
+        _err(
+            f"gate {name!r}: option keys must be non-empty strings "
+            f"(the empty key collides with the no-default sentinel)",
+            ctx.file,
+        )
     # default: is optional (W1b). Present → must be one of options. Absent → "" so gatekit's
     # falsy-default path raises GateNeedsHuman (exit 6) under headless.
     default = raw.get("default")

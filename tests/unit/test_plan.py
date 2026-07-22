@@ -1429,9 +1429,23 @@ def test_gate_bad_default_still_errors(tmp_path):
         _plan_p(tmp_path, steps)
 
 
+def test_gate_empty_string_option_key_errors(tmp_path):
+    """T7 r1 I1: empty option key is illegal — \"\" is the no-default sentinel only."""
+    # Multiline so the empty key is unambiguous YAML (flow map '' key).
+    steps = (
+        "  - gate: g\n"
+        "    options:\n"
+        "      '': 'empty key'\n"
+        "      a: 'A'\n"
+    )
+    with pytest.raises(ConfigError, match=r"gate 'g'.*option keys must be non-empty"):
+        _plan_p(tmp_path, steps)
+
+
 def test_defaultless_gate_schedule_referenced_teaching_lint(tmp_path):
     """Defaultless gate + schedules.yaml naming this pipeline → warning naming the gate."""
-    steps = "  - { gate: approve, options: { yes: 'Y', no: 'N' }, ask: 'ok?' }\n"
+    # Quote yes/no — bare keys are YAML-1.1 booleans (EXAMPLE-BREASE-REBUILD.md).
+    steps = '  - { gate: approve, options: { "yes": \'Y\', "no": \'N\' }, ask: \'ok?\' }\n'
     ws = _write_ws(
         tmp_path,
         _HEADER + steps,
@@ -1453,14 +1467,14 @@ def test_defaultless_gate_schedule_referenced_teaching_lint(tmp_path):
 
 def test_defaultless_gate_no_schedule_no_teaching_lint(tmp_path):
     """Defaultless gate with no schedules.yaml → no schedule-park warning."""
-    steps = "  - { gate: approve, options: { yes: 'Y', no: 'N' } }\n"
+    steps = '  - { gate: approve, options: { "yes": \'Y\', "no": \'N\' } }\n'
     p = _plan_p(tmp_path, steps)
     assert not any("schedules.yaml" in w.message for w in p.warnings)
 
 
 def test_gate_with_default_on_schedule_no_teaching_lint(tmp_path):
     """A gate that HAS a default is fine on a scheduled pipeline — no park warning."""
-    steps = "  - { gate: approve, options: { yes: 'Y', no: 'N' }, default: no }\n"
+    steps = '  - { gate: approve, options: { "yes": \'Y\', "no": \'N\' }, default: "no" }\n'
     ws = _write_ws(
         tmp_path,
         _HEADER + steps,
@@ -1473,4 +1487,7 @@ def test_gate_with_default_on_schedule_no_teaching_lint(tmp_path):
         },
     )
     p = plan(ws, "p", {}, now=NOW)
+    g = _node(p, "approve")
+    assert isinstance(g, GateNode) and g.default == "no"
+    assert g.options == (("yes", "Y"), ("no", "N"))
     assert not any("no default" in w.message for w in p.warnings)
