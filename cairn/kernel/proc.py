@@ -11,6 +11,15 @@ implemented over it (``spawn(...).wait()``). One protocol, one seam — never tw
 APIs side by side (FACTORY-PLAN D10). The drain's crash-safety path (FACTORY-PLAN
 T5) needs the pid *before* exit; that is why spawn is the primitive.
 
+**Pipe-drain contract.** Production ``spawn`` PIPEs both stdout and stderr.
+Streams are drained **only** by :meth:`ProcessHandle.wait` (via ``communicate``).
+:meth:`ProcessHandle.poll` is a liveness probe and does **not** drain pipes. A
+caller that polls without a pending ``wait()`` will deadlock once the child
+fills the OS pipe buffer (~16–64 KiB). Safe patterns: (1) call ``wait()``
+promptly after recording the pid; (2) the factory drain pattern — a pool thread
+blocks in ``wait()`` while other code reads pid/liveness via ``pid``/``poll``;
+(3) bound the child's output so it cannot fill the pipe before ``wait()``.
+
 Two consumers, two idiomatic injection shapes over the SAME implementation:
 
 - schedkit injects a :class:`Runner` object — it needs ``input=`` (piping crontab text to
@@ -51,6 +60,12 @@ class ProcessHandle(Protocol):
     observable BEFORE exit so a host-woken drain can record it in the lease
     before the child terminates. ``wait`` captures streams; ``poll`` is
     non-blocking; ``terminate`` is the cooperative kill path.
+
+    **Reaping ownership.** Whoever holds the handle owns reaping: eventually
+    call :meth:`wait` (preferred — also drains streams) or :meth:`poll` until a
+    non-``None`` exit code. An unreaped handle leaks a zombie until this process
+    exits; on crash/exit, orphans reparent to init, which reaps them. Do not rely
+    on handle finalizers — explicit reaping is the contract.
     """
 
     @property
@@ -61,13 +76,21 @@ class ProcessHandle(Protocol):
     def wait(self, timeout: float | None = None) -> RunResult:
         """Block until exit (optional timeout); return code + captured streams.
 
-        Never raises on a non-zero child exit — the code IS the signal. May raise
-        on timeout or OS-level spawn failure already surfaced at spawn time.
+        The **only** method that drains the child's stdout/stderr pipes. Never
+        raises on a non-zero child exit — the code IS the signal. May raise on
+        timeout or OS-level spawn failure already surfaced at spawn time.
+        A second call returns the cached result and ignores ``timeout``.
         """
         ...
 
     def poll(self) -> int | None:
-        """Return the exit code if the child has exited, else ``None``."""
+        """Liveness probe: exit code if the child has exited, else ``None``.
+
+        Does **not** drain stdout/stderr. Safe only for pid/liveness checks while
+        a concurrent :meth:`wait` is already draining, or when child output is
+        known-bounded. A poll-only loop against a verbose child deadlocks once
+        the OS pipe buffer fills — see the module pipe-drain contract.
+        """
         ...
 
     def terminate(self) -> None:
@@ -89,7 +112,15 @@ class Runner(Protocol):
     def spawn(
         self, argv: list[str], *, input: str | None = None, cwd: Path | None = None
     ) -> ProcessHandle:
-        """Start a child; return a handle whose pid is already observable."""
+        """Start a child; return a handle whose pid is already observable.
+
+        Production implementations PIPE both stdout and stderr. Streams are
+        drained **only** by :meth:`ProcessHandle.wait` — not by
+        :meth:`ProcessHandle.poll`. After spawn, either call ``wait()`` promptly
+        (or inherit it via :meth:`run`), or use the factory drain pattern: a pool
+        thread blocks in ``wait()`` while other code reads pid/liveness. A
+        poll-without-wait loop deadlocks once the child fills the pipe buffer.
+        """
         ...
 
     def run(
@@ -118,7 +149,15 @@ class RunnerBase:
 
 
 class _PopenHandle:
-    """ProcessHandle over ``subprocess.Popen`` — pid immediate; wait captures streams."""
+    """ProcessHandle over ``subprocess.Popen`` — pid immediate; wait captures streams.
+
+    stdout and stderr are PIPEd at spawn. :meth:`wait` is the sole drain path
+    (``Popen.communicate``); :meth:`poll` only checks exit status and never reads
+    the pipes. Callers that poll without a concurrent/pending ``wait()`` will
+    deadlock if the child writes more than the OS pipe buffer holds — see the
+    module pipe-drain contract (factory drain: pool thread waits, other code
+    reads pid/liveness).
+    """
 
     def __init__(self, proc: subprocess.Popen[str], input_text: str | None) -> None:
         self._proc = proc
@@ -141,6 +180,7 @@ class _PopenHandle:
         return self._result
 
     def poll(self) -> int | None:
+        # Liveness only — does not drain pipes (see class docstring).
         if self._result is not None:
             return self._result.returncode
         return self._proc.poll()
@@ -168,6 +208,7 @@ class SubprocessRunner(RunnerBase):
     def spawn(
         self, argv: list[str], *, input: str | None = None, cwd: Path | None = None
     ) -> ProcessHandle:
+        # Both streams PIPEd — only wait() drains them (see module pipe-drain contract).
         proc = subprocess.Popen(
             [str(a) for a in argv],
             stdin=subprocess.PIPE if input is not None else None,

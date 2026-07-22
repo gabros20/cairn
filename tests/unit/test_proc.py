@@ -120,3 +120,35 @@ def test_run_with_cwd(tmp_path):
     )
     assert result.returncode == 0
     assert result.stdout.strip() == str(tmp_path)
+
+
+def test_wait_drains_large_stdout_without_hang():
+    """Regression: wait() must drain PIPEd stdout past the OS pipe buffer.
+
+    A poll-only loop would deadlock once the child fills ~16–64 KiB; wait()
+    (communicate) is the sole drain path. Bound with wait(timeout=...) so a
+    regression fails fast instead of hanging the suite.
+    """
+    # 256 KiB of pure payload (no newlines) — well above typical pipe buffers.
+    nbytes = 256 * 1024
+    runner = SubprocessRunner()
+    handle = runner.spawn(
+        _py(
+            f"import sys; sys.stdout.write('x' * {nbytes}); sys.stdout.flush()",
+        )
+    )
+    result = handle.wait(timeout=10.0)
+    assert result.returncode == 0
+    assert len(result.stdout) == nbytes
+    assert result.stdout == "x" * nbytes
+    assert result.stderr == ""
+
+
+def test_spawn_missing_binary_raises_file_not_found_synchronously():
+    """Real exec failure: Popen raises FileNotFoundError before a handle exists.
+
+    Matches the historical blocking path — no fake, no handle constructed.
+    """
+    runner = SubprocessRunner()
+    with pytest.raises(FileNotFoundError):
+        runner.spawn(["/nonexistent-xyz"])
