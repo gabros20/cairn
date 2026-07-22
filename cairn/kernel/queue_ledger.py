@@ -165,11 +165,12 @@ def _links_same_source(candidate: Path, dest: Path) -> bool:
 def _place(claim_path: Path, dest_dir: Path, name: str, *, fs: Any = None) -> Path:
     """Move ``claim_path`` into ``dest_dir`` under ``name`` (symlink-safe, never overwrite).
 
-    Collision gets a ``-v2``, ``-v3``, ... suffix before the extension (the
-    ``bootstrap_run`` convention — see ``walk.py``'s ``-v2`` collision handling).
-    Mechanical ops: :func:`durable_link` + :func:`durable_unlink` via :func:`_hardlink`
-    (durafs order: dest parent fsynced before source disappears). ``FileExistsError`` on
-    a taken target name is caller policy for the collision loop.
+    Genuine name collisions (a *different* file already at ``dest``) get a ``-v2``,
+    ``-v3``, ... suffix (the ``bootstrap_run`` convention). A concurrent racer that
+    already linked the *same* source inode into ``dest`` is a lost race, not a
+    collision: return the existing ``dest`` and tolerate a source unlink that the
+    winner already performed (same discipline as :func:`claim` / ``_links_same_source``).
+    Mechanical ops: :func:`durable_link` + :func:`durable_unlink` via :func:`_hardlink`.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     stem, ext = Path(name).stem, Path(name).suffix
@@ -180,11 +181,21 @@ def _place(claim_path: Path, dest_dir: Path, name: str, *, fs: Any = None) -> Pa
         try:
             _hardlink(claim_path, dest, fs=fs)
         except FileExistsError:
+            if _links_same_source(claim_path, dest):
+                # Lost race: winner already placed this inode under dest_name.
+                try:
+                    durable_unlink(claim_path, fs=fs)
+                except FileNotFoundError:
+                    pass
+                return dest
             suffix += 1
             dest_name = f"{stem}-v{suffix}{ext}"
             continue
         break
-    durable_unlink(claim_path, fs=fs)
+    try:
+        durable_unlink(claim_path, fs=fs)
+    except FileNotFoundError:
+        pass  # concurrent winner unlinked first
     return dest
 
 
@@ -212,7 +223,13 @@ def write_pointer(
     child_pid: int | None = None,
     fs: Any = None,
 ) -> None:
-    """Durably write one JSON-line pointer record (D8 outcome class when known)."""
+    """Durably write one JSON-line pointer record (D8 outcome class when known).
+
+    ``child_pid`` is historical-by-construction: recorded at spawn time for W3 lease
+    prep. By the time a pointer lives in ``.waiting/`` the child has already exited
+    (park happens after ``wait()``); this field is not a liveness signal — leases own
+    liveness in W3.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     rec = {
@@ -247,18 +264,6 @@ def _tombstone(watch_abs: Path, name: str, *, fs: Any = None) -> Path:
     if not dest.exists():
         atomic_write_text(dest, "", fs=fs)
     return dest
-
-
-def _move_pointer(src: Path, dest: Path, *, fs: Any = None) -> None:
-    """Pointer-first move: durable_move of the pointer file (T5)."""
-    dest = Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists():
-        # Unlikely name collision on pointer; -v2 not used for pointers — overwrite is
-        # wrong; durable_move raises FileExistsError. Drop dest only if identical content
-        # race: prefer leaving src and letting repair complete later.
-        durable_unlink(dest, fs=fs)
-    durable_move(src, dest, fs=fs)
 
 
 def _resolve_pointer_fields(
@@ -299,6 +304,11 @@ def _relocate_pointer(
     Order for crash recovery (T5): dest pointer is durable before the item moves.
     Writing dest first (not move-then-rewrite) means a crash leaves a complete dest
     pointer even when the item is still in the source lane — :func:`sweep` repairs.
+
+    Concurrent racers: ``write_pointer`` is idempotent (atomic replace); a source
+    unlink that loses the race (winner already unlinked) is benign
+    (``FileNotFoundError`` swallowed). Same-content dest already present is fine —
+    we rewrite then drop source.
     """
     write_pointer(
         dest_ptr,
@@ -309,7 +319,10 @@ def _relocate_pointer(
         fs=fs,
     )
     if src_ptr.is_file() and src_ptr.resolve() != dest_ptr.resolve():
-        durable_unlink(src_ptr, fs=fs)
+        try:
+            durable_unlink(src_ptr, fs=fs)
+        except FileNotFoundError:
+            pass  # concurrent winner already dropped the source pointer
 
 
 def retire(
@@ -388,14 +401,23 @@ def retire(
             fs=fs,
         )
     if on_done == "delete":
-        durable_unlink(claim_path, fs=fs)
+        try:
+            durable_unlink(claim_path, fs=fs)
+        except FileNotFoundError:
+            pass
         if src_ptr.is_file():
-            durable_unlink(src_ptr, fs=fs)
+            try:
+                durable_unlink(src_ptr, fs=fs)
+            except FileNotFoundError:
+                pass
         _tombstone(watch_abs, name, fs=fs)
         return None
     placed = _place(claim_path, watch_abs / ".done", name, fs=fs)
     if src_ptr.is_file():
-        durable_unlink(src_ptr, fs=fs)
+        try:
+            durable_unlink(src_ptr, fs=fs)
+        except FileNotFoundError:
+            pass
     _tombstone(watch_abs, name, fs=fs)
     return placed
 
@@ -500,6 +522,33 @@ def _last_trail_terminal(run_dir: Path) -> tuple[str, int | None]:
     return kind, exit_code
 
 
+def _quarantine_corrupt_pointer(
+    watch_abs: Path, pointer: Path, name: str, *, reason: str, fs: Any = None
+) -> str:
+    """Move an unparseable pointer to ``.failed/.runs/<name>.corrupt``; return diagnostic."""
+    failed_runs = pointer_dir(Path(watch_abs) / ".failed")
+    failed_runs.mkdir(parents=True, exist_ok=True)
+    dest = failed_runs / f"{name}.corrupt"
+    # Collision on quarantine name: suffix so we never destroy prior evidence.
+    if dest.exists():
+        n = 2
+        while (failed_runs / f"{name}.corrupt-v{n}").exists():
+            n += 1
+        dest = failed_runs / f"{name}.corrupt-v{n}"
+    try:
+        durable_move(pointer, dest, fs=fs)
+    except FileNotFoundError:
+        return f"corrupt pointer {name} vanished before quarantine ({reason})"
+    except FileExistsError:
+        # Racer quarantined first — drop our copy if still present.
+        try:
+            durable_unlink(pointer, fs=fs)
+        except FileNotFoundError:
+            pass
+        return f"corrupt pointer {name} already quarantined by concurrent repair ({reason})"
+    return f"quarantined corrupt pointer {name} → {dest} ({reason})"
+
+
 def _repair_pointer_item_pair(
     watch_abs: Path,
     *,
@@ -511,6 +560,11 @@ def _repair_pointer_item_pair(
     """Complete an interrupted pointer-first move (T5).
 
     Returns ``(repaired_item_path_or_None, diagnostic_or_None)``.
+
+    Lost-race discipline: concurrent repairs of the same interrupted move treat
+    ``FileExistsError`` / ``FileNotFoundError`` on the completing move as benign when
+    the destination already holds the item. Corrupt pointer content is quarantined
+    (not silently deleted); only a well-formed orphan with no validated run is removed.
     """
     watch_abs = Path(watch_abs)
     items = _ledger_item_locations(watch_abs, name)
@@ -518,7 +572,17 @@ def _repair_pointer_item_pair(
     expected_item = ptr_lane / name
 
     if expected_item.is_file():
-        return None, None  # consistent
+        # Consistent — or a racer already finished the item move; drop a leftover source
+        # if it is the same inode still lingering in another lane.
+        for extra in items:
+            if extra == expected_item:
+                continue
+            if _links_same_source(extra, expected_item):
+                try:
+                    durable_unlink(extra, fs=fs)
+                except FileNotFoundError:
+                    pass
+        return None, None
 
     if items:
         # Pointer moved; item still elsewhere — complete the move into pointer's lane.
@@ -527,18 +591,48 @@ def _repair_pointer_item_pair(
             dest_dir = ptr_lane
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest = dest_dir / name
-            if not dest.exists():
+            try:
+                if dest.exists():
+                    if _links_same_source(src_item, dest):
+                        try:
+                            durable_unlink(src_item, fs=fs)
+                        except FileNotFoundError:
+                            pass
+                    return dest, None
                 durable_move(src_item, dest, fs=fs)
+            except FileExistsError:
+                # Concurrent repair won the dest slot.
+                if dest.exists() and (
+                    not src_item.exists() or _links_same_source(src_item, dest)
+                ):
+                    try:
+                        durable_unlink(src_item, fs=fs)
+                    except FileNotFoundError:
+                        pass
+                    return dest, None
+                raise
+            except FileNotFoundError:
+                # Source vanished mid-move — winner finished, or item already gone.
+                if dest.exists():
+                    return dest, None
+                return None, (
+                    f"repair of {name}: source item vanished and dest missing — skipped"
+                )
             return dest, None
         return None, None
 
-    # Pointer without item anywhere: keep pointer only if run.json is schema-validated
-    # (T4: "validated run.json" — load_run, not a bare existence check).
+    # Pointer without item anywhere. Corrupt content ≠ orphan: quarantine evidence.
     try:
         rec = read_pointer(pointer)
-        run_dir = Path(rec["run_dir"]) if rec.get("run_dir") else None
-    except (OSError, ValueError, json.JSONDecodeError, KeyError):
-        run_dir = None
+    except (ValueError, json.JSONDecodeError) as exc:
+        diag = _quarantine_corrupt_pointer(
+            watch_abs, pointer, name, reason=str(exc), fs=fs
+        )
+        return None, diag
+    except OSError as exc:
+        return None, f"pointer {name} unreadable ({exc}) — left in place"
+
+    run_dir = Path(rec["run_dir"]) if rec.get("run_dir") else None
     if run_dir is not None:
         try:
             load_run(run_dir)
@@ -549,8 +643,11 @@ def _repair_pointer_item_pair(
                 f"pointer {pointer.name} has no item in any ledger lane but a validated "
                 f"run.json exists at {run_dir} — left for operator/audit"
             )
-    # No item, no validated run — drop orphan pointer.
-    durable_unlink(pointer, fs=fs)
+    # Well-formed orphan: no item, no validated run — drop pointer.
+    try:
+        durable_unlink(pointer, fs=fs)
+    except FileNotFoundError:
+        pass  # concurrent repair already cleaned it
     return None, f"deleted orphan pointer {pointer.name} (no item, no validated run.json)"
 
 
@@ -562,9 +659,13 @@ def sweep(watch_abs: Path, *, on_done: str, fs: Any = None) -> SweepReport:
     waiting-class halt → leave. Vanished run dir → FAILED + diagnostic naming gc.
 
     Pointer repair (T5): pointer-without-item completes an interrupted move when the
-    item is found in another lane; only deletes a pointer when no item exists anywhere
-    and no validated ``run.json`` remains. Item-without-pointer is left as stuck
-    evidence (not guessed).
+    item is found in another lane; corrupt pointers are quarantined; only a well-formed
+    orphan with no validated ``run.json`` is deleted. Item-without-pointer is left as
+    stuck evidence (not guessed).
+
+    Per-item isolation: one item's hazard is recorded in ``diagnostics`` and the sweep
+    continues (same posture as ``run_trigger``'s per-candidate loop). An uncaught
+    exception escaping this function is a bug.
     """
     watch_abs = Path(watch_abs)
     waiting = watch_abs / ".waiting"
@@ -579,96 +680,108 @@ def sweep(watch_abs: Path, *, on_done: str, fs: Any = None) -> SweepReport:
         if not runs.is_dir():
             continue
         for ptr in sorted(p for p in runs.iterdir() if p.is_file()):
-            item_path = (watch_abs / lane / ptr.name)
+            # Skip quarantine artifacts left by prior corrupt-pointer repairs.
+            if ptr.name.endswith(".corrupt") or ".corrupt-v" in ptr.name:
+                continue
+            item_path = watch_abs / lane / ptr.name
             if item_path.is_file():
                 continue
-            result, diag = _repair_pointer_item_pair(
-                watch_abs, name=ptr.name, pointer=ptr, on_done=on_done, fs=fs
-            )
-            if result is not None:
-                repaired.append(result)
-            if diag:
-                diagnostics.append(diag)
+            try:
+                result, diag = _repair_pointer_item_pair(
+                    watch_abs, name=ptr.name, pointer=ptr, on_done=on_done, fs=fs
+                )
+                if result is not None:
+                    repaired.append(result)
+                if diag:
+                    diagnostics.append(diag)
+            except Exception as exc:  # noqa: BLE001 — per-item isolation
+                diagnostics.append(f"repair of {ptr.name} hazarded: {exc}")
 
-    # Item-without-pointer in .waiting → leave as stuck evidence (do not guess).
+    # Advance / leave each .waiting/ item (isolated).
     if waiting.is_dir():
         for item in sorted(p for p in waiting.iterdir() if p.is_file()):
-            ptr = pointer_path(waiting, item.name)
-            if not ptr.is_file():
-                left.append(item)
-                diagnostics.append(
-                    f"waiting item {item.name} has no pointer — left in place (stuck; do not guess)"
-                )
-                continue
-
             try:
-                rec = read_pointer(ptr)
-            except (OSError, ValueError, json.JSONDecodeError) as exc:
-                left.append(item)
-                diagnostics.append(f"waiting item {item.name}: unreadable pointer ({exc})")
-                continue
-
-            run_dir_s = rec.get("run_dir") or ""
-            run_dir = Path(run_dir_s) if run_dir_s else None
-            if run_dir is None or not run_dir.is_dir():
-                # Vanished run dir → failed + diagnostic naming gc.
-                dest = retire(
-                    watch_abs,
-                    item,
-                    outcome=RunOutcome(outcome=OutcomeClass.FAILED),
-                    on_done=on_done,
-                    exit_code=rec.get("exit_code"),
-                    child_pid=rec.get("child_pid"),
-                    run_dir=run_dir_s,
-                    fs=fs,
-                )
-                if dest is not None:
-                    moved.append(dest)
-                diagnostics.append(
-                    f"waiting item {item.name}: run dir vanished ({run_dir_s or 'unset'}) "
-                    f"— retired to .failed/ (possible gc)"
-                )
-                continue
-
-            kind, halt_code = _last_trail_terminal(run_dir)
-            if kind == "done":
-                dest = retire(
-                    watch_abs,
-                    item,
-                    outcome=RunOutcome(outcome=OutcomeClass.DONE),
-                    on_done=on_done,
-                    exit_code=0,
-                    child_pid=rec.get("child_pid"),
-                    run_dir=run_dir,
-                    fs=fs,
-                )
-                if dest is not None:
-                    moved.append(dest)
-                elif on_done == "delete":
-                    moved.append(item)  # logical move (deleted)
-                continue
-            if kind == "halt" and halt_code is not None:
-                outcome = classify_exit(halt_code)
-                if outcome.outcome is OutcomeClass.WAITING:
+                ptr = pointer_path(waiting, item.name)
+                if not ptr.is_file():
                     left.append(item)
+                    diagnostics.append(
+                        f"waiting item {item.name} has no pointer — left in place "
+                        f"(stuck; do not guess)"
+                    )
                     continue
-                dest = retire(
-                    watch_abs,
-                    item,
-                    outcome=outcome,
-                    on_done=on_done,
-                    exit_code=halt_code,
-                    child_pid=rec.get("child_pid"),
-                    run_dir=run_dir,
-                    fs=fs,
-                )
-                if dest is not None:
-                    moved.append(dest)
-                elif outcome.outcome is OutcomeClass.DONE and on_done == "delete":
-                    moved.append(item)
-                continue
-            # No terminal trail event yet — leave.
-            left.append(item)
+
+                try:
+                    rec = read_pointer(ptr)
+                except (OSError, ValueError, json.JSONDecodeError) as exc:
+                    left.append(item)
+                    diagnostics.append(
+                        f"waiting item {item.name}: unreadable pointer ({exc})"
+                    )
+                    continue
+
+                run_dir_s = rec.get("run_dir") or ""
+                run_dir = Path(run_dir_s) if run_dir_s else None
+                if run_dir is None or not run_dir.is_dir():
+                    dest = retire(
+                        watch_abs,
+                        item,
+                        outcome=RunOutcome(outcome=OutcomeClass.FAILED),
+                        on_done=on_done,
+                        exit_code=rec.get("exit_code"),
+                        child_pid=rec.get("child_pid"),
+                        run_dir=run_dir_s,
+                        fs=fs,
+                    )
+                    if dest is not None:
+                        moved.append(dest)
+                    diagnostics.append(
+                        f"waiting item {item.name}: run dir vanished "
+                        f"({run_dir_s or 'unset'}) — retired to .failed/ (possible gc)"
+                    )
+                    continue
+
+                kind, halt_code = _last_trail_terminal(run_dir)
+                if kind == "done":
+                    dest = retire(
+                        watch_abs,
+                        item,
+                        outcome=RunOutcome(outcome=OutcomeClass.DONE),
+                        on_done=on_done,
+                        exit_code=0,
+                        child_pid=rec.get("child_pid"),
+                        run_dir=run_dir,
+                        fs=fs,
+                    )
+                    if dest is not None:
+                        moved.append(dest)
+                    elif on_done == "delete":
+                        moved.append(item)
+                    continue
+                if kind == "halt" and halt_code is not None:
+                    outcome = classify_exit(halt_code)
+                    if outcome.outcome is OutcomeClass.WAITING:
+                        left.append(item)
+                        continue
+                    dest = retire(
+                        watch_abs,
+                        item,
+                        outcome=outcome,
+                        on_done=on_done,
+                        exit_code=halt_code,
+                        child_pid=rec.get("child_pid"),
+                        run_dir=run_dir,
+                        fs=fs,
+                    )
+                    if dest is not None:
+                        moved.append(dest)
+                    elif outcome.outcome is OutcomeClass.DONE and on_done == "delete":
+                        moved.append(item)
+                    continue
+                left.append(item)
+            except Exception as exc:  # noqa: BLE001 — per-item isolation
+                diagnostics.append(f"waiting item {item.name} hazarded: {exc}")
+                if item.is_file():
+                    left.append(item)
 
     return SweepReport(
         moved=tuple(moved),

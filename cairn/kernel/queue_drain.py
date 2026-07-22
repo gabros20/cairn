@@ -32,6 +32,7 @@ from cairn.kernel.queue_ledger import (
     write_pointer,
 )
 from cairn.kernel.runctl import Minted, Refusal, mint_new
+from cairn.kernel.runstate import RunExistsError
 from cairn.kernel.trigger_host import Trigger, load_triggers, watch_dir
 from cairn.kernel.types import Finding, OutcomeClass, classify_exit
 
@@ -48,6 +49,12 @@ def run_dir_for_item(
     collision-suffixed claim ``one-v2.json`` becomes stem ``one-v2``). Identity/rev
     grammar (``p<prio>-<source>-<id>-r<rev>``) lands with W3 admission; until then
     the stem of the ledger filename is the stable key.
+
+    Re-dropping an identical filename while a prior run dir still exists raises
+    :class:`~cairn.kernel.runstate.RunExistsError` at mint (``create_run`` never
+    auto-suffixes an explicit ``run_dir``). The drain treats that as a guard-class
+    refusal: unclaim the item back to the inbox with a diagnostic — not a stuck
+    claim. W3 identity/rev dedupe will admit-skip same-name re-entry cleanly.
     """
     stem = Path(item_name).stem
     return Path(runs_root) / f"{trigger_name}-{stem}"
@@ -224,6 +231,25 @@ def run_trigger(
                 print(
                     f"cairn: trigger {name!r}: candidate {candidate.name!r} mint refused "
                     f"(config) — left in place: {exc}",
+                    file=diag,
+                )
+                continue
+            except RunExistsError as exc:
+                # Same-filename re-drop while a prior run dir still exists (I1 / W1a).
+                # Guard-class: unclaim back to inbox — not an outcome, not a stuck claim.
+                item_name = claimed.name
+                unclaim(watch_abs, claimed)
+                try:
+                    runs_root = _runs_root(workspace_dir)
+                except Exception:  # noqa: BLE001 — diagnostic only; default runs/
+                    runs_root = Path(workspace_dir) / "runs"
+                existing = run_dir_for_item(runs_root, trigger.name, item_name)
+                print(
+                    f"cairn: trigger {name!r}: candidate {candidate.name!r} mint refused "
+                    f"(run-dir-exists) — left in place: run dir already exists for this "
+                    f"item name ({existing}) — earlier run of the same event; W3 dedupe "
+                    f"will admit-skip; re-drop under a new name or remove the run dir "
+                    f"({exc})",
                     file=diag,
                 )
                 continue
