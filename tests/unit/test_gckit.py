@@ -308,3 +308,181 @@ def test_apply_refuses_a_candidate_outside_the_runs_root(tmp_path):
     assert result.deleted == []
     assert any("outside" in reason for _, reason in result.errors)
     assert (outside / "escapee-20260601").exists()  # not touched
+
+
+# --------------------------------------------------------------------------- #
+# W1d — waiting-class outcome protection + reciprocal queue pins
+# --------------------------------------------------------------------------- #
+
+
+def _make_halted_run(
+    runs_root,
+    run_id,
+    *,
+    exit_code: int,
+    age_days=30.0,
+    pipeline="brease-rebuild",
+    status="halted",
+    artifacts=True,
+):
+    """Run whose trail ends in run-halt with the given exit_code (derived=halted)."""
+    run_dir = runs_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    created = NOW - timedelta(days=age_days)
+    run_dir.joinpath("run.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "pipeline": pipeline,
+                "created_at": _iso(created),
+                "status": status,
+            }
+        )
+    )
+    w = TrailWriter(run_dir, run_id)
+    w.emit("run-start")
+    w.emit("run-halt", data={"exit_code": exit_code, "reason": "park"})
+    w.close()
+    if artifacts:
+        (run_dir / "logs").mkdir(exist_ok=True)
+        (run_dir / "logs" / "capture.log").write_text("x" * 1000)
+        (run_dir / "artifacts").mkdir(exist_ok=True)
+        (run_dir / "artifacts" / "site-map.json").write_text("{}")
+    return run_dir
+
+
+def test_waiting_halt_exit_6_survives_keep_days_0(tmp_path):
+    """Headless park (exit 6) derives as halted — still gc-protected by WAITING outcome."""
+    _make_halted_run(tmp_path, "park-nh-20260601", exit_code=6, age_days=30)
+
+    plan = plan_gc(tmp_path, keep_days=0, now=NOW)
+
+    assert plan.candidates == []
+    assert any(
+        rid == "park-nh-20260601" and "waiting (needs_human)" in reason
+        for rid, reason in plan.skipped
+    )
+
+
+def test_capacity_and_blocked_survive_include_needs_human(tmp_path):
+    """Exit 8/9 parks are not force-collectable via include_needs_human (unlike gate)."""
+    _make_halted_run(tmp_path, "park-cap-20260601", exit_code=8, age_days=30)
+    _make_halted_run(tmp_path, "park-blk-20260601", exit_code=9, age_days=30)
+
+    plan = plan_gc(tmp_path, keep_days=0, now=NOW, include_needs_human=True)
+
+    assert plan.candidates == []
+    reasons = {rid: reason for rid, reason in plan.skipped}
+    assert "waiting (capacity)" in reasons["park-cap-20260601"]
+    assert "waiting (blocked)" in reasons["park-blk-20260601"]
+
+
+def test_plain_gate_still_respects_include_needs_human(tmp_path):
+    """Back-compat: derived gate + include_needs_human still selects for collection."""
+    _make_run(tmp_path, "gate-20260601", status="done", age_days=30, last_event="gate-pending")
+
+    protected = plan_gc(tmp_path, keep_days=0, now=NOW)
+    assert "gate-20260601" not in [c.run_id for c in protected.candidates]
+    assert any("needs-human" in r for _, r in protected.skipped)
+
+    included = plan_gc(tmp_path, keep_days=0, now=NOW, include_needs_human=True)
+    assert "gate-20260601" in [c.run_id for c in included.candidates]
+
+
+def test_done_run_not_protected_by_waiting_rule(tmp_path):
+    """DONE (run-done / halt exit 0) is collectable — protection is waiting-class only."""
+    _make_run(tmp_path, "done-20260601", age_days=30, last_event="run-done")
+    # halt with exit 0 is DONE class, not WAITING
+    _make_halted_run(tmp_path, "halt0-20260601", exit_code=0, age_days=30)
+
+    plan = plan_gc(tmp_path, keep_days=0, now=NOW)
+
+    ids = [c.run_id for c in plan.candidates]
+    assert "done-20260601" in ids
+    assert "halt0-20260601" in ids
+
+
+def test_failed_halt_not_protected_by_waiting_rule(tmp_path):
+    """Executor failure (exit 4) is FAILED class — collectable."""
+    _make_halted_run(tmp_path, "fail-20260601", exit_code=4, age_days=30)
+
+    plan = plan_gc(tmp_path, keep_days=0, now=NOW)
+    assert "fail-20260601" in [c.run_id for c in plan.candidates]
+
+
+def test_queue_pin_protects_full_delete_and_artifacts_only(tmp_path):
+    from cairn.kernel.gckit import QUEUE_PIN_NAME, write_queue_pin
+
+    run_dir = _make_run(tmp_path, "pinned-20260601", age_days=30)
+    write_queue_pin(
+        run_dir,
+        trigger="on-webhook",
+        item="p1-src-id-r1.json",
+        pinned_at="2026-06-01T00:00:00.000Z",
+    )
+    assert (run_dir / QUEUE_PIN_NAME).is_file()
+
+    full = plan_gc(tmp_path, keep_days=0, now=NOW)
+    assert full.candidates == []
+    assert any(
+        rid == "pinned-20260601" and "queue-pinned (on-webhook)" in reason
+        for rid, reason in full.skipped
+    )
+
+    slim = plan_gc(tmp_path, keep_days=0, artifacts_only=True, now=NOW)
+    assert slim.candidates == []
+    assert any("queue-pinned" in reason for _, reason in slim.skipped)
+
+
+def test_apply_refuses_artifacts_only_on_pinned_run(tmp_path):
+    """Even a hand-forged plan cannot slim a pin-bearing run (evidence is the pin)."""
+    from cairn.kernel.gckit import GcCandidate, write_queue_pin
+
+    run_dir = _make_run(tmp_path, "pinned-20260601", age_days=30)
+    write_queue_pin(
+        run_dir,
+        trigger="t",
+        item="i.json",
+        pinned_at="2026-06-01T00:00:00.000Z",
+    )
+    plan = GcPlan(
+        runs_root=tmp_path,
+        candidates=[
+            GcCandidate(
+                run_id="pinned-20260601",
+                run_dir=run_dir,
+                pipeline="p",
+                status="done",
+                created_at=None,
+                age_days=None,
+                reason="keep-days",
+                artifacts_only=True,
+            )
+        ],
+        skipped=[],
+        artifacts_only=True,
+        keep_days=0,
+        keep_last=None,
+    )
+    result = apply_gc(plan)
+    assert result.deleted == []
+    assert any("queue-pinned" in reason for _, reason in result.errors)
+    assert (run_dir / "logs").exists()  # not slimmed
+
+
+def test_stale_pin_still_protects(tmp_path):
+    """Crash between terminal ledger placement and pin clear → over-protects (safe)."""
+    from cairn.kernel.gckit import write_queue_pin
+
+    # DONE trail but pin left behind (retire crashed before clear).
+    run_dir = _make_run(tmp_path, "stale-pin-20260601", age_days=30, last_event="run-done")
+    write_queue_pin(
+        run_dir,
+        trigger="t",
+        item="left.json",
+        pinned_at="2026-06-01T00:00:00.000Z",
+    )
+
+    plan = plan_gc(tmp_path, keep_days=0, now=NOW)
+    assert plan.candidates == []
+    assert any("queue-pinned" in reason for _, reason in plan.skipped)

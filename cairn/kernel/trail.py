@@ -228,6 +228,33 @@ def read_trail(run_dir: Path, since: int | None = None) -> Iterator[dict]:
             yield ev
 
 
+def last_trail_terminal(run_dir: Path) -> tuple[str, int | None]:
+    """Scan the trail for the last terminal event.
+
+    Returns ``('done', None)`` when the last terminal is ``run-done``,
+    ``('halt', exit_code)`` when it is ``run-halt`` (exit_code may be None if
+    missing/unparseable), or ``('none', None)`` when no terminal event exists.
+    Intermediate events do not reset an earlier terminal — the last matching
+    terminal wins (same contract the queue sweep uses to route by exit code).
+    """
+    kind = "none"
+    exit_code: int | None = None
+    for ev in read_trail(run_dir):
+        event = ev.get("event")
+        if event == "run-done":
+            kind = "done"
+            exit_code = None
+        elif event == "run-halt":
+            kind = "halt"
+            data = ev.get("data") or {}
+            raw = data.get("exit_code")
+            try:
+                exit_code = int(raw) if raw is not None else None
+            except (TypeError, ValueError):
+                exit_code = None
+    return kind, exit_code
+
+
 def follow(
     run_dir: Path,
     since: int | None = None,

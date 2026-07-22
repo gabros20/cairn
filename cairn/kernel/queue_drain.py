@@ -19,6 +19,7 @@ from typing import TextIO
 
 from cairn.kernel.config import load_config
 from cairn.kernel.errors import CairnError, ConfigError
+from cairn.kernel.gckit import write_queue_pin
 from cairn.kernel.plan import plan as build_plan
 from cairn.kernel.proc import Runner
 from cairn.kernel.queue_ledger import (
@@ -33,6 +34,7 @@ from cairn.kernel.queue_ledger import (
 )
 from cairn.kernel.runctl import Minted, Refusal, mint_new
 from cairn.kernel.runstate import RunExistsError
+from cairn.kernel.trail import format_at
 from cairn.kernel.trigger_host import Trigger, load_triggers, watch_dir
 from cairn.kernel.types import Finding, OutcomeClass, classify_exit
 
@@ -95,7 +97,7 @@ def preallocate_run(
         now=now,
         headless=True,
     )
-    return mint_new(
+    minted = mint_new(
         workspace_dir,
         p,
         now=now,
@@ -103,6 +105,16 @@ def preallocate_run(
         runs_root=runs_root,
         run_dir=run_dir,
     )
+    # Reciprocal gc pin (W1d): local sentinel so routine gc cannot delete a run the
+    # queue still owns — even when the gc process cannot see this workspace's ledgers.
+    if isinstance(minted, Minted):
+        write_queue_pin(
+            minted.run_dir,
+            trigger=trigger.name,
+            item=claimed_path.name,
+            pinned_at=format_at(now),
+        )
+    return minted
 
 
 def _run_one(

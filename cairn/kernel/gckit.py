@@ -12,6 +12,13 @@ Safety first:
   * A run that is live is never selected — `run.json.status == "running"`, a held advisory
     flock, or a trail whose derived status is `running`/`gate` all protect it. A `gate`
     (needs-human) run is protected unless `include_needs_human=True`.
+  * A run whose last terminal trail event is a waiting-class `run-halt` (exit 6/8/9) is
+    protected by outcome class (FACTORY-PLAN W1d / D8) — even when derived status is
+    merely `halted`. Capacity(8)/blocked(9) parks ignore `include_needs_human`; a plain
+    `gate` derived status keeps the include override for back-compat.
+  * A run carrying an unreleased queue pin (`.queue-pin.json`) is protected for both full
+    delete and `--artifacts-only` slim — local pin only, no ledger read (multi-factory
+    shared runs root safety).
   * A run with a missing/corrupt run.json or an unparseable `created_at` is treated as junk /
     unevaluable and skipped (never selected), so bad data can never cause a deletion.
   * `--artifacts-only` slims a run instead of deleting it: it drops heavyweight artifact/log
@@ -29,9 +36,12 @@ import shutil
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 
+from cairn.kernel.durafs import atomic_write_text, durable_unlink
 from cairn.kernel.runstate import LOCK_NAME, RUN_JSON
-from cairn.kernel.trail import TRAIL_NAME, derive_status
+from cairn.kernel.trail import TRAIL_NAME, derive_status, last_trail_terminal
+from cairn.kernel.types import OutcomeClass, classify_exit
 
 # The audit skeleton that survives an `--artifacts-only` slim — everything else in the run
 # dir is heavyweight payload and may be dropped.
@@ -40,6 +50,10 @@ SURVIVES_ARTIFACTS_ONLY: frozenset[str] = frozenset({RUN_JSON, TRAIL_NAME, LOCK_
 # Derived-status values that mean the run is alive / awaiting a human and must be protected.
 _LIVE = {"running"}
 _NEEDS_HUMAN = {"gate"}
+
+# Reciprocal queue pin (FACTORY-PLAN W1d / T3): local sentinel written at mint, cleared at
+# terminal retire. gc reads this file only — never the owning workspace's ledgers.
+QUEUE_PIN_NAME = ".queue-pin.json"
 
 
 @dataclass(frozen=True)
@@ -86,6 +100,66 @@ class _RunInfo:
     created_dt: datetime | None
     status_runjson: str | None
     derived: str
+    halt_exit_code: int | None  # last terminal run-halt exit_code, else None
+    waiting_kind: str | None    # needs_human|capacity|blocked when halt is WAITING
+
+
+# --------------------------------------------------------------------------- #
+# Queue pin — write at mint, clear at terminal retire, respect in gc (W1d)
+# --------------------------------------------------------------------------- #
+
+
+def write_queue_pin(
+    run_dir: Path,
+    *,
+    trigger: str,
+    item: str,
+    pinned_at: str,
+    fs: Any = None,
+) -> None:
+    """Durably write ``.queue-pin.json`` into ``run_dir`` (mint-side of the pin lifecycle)."""
+    run_dir = Path(run_dir)
+    payload = {
+        "trigger": trigger,
+        "item": item,
+        "pinned_at": pinned_at,
+    }
+    atomic_write_text(
+        run_dir / QUEUE_PIN_NAME,
+        json.dumps(payload, ensure_ascii=False) + "\n",
+        fs=fs,
+    )
+
+
+def clear_queue_pin(run_dir: Path, *, fs: Any = None) -> None:
+    """Durably remove the queue pin after terminal ledger placement (T3 ordering).
+
+    Missing pin is tolerated (idempotent) — a crash after clear, or a run never
+    minted via the queue, must not fail retire.
+    """
+    path = Path(run_dir) / QUEUE_PIN_NAME
+    try:
+        durable_unlink(path, fs=fs)
+    except FileNotFoundError:
+        pass
+
+
+def read_queue_pin(run_dir: Path) -> dict | None:
+    """Return the pin payload if present and parseable; else None."""
+    path = Path(run_dir) / QUEUE_PIN_NAME
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        # Absent, unreadable, or corrupt: treat as unpinned for selection of
+        # *other* runs, but a present unparseable pin file still blocks (see
+        # _pin_present) so we never delete a dir that looks pin-marked.
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _pin_present(run_dir: Path) -> bool:
+    """True when a pin sentinel file exists (even if JSON is corrupt — fail closed)."""
+    return (Path(run_dir) / QUEUE_PIN_NAME).is_file()
 
 
 def _parse_dt(value: str) -> datetime | None:
@@ -100,6 +174,21 @@ def _parse_dt(value: str) -> datetime | None:
     return dt
 
 
+def _waiting_kind_from_trail(run_dir: Path) -> tuple[int | None, str | None]:
+    """Return (halt_exit_code, waiting_kind) from the last terminal trail event.
+
+    waiting_kind is set only when the last terminal is run-halt with a WAITING-class
+    exit code (6/8/9 via classify_exit). Done / failed / none → (code_or_None, None).
+    """
+    kind, exit_code = last_trail_terminal(run_dir)
+    if kind != "halt" or exit_code is None:
+        return (exit_code if kind == "halt" else None, None)
+    outcome = classify_exit(exit_code)
+    if outcome.outcome is OutcomeClass.WAITING:
+        return (exit_code, outcome.waiting_kind)
+    return (exit_code, None)
+
+
 def _load_info(run_dir: Path) -> _RunInfo | None:
     """Gather what gc needs about a run dir; None if it isn't a legible run."""
     try:
@@ -110,6 +199,7 @@ def _load_info(run_dir: Path) -> _RunInfo | None:
         return None
     created_at = doc.get("created_at")
     pipeline = doc.get("pipeline")
+    halt_exit_code, waiting_kind = _waiting_kind_from_trail(run_dir)
     return _RunInfo(
         run_id=doc.get("run_id") or run_dir.name,
         run_dir=run_dir,
@@ -118,6 +208,8 @@ def _load_info(run_dir: Path) -> _RunInfo | None:
         created_dt=_parse_dt(created_at) if isinstance(created_at, str) else None,
         status_runjson=doc.get("status") if isinstance(doc.get("status"), str) else None,
         derived=derive_status(run_dir).status,
+        halt_exit_code=halt_exit_code,
+        waiting_kind=waiting_kind,
     )
 
 
@@ -197,7 +289,30 @@ def plan_gc(
 
     candidates: list[GcCandidate] = []
     for info in infos:
-        # --- liveness / safety protection (never delete an active or waiting run) --------
+        # --- safety protection (never delete a pin / waiting park / active run) ----------
+        # Queue pin first: local file only — factory B's gc on a shared runs root cannot
+        # delete factory A's still-claimed run without reading A's ledgers.
+        if _pin_present(info.run_dir):
+            pin = read_queue_pin(info.run_dir) or {}
+            trigger = pin.get("trigger") if isinstance(pin.get("trigger"), str) else "?"
+            skipped.append((info.run_id, f"protected: queue-pinned ({trigger})"))
+            continue
+
+        # Waiting-class park by outcome (W1d): last terminal run-halt with exit 6/8/9.
+        # Rule: capacity/blocked always protected (not force-collectable via include);
+        # needs_human (exit 6) respects include_needs_human like a plain gate.
+        if info.waiting_kind is not None:
+            if info.waiting_kind in ("capacity", "blocked"):
+                skipped.append(
+                    (info.run_id, f"protected: waiting ({info.waiting_kind})")
+                )
+                continue
+            if info.waiting_kind == "needs_human" and not include_needs_human:
+                skipped.append(
+                    (info.run_id, f"protected: waiting ({info.waiting_kind})")
+                )
+                continue
+
         # A gate is a distinct state (awaiting a human), classified before liveness so a
         # gate-pending run reads as needs-human even while its run.json still says running.
         if info.derived in _NEEDS_HUMAN:
@@ -296,6 +411,8 @@ def apply_gc(plan: GcPlan) -> GcResult:
 
     Each candidate is re-checked for its advisory lock at apply time (a run may have been
     resumed since planning); a now-locked run is skipped as an error, never force-deleted.
+    A pin that appeared (or was still present) at apply time refuses both full delete and
+    artifacts-only slim — the artifacts ARE the judgment evidence.
     The lock is not held across the deletion itself, so a walker starting in the window
     between the re-check and the rmtree is an inherent (accepted) race — gc is an explicit
     operator action on runs already judged dead, not a concurrent-safe primitive.
@@ -322,6 +439,13 @@ def apply_gc(plan: GcPlan) -> GcResult:
             continue
         if not _lock_free(run_dir):
             errors.append((cand.run_id, "skipped: run became locked since planning"))
+            continue
+        if _pin_present(run_dir):
+            pin = read_queue_pin(run_dir) or {}
+            trigger = pin.get("trigger") if isinstance(pin.get("trigger"), str) else "?"
+            errors.append(
+                (cand.run_id, f"skipped: run is queue-pinned ({trigger})")
+            )
             continue
 
         try:

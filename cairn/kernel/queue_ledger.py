@@ -21,8 +21,9 @@ from typing import Any
 
 from cairn.kernel.durafs import atomic_write_text, durable_link, durable_move, durable_unlink
 from cairn.kernel.errors import CairnError, ConfigError
+from cairn.kernel.gckit import clear_queue_pin
 from cairn.kernel.runstate import load_run
-from cairn.kernel.trail import read_trail
+from cairn.kernel.trail import last_trail_terminal
 from cairn.kernel.types import OutcomeClass, RunOutcome, classify_exit
 
 
@@ -359,6 +360,7 @@ def retire(
     outcome_s = outcome.outcome.value
 
     if outcome.outcome is OutcomeClass.WAITING:
+        # Waiting parks retain the reciprocal gc pin (judgment still pending).
         dest_lane = watch_abs / ".waiting"
         dest_lane.mkdir(parents=True, exist_ok=True)
         _relocate_pointer(
@@ -386,6 +388,9 @@ def retire(
         )
         placed = _place(claim_path, dest_lane, name, fs=fs)
         _tombstone(watch_abs, name, fs=fs)
+        # T3 pin-release: terminal ledger placement FIRST, then clear pin.
+        if run_dir_s:
+            clear_queue_pin(Path(run_dir_s), fs=fs)
         return placed
 
     # DONE — terminal: item to .done/ (or delete), drop live pointer, always tombstone.
@@ -411,6 +416,8 @@ def retire(
             except FileNotFoundError:
                 pass
         _tombstone(watch_abs, name, fs=fs)
+        if run_dir_s:
+            clear_queue_pin(Path(run_dir_s), fs=fs)
         return None
     placed = _place(claim_path, watch_abs / ".done", name, fs=fs)
     if src_ptr.is_file():
@@ -419,6 +426,9 @@ def retire(
         except FileNotFoundError:
             pass
     _tombstone(watch_abs, name, fs=fs)
+    # T3 pin-release: terminal ledger placement FIRST, then clear pin.
+    if run_dir_s:
+        clear_queue_pin(Path(run_dir_s), fs=fs)
     return placed
 
 
@@ -500,26 +510,6 @@ def _all_pointers(watch_abs: Path, name: str) -> list[Path]:
         if p.is_file():
             found.append(p)
     return found
-
-
-def _last_trail_terminal(run_dir: Path) -> tuple[str, int | None]:
-    """Return ``('done', None)``, ``('halt', exit_code)``, or ``('none', None)``."""
-    kind = "none"
-    exit_code: int | None = None
-    for ev in read_trail(run_dir):
-        event = ev.get("event")
-        if event == "run-done":
-            kind = "done"
-            exit_code = None
-        elif event == "run-halt":
-            kind = "halt"
-            data = ev.get("data") or {}
-            raw = data.get("exit_code")
-            try:
-                exit_code = int(raw) if raw is not None else None
-            except (TypeError, ValueError):
-                exit_code = None
-    return kind, exit_code
 
 
 def _quarantine_corrupt_pointer(
@@ -740,7 +730,7 @@ def sweep(watch_abs: Path, *, on_done: str, fs: Any = None) -> SweepReport:
                     )
                     continue
 
-                kind, halt_code = _last_trail_terminal(run_dir)
+                kind, halt_code = last_trail_terminal(run_dir)
                 if kind == "done":
                     dest = retire(
                         watch_abs,
