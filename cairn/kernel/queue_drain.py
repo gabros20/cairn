@@ -145,6 +145,8 @@ def _run_one(
         str(run_dir),
         "--param",
         f"{trigger.param}={claimed_path}",
+        "--origin",
+        f"trigger:{trigger.name}",
     ]
     handle = runner.spawn(argv, cwd=workspace_dir)
     pid = handle.pid

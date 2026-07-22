@@ -1,9 +1,10 @@
 """cairn CLI — the argparse frame plus the thin wiring that turns the kernel into a tool.
 
 Every subcommand parses its flags, wires kernel objects together, and prints; the logic
-stays in the kernel. Verbs (docs/API.md §9): plan/run/resume/gate/validate/trail/ps/doctor/
-test/compose/new plus the fleet verbs batch/learnings/gc/schedule/trigger are all live —
-each is a thin binding over its kernel module (batchkit/learnkit/gckit/schedkit/triggerkit).
+stays in the kernel. Verbs (docs/API.md §9): plan/run/resume/gate/validate/trail/ps/inbox/
+doctor/test/compose/new plus the fleet verbs batch/learnings/gc/schedule/trigger are all
+live — each is a thin binding over its kernel module (batchkit/learnkit/gckit/schedkit/
+triggerkit).
 
 Guard wiring (the pinned contract): in run/resume, a plan's ``shim``-enforced guards get a
 fresh PATH-shim dir per run (:func:`~cairn.kernel.guards.build_shims`), and every executor is
@@ -56,10 +57,12 @@ from cairn.kernel.plan import (
     plan as build_plan,
 )
 from cairn.kernel.proc import SubprocessRunner as _SubprocessRunner
+from cairn.kernel.queue_ledger import pointer_path, read_pointer, sweep
 from cairn.kernel.runctl import (
     AlreadyDone,
     Minted,
     Refusal,
+    RefusalKind,
     Resumable,
     preflight_tools,
     resolve_run,
@@ -75,7 +78,8 @@ from cairn.kernel.schedkit import (
     run_schedule,
     uninstall as uninstall_schedules,
 )
-from cairn.kernel.trail import derive_status, follow, read_trail
+from cairn.kernel.trail import derive_status, follow, last_trail_terminal, read_trail
+from cairn.kernel.trigger_host import load_triggers, watch_dir
 from cairn.kernel.triggerkit import (
     TriggerStatus,
     list_installed_triggers,
@@ -83,7 +87,7 @@ from cairn.kernel.triggerkit import (
     run_trigger,
     sync_triggers,
 )
-from cairn.kernel.types import ExitCode
+from cairn.kernel.types import ExitCode, classify_exit
 from cairn.kernel.walk import invalidate_from, walk
 
 # The full verb surface (docs/API.md §9). Order is the help-listing order.
@@ -95,6 +99,7 @@ SUBCOMMANDS: list[str] = [
     "validate",
     "trail",
     "ps",
+    "inbox",
     "doctor",
     "test",
     "new",
@@ -514,6 +519,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
     elif isinstance(outcome, Resumable):
         _print_advisories(outcome.advisories)
 
+    # Origin provenance (W2): drain stamps --origin trigger:<name>; inbox groups/sweeps by it.
+    # Schema root allows additional properties; origin is an extra field on run.json.
+    origin = getattr(args, "origin", None)
+    if origin:
+        update_run(run_dir, lambda doc: doc.__setitem__("origin", origin))
+
     interactive = (not args.headless) and sys.stdin.isatty()
     try:
         return _drive(
@@ -601,6 +612,77 @@ def _repin_manifest(run_dir: Path, run_doc: dict, current_hash: str) -> None:
     )
 
 
+def _drive_resume(
+    ws: Path,
+    run_dir: Path,
+    run_doc: dict,
+    *,
+    force: bool = False,
+    from_node: str | None = None,
+    interactive: bool | None = None,
+    now: datetime | None = None,
+    phash: str | None = None,
+) -> int:
+    """Shared post-guard resume drive — ONE path for ``cairn resume`` and ``cairn inbox`` (D10).
+
+    Callers must already have passed :func:`resume_existing` and printed advisories.
+    This owns --force re-pin, plan rebuild from the recorded fleet, tool preflight,
+    optional ``--from`` invalidation, and the walk. Returns an exit code.
+    """
+    now = now if now is not None else _now()
+    pipeline = run_doc["pipeline"]
+    if phash is None:
+        pfile = ws / "pipelines" / f"{pipeline}.yaml"
+        if not pfile.is_file():
+            print(f"cairn: cannot resume — pipeline file {pfile} no longer exists", file=sys.stderr)
+            return int(ExitCode.CONFIG)
+        phash = _pipeline_hash(ws, pipeline)
+    if force:
+        _repin_manifest(run_dir, run_doc, phash)
+
+    params = {k: _param_str(v) for k, v in (run_doc.get("params") or {}).items() if v is not None}
+    # Reconstruct the recorded fleet (§8.1 executors) so a mixed-executor run resumes on the
+    # same models, not the workspace defaults.
+    ex_doc = run_doc.get("executors") or {}
+    recorded_default = ex_doc.get("default") or None
+    recorded_overrides = {k: str(v) for k, v in (ex_doc.get("overrides") or {}).items()}
+    try:
+        p = build_plan(
+            ws, pipeline, params, executor=recorded_default, step_executors=recorded_overrides, now=now
+        )
+        config = load_config(ws)
+    except ConfigError as exc:
+        return _print_config_error(exc)
+
+    # Resume re-checks in-range tools: a tool can vanish between sessions and the steps ahead
+    # still need it (docs/TOOLING-AND-GROWTH §2). Cheap, and nothing is walked on a failure.
+    refused = preflight_tools(p)
+    if refused is not None:
+        return _print_refusal(refused)
+
+    if from_node:
+        try:
+            cleared, moved = invalidate_from(p, run_dir, from_node, now=now)
+        except ConfigError as exc:
+            return _print_config_error(exc)
+        except CairnError as exc:  # LockHeldError — another process holds the run
+            print(f"cairn: {exc}", file=sys.stderr)
+            return int(ExitCode.EXECUTOR)
+        print(
+            f"cairn: --from {from_node!r} — cleared {cleared} node record(s), "
+            f"superseded {moved} artifact file(s)",
+            file=sys.stderr,
+        )
+
+    if interactive is None:
+        interactive = sys.stdin.isatty()
+    try:
+        return _drive(p, run_dir, ws, config, interactive=interactive, gate_presets={}, now=now)
+    except CairnError as exc:
+        print(f"cairn: {exc}", file=sys.stderr)
+        return int(ExitCode.EXECUTOR)
+
+
 def _cmd_resume(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
     ws = _workspace(args)
@@ -614,8 +696,6 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         return int(ExitCode.CONFIG)
 
     pipeline = run_doc["pipeline"]
-    params = {k: _param_str(v) for k, v in (run_doc.get("params") or {}).items() if v is not None}
-
     pfile = ws / "pipelines" / f"{pipeline}.yaml"
     if not pfile.is_file():
         print(f"cairn: cannot resume — pipeline file {pfile} no longer exists", file=sys.stderr)
@@ -630,47 +710,16 @@ def _cmd_resume(args: argparse.Namespace) -> int:
     # Advisories (force-override / version / repro) print here — same position as the
     # former in-guard stderr writes, before --force re-pin.
     _print_advisories(outcome.advisories)
-    run_doc = outcome.run_doc
-    if args.force:
-        _repin_manifest(run_dir, run_doc, phash)
-
-    # Reconstruct the recorded fleet (§8.1 executors) so a mixed-executor run resumes on the
-    # same models, not the workspace defaults.
-    ex_doc = run_doc.get("executors") or {}
-    recorded_default = ex_doc.get("default") or None
-    recorded_overrides = {k: str(v) for k, v in (ex_doc.get("overrides") or {}).items()}
-    try:
-        p = build_plan(ws, pipeline, params, executor=recorded_default, step_executors=recorded_overrides, now=now)
-        config = load_config(ws)
-    except ConfigError as exc:
-        return _print_config_error(exc)
-
-    # Resume re-checks in-range tools: a tool can vanish between sessions and the steps ahead
-    # still need it (docs/TOOLING-AND-GROWTH §2). Cheap, and nothing is walked on a failure.
-    refused = preflight_tools(p)
-    if refused is not None:
-        return _print_refusal(refused)
-
-    if args.from_node:
-        try:
-            cleared, moved = invalidate_from(p, run_dir, args.from_node, now=now)
-        except ConfigError as exc:
-            return _print_config_error(exc)
-        except CairnError as exc:  # LockHeldError — another process holds the run
-            print(f"cairn: {exc}", file=sys.stderr)
-            return int(ExitCode.EXECUTOR)
-        print(
-            f"cairn: --from {args.from_node!r} — cleared {cleared} node record(s), "
-            f"superseded {moved} artifact file(s)",
-            file=sys.stderr,
-        )
-
-    interactive = sys.stdin.isatty()
-    try:
-        return _drive(p, run_dir, ws, config, interactive=interactive, gate_presets={}, now=now)
-    except CairnError as exc:
-        print(f"cairn: {exc}", file=sys.stderr)
-        return int(ExitCode.EXECUTOR)
+    return _drive_resume(
+        ws,
+        run_dir,
+        outcome.run_doc,
+        force=bool(args.force),
+        from_node=args.from_node,
+        interactive=sys.stdin.isatty(),
+        now=now,
+        phash=phash,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -954,6 +1003,505 @@ def _age(at: str | None) -> str:
     if secs < 5400:
         return f"{int(secs // 60)}m"
     return f"{int(secs // 3600)}h"
+
+
+def _age_secs(at: str | None) -> float:
+    """Numeric age in seconds for oldest-first sorting; missing/unparseable → 0."""
+    if not at:
+        return 0.0
+    try:
+        then = datetime.fromisoformat(at.replace("Z", "+00:00"))
+        return max(0.0, (datetime.now(timezone.utc) - then).total_seconds())
+    except (ValueError, TypeError):
+        return 0.0
+
+
+# --------------------------------------------------------------------------- #
+# inbox — the cross-run judgment drain (FACTORY-PLAN W2)
+# --------------------------------------------------------------------------- #
+
+
+@dataclasses.dataclass
+class _InboxCard:
+    """One parked judgment the human may answer (or a non-answerable wait note)."""
+
+    run_dir: Path
+    run_id: str
+    pipeline: str
+    kind: str  # gate | manual | waiting_other
+    node: str
+    question: str
+    options: list[str]
+    manual_text: str | None
+    produces: list[str]
+    reads: list[dict[str, Any]]  # {name, path, size, mtime}
+    age: str
+    age_secs: float
+    origin: str | None
+    waiting_kind: str | None
+    at: str | None
+
+
+def _last_gate_pending(run_dir: Path) -> dict | None:
+    """The last ``gate-pending`` trail event (gate or manual park marker)."""
+    last: dict | None = None
+    for ev in read_trail(run_dir):
+        if ev.get("event") == "gate-pending":
+            last = ev
+    return last
+
+
+def _reads_for_gate(
+    ws: Path, run_doc: dict, gate_name: str, run_dir: Path, now: datetime
+) -> list[dict[str, Any]]:
+    """Resolve a gate's ``reads`` artifacts to path/size/mtime (best-effort)."""
+    pipeline = run_doc.get("pipeline")
+    if not isinstance(pipeline, str):
+        return []
+    params = {k: _param_str(v) for k, v in (run_doc.get("params") or {}).items() if v is not None}
+    try:
+        p = build_plan(ws, pipeline, params, now=now)
+    except ConfigError:
+        return []
+    gates = {g.name: g for g in _iter_gates(p.nodes)}
+    gate = gates.get(gate_name)
+    if gate is None:
+        return []
+    out: list[dict[str, Any]] = []
+    for name in gate.reads:
+        decl = p.artifacts.get(name)
+        if decl is None:
+            out.append({"name": name, "path": None, "size": None, "mtime": None})
+            continue
+        try:
+            rendered = render_artifact_path(
+                decl, params=p.params, dims=p.dims, pipeline=p.pipeline, cycle=None, now=now
+            )
+            resolved = resolve_path(decl, rendered, run_dir)
+        except (OSError, ValueError, ConfigError, CairnError):
+            out.append({"name": name, "path": None, "size": None, "mtime": None})
+            continue
+        path = resolved.paths[0] if resolved.paths else run_dir / rendered
+        size = mtime = None
+        if path.is_file():
+            try:
+                st = path.stat()
+                size = st.st_size
+                mtime = datetime.fromtimestamp(st.st_mtime, tz=timezone.utc).isoformat()
+            except OSError:
+                pass
+        out.append({"name": name, "path": str(path), "size": size, "mtime": mtime})
+    return out
+
+
+def _card_from_run(
+    ws: Path, run_dir: Path, run_doc: dict, *, now: datetime, grace: int | None
+) -> _InboxCard | None:
+    """Build an inbox card for a run that needs human judgment, else None.
+
+    Answerable: derive_status == ``gate``, or ``halted`` with last terminal exit 6.
+    Capacity(8)/blocked(9) return a ``waiting_other`` card (listed, not answerable).
+    """
+    st = derive_status(run_dir, heartbeat_grace_s=grace)
+    term_kind, exit_code = last_trail_terminal(run_dir)
+    origin = run_doc.get("origin") if isinstance(run_doc.get("origin"), str) else None
+    run_id = str(run_doc.get("run_id") or run_dir.name)
+    pipeline = str(run_doc.get("pipeline") or "?")
+
+    answerable = False
+    waiting_kind: str | None = None
+    if st.status == "gate":
+        answerable = True
+    elif st.status == "halted" and term_kind == "halt" and exit_code is not None:
+        outcome = classify_exit(exit_code)
+        if outcome.waiting_kind == "needs_human":
+            answerable = True
+            waiting_kind = "needs_human"
+        elif outcome.waiting_kind in ("capacity", "blocked"):
+            waiting_kind = outcome.waiting_kind
+            last = st.last_event or {}
+            at = last.get("at") if isinstance(last.get("at"), str) else None
+            return _InboxCard(
+                run_dir=run_dir,
+                run_id=run_id,
+                pipeline=pipeline,
+                kind="waiting_other",
+                node=str(st.node or "-"),
+                question=f"waiting ({waiting_kind}) — not yours to answer here",
+                options=[],
+                manual_text=None,
+                produces=[],
+                reads=[],
+                age=_age(at),
+                age_secs=_age_secs(at),
+                origin=origin,
+                waiting_kind=waiting_kind,
+                at=at,
+            )
+    if not answerable:
+        return None
+
+    pending = _last_gate_pending(run_dir)
+    data = (pending.get("data") or {}) if pending else {}
+    node = str((pending or {}).get("node") or st.node or "-")
+    at = (pending or st.last_event or {}).get("at")
+    at_s = at if isinstance(at, str) else None
+
+    # Manual parks share the gate-pending event with data.manual (walk._run_manual).
+    if isinstance(data.get("manual"), str):
+        produces = [str(x) for x in (data.get("produces") or [])]
+        return _InboxCard(
+            run_dir=run_dir,
+            run_id=run_id,
+            pipeline=pipeline,
+            kind="manual",
+            node=node,
+            question="manual step requires an operator",
+            options=[],
+            manual_text=data["manual"],
+            produces=produces,
+            reads=[],
+            age=_age(at_s),
+            age_secs=_age_secs(at_s),
+            origin=origin,
+            waiting_kind=waiting_kind or "needs_human",
+            at=at_s,
+        )
+
+    # Gate: question/options on the pending event; reads from the plan.
+    question = str(data.get("question") or f"gate {node} needs a decision")
+    options = [str(o) for o in (data.get("options") or [])]
+    reads = _reads_for_gate(ws, run_doc, node, run_dir, now)
+    return _InboxCard(
+        run_dir=run_dir,
+        run_id=run_id,
+        pipeline=pipeline,
+        kind="gate",
+        node=node,
+        question=question,
+        options=options,
+        manual_text=None,
+        produces=[],
+        reads=reads,
+        age=_age(at_s),
+        age_secs=_age_secs(at_s),
+        origin=origin,
+        waiting_kind=waiting_kind or "needs_human",
+        at=at_s,
+    )
+
+
+def _enumerate_inbox(
+    ws: Path, runs_root: Path, *, grace: int | None, now: datetime
+) -> tuple[list[_InboxCard], list[_InboxCard]]:
+    """Walk runs_root; return (answerable oldest-first, waiting_other)."""
+    answerable: list[_InboxCard] = []
+    other: list[_InboxCard] = []
+    if not runs_root.is_dir():
+        return answerable, other
+    for d in sorted(runs_root.iterdir()):
+        if not d.is_dir() or not (d / "run.json").is_file():
+            continue
+        try:
+            doc = load_run(d)
+        except (OSError, ValueError, ConfigError):
+            continue
+        card = _card_from_run(ws, d, doc, now=now, grace=grace)
+        if card is None:
+            continue
+        if card.kind == "waiting_other":
+            other.append(card)
+        else:
+            answerable.append(card)
+    # Oldest-first (largest age_secs first); stable secondary key for determinism.
+    answerable.sort(key=lambda c: (-c.age_secs, c.run_id))
+    return answerable, other
+
+
+def _render_card(card: _InboxCard) -> None:
+    print("─" * 56)
+    print(f"pipeline · {card.pipeline}")
+    print(f"run      · {card.run_dir}")
+    print(f"gate     · {card.node}  ({card.kind})")
+    if card.kind == "manual":
+        print(f"instruction · {card.manual_text}")
+        print(f"produces · {', '.join(card.produces) or '(none)'}")
+        print("(do the work, then confirm with Enter to resume — validators own done)")
+    else:
+        print(f"question · {card.question}")
+        if card.options:
+            print(f"options  · {' / '.join(card.options)}")
+    if card.reads:
+        print("reads:")
+        for r in card.reads:
+            size = f"{r['size']}B" if r.get("size") is not None else "?"
+            print(f"  - {r.get('name')}: {r.get('path') or '?'} ({size})")
+    print(f"age      · {card.age}")
+    print(f"origin   · {card.origin or '-'}")
+
+
+def _prompt(msg: str) -> str:
+    try:
+        return input(msg).strip()
+    except (EOFError, KeyboardInterrupt):
+        return "s"
+
+
+def _sweep_origin(ws: Path, origin: str | None) -> None:
+    """After a successful resume, retire the origin trigger's waiting item if any."""
+    if not origin or not origin.startswith("trigger:"):
+        return
+    name = origin[len("trigger:") :]
+    if not name:
+        return
+    try:
+        triggers = load_triggers(ws)
+    except ConfigError as exc:
+        print(f"cairn: inbox: cannot load triggers for origin sweep: {exc}", file=sys.stderr)
+        return
+    trigger = triggers.get(name)
+    if trigger is None:
+        print(f"cairn: inbox: origin trigger {name!r} not declared — skip sweep", file=sys.stderr)
+        return
+    try:
+        watch_abs = watch_dir(trigger, ws)
+        report = sweep(watch_abs, on_done=trigger.on_done)
+    except (OSError, ConfigError, CairnError) as exc:
+        print(f"cairn: inbox: origin sweep for {name!r} failed: {exc}", file=sys.stderr)
+        return
+    if report.moved:
+        names = ", ".join(p.name for p in report.moved)
+        print(f"cairn: inbox: origin sweep retired {names} under {trigger.watch}")
+    for d in report.diagnostics:
+        print(f"cairn: inbox: sweep note: {d}", file=sys.stderr)
+
+
+def _inbox_resume_card(ws: Path, card: _InboxCard, *, force: bool, now: datetime) -> int:
+    """Call resume_existing + shared _drive_resume; handle DRIFT card (never auto-force)."""
+    run_dir = card.run_dir
+    try:
+        run_doc = load_run(run_dir)
+    except (OSError, ValueError, ConfigError) as exc:
+        print(f"cairn: cannot read {run_dir}/run.json: {exc}", file=sys.stderr)
+        return int(ExitCode.CONFIG)
+    pipeline = run_doc["pipeline"]
+    pfile = ws / "pipelines" / f"{pipeline}.yaml"
+    if not pfile.is_file():
+        print(f"cairn: cannot resume — pipeline file {pfile} no longer exists", file=sys.stderr)
+        return int(ExitCode.CONFIG)
+    phash = _pipeline_hash(ws, pipeline)
+    outcome = resume_existing(run_dir, ws=ws, phash=phash, pipeline=pipeline, force=force)
+    if isinstance(outcome, Refusal):
+        if outcome.kind is RefusalKind.DRIFT and not force:
+            print("─" * 56)
+            print("DRIFT CARD — pipeline changed since this run started")
+            print(outcome.message)
+            print("Auto-force is never applied. Type 'f' to force-resume, anything else to leave parked.")
+            choice = _prompt("force? [f/s]: ").lower()
+            if choice == "f":
+                return _inbox_resume_card(ws, card, force=True, now=now)
+            print(f"cairn: inbox: left parked → {run_dir}")
+            return int(outcome.code)
+        _print_refusal(outcome)
+        return int(outcome.code)
+    _print_advisories(outcome.advisories)
+    # Inbox resumes are non-interactive for gates (already answered) and for manuals
+    # (produces already written — interactive manual would re-prompt).
+    code = _drive_resume(
+        ws,
+        run_dir,
+        outcome.run_doc,
+        force=force,
+        from_node=None,
+        interactive=False,
+        now=now,
+        phash=phash,
+    )
+    if code == int(ExitCode.OK):
+        origin = outcome.run_doc.get("origin") or card.origin
+        _sweep_origin(ws, origin if isinstance(origin, str) else None)
+    return code
+
+
+def _inbox_answer_and_resume(ws: Path, card: _InboxCard, choice: str, *, now: datetime) -> int:
+    """Answer a gate (or confirm a manual) then drive the shared resume path."""
+    if card.kind == "gate":
+        if choice not in card.options:
+            print(f"cairn: {choice!r} is not an option (options: {', '.join(card.options)})", file=sys.stderr)
+            return int(ExitCode.CONFIG)
+        answer_gate(card.run_dir, card.node, choice)
+        print(f"cairn: gate {card.node!r} answered {choice!r} (by external)")
+    # manual: human already produced; no answer_gate — validators own done on resume.
+    return _inbox_resume_card(ws, card, force=False, now=now)
+
+
+def _list_failed(ws: Path) -> list[dict[str, Any]]:
+    """Read-only listing of ``.failed/`` items that carry a run pointer (retry is W3)."""
+    rows: list[dict[str, Any]] = []
+    try:
+        triggers = load_triggers(ws)
+    except ConfigError:
+        return rows
+    for name, trigger in sorted(triggers.items()):
+        try:
+            watch_abs = watch_dir(trigger, ws)
+        except ConfigError:
+            continue
+        failed = watch_abs / ".failed"
+        if not failed.is_dir():
+            continue
+        for item in sorted(p for p in failed.iterdir() if p.is_file() and not p.name.startswith(".")):
+            ptr = pointer_path(failed, item.name)
+            run_ptr = None
+            if ptr.is_file():
+                try:
+                    rec = read_pointer(ptr)
+                    run_ptr = rec.get("run_dir")
+                except (OSError, ValueError):
+                    run_ptr = "(unreadable pointer)"
+            rows.append(
+                {
+                    "trigger": name,
+                    "item": item.name,
+                    "watch": trigger.watch,
+                    "run_dir": run_ptr,
+                    "note": "cairn trigger retry (future) will resume these",
+                }
+            )
+    return rows
+
+
+def _cmd_inbox(args: argparse.Namespace) -> int:
+    ws = _workspace(args)
+    now = _now()
+    try:
+        config = load_config(ws)
+    except ConfigError as exc:
+        return _print_config_error(exc)
+    runs_root = _runs_root(ws, config)
+    grace = config.defaults.heartbeat_s
+
+    if args.failed:
+        rows = _list_failed(ws)
+        if args.json:
+            print(json.dumps(rows, indent=2))
+            return int(ExitCode.OK)
+        if not rows:
+            print("cairn: no failed items with run pointers")
+            return int(ExitCode.OK)
+        print(f"{'TRIGGER':20} {'ITEM':28} RUN_DIR")
+        for r in rows:
+            print(f"{r['trigger']:20} {r['item']:28} {r['run_dir'] or '-'}")
+        print(
+            "note: listing only — `cairn trigger retry` (W3) will resume these; "
+            "inbox does not retry failed items."
+        )
+        return int(ExitCode.OK)
+
+    answerable, other = _enumerate_inbox(ws, runs_root, grace=grace, now=now)
+    list_mode = bool(args.list or args.json or not sys.stdout.isatty())
+
+    if list_mode:
+        if args.json:
+            payload = [
+                {
+                    "run": c.run_id,
+                    "run_dir": str(c.run_dir),
+                    "pipeline": c.pipeline,
+                    "gate": c.node,
+                    "kind": c.kind,
+                    "age": c.age,
+                    "origin": c.origin,
+                    "question": c.question,
+                    "options": c.options,
+                    "produces": c.produces,
+                    "manual": c.manual_text,
+                    "reads": c.reads,
+                }
+                for c in answerable
+            ]
+            if other:
+                payload.extend(
+                    {
+                        "run": c.run_id,
+                        "run_dir": str(c.run_dir),
+                        "pipeline": c.pipeline,
+                        "gate": c.node,
+                        "kind": c.kind,
+                        "age": c.age,
+                        "origin": c.origin,
+                        "waiting_kind": c.waiting_kind,
+                        "note": "waiting (not yours to answer)",
+                    }
+                    for c in other
+                )
+            print(json.dumps(payload, indent=2))
+            return int(ExitCode.OK)
+        if not answerable and not other:
+            print("cairn: inbox empty")
+            return int(ExitCode.OK)
+        print(f"{'RUN':30} {'PIPELINE':16} {'GATE':14} {'AGE':6} ORIGIN")
+        for c in answerable:
+            print(
+                f"{c.run_id:30} {c.pipeline:16} {c.node:14} {c.age:6} {c.origin or '-'}"
+            )
+        if other:
+            print("waiting (not yours to answer) — capacity/blocked resume on capacity/auth (W3):")
+            for c in other:
+                print(
+                    f"{c.run_id:30} {c.pipeline:16} {c.node:14} {c.age:6} "
+                    f"{c.waiting_kind or '-'} {c.origin or '-'}"
+                )
+        return int(ExitCode.OK)
+
+    # Interactive (stdout is a TTY and neither --list nor --json).
+    if not answerable:
+        print("cairn: inbox empty")
+        if other:
+            print("waiting (not yours to answer):")
+            for c in other:
+                print(f"  {c.run_id}  {c.waiting_kind}  age={c.age}")
+        return int(ExitCode.OK)
+
+    for card in answerable:
+        while True:
+            _render_card(card)
+            if card.kind == "manual":
+                raw = _prompt("ready? [Enter=resume / s=skip / o=open]: ")
+                if raw.lower() == "s" or raw.lower() == "skip":
+                    print(f"cairn: inbox: skipped {card.run_id}")
+                    break
+                if raw.lower() == "o" or raw.lower() == "open":
+                    print(f"(manual instruction)\n{card.manual_text}")
+                    print(f"produces: {', '.join(card.produces) or '(none)'}")
+                    print(f"run dir: {card.run_dir}")
+                    continue
+                # Enter or any other confirm → resume (human did the work).
+                code = _inbox_answer_and_resume(ws, card, "", now=now)
+                if code != int(ExitCode.OK):
+                    print(f"cairn: inbox: resume exited {code} → {card.run_dir}", file=sys.stderr)
+                break
+            # Gate card.
+            opt_hint = "/".join(card.options) if card.options else "?"
+            raw = _prompt(f"choice [{opt_hint}] (s=skip, o=open): ")
+            if raw.lower() in ("s", "skip"):
+                print(f"cairn: inbox: skipped {card.run_id}")
+                break
+            if raw.lower() in ("o", "open"):
+                if card.reads:
+                    for r in card.reads:
+                        print(f"  {r.get('name')}: {r.get('path') or '?'}")
+                else:
+                    print("(no reads)")
+                continue
+            if card.options and raw not in card.options:
+                print(f"{raw!r} is not one of {card.options} (or s/o)", file=sys.stderr)
+                continue
+            code = _inbox_answer_and_resume(ws, card, raw, now=now)
+            if code != int(ExitCode.OK):
+                print(f"cairn: inbox: resume exited {code} → {card.run_dir}", file=sys.stderr)
+            break
+    return int(ExitCode.OK)
 
 
 # --------------------------------------------------------------------------- #
@@ -1489,6 +2037,11 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--from", dest="from_node")
     sp.add_argument("--run-dir")
     sp.add_argument("--idempotent", action="store_true")
+    sp.add_argument(
+        "--origin",
+        metavar="STR",
+        help="provenance stamp recorded on run.json (e.g. trigger:<name> from the drain)",
+    )
     sp.set_defaults(func=_cmd_run)
 
     # resume
@@ -1531,6 +2084,18 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--workspace", default=".")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=_cmd_ps)
+
+    # inbox — cross-run judgment drain (FACTORY-PLAN W2)
+    sp = sub.add_parser("inbox", help="cross-run judgment drain (answer gates/manuals, resume)")
+    sp.add_argument("--workspace", default=".")
+    sp.add_argument("--list", action="store_true", help="one line per parked judgment (non-interactive)")
+    sp.add_argument("--json", action="store_true", help="structured listing")
+    sp.add_argument(
+        "--failed",
+        action="store_true",
+        help="list .failed/ items with run pointers (read-only; retry is W3)",
+    )
+    sp.set_defaults(func=_cmd_inbox)
 
     # doctor
     sp = sub.add_parser("doctor", help="machine + workspace preflight")

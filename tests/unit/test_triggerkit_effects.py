@@ -477,6 +477,8 @@ def test_run_trigger_drains_one_candidate_and_retires_to_done(tmp_path, monkeypa
         str(run_dir),
         "--param",
         f"event={watch_abs / '.claim' / 'one.json'}",
+        "--origin",
+        "trigger:handle-reply",
     ]
     assert call["cwd"] == ws
     assert (watch_abs / ".done" / "tombstones" / "one.json").is_file()

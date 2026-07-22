@@ -79,7 +79,7 @@ def test_version_via_console_script():
 
 def test_all_expected_subcommands_are_registered():
     assert SUBCOMMANDS == [
-        "plan", "run", "resume", "gate", "validate", "trail", "ps",
+        "plan", "run", "resume", "gate", "validate", "trail", "ps", "inbox",
         "doctor", "test", "new", "compose", "batch", "learnings", "gc", "schedule", "trigger",
     ]
 
