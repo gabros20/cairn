@@ -436,6 +436,8 @@ it as a tool. Composition happens above the pipeline, never inside a step.
 | 5 | timeout | inspect `logs/<step>.log`, resume |
 | 6 | needs a human: a `manual:` step in headless mode, or an interactive gate whose TTY was closed/interrupted (headless gates can't reach here — their `default` is mandatory) | answer externally (`cairn gate <run> <name>=<choice>`) or preset (`--gate`), then resume — the operator-pattern hook for coding agents |
 | 7 | budget exceeded (`SECURITY.md` §4) | raise the cap or accept the partial run, then resume |
+| 8 | capacity: halted waiting for an agent slot (waiting-class, resumable) | free a slot (or wait for one), then resume |
+| 9 | blocked: halted on auth/network/environment trouble (waiting-class, resumable) | fix the environment, then resume |
 
 ## 10. Reproducibility
 

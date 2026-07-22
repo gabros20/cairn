@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import Enum, IntEnum
 from pathlib import Path
 from typing import Literal, Protocol, runtime_checkable
 
@@ -32,6 +32,45 @@ class ExitCode(IntEnum):
     TIMEOUT = 5
     NEEDS_HUMAN = 6  # halted at manual/gate in headless mode
     BUDGET = 7       # budget exceeded (docs/SECURITY.md §4)
+    CAPACITY = 8     # halted waiting for an agent slot — resumable
+    BLOCKED = 9      # halted on auth/network/environment trouble — needs an operator, resumable
+
+
+class OutcomeClass(str, Enum):
+    """High-level run outcome class (doctrine D8 — docs/FACTORY-PLAN.md)."""
+
+    DONE = "done"
+    WAITING = "waiting"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class RunOutcome:
+    """Classified process outcome (doctrine D8 — docs/FACTORY-PLAN.md).
+
+    Waiting-class outcomes carry a ``waiting_kind``; DONE and FAILED leave it None.
+    """
+
+    cls: OutcomeClass
+    waiting_kind: Literal["needs_human", "capacity", "blocked"] | None = None
+
+
+def classify_exit(code: int) -> RunOutcome:
+    """Map a process exit code to a RunOutcome (doctrine D8 — docs/FACTORY-PLAN.md).
+
+    0 → DONE; 6/8/9 → WAITING (needs_human/capacity/blocked); any other nonzero
+    (known failure codes, unknown positives, signal deaths) → FAILED. Fail-closed:
+    unknown codes never look like waiting.
+    """
+    if code == ExitCode.OK:
+        return RunOutcome(cls=OutcomeClass.DONE)
+    if code == ExitCode.NEEDS_HUMAN:
+        return RunOutcome(cls=OutcomeClass.WAITING, waiting_kind="needs_human")
+    if code == ExitCode.CAPACITY:
+        return RunOutcome(cls=OutcomeClass.WAITING, waiting_kind="capacity")
+    if code == ExitCode.BLOCKED:
+        return RunOutcome(cls=OutcomeClass.WAITING, waiting_kind="blocked")
+    return RunOutcome(cls=OutcomeClass.FAILED)
 
 
 @dataclass(frozen=True)

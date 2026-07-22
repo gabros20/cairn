@@ -11,7 +11,10 @@ from cairn.kernel.types import (
     ExitCode,
     Finding,
     Invocation,
+    OutcomeClass,
     Result,
+    RunOutcome,
+    classify_exit,
 )
 
 
@@ -51,3 +54,46 @@ def test_finding_defaults_fix_to_none():
     assert f.fix is None
     f2 = Finding(level="warning", message="off-version", fix="pin 0.138")
     assert f2.fix == "pin 0.138"
+
+
+def test_exit_codes_capacity_and_blocked():
+    assert ExitCode.CAPACITY == 8
+    assert ExitCode.BLOCKED == 9
+
+
+def test_classify_exit_done():
+    o = classify_exit(0)
+    assert o == RunOutcome(cls=OutcomeClass.DONE)
+    assert o.waiting_kind is None
+
+
+def test_classify_exit_waiting_kinds():
+    assert classify_exit(6) == RunOutcome(
+        cls=OutcomeClass.WAITING, waiting_kind="needs_human"
+    )
+    assert classify_exit(8) == RunOutcome(
+        cls=OutcomeClass.WAITING, waiting_kind="capacity"
+    )
+    assert classify_exit(9) == RunOutcome(
+        cls=OutcomeClass.WAITING, waiting_kind="blocked"
+    )
+
+
+def test_classify_exit_failed_known_unknown_and_negative():
+    # Known failure (4), unknown positive (77), signal death (-9) — all FAILED.
+    assert classify_exit(4) == RunOutcome(cls=OutcomeClass.FAILED)
+    assert classify_exit(77) == RunOutcome(cls=OutcomeClass.FAILED)
+    assert classify_exit(-9) == RunOutcome(cls=OutcomeClass.FAILED)
+    assert classify_exit(4).waiting_kind is None
+
+
+def test_run_outcome_frozen_and_equality():
+    a = RunOutcome(cls=OutcomeClass.WAITING, waiting_kind="capacity")
+    b = RunOutcome(cls=OutcomeClass.WAITING, waiting_kind="capacity")
+    assert a == b
+    try:
+        a.cls = OutcomeClass.DONE  # type: ignore[misc]
+        raise AssertionError("expected FrozenInstanceError")
+    except dataclasses.FrozenInstanceError:
+        pass
+
