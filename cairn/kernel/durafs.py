@@ -6,6 +6,11 @@ directory entry that publishes them, and a move's destination parent is fsynced
 before the source is unlinked (the new location is durable before the old
 disappears).
 
+Concurrency: ``atomic_write_json`` / ``atomic_write_text`` use a fixed tmp name
+(``<path>.tmp``) with no PID/random suffix. Callers must serialize writers to
+the same destination path (e.g. ``runstate.run_lock`` before writing
+``run.json``). This module does not provide locking.
+
 POLICY (EXDEV, symlink follow, collision suffixes) stays with callers. This
 module only does link/unlink/write + fsync; it never rewrites OSError semantics.
 
@@ -85,7 +90,11 @@ def fsync_dir(path: Path, *, fs: _FsOps | None = None) -> None:
 
 
 def atomic_write_text(path: Path, text: str, *, fs: _FsOps | None = None) -> None:
-    """Durably replace ``path`` with ``text``: tmp write → file fsync → replace → dir fsync."""
+    """Durably replace ``path`` with ``text``: tmp write → file fsync → replace → dir fsync.
+
+    The tmp name is fixed (``path`` + ``.tmp``); callers must serialize concurrent
+    writers to the same destination (e.g. ``run_lock`` for ``run.json``).
+    """
     ops = _resolve(fs)
     path = Path(path)
     tmp = path.with_name(path.name + ".tmp")
@@ -101,7 +110,8 @@ def atomic_write_json(path: Path, doc: dict, *, fs: _FsOps | None = None) -> Non
     """Durably replace ``path`` with JSON ``doc`` (indent=2, ensure_ascii=False).
 
     Same discipline as the former ``runstate._atomic_write``: tmp + file fsync +
-    ``os.replace`` + parent-dir fsync.
+    ``os.replace`` + parent-dir fsync. Fixed tmp name — callers serialize per-path
+    (e.g. ``run_lock`` before writing ``run.json``).
     """
     atomic_write_text(
         path,
@@ -113,7 +123,8 @@ def atomic_write_json(path: Path, doc: dict, *, fs: _FsOps | None = None) -> Non
 def durable_link(src: Path, dest: Path, *, fs: _FsOps | None = None) -> None:
     """Hard-link ``src`` to ``dest``, then fsync ``dest``'s parent directory.
 
-    ``OSError`` (including ``EXDEV``) propagates untouched — callers own policy.
+    ``OSError`` (including ``EXDEV`` and ``FileExistsError``) propagates untouched —
+    callers own policy.
     """
     ops = _resolve(fs)
     src, dest = Path(src), Path(dest)

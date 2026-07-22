@@ -1,13 +1,12 @@
 """durafs — unified durable write/link/move discipline (T0, D2 / D10).
 
 Happy paths hit the real filesystem. Ordering, crash-between-ops, and replay-loss
-use an injected ``_FsOps`` fake — never monkeypatch ``os.*`` (D10).
+use the shared :mod:`fstestkit` fake — never monkeypatch ``os.*`` (D10).
 """
 
 from __future__ import annotations
 
 import errno
-import io
 import json
 from pathlib import Path
 
@@ -21,200 +20,7 @@ from cairn.kernel.durafs import (
     durable_unlink,
     fsync_dir,
 )
-
-
-# --------------------------------------------------------------------------- #
-# Recording / crash / loss fake (injected fs seam)
-# --------------------------------------------------------------------------- #
-
-
-class SimulatedCrash(Exception):
-    """Raised by the fake after a configured op prefix to model power loss."""
-
-
-class _MemFile(io.StringIO):
-    """In-memory text file that participates in the fake's fd table."""
-
-    def __init__(self, path: Path, fs: RecordingFs, mode: str) -> None:
-        super().__init__()
-        self._path = path
-        self._fs = fs
-        self._mode = mode
-        self._fd = fs._alloc_fd(self)
-        if "r" in mode and "w" not in mode and path in fs.files:
-            self.write(fs.files[path])
-            self.seek(0)
-
-    def fileno(self) -> int:
-        return self._fd
-
-    def flush(self) -> None:
-        super().flush()
-        if "w" in self._mode or "a" in self._mode:
-            # Visible in the page cache; durable only after fsync_file.
-            self._fs.files[self._path] = self.getvalue()
-
-    def close(self) -> None:
-        if not self.closed:
-            self.flush()
-            super().close()
-
-
-class RecordingFs:
-    """In-memory ``_FsOps`` that records ops, can crash after N, and drops un-fsynced work.
-
-    Durability model:
-    - File content written via ``open`` is volatile until ``fsync(file_fd)``.
-    - Directory entry mutations (link / unlink / replace / create-via-open) are
-      volatile for that parent until ``fsync(dir_fd)``.
-    - On :class:`SimulatedCrash`, volatile file content and un-fsynced directory
-      entries are discarded (replay-loss of non-fsynced suffixes).
-    """
-
-    def __init__(self, *, crash_after: int | None = None) -> None:
-        self.ops: list[tuple] = []
-        self.crash_after = crash_after
-        # Currently visible namespace (includes volatile).
-        self.files: dict[Path, str] = {}
-        # Survives crash: path → content for durable dir entries with durable bytes.
-        self._durable: dict[Path, str] = {}
-        # File fds whose content has been fsynced (bytes safe; name may still be volatile).
-        self._file_content_synced: set[Path] = set()
-        self._fds: dict[int, object] = {}
-        self._dir_fds: dict[int, Path] = {}
-        self._file_fds: dict[int, Path] = {}
-        self._next_fd = 100
-        # Volatile dir-entry ops since last fsync of the relevant parent:
-        # path → content if created/replaced, or None if unlinked.
-        self._pending_dir: dict[Path, str | None] = {}
-
-    def seed(self, path: Path, content: str = "payload") -> None:
-        path = Path(path)
-        self.files[path] = content
-        self._durable[path] = content
-        self._file_content_synced.add(path)
-
-    def _alloc_fd(self, obj: object) -> int:
-        fd = self._next_fd
-        self._next_fd += 1
-        self._fds[fd] = obj
-        return fd
-
-    def _record(self, *op: object) -> None:
-        self.ops.append(op)
-        if self.crash_after is not None and len(self.ops) > self.crash_after:
-            self._lose_unsynced()
-            raise SimulatedCrash(op)
-
-    def _lose_unsynced(self) -> None:
-        """Replay-loss: only durable dir entries (with their durable content) remain."""
-        self.files = dict(self._durable)
-        self._pending_dir.clear()
-        # Content-synced flags for paths that no longer exist are irrelevant.
-        self._file_content_synced = {p for p in self._file_content_synced if p in self._durable}
-
-    def visible(self, path: Path) -> bool:
-        return Path(path) in self.files
-
-    def _note_dir_create(self, path: Path, content: str) -> None:
-        self.files[path] = content
-        self._pending_dir[path] = content
-
-    def _note_dir_unlink(self, path: Path) -> None:
-        self.files.pop(path, None)
-        self._pending_dir[path] = None
-
-    # -- _FsOps ------------------------------------------------------------- #
-
-    def open(self, path: Path, mode: str = "w", *, encoding: str = "utf-8") -> _MemFile:
-        path = Path(path)
-        self._record("open", path, mode)
-        fh = _MemFile(path, self, mode)
-        self._file_fds[fh.fileno()] = path
-        if "w" in mode:
-            self._note_dir_create(path, "")
-            self._file_content_synced.discard(path)
-        return fh
-
-    def replace(self, src: Path, dst: Path) -> None:
-        src, dst = Path(src), Path(dst)
-        self._record("replace", src, dst)
-        if src not in self.files:
-            raise FileNotFoundError(src)
-        content = self.files[src]
-        # Atomic rename: src goes, dst appears — both dir entries pending until parent fsync.
-        # Same-parent case (the common one): one parent fsync commits both.
-        self._note_dir_unlink(src)
-        self._note_dir_create(dst, content)
-        if src in self._file_content_synced:
-            self._file_content_synced.add(dst)
-            self._file_content_synced.discard(src)
-
-    def link(self, src: Path, dst: Path) -> None:
-        src, dst = Path(src), Path(dst)
-        self._record("link", src, dst)
-        if src not in self.files:
-            raise FileNotFoundError(src)
-        if dst in self.files:
-            raise FileExistsError(dst)
-        content = self.files[src]
-        self._note_dir_create(dst, content)
-        if src in self._file_content_synced:
-            self._file_content_synced.add(dst)
-
-    def unlink(self, path: Path) -> None:
-        path = Path(path)
-        self._record("unlink", path)
-        if path not in self.files:
-            raise FileNotFoundError(path)
-        self._note_dir_unlink(path)
-
-    def fsync(self, fd: int) -> None:
-        if fd in self._dir_fds:
-            parent = self._dir_fds[fd]
-            self._record("fsync_dir", parent)
-            for p, content in list(self._pending_dir.items()):
-                if p.parent != parent:
-                    continue
-                if content is None:
-                    self._durable.pop(p, None)
-                else:
-                    # Publish name only if file bytes were fsynced (or hardlinked from synced).
-                    if p in self._file_content_synced or p in self._durable:
-                        self._durable[p] = content
-                    else:
-                        # Name points at un-fsynced bytes — treat content as empty/lost on
-                        # crash, but the durable model still requires file fsync first;
-                        # we simply refuse to promote un-synced content.
-                        self._durable[p] = content  # content already in files from flush+fsync_file path
-                        # Actually: for hard links, content is shared and already synced.
-                        # For atomic_write, fsync_file precedes replace, so content is synced.
-                        self._durable[p] = self.files.get(p, content)
-                del self._pending_dir[p]
-        elif fd in self._file_fds:
-            path = self._file_fds[fd]
-            self._record("fsync_file", path)
-            # Pull latest buffer into files (flush may have run).
-            obj = self._fds.get(fd)
-            if isinstance(obj, _MemFile) and not obj.closed:
-                obj.flush()
-            if path in self.files:
-                self._file_content_synced.add(path)
-        else:
-            self._record("fsync", fd)
-
-    def open_dir(self, path: Path) -> int:
-        path = Path(path)
-        self._record("open_dir", path)
-        fd = self._alloc_fd(path)
-        self._dir_fds[fd] = path
-        return fd
-
-    def close(self, fd: int) -> None:
-        self._record("close", fd)
-        self._dir_fds.pop(fd, None)
-        self._fds.pop(fd, None)
-        self._file_fds.pop(fd, None)
+from fstestkit import RecordingFs, SimulatedCrash
 
 
 # --------------------------------------------------------------------------- #
@@ -262,6 +68,30 @@ def test_durable_move_leaves_only_dest(tmp_path: Path) -> None:
     durable_move(src, dest)
     assert not src.exists()
     assert dest.read_text(encoding="utf-8") == "payload"
+
+
+def test_durable_link_existing_dest_raises_file_exists(tmp_path: Path) -> None:
+    """Collision case that gates QTP claim races: dest taken → FileExistsError, both intact."""
+    src = tmp_path / "src.txt"
+    dest = tmp_path / "dest.txt"
+    src.write_text("from-src", encoding="utf-8")
+    dest.write_text("already-here", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        durable_link(src, dest)
+    assert src.read_text(encoding="utf-8") == "from-src"
+    assert dest.read_text(encoding="utf-8") == "already-here"
+    assert src.exists() and dest.exists()
+
+
+def test_durable_move_existing_dest_raises_file_exists(tmp_path: Path) -> None:
+    src = tmp_path / "src.txt"
+    dest = tmp_path / "dest.txt"
+    src.write_text("from-src", encoding="utf-8")
+    dest.write_text("already-here", encoding="utf-8")
+    with pytest.raises(FileExistsError):
+        durable_move(src, dest)
+    assert src.read_text(encoding="utf-8") == "from-src"
+    assert dest.read_text(encoding="utf-8") == "already-here"
 
 
 # --------------------------------------------------------------------------- #
@@ -323,6 +153,31 @@ def test_durable_unlink_fsyncs_parent() -> None:
     assert not fs.visible(path)
 
 
+def test_recording_fs_refuses_promotion_without_file_fsync() -> None:
+    """Prior durability of a path must not auto-promote unsynced rewrite bytes.
+
+    Models the re-write case (run.json / ledger / lease): seed durable content,
+    stage a pending dir entry with new bytes that were never file-fsynced, dir-fsync,
+    then assert promotion is refused and crash recovery keeps the old content.
+    """
+    fs = RecordingFs()
+    path = Path("/run/run.json")
+    fs.seed(path, "old-durable")
+    # Rewrite visible in the page cache but not content-fsynced this generation.
+    fs.files[path] = "new-unsynced"
+    fs._pending_dir[path] = "new-unsynced"
+    fs._file_content_synced.discard(path)
+
+    dir_fd = fs.open_dir(path.parent)
+    fs.fsync(dir_fd)
+    fs.close(dir_fd)
+
+    assert fs._durable[path] == "old-durable"
+    assert path not in fs._file_content_synced
+    fs._lose_unsynced()
+    assert fs.files[path] == "old-durable"
+
+
 # --------------------------------------------------------------------------- #
 # Replay-loss: crash after each op prefix → legal QTP visible state
 # --------------------------------------------------------------------------- #
@@ -381,8 +236,6 @@ def test_atomic_write_replay_loss_no_corrupt_authority() -> None:
             atomic_write_json(path, {"v": 2}, fs=fs)
         except SimulatedCrash:
             pass
-        # After loss, the authority path should still be present with parseable JSON
-        # of either generation (tmp may vanish; prior durable publish remains).
         assert fs.visible(path), f"authority missing after crash_after={crash_after}"
         doc = json.loads(fs.files[path])
         assert doc in ({"v": 1}, {"v": 2})

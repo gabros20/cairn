@@ -53,6 +53,7 @@ from typing import Any, Callable, Iterator
 
 import cairn
 from cairn.executors.base import ExecTimeout
+from cairn.kernel import durafs
 from cairn.kernel.artifacts import (
     DEFAULT_VALIDATOR_TIMEOUT_S,
     done,
@@ -154,22 +155,14 @@ def _cursor_lock(cursor_path: Path) -> Iterator[None]:
 
 
 def _atomic_write_cursor(path: Path, doc: dict) -> None:
-    """tmp + fsync + rename + dir-fsync — mirrors ``runstate._atomic_write`` (``run.json``
-    is the kernel's other on-disk state authority). The cursor file deserves the same
-    durability: an un-fsynced tmp lost to a crash mid-rename would silently re-widen the
-    next poll's window, defeating the entire point of a persisted watermark.
+    """Durably replace the cursor file via :func:`cairn.kernel.durafs.atomic_write_text`.
+
+    The cursor is a state authority (like ``run.json``): an un-fsynced tmp lost to a
+    crash mid-rename would silently re-widen the next poll's window, defeating the
+    entire point of a persisted watermark. Formatting stays byte-identical to the
+    historical hand-rolled write (``indent=2, ensure_ascii=False``).
     """
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        fh.write(json.dumps(doc, indent=2, ensure_ascii=False))
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
-    dir_fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    durafs.atomic_write_text(path, json.dumps(doc, indent=2, ensure_ascii=False))
 
 
 def _assert_cursor_contained(step_id: str, cursor_rel: str, candidate: Path, real_workspace_dir: Path) -> None:
