@@ -390,6 +390,13 @@ def test_list_installed_triggers_reports_declared_installed_and_stuck(tmp_path):
     claim_dir = watch_abs / ".claim"
     claim_dir.mkdir(parents=True)
     (claim_dir / "orphan.json").write_text("stuck", encoding="utf-8")
+    # Ledger depth counts (W1a additive fields on TriggerStatus).
+    (watch_abs / ".waiting").mkdir()
+    (watch_abs / ".waiting" / "parked.json").write_text("p", encoding="utf-8")
+    (watch_abs / ".failed").mkdir()
+    (watch_abs / ".failed" / "bad.json").write_text("b", encoding="utf-8")
+    (watch_abs / ".done").mkdir()
+    (watch_abs / ".done" / "ok.json").write_text("o", encoding="utf-8")
 
     statuses = list_installed_triggers(ws, backend="launchd", runner=runner, launchd_dir=launchd_dir)
     assert len(statuses) == 1
@@ -398,6 +405,9 @@ def test_list_installed_triggers_reports_declared_installed_and_stuck(tmp_path):
     assert status.declared is True
     assert status.installed is True
     assert [p.name for p in status.stuck] == ["orphan.json"]
+    assert status.waiting == 1
+    assert status.failed == 1
+    assert status.done == 1
 
 
 def test_list_installed_triggers_declared_not_installed_and_installed_not_declared(tmp_path):
@@ -423,10 +433,29 @@ def test_list_installed_triggers_cron_backend_refuses(tmp_path):
 
 
 # --- run_trigger -----------------------------------------------------------
+# D7-amended: drain now mints a run dir + writes a claim pointer + spawns with
+# --run-dir + retires by RunOutcome. Tests stub preallocate_run (plan/mint seam)
+# and patch ledger names on queue_drain (facade setattr mirror removed).
 
 
-def test_run_trigger_drains_one_candidate_and_consumes_to_done(tmp_path):
+def _stub_mint(monkeypatch, ws: Path):
+    """Patch queue_drain.preallocate_run to create a deterministic run dir without planning."""
+    import cairn.kernel.queue_drain as qd
+    from cairn.kernel.runctl import Minted
+
+    def fake_preallocate(workspace_dir, trigger, claimed_path, *, now):
+        run_dir = qd.run_dir_for_item(ws / "runs", trigger.name, claimed_path.name)
+        run_dir.mkdir(parents=True, exist_ok=True)
+        (run_dir / "run.json").write_text('{"status":"running"}', encoding="utf-8")
+        return Minted(run_dir=run_dir)
+
+    monkeypatch.setattr(qd, "preallocate_run", fake_preallocate)
+
+
+def test_run_trigger_drains_one_candidate_and_retires_to_done(tmp_path, monkeypatch):
+    # D7 rewrite of test_run_trigger_drains_one_candidate_and_consumes_to_done
     ws = _workspace(tmp_path, TRIGGERS_ONE)
+    _stub_mint(monkeypatch, ws)
     watch_abs = ws / "inbox" / "replies"
     watch_abs.mkdir(parents=True)
     (watch_abs / "one.json").write_text("event payload", encoding="utf-8")
@@ -438,19 +467,24 @@ def test_run_trigger_drains_one_candidate_and_consumes_to_done(tmp_path):
     call = runner.calls[-1]
     claimed_path = watch_abs / ".done" / "one.json"
     assert claimed_path.is_file()
+    run_dir = ws / "runs" / "handle-reply-one"
     assert call["argv"] == [
         "cairn",
         "run",
         "handle-reply",
         "--headless",
+        "--run-dir",
+        str(run_dir),
         "--param",
         f"event={watch_abs / '.claim' / 'one.json'}",
     ]
     assert call["cwd"] == ws
+    assert (watch_abs / ".done" / "tombstones" / "one.json").is_file()
 
 
-def test_run_trigger_empty_scan_returns_zero_and_calls_nothing(tmp_path):
+def test_run_trigger_empty_scan_returns_zero_and_calls_nothing(tmp_path, monkeypatch):
     ws = _workspace(tmp_path, TRIGGERS_ONE)
+    _stub_mint(monkeypatch, ws)
     runner = FakeRunner()
     assert run_trigger("handle-reply", ws, runner=runner, cairn_bin="cairn", now=NOW) == 0
     assert runner.calls == []
@@ -462,8 +496,9 @@ def test_run_trigger_unknown_name_lists_declared_triggers(tmp_path):
         run_trigger("ghost", ws, runner=FakeRunner(), cairn_bin="cairn", now=NOW)
 
 
-def test_run_trigger_drain_continues_past_a_failed_child(tmp_path):
+def test_run_trigger_drain_continues_past_a_failed_child(tmp_path, monkeypatch):
     ws = _workspace(tmp_path, TRIGGERS_ONE)
+    _stub_mint(monkeypatch, ws)
     watch_abs = ws / "inbox" / "replies"
     watch_abs.mkdir(parents=True)
     # "fail-me" sorts before "ok" — proves the SECOND candidate still runs after the
@@ -477,7 +512,7 @@ def test_run_trigger_drain_continues_past_a_failed_child(tmp_path):
 
         def spawn(self, argv, *, input=None, cwd=None):
             self.calls.append({"argv": list(argv), "cwd": cwd})
-            ok = "fail-me" not in argv[-1]
+            ok = "fail-me" not in " ".join(argv)
             return _CannedHandle(RunResult(returncode=0 if ok else 3))
 
     runner = SelectiveRunner()
@@ -489,11 +524,12 @@ def test_run_trigger_drain_continues_past_a_failed_child(tmp_path):
     assert (watch_abs / ".done" / "ok.json").is_file()
 
 
-def test_run_trigger_uses_the_v2_suffixed_claim_path_when_a_stuck_claim_collides(tmp_path):
+def test_run_trigger_uses_the_v2_suffixed_claim_path_when_a_stuck_claim_collides(tmp_path, monkeypatch):
     # addendum: claim()'s returned path may carry a -v2 suffix when a same-named stuck
     # claim already sits in .claim/ — run_trigger must operate on the RETURNED path,
     # never reconstruct it from the candidate's own basename.
     ws = _workspace(tmp_path, TRIGGERS_ONE)
+    _stub_mint(monkeypatch, ws)
     watch_abs = ws / "inbox" / "replies"
     watch_abs.mkdir(parents=True)
     claim_dir = watch_abs / ".claim"
@@ -506,45 +542,44 @@ def test_run_trigger_uses_the_v2_suffixed_claim_path_when_a_stuck_claim_collides
 
     assert code == 0
     call = runner.calls[-1]
-    assert call["argv"][-1] == f"event={watch_abs / '.claim' / 'one-v2.json'}"
+    assert f"event={watch_abs / '.claim' / 'one-v2.json'}" in call["argv"]
     assert (watch_abs / ".done" / "one-v2.json").is_file()
     # the original stuck claim is untouched — still sitting in .claim/, never overwritten
     assert (claim_dir / "one.json").read_text(encoding="utf-8") == "stuck from a crashed prior firing"
 
 
 def test_run_trigger_claim_hazard_halts_only_that_event_not_the_whole_drain(tmp_path, monkeypatch):
+    # D7 rewrite: patch target is queue_drain.claim (facade setattr mirror removed).
     ws = _workspace(tmp_path, TRIGGERS_ONE)
+    _stub_mint(monkeypatch, ws)
     watch_abs = ws / "inbox" / "replies"
     watch_abs.mkdir(parents=True)
     (watch_abs / "bad.json").write_text("x", encoding="utf-8")
     (watch_abs / "good.json").write_text("y", encoding="utf-8")
 
-    import cairn.kernel.triggerkit as tk
+    import cairn.kernel.queue_drain as qd
 
-    real_claim = tk.claim
+    real_claim = qd.claim
 
     def flaky_claim(watch_abs_arg, candidate):
         if candidate.name == "bad.json":
             raise CairnError("simulated cross-device hazard")
         return real_claim(watch_abs_arg, candidate)
 
-    monkeypatch.setattr(tk, "claim", flaky_claim)
+    monkeypatch.setattr(qd, "claim", flaky_claim)
     runner = FakeRunner({("cairn", "run"): RunResult(0, "", "")})
     code = run_trigger("handle-reply", ws, runner=runner, cairn_bin="cairn", now=NOW)
 
     assert code != 0  # the hazard counts as a failure
     assert (watch_abs / "bad.json").is_file()  # never claimed — left exactly where it was
-    assert not (watch_abs / ".failed" / "bad.json").exists()  # nothing to consume — never claimed
+    assert not (watch_abs / ".failed" / "bad.json").exists()  # never claimed
     assert (watch_abs / ".done" / "good.json").is_file()  # drain continued past the hazard
 
 
-def test_run_trigger_reemits_captured_child_streams_to_injected_buffers(tmp_path):
-    # A halted child (e.g. NEEDS_HUMAN) captures output in the Runner — re-emit it so a
-    # launchd/systemd-fired trigger's operator sees the halt reason and resume hint
-    # instead of just an exit code (mirrors test_run_schedule_reemits_captured_streams...).
-    import io
-
+def test_run_trigger_waiting_park_exits_zero(tmp_path, monkeypatch):
+    """Exit 6 (NEEDS_HUMAN) parks to .waiting/ and does NOT set any_failed (exit 0)."""
     ws = _workspace(tmp_path, TRIGGERS_ONE)
+    _stub_mint(monkeypatch, ws)
     watch_abs = ws / "inbox" / "replies"
     watch_abs.mkdir(parents=True)
     (watch_abs / "one.json").write_text("event payload", encoding="utf-8")
@@ -552,45 +587,54 @@ def test_run_trigger_reemits_captured_child_streams_to_injected_buffers(tmp_path
     runner = FakeRunner(
         {("cairn", "run"): RunResult(6, "run halted at gate\n", "resume: cairn resume acme-x\n")}
     )
+    import io
+
     out, err = io.StringIO(), io.StringIO()
     code = run_trigger("handle-reply", ws, runner=runner, cairn_bin="cairn", now=NOW, out=out, err=err)
 
-    assert code != 0
+    assert code == 0  # waiting park is not a drain failure
+    assert (watch_abs / ".waiting" / "one.json").is_file()
+    assert not (watch_abs / ".failed" / "one.json").exists()
     assert out.getvalue() == "run halted at gate\n"
     assert err.getvalue() == "resume: cairn resume acme-x\n"
+    from cairn.kernel.queue_ledger import read_pointer, pointer_path
+
+    ptr = read_pointer(pointer_path(watch_abs / ".waiting", "one.json"))
+    assert ptr["outcome"] == "waiting"
+    assert ptr["exit_code"] == 6
+    assert ptr["child_pid"] == 1  # FakeRunner default pid
 
 
-def test_run_trigger_stays_silent_when_no_buffers_given(tmp_path):
-    # backward compat: without out/err, the captured child streams are simply not
-    # re-emitted — return-code semantics are unchanged.
+def test_run_trigger_stays_silent_when_no_buffers_given(tmp_path, monkeypatch):
+    # waiting park exits 0 now; without out/err, streams are not re-emitted.
     ws = _workspace(tmp_path, TRIGGERS_ONE)
+    _stub_mint(monkeypatch, ws)
     watch_abs = ws / "inbox" / "replies"
     watch_abs.mkdir(parents=True)
     (watch_abs / "one.json").write_text("event payload", encoding="utf-8")
 
     runner = FakeRunner({("cairn", "run"): RunResult(6, "noisy stdout", "noisy stderr")})
     code = run_trigger("handle-reply", ws, runner=runner, cairn_bin="cairn", now=NOW)
-    assert code != 0  # no exception, nothing written anywhere
+    assert code == 0
+    assert (watch_abs / ".waiting" / "one.json").is_file()
 
 
 def test_run_trigger_claim_hazard_writes_a_candidate_named_diagnostic_to_err(tmp_path, monkeypatch):
-    # WB-1 item 3, pre-claim branch: claim() hazarding must no longer be silently
-    # swallowed — a one-line diagnostic naming the candidate and the exception must
-    # land on the injected err, and the "left in place" wording must distinguish this
-    # from the post-claim (stuck-claim) case below.
+    # D7 rewrite: patch queue_drain.claim (not triggerkit facade).
     import io
 
     ws = _workspace(tmp_path, TRIGGERS_ONE)
+    _stub_mint(monkeypatch, ws)
     watch_abs = ws / "inbox" / "replies"
     watch_abs.mkdir(parents=True)
     (watch_abs / "bad.json").write_text("x", encoding="utf-8")
 
-    import cairn.kernel.triggerkit as tk
+    import cairn.kernel.queue_drain as qd
 
     def flaky_claim(watch_abs_arg, candidate):
         raise CairnError("simulated cross-device hazard")
 
-    monkeypatch.setattr(tk, "claim", flaky_claim)
+    monkeypatch.setattr(qd, "claim", flaky_claim)
     err = io.StringIO()
     code = run_trigger(
         "handle-reply", ws, runner=FakeRunner(), cairn_bin="cairn", now=NOW, err=err
@@ -604,14 +648,13 @@ def test_run_trigger_claim_hazard_writes_a_candidate_named_diagnostic_to_err(tmp
     assert "simulated cross-device hazard" in diagnostic
 
 
-def test_run_trigger_runner_hazard_after_claim_writes_a_stuck_claim_diagnostic_to_err(tmp_path):
-    # WB-1 item 3, post-claim branch: a spawn/consume hazard after a successful claim
-    # must also write a candidate-named diagnostic — distinguished from the pre-claim
-    # case by "stuck claim in .claim/" wording, since this candidate's file IS now
-    # sitting in .claim/ with no recorded outcome.
+def test_run_trigger_runner_hazard_after_claim_writes_a_stuck_claim_diagnostic_to_err(tmp_path, monkeypatch):
+    # WB-1 item 3, post-claim branch: a spawn hazard after a successful claim
+    # must write a candidate-named diagnostic with "stuck claim in .claim/" wording.
     import io
 
     ws = _workspace(tmp_path, TRIGGERS_ONE)
+    _stub_mint(monkeypatch, ws)
     watch_abs = ws / "inbox" / "replies"
     watch_abs.mkdir(parents=True)
     (watch_abs / "bad.json").write_text("x", encoding="utf-8")
@@ -633,14 +676,12 @@ def test_run_trigger_runner_hazard_after_claim_writes_a_stuck_claim_diagnostic_t
     assert "cairn_bin not found on PATH" in diagnostic
 
 
-def test_run_trigger_runner_hazard_after_claim_leaves_a_stuck_claim_but_continues_the_drain(tmp_path):
-    # The reviewer's exact Finding 4 repro: runner.run() itself RAISES (not just
-    # returns nonzero) for a candidate that was already successfully claimed — e.g. a
-    # missing cairn_bin. Per-candidate isolation must wrap the whole claim+spawn+consume
-    # unit of work, not just claim(): the exception must not abort the drain, and the
-    # already-claimed file (which never got a recorded outcome) is a stuck claim by
-    # definition — surfaced, not silently lost or retried.
+def test_run_trigger_runner_hazard_after_claim_leaves_a_stuck_claim_but_continues_the_drain(
+    tmp_path, monkeypatch
+):
+    # Per-candidate isolation wraps claim+mint+spawn+retire; stuck claim stays stuck.
     ws = _workspace(tmp_path, TRIGGERS_ONE)
+    _stub_mint(monkeypatch, ws)
     watch_abs = ws / "inbox" / "replies"
     watch_abs.mkdir(parents=True)
     (watch_abs / "bad.json").write_text("x", encoding="utf-8")
@@ -652,7 +693,7 @@ def test_run_trigger_runner_hazard_after_claim_leaves_a_stuck_claim_but_continue
 
         def spawn(self, argv, *, input=None, cwd=None):
             self.calls.append({"argv": list(argv), "cwd": cwd})
-            if "bad.json" in argv[-1]:
+            if "bad.json" in " ".join(argv):
                 raise FileNotFoundError("cairn_bin not found on PATH (simulated)")
             return _CannedHandle(RunResult(returncode=0, stdout="", stderr=""))
 
@@ -663,6 +704,96 @@ def test_run_trigger_runner_hazard_after_claim_leaves_a_stuck_claim_but_continue
     assert len(runner.calls) == 2  # BOTH candidates were attempted — the drain never stopped
     assert (watch_abs / ".done" / "good.json").is_file()  # second candidate fully processed
     stuck = stuck_claims(watch_abs)
-    assert [p.name for p in stuck] == ["bad.json"]  # claimed but never consumed — surfaced as stuck
-    assert not (watch_abs / ".failed" / "bad.json").exists()  # never consumed either way
+    assert [p.name for p in stuck] == ["bad.json"]  # claimed but never retired — stuck
+    assert not (watch_abs / ".failed" / "bad.json").exists()
     assert not (watch_abs / "bad.json").exists()  # not left in the inbox — it WAS claimed
+
+
+def test_run_trigger_refusal_leaves_item_in_place(tmp_path, monkeypatch):
+    """Mint Refusal is not an outcome: item returns to inbox, exit still 0 for that event."""
+    import io
+
+    import cairn.kernel.queue_drain as qd
+    from cairn.kernel.runctl import Refusal, RefusalKind
+    from cairn.kernel.types import ExitCode
+
+    ws = _workspace(tmp_path, TRIGGERS_ONE)
+    watch_abs = ws / "inbox" / "replies"
+    watch_abs.mkdir(parents=True)
+    (watch_abs / "one.json").write_text("event payload", encoding="utf-8")
+
+    def refuse(*a, **k):
+        return Refusal(
+            code=ExitCode.CONFIG,
+            message="cairn: tools unverified",
+            kind=RefusalKind.TOOLS,
+        )
+
+    monkeypatch.setattr(qd, "preallocate_run", refuse)
+    err = io.StringIO()
+    code = run_trigger(
+        "handle-reply", ws, runner=FakeRunner(), cairn_bin="cairn", now=NOW, err=err
+    )
+    assert code == 0  # refusal is neither failed nor parked
+    assert (watch_abs / "one.json").is_file()  # back in place
+    assert not (watch_abs / ".failed" / "one.json").exists()
+    assert not (watch_abs / ".waiting" / "one.json").exists()
+    assert "mint refused" in err.getvalue()
+    assert "tools" in err.getvalue()
+
+
+def test_run_trigger_records_child_pid_in_pointer_before_wait_returns(tmp_path, monkeypatch):
+    """Pointer holds child_pid before wait completes (T5 / W3 lease prep)."""
+    import threading
+    import time
+
+    import cairn.kernel.queue_drain as qd
+    from cairn.kernel.queue_ledger import pointer_path, read_pointer
+
+    ws = _workspace(tmp_path, TRIGGERS_ONE)
+    _stub_mint(monkeypatch, ws)
+    watch_abs = ws / "inbox" / "replies"
+    watch_abs.mkdir(parents=True)
+    (watch_abs / "one.json").write_text("event payload", encoding="utf-8")
+
+    pid_seen: list[int] = []
+    ready = threading.Event()
+
+    class BlockingHandle:
+        def __init__(self):
+            self._pid = 4242
+
+        @property
+        def pid(self):
+            return self._pid
+
+        def wait(self, timeout=None):
+            # Give the drain a moment after spawn returned (pid recorded) before finishing.
+            ready.set()
+            time.sleep(0.05)
+            return RunResult(returncode=0, stdout="", stderr="")
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            return None
+
+    class BlockingRunner(RunnerBase):
+        def spawn(self, argv, *, input=None, cwd=None):
+            return BlockingHandle()
+
+    # Observe pointer mid-wait via a thin wrap of write_pointer after spawn's pid write.
+    real_write = qd.write_pointer
+
+    def tracking_write(path, **kwargs):
+        real_write(path, **kwargs)
+        if kwargs.get("child_pid") is not None:
+            pid_seen.append(kwargs["child_pid"])
+
+    monkeypatch.setattr(qd, "write_pointer", tracking_write)
+    code = run_trigger("handle-reply", ws, runner=BlockingRunner(), cairn_bin="cairn", now=NOW)
+    assert code == 0
+    assert 4242 in pid_seen
+    # After retire to done, live pointer is gone; tombstone remains.
+    assert (watch_abs / ".done" / "one.json").is_file()

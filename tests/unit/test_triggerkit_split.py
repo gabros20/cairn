@@ -10,14 +10,16 @@ import cairn.kernel.queue_ledger as queue_ledger
 import cairn.kernel.trigger_host as trigger_host
 import cairn.kernel.triggerkit as triggerkit
 
-# Every name the facade must keep working for existing importers (task-T5 brief).
+# Every name the facade must keep working for existing importers (T5 + W1a T6).
 _FACADE_PUBLIC = (
     "Trigger",
     "load_triggers",
     "watch_dir",
     "scan_candidates",
     "claim",
-    "consume",
+    "retire",
+    "sweep",
+    "SweepReport",
     "stuck_claims",
     "sync_triggers",
     "remove_trigger",
@@ -37,7 +39,9 @@ _HOME = {
     "watch_dir": trigger_host,
     "scan_candidates": queue_ledger,
     "claim": queue_ledger,
-    "consume": queue_ledger,
+    "retire": queue_ledger,
+    "sweep": queue_ledger,
+    "SweepReport": queue_ledger,
     "stuck_claims": queue_ledger,
     "sync_triggers": trigger_host,
     "remove_trigger": trigger_host,

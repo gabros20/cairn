@@ -1427,6 +1427,9 @@ def _trigger_status_json(status: TriggerStatus) -> dict[str, Any]:
         "declared": status.declared,
         "installed": status.installed,
         "stuck": [str(p) for p in status.stuck],
+        "waiting": status.waiting,
+        "failed": status.failed,
+        "done": status.done,
     }
 
 
@@ -1442,6 +1445,11 @@ def _print_trigger_list(statuses: list[TriggerStatus], backend: str) -> None:
         else:
             note = "- installed, not declared"
         print(f"  {note:32} {s.name}")
+        if s.declared and (s.waiting or s.failed or s.done or s.stuck):
+            print(
+                f"      waiting={s.waiting} failed={s.failed} done={s.done} "
+                f"stuck={len(s.stuck)}"
+            )
         for claim_path in s.stuck:
             print(f"      ! stuck claim (never auto-retried): {claim_path}")
 

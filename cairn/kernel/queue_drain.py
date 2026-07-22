@@ -1,65 +1,156 @@
-"""queue_drain — drain loop: scan → claim → run → consume.
+"""queue_drain — drain loop: sweep → scan → claim → mint → spawn → retire.
 
-Process orchestration for one trigger firing (docs/FACTORY-PLAN.md §3 W0.5 / D10).
-Imports trigger_host (declaration) and queue_ledger (claim engine); is not imported
-by either sibling.
+Process orchestration for one trigger firing (docs/FACTORY-PLAN.md §3 W0.5 / D10,
+W1a QTP retire-side T3–T6). Imports trigger_host (declaration) and queue_ledger
+(claim engine); is not imported by either sibling.
+
+Ledger functions are looked up as **module globals** on this module (``claim``,
+``retire``, ``sweep``, ``scan_candidates``). Tests patch those names here —
+there is no facade setattr mirror (T5 review obligation).
 """
 
 from __future__ import annotations
 
+import hashlib
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import TextIO
 
+from cairn.kernel.config import load_config
 from cairn.kernel.errors import CairnError, ConfigError
+from cairn.kernel.plan import plan as build_plan
 from cairn.kernel.proc import Runner
-from cairn.kernel.queue_ledger import claim, consume, scan_candidates
+from cairn.kernel.queue_ledger import (
+    claim,
+    pointer_path,
+    read_pointer,
+    retire,
+    scan_candidates,
+    sweep,
+    unclaim,
+    write_pointer,
+)
+from cairn.kernel.runctl import Minted, Refusal, mint_new
 from cairn.kernel.trigger_host import Trigger, load_triggers, watch_dir
-from cairn.kernel.types import Finding
+from cairn.kernel.types import Finding, OutcomeClass, classify_exit
+
+
+def run_dir_for_item(
+    runs_root: Path,
+    trigger_name: str,
+    item_name: str,
+) -> Path:
+    """Deterministic run-dir path for a claimed work item (FACTORY-PLAN T5 / W1a).
+
+    Derivation: ``<runs_root>/<trigger_name>-<item_stem>`` where ``item_stem`` is
+    ``Path(item_name).stem`` (the claim basename without its final suffix — so a
+    collision-suffixed claim ``one-v2.json`` becomes stem ``one-v2``). Identity/rev
+    grammar (``p<prio>-<source>-<id>-r<rev>``) lands with W3 admission; until then
+    the stem of the ledger filename is the stable key.
+    """
+    stem = Path(item_name).stem
+    return Path(runs_root) / f"{trigger_name}-{stem}"
+
+
+def _runs_root(workspace_dir: Path) -> Path:
+    config = load_config(workspace_dir)
+    root = Path(config.workspace.runs_dir)
+    return root if root.is_absolute() else Path(workspace_dir) / root
+
+
+def _pipeline_hash(workspace_dir: Path, pipeline: str) -> str:
+    path = Path(workspace_dir) / "pipelines" / f"{pipeline}.yaml"
+    return "sha256:" + hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def preallocate_run(
+    workspace_dir: Path,
+    trigger: Trigger,
+    claimed_path: Path,
+    *,
+    now: datetime,
+) -> Minted | Refusal:
+    """Build the plan and :func:`mint_new` into the deterministic run dir.
+
+    Patchable seam for unit tests that drive the drain with a FakeRunner and do
+    not want a full plan/mint. Production always plans + mints.
+    """
+    workspace_dir = Path(workspace_dir)
+    claimed_path = Path(claimed_path)
+    runs_root = _runs_root(workspace_dir)
+    run_dir = run_dir_for_item(runs_root, trigger.name, claimed_path.name)
+    params = {trigger.param: str(claimed_path)}
+    p = build_plan(
+        workspace_dir,
+        trigger.pipeline,
+        params,
+        now=now,
+        headless=True,
+    )
+    return mint_new(
+        workspace_dir,
+        p,
+        now=now,
+        pipeline_hash=_pipeline_hash(workspace_dir, trigger.pipeline),
+        runs_root=runs_root,
+        run_dir=run_dir,
+    )
 
 
 def _run_one(
     trigger: Trigger,
     claimed_path: Path,
+    run_dir: Path,
     workspace_dir: Path,
     runner: Runner,
     cairn_bin: str,
     *,
     out: TextIO | None = None,
     err: TextIO | None = None,
-) -> bool:
-    """Fire the one child ``cairn run`` for a single claimed event (TRIGGERS-PLAN.md §2
-    step 3). ``claimed_path`` is ALWAYS the exact path :func:`claim` returned — including
-    any ``-v2`` collision suffix — never reconstructed from the original candidate's
-    basename (T1 quality finding G2 / addendum): the child must receive the ledger's
-    real location, not a guess at what it might be. Already absolute (built from
-    :func:`watch_dir`'s resolved watch dir), so no further resolution is applied here —
-    doing so would risk dereferencing a claimed file that is itself a symlink, which T1's
-    claim/consume deliberately never do.
+) -> tuple[int, int]:
+    """Spawn one child ``cairn run`` for a claimed event; return ``(returncode, pid)``.
 
-    Mirrors ``schedkit.run_schedule``'s re-emission exactly: the Runner captures the
-    child's stdout/stderr, so a firing that halts (a halt reason, a resume hint) would
-    otherwise produce ZERO output and a launchd/systemd-fired trigger's operator would
-    see nothing but an exit code — silently rotting, which §4 forbids. When ``out``/
-    ``err`` are provided, the captured streams are re-emitted VERBATIM to them after the
-    child completes; when they are None, nothing is re-emitted (matches ``run_schedule``'s
-    backward-compatible default).
+    ``claimed_path`` is ALWAYS the exact path :func:`claim` returned — including any
+    ``-v2`` collision suffix — never reconstructed from the original candidate's
+    basename. The child receives ``--run-dir`` so it resumes the preallocated run
+    (FACTORY-PLAN T5). Streams are re-emitted to ``out``/``err`` when given
+    (schedkit/run_schedule posture).
     """
     argv = [
         cairn_bin,
         "run",
         trigger.pipeline,
         "--headless",
+        "--run-dir",
+        str(run_dir),
         "--param",
         f"{trigger.param}={claimed_path}",
     ]
-    result = runner.run(argv, cwd=workspace_dir)
+    handle = runner.spawn(argv, cwd=workspace_dir)
+    pid = handle.pid
+    # Record pid into the claim pointer before wait returns (T5 / W3 lease prep).
+    ptr = pointer_path(claimed_path.parent, claimed_path.name)
+    if ptr.is_file():
+        try:
+            rec = read_pointer(ptr)
+            write_pointer(
+                ptr,
+                run_dir=rec.get("run_dir") or run_dir,
+                outcome=rec.get("outcome"),
+                exit_code=rec.get("exit_code"),
+                child_pid=pid,
+            )
+        except (OSError, ValueError):
+            write_pointer(ptr, run_dir=run_dir, child_pid=pid)
+    else:
+        write_pointer(ptr, run_dir=run_dir, child_pid=pid)
+    result = handle.wait()
     if out is not None and result.stdout:
         out.write(result.stdout)
     if err is not None and result.stderr:
         err.write(result.stderr)
-    return result.returncode == 0
+    return result.returncode, pid
 
 
 def run_trigger(
@@ -72,64 +163,16 @@ def run_trigger(
     out: TextIO | None = None,
     err: TextIO | None = None,
 ) -> int:
-    """Drain trigger ``name``'s inbox: scan, claim each candidate, fire one ``cairn run``
-    child per claim, consume on outcome (TRIGGERS-PLAN.md §2). This is the function the
-    host watcher's ``cairn trigger run <name>`` argv (the T2 renderers' stable entry)
-    resolves to.
+    """Drain trigger ``name``: sweep waiting first, then claim+mint+spawn+retire.
 
-    ``now`` is accepted per the module's no-hidden-clock discipline (mirroring
-    schedkit's ``install``/``run_schedule`` posture) even though nothing in this
-    function currently branches on it — no timestamp is embedded at this layer (the
-    child's own ``run_id`` templating does that, per TRIGGERS-PLAN.md §2's closing
-    paragraph). Kept as an injected parameter rather than a bare ``datetime.now()`` so a
-    future addition (e.g. stuck-claim age reporting) never needs a signature change.
+    Exit code: ``0`` when every candidate was processed clean (including waiting-class
+    parks — they do NOT set failure), OR the scan was empty; nonzero when ANY
+    candidate failed (FAILED outcome) or a claim/spawn/retire hazard raised.
+    Guard-refusals from mint are not outcomes: item returns to the inbox, diagnostic
+    only, neither failed nor parked (FACTORY-PLAN T6).
 
-    ``out``/``err`` mirror ``schedkit.run_schedule`` exactly (same signature, same
-    backward-compatible None default): the Runner captures each child's stdout/stderr,
-    so a firing that halts would otherwise produce ZERO output on the operator's
-    notification channel — the exact "silently rotting" failure run_schedule exists to
-    prevent, and this is the doctrine's primary target platform (launchd/systemd-fired).
-    When given, every child's captured streams are re-emitted verbatim to them via
-    :func:`_run_one` as each candidate is processed. A claim/spawn/consume hazard (see
-    below) has no child stream to re-emit — instead, a one-line diagnostic naming the
-    candidate and the exception is written to ``err`` (falling back to ``sys.stderr``
-    when ``err`` is None, so the hazard is never silent even when the caller passes
-    nothing).
-
-    Exit code: ``0`` when every candidate was processed clean, OR there was nothing to
-    claim (an empty scan is a successful no-op drain, not a failure); nonzero when ANY
-    candidate failed to process — its child exited nonzero, OR the claim/spawn/consume
-    step itself hazarded (a raised exception, not just a nonzero child exit). A failing
-    candidate never stops the drain — every remaining candidate still gets claimed and
-    run (the brief's rejected alternative is retrying a failed event, not draining past
-    it: draining past it is required). The failed
-    claim moves to ``.failed/`` (never auto-retried) while the run overall reports
-    failure via its exit code.
-
-    :func:`claim` can raise :class:`CairnError` for a filesystem/platform hazard (a
-    hardlink-unsupported platform, or ``.claim/`` on a different filesystem than the
-    watch dir — T1's ``_hardlink``) instead of returning ``None``/a path. That hazard
-    afflicts every candidate in this watch dir identically, not one poison file, but the
-    same principle applies: a clear halt of that ONE event beats a crash of the whole
-    drain. It is caught per-candidate, counted as a failure, and the loop moves on to
-    the next candidate rather than aborting the whole run. Nothing was ever claimed in
-    that case, so there is no claim path to :func:`consume` — the candidate is left
-    exactly where it was, to be picked up again on the NEXT firing once the underlying
-    filesystem/platform hazard is fixed (a structural misconfiguration, not the
-    poison-file scenario ``.failed/``-and-stop targets).
-
-    Once a candidate IS claimed, the child spawn (:func:`_run_one`) and :func:`consume`
-    are wrapped in that SAME per-candidate isolation, not just ``claim()`` — a runner
-    that can't even spawn the child (a missing ``cairn_bin``, a ``PermissionError``) or a
-    ``consume`` that hazards while retiring the claim (its own ``_hardlink`` path can
-    raise, per T1's docstring) must not abort the whole drain either
-    (review-T3-quality-r1.md Finding 4). Unlike the pre-claim hazard above, this
-    candidate's file IS now sitting in ``.claim/`` with no recorded outcome once such an
-    exception hits — by definition a stuck claim (never auto-retried; surfaced via
-    :func:`stuck_claims`/``trigger list`` for the operator to re-drop or discard by
-    hand), a deliberate choice rather than a bug: a claim whose child never ran has no
-    known outcome to consume it with, so surfacing it as stuck is honest, where silently
-    retrying it would risk re-running a child that already did partial, unknown work.
+    Per-candidate isolation preserved: a hazard on one event never aborts the drain;
+    post-claim exceptions leave stuck claims in ``.claim/``.
     """
     workspace_dir = Path(workspace_dir)
     triggers = load_triggers(workspace_dir)
@@ -143,6 +186,21 @@ def run_trigger(
     watch_abs = watch_dir(trigger, workspace_dir)
     diag = err if err is not None else sys.stderr
     any_failed = False
+
+    # T6: sweep FIRST — advance .waiting/ from trail evidence before new claims.
+    try:
+        report = sweep(watch_abs, on_done=trigger.on_done)
+    except Exception as exc:  # noqa: BLE001 — sweep must never abort the drain
+        any_failed = True
+        print(
+            f"cairn: trigger {name!r}: sweep hazarded: {exc}",
+            file=diag,
+        )
+        report = None
+    if report is not None:
+        for line in report.diagnostics:
+            print(f"cairn: trigger {name!r}: sweep: {line}", file=diag)
+
     for candidate in scan_candidates(watch_abs, trigger.glob):
         try:
             claimed = claim(watch_abs, candidate)
@@ -156,15 +214,59 @@ def run_trigger(
             continue
         if claimed is None:
             continue  # lost the claim race to a concurrent firing — not our event
+
         try:
-            ok = _run_one(trigger, claimed, workspace_dir, runner, cairn_bin, out=out, err=err)
-            consume(watch_abs, claimed, ok=ok, on_done=trigger.on_done)
+            try:
+                minted = preallocate_run(workspace_dir, trigger, claimed, now=now)
+            except ConfigError as exc:
+                # Plan/config failure is a guard-class refusal, not a run outcome.
+                unclaim(watch_abs, claimed)
+                print(
+                    f"cairn: trigger {name!r}: candidate {candidate.name!r} mint refused "
+                    f"(config) — left in place: {exc}",
+                    file=diag,
+                )
+                continue
+            if isinstance(minted, Refusal):
+                # Not an outcome: put the item back; neither failed nor parked.
+                unclaim(watch_abs, claimed)
+                print(
+                    f"cairn: trigger {name!r}: candidate {candidate.name!r} mint refused "
+                    f"({minted.kind.value}) — left in place: {minted.message}",
+                    file=diag,
+                )
+                continue
+            run_dir = minted.run_dir
+            # Pointer BEFORE spawn (T5).
+            write_pointer(
+                pointer_path(claimed.parent, claimed.name),
+                run_dir=run_dir,
+                outcome=None,
+                exit_code=None,
+                child_pid=None,
+            )
+            returncode, child_pid = _run_one(
+                trigger,
+                claimed,
+                run_dir,
+                workspace_dir,
+                runner,
+                cairn_bin,
+                out=out,
+                err=err,
+            )
+            outcome = classify_exit(returncode)
+            retire(
+                watch_abs,
+                claimed,
+                outcome=outcome,
+                on_done=trigger.on_done,
+                exit_code=returncode,
+                child_pid=child_pid,
+                run_dir=run_dir,
+            )
         except Exception as exc:
-            # The child spawn or the consume step itself hazarded (see the docstring's
-            # "Once a candidate IS claimed" paragraph) — this candidate is now a stuck
-            # claim by definition, not silently lost or retried; count it as a failure
-            # and move on rather than aborting the whole drain (review-T3-quality-r1.md
-            # Finding 4).
+            # Spawn / retire hazard after claim — stuck claim, not silent retry.
             any_failed = True
             print(
                 f"cairn: trigger {name!r}: candidate {candidate.name!r} hazarded and was "
@@ -172,6 +274,7 @@ def run_trigger(
                 file=diag,
             )
             continue
-        if not ok:
+        if outcome.outcome is OutcomeClass.FAILED:
             any_failed = True
+        # WAITING parks do not set any_failed; DONE is clean.
     return 1 if any_failed else 0

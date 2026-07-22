@@ -1885,7 +1885,17 @@ def test_trigger_sync_list_remove_launchd_roundtrip(hello_ws, monkeypatch, tmp_p
         ExitCode.OK
     )
     payload = json.loads(capsys.readouterr().out)
-    assert payload == [{"name": "handle-reply", "declared": True, "installed": True, "stuck": []}]
+    assert payload == [
+        {
+            "name": "handle-reply",
+            "declared": True,
+            "installed": True,
+            "stuck": [],
+            "waiting": 0,
+            "failed": 0,
+            "done": 0,
+        }
+    ]
 
     assert main(
         ["trigger", "remove", "handle-reply", "--backend", "launchd", "--launchd-dir", str(ld)]
@@ -1927,12 +1937,11 @@ def test_trigger_run_unknown_name_is_config_error(hello_ws, monkeypatch, capsys)
 
 def test_trigger_run_drives_a_real_child_run_end_to_end(hello_ws, monkeypatch):
     # No _FakeRunner here — the real _SubprocessRunner, so `cairn trigger run` genuinely
-    # spawns a child `cairn run on-event --headless --param event=<claimed-path>` process
-    # (requirement 4's "REAL child cairn run" smoke). PATH has the ambient `cairn` console
-    # script stripped out (`_path_without_cairn`) so `_resolve_cairn_bin` can't lean on
-    # PATH resolution — it must fall back to the sibling of `sys.executable`, the same
-    # interpreter-tied guarantee the batch tests get from spawning
-    # `[sys.executable, "-m", "cairn", ...]` directly.
+    # spawns a child `cairn run on-event --headless --run-dir <dir> --param event=<path>`
+    # process (requirement 4's "REAL child cairn run" smoke). PATH has the ambient `cairn`
+    # console script stripped out (`_path_without_cairn`) so `_resolve_cairn_bin` can't lean
+    # on PATH resolution — it must fall back to the sibling of `sys.executable`.
+    # Run-dir derivation (W1a): runs/<trigger>-<item-stem> = handle-reply-one.
     _write_triggers(hello_ws, "handle-reply:\n  pipeline: on-event\n  watch: inbox/replies\n")
     _write_on_event_pipeline(hello_ws)
     inbox = hello_ws / "inbox" / "replies"
@@ -1945,14 +1954,15 @@ def test_trigger_run_drives_a_real_child_run_end_to_end(hello_ws, monkeypatch):
     rc = main(["trigger", "run", "handle-reply"])
     assert rc == int(ExitCode.OK)
 
-    assert not event.exists()  # claimed and consumed, not left in the inbox
+    assert not event.exists()  # claimed and retired, not left in the inbox
     done = list((inbox / ".done").glob("*.json"))
     assert [p.name for p in done] == ["one.json"]
     assert done[0].read_text(encoding="utf-8") == '{"hello": "world"}'
+    assert (inbox / ".done" / "tombstones" / "one.json").is_file()
 
-    run_dirs = [d for d in (hello_ws / "runs").iterdir() if d.name.startswith("on-event-")]
-    assert len(run_dirs) == 1
-    assert (run_dirs[0] / "echoed.txt").read_text(encoding="utf-8") == '{"hello": "world"}'
+    run_dir = hello_ws / "runs" / "handle-reply-one"
+    assert run_dir.is_dir()
+    assert (run_dir / "echoed.txt").read_text(encoding="utf-8") == '{"hello": "world"}'
 
 
 def test_trigger_run_failing_pipeline_moves_event_to_failed_and_exits_nonzero(hello_ws, monkeypatch):
@@ -1975,7 +1985,78 @@ def test_trigger_run_failing_pipeline_moves_event_to_failed_and_exits_nonzero(he
     assert not event.exists()
     failed = list((inbox / ".failed").glob("*.json"))
     assert [p.name for p in failed] == ["bad.json"]
-    assert not list((inbox / ".done").glob("*"))
+    assert (inbox / ".done" / "tombstones" / "bad.json").is_file()
+    assert not list((inbox / ".done").glob("*.json"))
+
+
+def _write_on_event_manual_pipeline(ws: Path) -> None:
+    # Manual step halts headless with exit 6 (NEEDS_HUMAN) — park surface for W1a e2e.
+    # Hand-answer = write the produces artifact; then resume finishes to run-done.
+    (ws / "pipelines" / "on-event-manual.yaml").write_text(
+        "pipeline: on-event-manual\n"
+        "version: 1\n"
+        "params:\n"
+        "  event: { type: string, required: true }\n"
+        "artifacts:\n"
+        "  token:\n"
+        "    path: token.txt\n"
+        "    validator: validators/nonempty.py\n"
+        "steps:\n"
+        "  - id: approve\n"
+        "    manual: \"write token.txt after reviewing {params.event}\"\n"
+        "    produces: [token]\n",
+        encoding="utf-8",
+    )
+
+
+def test_trigger_run_park_answer_resume_sweep_retires_to_done(hello_ws, monkeypatch, capsys):
+    """W1a e2e: drop event → park (exit 6) → hand-answer → resume → second trigger run
+    sweeps to .done/. Excerpt of operator-visible log captured for the report.
+    """
+    _write_triggers(
+        hello_ws, "handle-reply:\n  pipeline: on-event-manual\n  watch: inbox/replies\n"
+    )
+    _write_on_event_manual_pipeline(hello_ws)
+    inbox = hello_ws / "inbox" / "replies"
+    inbox.mkdir(parents=True)
+    event = inbox / "need-human.json"
+    event.write_text('{"ticket": 1}', encoding="utf-8")
+    monkeypatch.chdir(hello_ws)
+    monkeypatch.setenv("PATH", _path_without_cairn())
+
+    # 1) First drain: child halts at manual → park to .waiting/, drain exit 0.
+    rc1 = main(["trigger", "run", "handle-reply"])
+    out1 = capsys.readouterr()
+    assert rc1 == int(ExitCode.OK)
+    assert (inbox / ".waiting" / "need-human.json").is_file()
+    assert not (inbox / ".failed" / "need-human.json").exists()
+    run_dir = hello_ws / "runs" / "handle-reply-need-human"
+    assert run_dir.is_dir()
+
+    # 2) Hand-answer: write the produces artifact the manual step needs.
+    (run_dir / "token.txt").write_text("approved\n", encoding="utf-8")
+
+    # 3) Resume the run to completion (trail ends with run-done).
+    rc_resume = main(["resume", str(run_dir)])
+    assert rc_resume == int(ExitCode.OK)
+
+    # 4) Second drain: sweep sees run-done → retire to .done/.
+    rc2 = main(["trigger", "run", "handle-reply"])
+    out2 = capsys.readouterr()
+    assert rc2 == int(ExitCode.OK)
+    assert (inbox / ".done" / "need-human.json").is_file()
+    assert not (inbox / ".waiting" / "need-human.json").exists()
+    assert (inbox / ".done" / "tombstones" / "need-human.json").is_file()
+
+    # Log excerpt for the report (park → answer → retire).
+    log_excerpt = (
+        f"park_rc={rc1} waiting={ (inbox / '.waiting' / 'need-human.json').exists() } "
+        f"resume_rc={rc_resume} sweep_rc={rc2} "
+        f"done={ (inbox / '.done' / 'need-human.json').is_file() } "
+        f"err1={out1.err!r} err2={out2.err!r}"
+    )
+    # Keep a breadcrumb in the workspace for report paste (tests/ never assert on this path).
+    (hello_ws / "runs" / "_park_answer_retire.log").write_text(log_excerpt + "\n", encoding="utf-8")
 
 
 def test_subprocess_runner_actually_shells_out():

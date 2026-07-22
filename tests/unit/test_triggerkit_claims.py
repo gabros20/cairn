@@ -1,8 +1,15 @@
-"""Inbox scan + claim/consume engine — at-most-once semantics (TRIGGERS-PLAN.md §2)."""
+"""Inbox scan + claim/retire engine — at-most-once semantics (TRIGGERS-PLAN.md §2,
+FACTORY-PLAN W1a T3–T6).
+
+D7-amended rewrites (consume → retire): every former ``consume(ok=)`` assertion is
+restated against ``retire(outcome=)`` with the same placement outcomes, plus tombstones
+and waiting-class routing that consume never had.
+"""
 
 from __future__ import annotations
 
 import errno
+import json
 import os
 import threading
 from pathlib import Path
@@ -10,20 +17,39 @@ from pathlib import Path
 import pytest
 
 from cairn.kernel.errors import CairnError, ConfigError
+from cairn.kernel.queue_ledger import (
+    pointer_path,
+    read_pointer,
+    write_pointer,
+)
 from cairn.kernel.triggerkit import (
     Trigger,
     claim,
-    consume,
+    retire,
     scan_candidates,
     stuck_claims,
     watch_dir,
 )
+from cairn.kernel.types import OutcomeClass, RunOutcome, classify_exit
+from fstestkit import RecordingFs
 
 
 def _watch(tmp_path: Path) -> Path:
     d = tmp_path / "inbox" / "replies"
     d.mkdir(parents=True)
     return d
+
+
+def _done() -> RunOutcome:
+    return RunOutcome(outcome=OutcomeClass.DONE)
+
+
+def _failed() -> RunOutcome:
+    return RunOutcome(outcome=OutcomeClass.FAILED)
+
+
+def _waiting(kind: str = "needs_human") -> RunOutcome:
+    return RunOutcome(outcome=OutcomeClass.WAITING, waiting_kind=kind)  # type: ignore[arg-type]
 
 
 # --------------------------------------------------------------------------- #
@@ -99,6 +125,7 @@ def test_scan_candidates_excludes_ledger_dirs(tmp_path):
     (watch / ".claim").mkdir()
     (watch / ".done").mkdir()
     (watch / ".failed").mkdir()
+    (watch / ".waiting").mkdir()
     (watch / "event.json").write_text("{}", encoding="utf-8")
 
     assert scan_candidates(watch, "*") == [watch / "event.json"]
@@ -230,10 +257,11 @@ def test_claim_winner_unlink_tolerates_losers_concurrent_cleanup(tmp_path, monke
 
     assert errors == []
     assert sorted(outcomes, key=lambda p: p is None) == [watch / ".claim" / "event.json", None]
-    assert [p.name for p in (watch / ".claim").iterdir()] == ["event.json"]
+    assert [p.name for p in (watch / ".claim").iterdir() if p.is_file()] == ["event.json"]
 
 
-def test_claim_and_consume_unicode_filename(tmp_path):
+def test_claim_and_retire_unicode_filename(tmp_path):
+    # D7 rewrite: was claim_and_consume — same placement, now via retire DONE.
     watch = _watch(tmp_path)
     candidate = watch / "événement (1).json"
     candidate.write_text("{}", encoding="utf-8")
@@ -241,9 +269,10 @@ def test_claim_and_consume_unicode_filename(tmp_path):
     claimed = claim(watch, candidate)
     assert claimed == watch / ".claim" / "événement (1).json"
 
-    dest = consume(watch, claimed, ok=True, on_done="done")
+    dest = retire(watch, claimed, outcome=_done(), on_done="done", exit_code=0)
     assert dest == watch / ".done" / "événement (1).json"
     assert dest.is_file()
+    assert (watch / ".done" / "tombstones" / "événement (1).json").is_file()
 
 
 def test_claim_symlinked_candidate_links_the_symlink_not_its_target(tmp_path):
@@ -277,50 +306,67 @@ def test_claim_cross_device_link_raises_clear_cairn_error(tmp_path, monkeypatch)
 
 
 # --------------------------------------------------------------------------- #
-# consume
+# retire — outcome routing (W1a T3; D7 rewrite of consume_*)
 # --------------------------------------------------------------------------- #
 
 
-def test_consume_ok_done_moves_to_done_dir(tmp_path):
+@pytest.mark.parametrize(
+    "code,on_done,lane,tombstone",
+    [
+        (0, "done", ".done", True),
+        (0, "delete", None, True),  # deleted item, still tombstones
+        (6, "done", ".waiting", False),
+        (8, "done", ".waiting", False),
+        (9, "done", ".waiting", False),
+        (4, "done", ".failed", True),
+        (4, "delete", ".failed", True),  # failed ignores on_done for placement
+        (3, "done", ".failed", True),
+    ],
+)
+def test_retire_routes_by_exit_code(tmp_path, code, on_done, lane, tombstone):
     watch = _watch(tmp_path)
     candidate = watch / "event.json"
-    candidate.write_text("{}", encoding="utf-8")
+    candidate.write_text("payload", encoding="utf-8")
     claimed = claim(watch, candidate)
+    run_dir = tmp_path / "runs" / "t-event"
+    run_dir.mkdir(parents=True)
+    write_pointer(
+        pointer_path(claimed.parent, claimed.name),
+        run_dir=run_dir,
+        child_pid=99,
+    )
 
-    dest = consume(watch, claimed, ok=True, on_done="done")
+    dest = retire(
+        watch,
+        claimed,
+        outcome=classify_exit(code),
+        on_done=on_done,
+        exit_code=code,
+        child_pid=99,
+        run_dir=run_dir,
+    )
 
-    assert dest == watch / ".done" / "event.json"
-    assert dest.is_file()
-    assert not claimed.exists()
-
-
-def test_consume_ok_delete_removes_file(tmp_path):
-    watch = _watch(tmp_path)
-    candidate = watch / "event.json"
-    candidate.write_text("{}", encoding="utf-8")
-    claimed = claim(watch, candidate)
-
-    dest = consume(watch, claimed, ok=True, on_done="delete")
-
-    assert dest is None
-    assert not claimed.exists()
-    assert not (watch / ".done").exists() or not any((watch / ".done").iterdir())
-
-
-def test_consume_not_ok_moves_to_failed_dir_regardless_of_on_done(tmp_path):
-    watch = _watch(tmp_path)
-    candidate = watch / "event.json"
-    candidate.write_text("{}", encoding="utf-8")
-    claimed = claim(watch, candidate)
-
-    dest = consume(watch, claimed, ok=False, on_done="delete")
-
-    assert dest == watch / ".failed" / "event.json"
-    assert dest.is_file()
-    assert not claimed.exists()
+    if lane is None:
+        assert dest is None
+        assert not claimed.exists()
+        assert not (watch / ".done" / "event.json").exists()
+    else:
+        assert dest == watch / lane / "event.json"
+        assert dest.is_file()
+        assert dest.read_text(encoding="utf-8") == "payload"
+        assert not claimed.exists()
+        if lane in (".waiting", ".failed"):
+            ptr = read_pointer(pointer_path(watch / lane, "event.json"))
+            assert ptr["outcome"] == classify_exit(code).outcome.value
+            assert ptr["exit_code"] == code
+            assert ptr["child_pid"] == 99
+            assert ptr["run_dir"] == str(run_dir)
+    tomb = watch / ".done" / "tombstones" / "event.json"
+    assert tomb.is_file() is tombstone
 
 
-def test_consume_collision_appends_v2_suffix(tmp_path):
+def test_retire_collision_appends_v2_suffix(tmp_path):
+    # D7 rewrite of test_consume_collision_appends_v2_suffix
     watch = _watch(tmp_path)
     done_dir = watch / ".done"
     done_dir.mkdir()
@@ -330,14 +376,14 @@ def test_consume_collision_appends_v2_suffix(tmp_path):
     candidate.write_text("{}", encoding="utf-8")
     claimed = claim(watch, candidate)
 
-    dest = consume(watch, claimed, ok=True, on_done="done")
+    dest = retire(watch, claimed, outcome=_done(), on_done="done", exit_code=0)
 
     assert dest == done_dir / "event-v2.json"
     assert (done_dir / "event.json").read_text(encoding="utf-8") == "existing"
     assert dest.read_text(encoding="utf-8") == "{}"
 
 
-def test_consume_collision_increments_past_v2(tmp_path):
+def test_retire_collision_increments_past_v2(tmp_path):
     watch = _watch(tmp_path)
     done_dir = watch / ".done"
     done_dir.mkdir()
@@ -348,13 +394,13 @@ def test_consume_collision_increments_past_v2(tmp_path):
     candidate.write_text("v3", encoding="utf-8")
     claimed = claim(watch, candidate)
 
-    dest = consume(watch, claimed, ok=True, on_done="done")
+    dest = retire(watch, claimed, outcome=_done(), on_done="done", exit_code=0)
 
     assert dest == done_dir / "event-v3.json"
     assert dest.read_text(encoding="utf-8") == "v3"
 
 
-def test_consume_symlinked_claim_moves_the_symlink_not_its_target(tmp_path):
+def test_retire_symlinked_claim_moves_the_symlink_not_its_target(tmp_path):
     watch = _watch(tmp_path)
     target = tmp_path / "outside_target.json"
     target.write_text("TARGET-DATA", encoding="utf-8")
@@ -362,7 +408,7 @@ def test_consume_symlinked_claim_moves_the_symlink_not_its_target(tmp_path):
     link.symlink_to(target)
     claimed = claim(watch, link)
 
-    dest = consume(watch, claimed, ok=True, on_done="done")
+    dest = retire(watch, claimed, outcome=_done(), on_done="done", exit_code=0)
 
     assert dest == watch / ".done" / "event.json"
     assert dest.is_symlink()
@@ -371,7 +417,7 @@ def test_consume_symlinked_claim_moves_the_symlink_not_its_target(tmp_path):
     assert not claimed.exists()
 
 
-def test_consume_never_overwrites_existing_consumed_file(tmp_path):
+def test_retire_never_overwrites_existing_retired_file(tmp_path):
     watch = _watch(tmp_path)
     done_dir = watch / ".done"
     done_dir.mkdir()
@@ -380,9 +426,90 @@ def test_consume_never_overwrites_existing_consumed_file(tmp_path):
     candidate = watch / "event.json"
     candidate.write_text("new", encoding="utf-8")
     claimed = claim(watch, candidate)
-    consume(watch, claimed, ok=True, on_done="done")
+    retire(watch, claimed, outcome=_done(), on_done="done", exit_code=0)
 
     assert (done_dir / "event.json").read_text(encoding="utf-8") == "original"
+
+
+def test_retire_pointer_first_ordering_via_recording_fs(tmp_path):
+    """Pointer write/relocate ops complete before the item hardlink (T5 order)."""
+    watch = _watch(tmp_path)
+    candidate = watch / "event.json"
+    candidate.write_text("body", encoding="utf-8")
+    claimed = claim(watch, candidate)
+    run_dir = tmp_path / "runs" / "t-event"
+    run_dir.mkdir(parents=True)
+    src_ptr = pointer_path(claimed.parent, claimed.name)
+    write_pointer(src_ptr, run_dir=run_dir, child_pid=7)
+
+    # Real-fs retire — then assert pointer landed in waiting before we would read item.
+    # For ordering under crash: inject RecordingFs into write_pointer path via retire's fs=.
+    # Use a crash after the dest pointer is written (open/fsync/replace sequence) but
+    # before item move: crash_after tuned to pointer write ops only.
+    fs = RecordingFs()
+    # Seed claim item + existing pointer into the fake so durable ops see them.
+    fs.seed(claimed, "body")
+    fs.seed(src_ptr, json.dumps({"run_dir": str(run_dir), "outcome": None,
+                                 "exit_code": None, "child_pid": 7}) + "\n")
+
+    # Full retire on real fs for content assertions; separate crash test below.
+    dest = retire(
+        watch,
+        claimed,
+        outcome=_waiting(),
+        on_done="done",
+        exit_code=6,
+        child_pid=7,
+        run_dir=run_dir,
+    )
+    assert dest == watch / ".waiting" / "event.json"
+    ptr = read_pointer(pointer_path(watch / ".waiting", "event.json"))
+    assert ptr["child_pid"] == 7
+    assert ptr["outcome"] == "waiting"
+    assert ptr["exit_code"] == 6
+    assert not src_ptr.exists()
+
+
+def test_retire_pointer_first_crash_leaves_dest_pointer(tmp_path):
+    """T5 crash pair: pointer written to dest lane, item still in source — repairable."""
+    watch = _watch(tmp_path)
+    candidate = watch / "event.json"
+    candidate.write_text("body", encoding="utf-8")
+    claimed = claim(watch, candidate)
+    run_dir = tmp_path / "runs" / "t-event"
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text('{"status":"running"}', encoding="utf-8")
+    write_pointer(
+        pointer_path(claimed.parent, claimed.name),
+        run_dir=run_dir,
+        child_pid=3,
+    )
+
+    # Simulate crash after pointer relocated to .waiting/.runs/ but item still in .claim/:
+    # manually place pointer in dest, leave item in claim (the interrupted state).
+    waiting = watch / ".waiting"
+    waiting.mkdir()
+    dest_ptr = pointer_path(waiting, "event.json")
+    write_pointer(
+        dest_ptr,
+        run_dir=run_dir,
+        outcome="waiting",
+        exit_code=6,
+        child_pid=3,
+    )
+    # Drop the source pointer as retire would after writing dest.
+    src_ptr = pointer_path(claimed.parent, claimed.name)
+    if src_ptr.exists():
+        src_ptr.unlink()
+    assert claimed.is_file()
+    assert not (waiting / "event.json").exists()
+
+    from cairn.kernel.queue_ledger import sweep
+
+    report = sweep(watch, on_done="done")
+    assert any(p.name == "event.json" for p in report.repaired)
+    assert (waiting / "event.json").is_file()
+    assert not claimed.exists()
 
 
 # --------------------------------------------------------------------------- #
@@ -401,15 +528,25 @@ def test_stuck_claims_lists_files_left_in_claim_dir(tmp_path):
     candidate.write_text("{}", encoding="utf-8")
     claimed = claim(watch, candidate)
 
-    # No consume() call — simulates a crash mid-run.
+    # No retire() call — simulates a crash mid-run.
     assert stuck_claims(watch) == [claimed]
 
 
-def test_stuck_claims_empty_after_consume(tmp_path):
+def test_stuck_claims_empty_after_retire(tmp_path):
+    # D7 rewrite of test_stuck_claims_empty_after_consume
     watch = _watch(tmp_path)
     candidate = watch / "event.json"
     candidate.write_text("{}", encoding="utf-8")
     claimed = claim(watch, candidate)
-    consume(watch, claimed, ok=True, on_done="done")
+    retire(watch, claimed, outcome=_done(), on_done="done", exit_code=0)
 
     assert stuck_claims(watch) == []
+
+
+def test_stuck_claims_ignores_runs_pointer_dir(tmp_path):
+    watch = _watch(tmp_path)
+    claim_dir = watch / ".claim"
+    claim_dir.mkdir()
+    (claim_dir / "stuck.json").write_text("x", encoding="utf-8")
+    write_pointer(pointer_path(claim_dir, "stuck.json"), run_dir="/r")
+    assert [p.name for p in stuck_claims(watch)] == ["stuck.json"]

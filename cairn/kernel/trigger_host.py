@@ -20,7 +20,7 @@ import yaml
 
 from cairn.kernel.errors import ConfigError
 from cairn.kernel.proc import Runner
-from cairn.kernel.queue_ledger import stuck_claims
+from cairn.kernel.queue_ledger import ledger_counts, stuck_claims
 from cairn.kernel.types import Finding
 
 TRIGGERS_YAML = "triggers.yaml"
@@ -496,17 +496,21 @@ def _require_ownership(path: Path, trigger_name: str, classify: Callable[[Path],
 @dataclass(frozen=True)
 class TriggerStatus:
     """One trigger's status as ``trigger list`` reports it (TRIGGERS-PLAN.md §2/§3):
-    declared in ``triggers.yaml``, installed on the host watcher, and any files sitting
-    in ``.claim/`` from a crash mid-firing — surfaced here so the operator can re-drop or
-    discard them; never auto-retried. ``stuck`` is only ever non-empty for a DECLARED
-    trigger (its ``watch:`` must resolve to inspect ``.claim/``); a trigger that's
-    installed but no longer declared has no ``watch:`` left to check.
+    declared in ``triggers.yaml``, installed on the host watcher, ledger depths
+    (waiting/failed/done), and any files sitting in ``.claim/`` from a crash mid-firing
+    — surfaced here so the operator can re-drop or discard them; never auto-retried.
+    ``stuck`` and the depth counts are only ever non-empty for a DECLARED trigger (its
+    ``watch:`` must resolve); a trigger that's installed but no longer declared has no
+    ``watch:`` left to check.
     """
 
     name: str
     declared: bool
     installed: bool
     stuck: tuple[Path, ...] = ()
+    waiting: int = 0
+    failed: int = 0
+    done: int = 0
 
 
 def sync_triggers(
@@ -760,14 +764,23 @@ def list_installed_triggers(
     for name in sorted(set(triggers) | installed_names):
         trigger = triggers.get(name)
         stuck: tuple[Path, ...] = ()
+        waiting = failed = done = 0
         if trigger is not None:
-            stuck = tuple(stuck_claims(watch_dir(trigger, workspace_dir)))
+            watch_abs = watch_dir(trigger, workspace_dir)
+            stuck = tuple(stuck_claims(watch_abs))
+            counts = ledger_counts(watch_abs)
+            waiting = counts["waiting"]
+            failed = counts["failed"]
+            done = counts["done"]
         statuses.append(
             TriggerStatus(
                 name=name,
                 declared=name in triggers,
                 installed=name in installed_names,
                 stuck=stuck,
+                waiting=waiting,
+                failed=failed,
+                done=done,
             )
         )
     return statuses
