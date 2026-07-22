@@ -35,7 +35,7 @@ from cairn.kernel import newkit
 from cairn.kernel.artifacts import resolve_path, validate
 from cairn.kernel.batchkit import run_batch
 from cairn.kernel.compose import make_composer, render_artifact_path
-from cairn.kernel.config import Config, ExecutorConfig, installed_version, load_config, version_compat
+from cairn.kernel.config import Config, ExecutorConfig, installed_version, load_config
 from cairn.kernel.errors import CairnError, ConfigError
 from cairn.kernel.gatekit import (
     GateTampered,
@@ -56,11 +56,18 @@ from cairn.kernel.plan import (
     plan as build_plan,
 )
 from cairn.kernel.proc import SubprocessRunner as _SubprocessRunner
+from cairn.kernel.runctl import (
+    AlreadyDone,
+    Minted,
+    Refusal,
+    preflight_tools,
+    resolve_run,
+    resume_existing,
+    workspace_git_rev,
+)
 from cairn.kernel.runstate import load_run, update_run
-from cairn.kernel.toolcheck import run_tool_check
 from cairn.kernel.schedkit import (
     diff_schedules,
-    find_idempotent_run,
     install as install_schedules,
     list_installed,
     load_schedules,
@@ -76,7 +83,7 @@ from cairn.kernel.triggerkit import (
     sync_triggers,
 )
 from cairn.kernel.types import ExitCode
-from cairn.kernel.walk import bootstrap_run, invalidate_from, walk
+from cairn.kernel.walk import invalidate_from, walk
 
 # The full verb surface (docs/API.md §9). Order is the help-listing order.
 SUBCOMMANDS: list[str] = [
@@ -445,34 +452,10 @@ def _print_walk_result(code: ExitCode, run_dir: Path) -> None:
         print(f"cairn: run halted (exit {int(code)}) → {run_dir}", file=sys.stderr)
 
 
-def _preflight_tools(p: Plan) -> int | None:
-    """The `cairn run` hard-stop (docs/TOOLING-AND-GROWTH.md §2): run each in-range scoped tool's
-    ``check`` BEFORE anything is minted or walked. Wired into every entrance about to execute —
-    a fresh mint (before ``bootstrap_run``, so a failure creates nothing on disk), both resume
-    entrances of `cairn run`, and `cairn resume` — always AFTER the resume guards (drift →
-    version → tools, the same order on every path). Only the `--idempotent` entrances
-    short-circuit an already-complete run before any check; the non-idempotent resume entrances
-    re-check even when run.json says "done" — deliberate, not an oversight: the walk's
-    skip-if-valid semantics re-execute a "done" step whose artifact has since been deleted or
-    invalidated (see ``walk._is_done``), and that repair re-execution still needs its tools, so
-    a status-done fast-path here would be wrong, not just redundant.
-
-    A failing check refuses with a legible message naming the tool, the step(s)/pipeline needing
-    it, the failed check, and the fix (install hint + `cairn doctor`), and returns
-    ``ExitCode.CONFIG``. All checks pass → returns None with zero output. ``p.tool_requirements``
-    already excludes unscoped and out-of-range tools, so this runs no subprocess a plan-time
-    scope didn't already justify."""
-    failures = [req for req in p.tool_requirements if not run_tool_check(req.check)]
-    if not failures:
-        return None
-    lines = [f"cairn: refusing to run {p.pipeline!r} — required tool(s) unverified on this machine:"]
-    for req in failures:
-        lines.append(f"  ✗ {req.tool}  `{req.check}` failed (needed by: {', '.join(req.targets)})")
-        if req.install:
-            lines.append(f"      fix: {req.install}")
-    lines.append("  → run `cairn doctor` to verify tooling, then re-run.")
-    print("\n".join(lines), file=sys.stderr)
-    return int(ExitCode.CONFIG)
+def _print_refusal(r: Refusal) -> int:
+    """Adapter: print a runctl Refusal to stderr and return its exit code."""
+    print(r.message, file=sys.stderr)
+    return int(r.code)
 
 
 def _cmd_run(args: argparse.Namespace) -> int:
@@ -496,70 +479,25 @@ def _cmd_run(args: argparse.Namespace) -> int:
         return _print_config_error(exc)
 
     phash = _pipeline_hash(ws, args.pipeline)
+    runs_root = _runs_root(ws, config)
+    # Entrance decision tree lives in runctl (W0.2): --run-dir / --idempotent / fresh mint.
+    outcome = resolve_run(
+        ws,
+        p,
+        now=now,
+        pipeline_hash=phash,
+        runs_root=runs_root,
+        run_dir=args.run_dir,
+        idempotent=bool(args.idempotent),
+    )
+    if isinstance(outcome, Refusal):
+        return _print_refusal(outcome)
+    if isinstance(outcome, AlreadyDone):
+        print(f"cairn: already done → {outcome.run_dir}")
+        return int(ExitCode.OK)
 
-    # Resolve the run dir: honor --run-dir, respect --idempotent (resume-or-no-op).
-    created = False
-    if args.run_dir:
-        run_dir = Path(args.run_dir).resolve()
-        existing = (run_dir / "run.json").is_file()
-        if existing and args.idempotent:
-            fast = _idempotent_shortcut(run_dir)
-            if fast is not None:
-                return fast
-        if not existing:
-            # Fresh mint: verify in-range tools BEFORE minting — a failing check refuses with
-            # nothing created on disk (docs/TOOLING-AND-GROWTH §2).
-            fail = _preflight_tools(p)
-            if fail is not None:
-                return fail
-            run_dir = bootstrap_run(ws, p, now=now, run_dir=run_dir, pipeline_hash=phash)
-            created = True
-        else:
-            # An existing --run-dir resumes (with or without --idempotent) — through the same
-            # sequence as every other resume entrance: guards (drift → version), then the tool
-            # hard-stop. `cairn run` has no --force; the refusals name
-            # `cairn resume <run-dir> --force` as the escape hatch.
-            fail = _resume_guards(run_dir, phash, p.pipeline, ws, force=False)
-            if fail is not None:
-                return fail
-            fail = _preflight_tools(p)
-            if fail is not None:
-                return fail
-    else:
-        runs_root = _runs_root(ws, config)
-        # Idempotency's single source of truth is schedkit.find_idempotent_run — it matches by
-        # the (pipeline, params, {date}) content key a scheduled `--idempotent` firing would use,
-        # not by run-id string. Complete match → no-op; incomplete → resume; none → fresh run.
-        match = (
-            find_idempotent_run(runs_root, pipeline=p.pipeline, params=p.params, now=now)
-            if args.idempotent
-            else None
-        )
-        if match is not None and match.complete:
-            print(f"cairn: already done → {match.run_dir}")
-            return int(ExitCode.OK)
-        if match is not None:
-            # Incomplete equivalent run → resume it, never mint a variant — but through the
-            # same sequence `cairn resume` enforces: guards (a timer re-fire after a pipeline
-            # edit or a cross-major cairn upgrade must fail loud, not silently resume), then
-            # the tool hard-stop. `cairn run` has no --force flag; only
-            # `cairn resume … --force` can override.
-            fail = _resume_guards(match.run_dir, phash, p.pipeline, ws, force=False)
-            if fail is not None:
-                return fail
-            fail = _preflight_tools(p)
-            if fail is not None:
-                return fail
-            run_dir = match.run_dir
-        else:
-            # Fresh mint: verify in-range tools BEFORE minting (nothing on disk on failure).
-            fail = _preflight_tools(p)
-            if fail is not None:
-                return fail
-            run_dir = bootstrap_run(ws, p, now=now, runs_root=runs_root, pipeline_hash=phash)
-            created = True
-
-    if created:
+    run_dir = outcome.run_dir
+    if isinstance(outcome, Minted):
         # Record the actual executor routing so `cairn resume` reconstructs the same fleet
         # (mixed --executor / --step-executor) instead of silently falling back to defaults.
         global_default = (None if stub_mode else args.executor) or config.workspace.default_executor or ""
@@ -603,26 +541,6 @@ def _probe_executor_versions(resolved_models: dict[str, tuple[str, str, str | No
     return out
 
 
-def _workspace_git_rev(ws: Path) -> dict[str, Any] | None:
-    """The workspace's git ``HEAD`` + dirty flag for run.json's reproducibility record
-    (ARCHITECTURE §10), or ``None`` when ``ws`` isn't inside a git repo (or ``git`` itself is
-    unavailable). Never raises — a missing binary/non-repo workspace is absent, not a mint
-    failure, mirroring ``_probe_executor_versions``'s probe-failure handling."""
-    runner = _SubprocessRunner()
-    try:
-        head = runner.run(["git", "-C", str(ws), "rev-parse", "HEAD"])
-    except OSError:
-        return None
-    if head.returncode != 0 or not head.stdout.strip():
-        return None
-    try:
-        status = runner.run(["git", "-C", str(ws), "status", "--porcelain"])
-    except OSError:
-        status = None
-    dirty = bool(status.stdout.strip()) if status is not None and status.returncode == 0 else False
-    return {"rev": head.stdout.strip(), "dirty": dirty}
-
-
 def _record_executor_routing(
     run_dir: Path,
     now: datetime,
@@ -636,7 +554,7 @@ def _record_executor_routing(
     executor's probed ``--version`` and the workspace's git rev + dirty flag at mint (``None``
     for either on probe failure / a non-git workspace — never a mint crash)."""
     versions = _probe_executor_versions(resolved_models)
-    git = _workspace_git_rev(ws)
+    git = workspace_git_rev(ws)
 
     def mutate(doc: dict) -> None:
         ex = doc.setdefault("executors", {})
@@ -647,82 +565,6 @@ def _record_executor_routing(
         doc["git_dirty"] = git["dirty"] if git is not None else None
 
     update_run(run_dir, mutate)
-
-
-def _idempotent_shortcut(run_dir: Path) -> int | None:
-    """For ``--idempotent`` on an existing run dir: exit 0 fast if already done, else None
-    (the caller resumes)."""
-    try:
-        status = load_run(run_dir).get("status")
-    except (OSError, ValueError, ConfigError):
-        return None
-    if status == "done":
-        print(f"cairn: already done → {run_dir}")
-        return int(ExitCode.OK)
-    return None
-
-
-def _pipeline_drift_guard(recorded: str | None, current_hash: str, pipeline: str, run_dir: Path, *, force: bool) -> int | None:
-    """The pipeline-hash drift check shared by ``cairn resume`` and ``run --idempotent``'s
-    resume path: a recorded hash that matches neither the current file nor the pre-hash
-    sentinel means the pipeline changed under the run. Returns the exit code to fail with,
-    or None to proceed (with a warning when ``force`` overrode a real drift). The remedy
-    names the command that actually takes ``--force`` (``cairn run`` has no such flag)."""
-    if not recorded or recorded in ("sha256:unknown", current_hash):
-        return None
-    if not force:
-        print(
-            f"cairn: pipeline {pipeline!r} has changed since this run was planned "
-            f"(hash drift). Run `cairn resume {run_dir} --force` to resume against "
-            f"the current file.",
-            file=sys.stderr,
-        )
-        return int(ExitCode.CONFIG)
-    print(f"cairn: warning — resuming across pipeline-hash drift (--force) for {pipeline!r}", file=sys.stderr)
-    return None
-
-
-def _version_compat_guard(recorded: str | None, run_dir: Path, *, force: bool) -> int | None:
-    """The cross-version resume gate shared by ``cairn resume`` and ``run --idempotent``'s
-    resume path (docs/DISTRIBUTION.md §3, *Run-dir format*): compare the cairn version that
-    created this run against the installed one. Same major.minor resumes silently; a
-    cross-minor drift or an unrecorded/legacy version warns and proceeds; a cross-major
-    difference refuses without ``--force`` (run-dir semantics may not carry across a major).
-    Returns the exit code to fail with, or None to proceed. Mirrors `_pipeline_drift_guard`,
-    including the remedy naming the command that actually takes ``--force``."""
-    installed = installed_version()
-    verdict = version_compat(recorded, installed)
-    if verdict == "ok":
-        return None
-    if verdict == "warn":
-        if recorded:
-            print(
-                f"cairn: warning — resuming a run created by cairn {recorded} on cairn "
-                f"{installed} (version drift)",
-                file=sys.stderr,
-            )
-        else:
-            print(
-                f"cairn: warning — this run dir records no cairn version; resuming on cairn "
-                f"{installed}",
-                file=sys.stderr,
-            )
-        return None
-    # verdict == "refuse" — cross-major.
-    if not force:
-        print(
-            f"cairn: this run was created by cairn {recorded} but cairn {installed} is "
-            f"installed (major-version drift). Run `cairn resume {run_dir} --force` to "
-            f"resume against the installed version.",
-            file=sys.stderr,
-        )
-        return int(ExitCode.CONFIG)
-    print(
-        f"cairn: warning — resuming across cairn-version drift (--force): "
-        f"run {recorded} vs installed {installed}",
-        file=sys.stderr,
-    )
-    return None
 
 
 def _repin_manifest(run_dir: Path, run_doc: dict, current_hash: str) -> None:
@@ -748,73 +590,12 @@ def _repin_manifest(run_dir: Path, run_doc: dict, current_hash: str) -> None:
     )
 
 
-def _reproducibility_drift_guard(recorded: dict, ws: Path) -> None:
-    """Warn — never refuse — when an executor version or the workspace git rev recorded at
-    mint (ARCHITECTURE §10) has drifted by resume time. Unlike ``_pipeline_drift_guard``
-    (the pipeline itself changed under the run — potentially unsafe to resume against) or
-    ``_version_compat_guard``'s cross-major case (run-dir semantics may not carry across a
-    cairn major), a newer CLI or a workspace commit since mint doesn't invalidate what's on
-    disk — so this never blocks and takes no ``--force``. A probe failure here is silent (not
-    a second, redundant warning): the tool hard-stop / doctor already own "can this run at
-    all"; this guard only speaks up when a probe SUCCEEDS with a value that disagrees. Catches
-    both ``OSError`` and :class:`CairnError` — a Popen spawn failure surfaces as
-    ``ExecutorSpawnError`` (a ``CairnError``), not a bare ``OSError`` (see
-    ``_probe_executor_versions``). NOTE: only ``git_rev`` is drift-compared here — ``git_dirty``
-    is recorded at mint but a clean↔dirty change alone (same rev) is never itself warned on."""
-    recorded_versions = (recorded.get("executors") or {}).get("versions") or {}
-    for name, old in sorted(recorded_versions.items()):
-        if not old or shutil.which(name) is None:
-            continue
-        try:
-            code, current = _probe_version(name)
-        except (OSError, CairnError):
-            continue
-        if code == 0 and current and current != old:
-            print(
-                f"cairn: warning — executor {name!r} reports {current!r} at resume, "
-                f"recorded {old!r} at mint (version drift)",
-                file=sys.stderr,
-            )
-
-    recorded_git = recorded.get("git_rev")
-    if recorded_git:
-        current = _workspace_git_rev(ws)
-        if current is not None and current["rev"] != recorded_git:
-            print(
-                f"cairn: warning — workspace is at git {current['rev']} at resume, "
-                f"recorded {recorded_git} at mint (workspace drift)",
-                file=sys.stderr,
-            )
-
-
-def _resume_guards(run_dir: Path, phash: str, pipeline: str, ws: Path, *, force: bool) -> int | None:
-    """The shared gate for ``cairn run``'s two resume entrances (``--run-dir <existing>``
-    and ``--idempotent``'s auto-match): read the manifest fail-loud, then drift → version →
-    reproducibility (advisory) — the same order ``cairn resume`` applies them. A dir chosen
-    for resume whose run.json can't be read (or fails the cairn:run schema) is a config
-    error: degrading to ``{}`` would print a misleading "records no cairn version" warning
-    and then crash later inside the walk. Returns the exit code to fail with, or None to
-    proceed. (``_cmd_resume`` stays separate — its force comes from argv and it needs the run
-    doc for params/executors.)"""
-    try:
-        recorded = load_run(run_dir)
-    except (OSError, ValueError, ConfigError) as exc:
-        print(f"cairn: cannot read {run_dir}/run.json: {exc}", file=sys.stderr)
-        return int(ExitCode.CONFIG)
-    fail = _pipeline_drift_guard(recorded.get("pipeline_hash"), phash, pipeline, run_dir, force=force)
-    if fail is not None:
-        return fail
-    fail = _version_compat_guard(recorded.get("cairn_version"), run_dir, force=force)
-    if fail is not None:
-        return fail
-    _reproducibility_drift_guard(recorded, ws)
-    return None
-
-
 def _cmd_resume(args: argparse.Namespace) -> int:
     run_dir = Path(args.run_dir).resolve()
     ws = _workspace(args)
     now = _now()
+    # Pipeline name is needed before the file-exists check; load once for that, then
+    # resume_existing reloads fail-loud through the shared guard path (W0.2).
     try:
         run_doc = load_run(run_dir)
     except (OSError, ValueError, ConfigError) as exc:
@@ -830,13 +611,12 @@ def _cmd_resume(args: argparse.Namespace) -> int:
         return int(ExitCode.CONFIG)
 
     phash = _pipeline_hash(ws, pipeline)
-    fail = _pipeline_drift_guard(run_doc.get("pipeline_hash"), phash, pipeline, run_dir, force=args.force)
-    if fail is not None:
-        return fail
-    fail = _version_compat_guard(run_doc.get("cairn_version"), run_dir, force=args.force)
-    if fail is not None:
-        return fail
-    _reproducibility_drift_guard(run_doc, ws)
+    outcome = resume_existing(
+        run_dir, ws=ws, phash=phash, pipeline=pipeline, force=bool(args.force)
+    )
+    if isinstance(outcome, Refusal):
+        return _print_refusal(outcome)
+    run_doc = outcome.run_doc
     if args.force:
         _repin_manifest(run_dir, run_doc, phash)
 
@@ -853,9 +633,9 @@ def _cmd_resume(args: argparse.Namespace) -> int:
 
     # Resume re-checks in-range tools: a tool can vanish between sessions and the steps ahead
     # still need it (docs/TOOLING-AND-GROWTH §2). Cheap, and nothing is walked on a failure.
-    fail = _preflight_tools(p)
-    if fail is not None:
-        return fail
+    refused = preflight_tools(p)
+    if refused is not None:
+        return _print_refusal(refused)
 
     if args.from_node:
         try:

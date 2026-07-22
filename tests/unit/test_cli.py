@@ -260,7 +260,7 @@ def test_run_full_brease_rebuild_hardstops_on_unverified_vercel(monkeypatch, tmp
     # verifies vercel up front and refuses (deploy is 15 steps away — fail-fast beats a P6 crash).
     # Hermetic: stub the check-runner to "failed" so the test never executes the fixture's real
     # `vercel whoami` (which would pass on an authed machine, or hit the network logged-out).
-    monkeypatch.setattr("cairn.cli.run_tool_check", lambda check: False)
+    monkeypatch.setattr("cairn.kernel.runctl.run_tool_check", lambda check: False)
     monkeypatch.chdir(BREASE_WS)
     rd = tmp_path / "r"
     rc = main([
@@ -421,7 +421,7 @@ def test_run_mint_records_null_on_executor_spawn_error(tmp_path, monkeypatch):
 
 
 def test_resume_survives_executor_spawn_error_during_drift_probe(tmp_path, monkeypatch):
-    # Same fix, the resume-side call site (_reproducibility_drift_guard): a probe raising
+    # Same fix, the resume-side call site (runctl._reproducibility_drift_guard): a probe raising
     # ExecutorSpawnError during the drift check must not crash the resume either.
     ws = _twofleet_ws(tmp_path)
     monkeypatch.chdir(ws)
@@ -432,7 +432,8 @@ def test_resume_survives_executor_spawn_error_during_drift_probe(tmp_path, monke
     def _boom(name: str, timeout_s: float = 15.0):
         raise ExecutorSpawnError(f"{name!r} failed to start", executable=name)
 
-    monkeypatch.setattr("cairn.cli._probe_version", _boom)
+    # Guard body lives in runctl (W0.2); patch the import site the guard uses.
+    monkeypatch.setattr("cairn.kernel.runctl._probe_version", _boom)
     rc = main(["resume", str(rd)])
     assert rc == int(ExitCode.OK)  # drift-probe failure is silent, never a crash
 
