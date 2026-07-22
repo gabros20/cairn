@@ -432,7 +432,12 @@ def test_retire_never_overwrites_existing_retired_file(tmp_path):
 
 
 def test_retire_pointer_first_ordering_via_recording_fs(tmp_path):
-    """Pointer write/relocate ops complete before the item hardlink (T5 order)."""
+    """Pointer write ops (incl. dir fsync) complete BEFORE the item link (T5 order).
+
+    Uses fstestkit RecordingFs injected via retire(fs=) — both pointer and item
+    paths ride the same durafs seam so the recorded op stream is complete.
+    Real dirs exist so Path.mkdir / is_file checks succeed; durable ops are faked.
+    """
     watch = _watch(tmp_path)
     candidate = watch / "event.json"
     candidate.write_text("body", encoding="utf-8")
@@ -442,18 +447,28 @@ def test_retire_pointer_first_ordering_via_recording_fs(tmp_path):
     src_ptr = pointer_path(claimed.parent, claimed.name)
     write_pointer(src_ptr, run_dir=run_dir, child_pid=7)
 
-    # Real-fs retire — then assert pointer landed in waiting before we would read item.
-    # For ordering under crash: inject RecordingFs into write_pointer path via retire's fs=.
-    # Use a crash after the dest pointer is written (open/fsync/replace sequence) but
-    # before item move: crash_after tuned to pointer write ops only.
-    fs = RecordingFs()
-    # Seed claim item + existing pointer into the fake so durable ops see them.
-    fs.seed(claimed, "body")
-    fs.seed(src_ptr, json.dumps({"run_dir": str(run_dir), "outcome": None,
-                                 "exit_code": None, "child_pid": 7}) + "\n")
+    dest_ptr = pointer_path(watch / ".waiting", "event.json")
+    dest_item = watch / ".waiting" / "event.json"
+    # Pre-create dest parents so retire's Path.mkdir is a no-op and RecordingFs
+    # only sees the durable ops (write/link/unlink/fsync).
+    dest_ptr.parent.mkdir(parents=True, exist_ok=True)
 
-    # Full retire on real fs for content assertions; separate crash test below.
-    dest = retire(
+    fs = RecordingFs()
+    fs.seed(claimed, "body")
+    fs.seed(
+        src_ptr,
+        json.dumps(
+            {
+                "run_dir": str(run_dir),
+                "outcome": None,
+                "exit_code": None,
+                "child_pid": 7,
+            }
+        )
+        + "\n",
+    )
+
+    retire(
         watch,
         claimed,
         outcome=_waiting(),
@@ -461,13 +476,27 @@ def test_retire_pointer_first_ordering_via_recording_fs(tmp_path):
         exit_code=6,
         child_pid=7,
         run_dir=run_dir,
+        fs=fs,
     )
-    assert dest == watch / ".waiting" / "event.json"
-    ptr = read_pointer(pointer_path(watch / ".waiting", "event.json"))
-    assert ptr["child_pid"] == 7
-    assert ptr["outcome"] == "waiting"
-    assert ptr["exit_code"] == 6
-    assert not src_ptr.exists()
+
+    kinds = [op[0] for op in fs.ops]
+    assert "link" in kinds, f"expected item link in ops: {fs.ops}"
+    first_link = kinds.index("link")
+    # Pointer write: atomic_write_text does fsync_file → replace → fsync_dir(parent).
+    # That dest-pointer parent fsync must land before the item link.
+    pre = fs.ops[:first_link]
+    pre_kinds = [op[0] for op in pre]
+    assert "replace" in pre_kinds, "pointer replace must precede item link"
+    assert "fsync_file" in pre_kinds, "pointer file fsync must precede item link"
+    assert any(
+        op[0] == "fsync_dir" and op[1] == dest_ptr.parent for op in pre
+    ), f"pointer parent dir fsync must precede item link; pre={pre}"
+    # Item link targets the waiting-lane item path.
+    assert fs.ops[first_link] == ("link", claimed, dest_item)
+    # Fake namespace: dest pointer + item present; source item unlinked.
+    assert fs.visible(dest_ptr)
+    assert fs.visible(dest_item)
+    assert not fs.visible(claimed)
 
 
 def test_retire_pointer_first_crash_leaves_dest_pointer(tmp_path):

@@ -57,7 +57,14 @@ class _OsFs:
         os.replace(src, dst)
 
     def link(self, src: Path, dst: Path) -> None:
-        os.link(src, dst)
+        # Prefer not following symlinks so QTP ledger moves transport a symlink
+        # inode intact (callers that need the target resolve first — policy stays
+        # with callers; this is only the mechanical default for platforms that
+        # expose follow_symlinks on link).
+        if os.link in os.supports_follow_symlinks:
+            os.link(src, dst, follow_symlinks=False)
+        else:
+            os.link(src, dst)
 
     def unlink(self, path: Path) -> None:
         os.unlink(path)

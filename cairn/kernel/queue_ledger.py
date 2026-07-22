@@ -19,8 +19,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from cairn.kernel.durafs import atomic_write_text, durable_move, durable_unlink, fsync_dir
-from cairn.kernel.errors import CairnError
+from cairn.kernel.durafs import atomic_write_text, durable_link, durable_move, durable_unlink
+from cairn.kernel.errors import CairnError, ConfigError
+from cairn.kernel.runstate import load_run
 from cairn.kernel.trail import read_trail
 from cairn.kernel.types import OutcomeClass, RunOutcome, classify_exit
 
@@ -58,40 +59,26 @@ def scan_candidates(watch_abs: Path, glob: str) -> list[Path]:
 # --------------------------------------------------------------------------- #
 
 
-def _hardlink(src: Path, dest: Path) -> None:
-    """Hard-link ``src`` into ``dest`` without ever dereferencing a symlinked ``src``.
+def _hardlink(src: Path, dest: Path, *, fs: Any = None) -> None:
+    """Hard-link ``src`` into ``dest`` via :func:`durable_link` (D10 single seam).
 
-    ``os.link``'s default ``follow_symlinks=True`` would resolve a symlinked event file
-    and link its TARGET, not the symlink — a scan-accepted symlink (``Path.is_file()``
-    follows symlinks, so ``scan_candidates`` happily accepts one) would then silently
-    ledger the wrong bytes and orphan the real target outside the watch dir entirely.
-    Passing ``follow_symlinks=False`` links the symlink itself, so it moves through the
-    ledger intact and its target is never read here.
+    Mechanical ops ride durafs (link + dest-parent fsync). Caller-owned POLICY stays
+    here: EXDEV reworded as :class:`CairnError`; platform that cannot target a symlink
+    without following it refused when ``src`` is a symlink; ``FileNotFoundError`` /
+    ``FileExistsError`` pass through for race/collision handling.
 
-    After a successful link, fsyncs ``dest``'s parent (durafs durable_link order) so the
-    new directory entry is durable before callers unlink the source.
-
-    ``FileNotFoundError`` (src vanished) and ``FileExistsError`` (dest already taken)
-    pass through unchanged for the caller's own race/collision handling. Anything this
-    layer can't handle safely becomes a :class:`CairnError` — a clear error beats a
-    wrong or corrupted file:
-
-    - a platform whose ``os.link`` can't target a symlink without dereferencing it
-      (checked via ``os.supports_follow_symlinks``), when ``src`` actually is one;
-    - ``src``/``dest`` on different filesystems (``EXDEV``) — a hard link can never
-      cross a filesystem boundary, symlink or not.
+    Keyword-only ``fs=`` is the fstestkit injection seam (never monkeypatch ``os.*``).
     """
-    if os.link in os.supports_follow_symlinks:
-        link_kwargs: dict[str, bool] = {"follow_symlinks": False}
-    elif src.is_symlink():
+    src, dest = Path(src), Path(dest)
+    # Policy: platforms that cannot hard-link a symlink without following it refuse loudly.
+    _link = getattr(os, "link")
+    if _link not in os.supports_follow_symlinks and src.is_symlink():
         raise CairnError(
-            f"cannot link symlinked event {src} into {dest}: this platform's os.link "
+            f"cannot link symlinked event {src} into {dest}: this platform's link "
             "cannot target a symlink without dereferencing it"
         )
-    else:
-        link_kwargs = {}
     try:
-        os.link(src, dest, **link_kwargs)
+        durable_link(src, dest, fs=fs)
     except OSError as exc:
         if exc.errno == errno.EXDEV:
             raise CairnError(
@@ -99,20 +86,19 @@ def _hardlink(src: Path, dest: Path) -> None:
                 "different filesystems (cross-device link)"
             ) from exc
         raise
-    fsync_dir(dest.parent)
 
 
-def claim(watch_abs: Path, candidate: Path) -> Path | None:
+def claim(watch_abs: Path, candidate: Path, *, fs: Any = None) -> Path | None:
     """Claim ``candidate`` by hard-linking it into ``<watch_abs>/.claim/`` and unlinking
     the original — never ``Path.rename``, because POSIX rename SILENTLY REPLACES an
     existing destination. A stuck claim left behind by an earlier crash is exactly the
     operator evidence :func:`stuck_claims` exists to surface; a rename-based claim would
     let a same-named new candidate destroy it with no error and no trace.
 
-    ``os.link`` (via :func:`_hardlink`) fails atomically with ``FileExistsError`` when
-    the destination name is taken, so a genuine name collision — a different event that
-    happens to share a filename with something already sitting in ``.claim/`` — gets the
-    same ``-v2`` collision-suffix treatment :func:`_place` uses for ``.done``/
+    :func:`durable_link` (via :func:`_hardlink`) fails atomically with ``FileExistsError``
+    when the destination name is taken, so a genuine name collision — a different event
+    that happens to share a filename with something already sitting in ``.claim/`` — gets
+    the same ``-v2`` collision-suffix treatment :func:`_place` uses for ``.done``/
     ``.failed``/``.waiting``, rather than an overwrite: both the stuck claim and the new
     one survive under distinct names.
 
@@ -135,12 +121,15 @@ def claim(watch_abs: Path, candidate: Path) -> Path | None:
     while True:
         dest = claim_dir / dest_name
         try:
-            _hardlink(candidate, dest)
+            _hardlink(candidate, dest, fs=fs)
         except FileNotFoundError:
             return None
         except FileExistsError:
             if _links_same_source(candidate, dest):
-                candidate.unlink(missing_ok=True)
+                try:
+                    durable_unlink(candidate, fs=fs)
+                except FileNotFoundError:
+                    pass
                 return None
             suffix += 1
             dest_name = f"{stem}-v{suffix}{ext}"
@@ -150,8 +139,10 @@ def claim(watch_abs: Path, candidate: Path) -> Path | None:
     # already unlinked candidate (it links to the same inode we just landed at dest) —
     # the postcondition (dest valid, candidate gone) holds regardless of which of the
     # two racers physically performs this unlink (G1).
-    candidate.unlink(missing_ok=True)
-    fsync_dir(candidate.parent)
+    try:
+        durable_unlink(candidate, fs=fs)
+    except FileNotFoundError:
+        pass
     return dest
 
 
@@ -159,8 +150,7 @@ def _links_same_source(candidate: Path, dest: Path) -> bool:
     """Whether ``dest`` (which just refused a new hard link under this name) is already
     a hard link to ``candidate`` itself, rather than an unrelated file that merely shares
     a name. ``lstat`` (not ``stat``) compares by the symlink's own inode when
-    ``candidate`` is one, matching the ``follow_symlinks=False`` link :func:`_hardlink`
-    makes."""
+    ``candidate`` is one, matching the non-following link :func:`_hardlink` makes."""
     try:
         c = candidate.lstat()
     except FileNotFoundError:
@@ -172,15 +162,14 @@ def _links_same_source(candidate: Path, dest: Path) -> bool:
     return (c.st_dev, c.st_ino) == (d.st_dev, d.st_ino)
 
 
-def _place(claim_path: Path, dest_dir: Path, name: str) -> Path:
+def _place(claim_path: Path, dest_dir: Path, name: str, *, fs: Any = None) -> Path:
     """Move ``claim_path`` into ``dest_dir`` under ``name`` (symlink-safe, never overwrite).
 
     Collision gets a ``-v2``, ``-v3``, ... suffix before the extension (the
     ``bootstrap_run`` convention — see ``walk.py``'s ``-v2`` collision handling).
-    Uses :func:`_hardlink` + durable unlink (durafs order: dest parent fsynced before
-    source disappears). ``os.link`` fails atomically with ``FileExistsError`` when the
-    target name is taken, so each attempt is race-safe even though the retry loop around
-    it is not.
+    Mechanical ops: :func:`durable_link` + :func:`durable_unlink` via :func:`_hardlink`
+    (durafs order: dest parent fsynced before source disappears). ``FileExistsError`` on
+    a taken target name is caller policy for the collision loop.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     stem, ext = Path(name).stem, Path(name).suffix
@@ -189,13 +178,13 @@ def _place(claim_path: Path, dest_dir: Path, name: str) -> Path:
     while True:
         dest = dest_dir / dest_name
         try:
-            _hardlink(claim_path, dest)
+            _hardlink(claim_path, dest, fs=fs)
         except FileExistsError:
             suffix += 1
             dest_name = f"{stem}-v{suffix}{ext}"
             continue
         break
-    durable_unlink(claim_path)
+    durable_unlink(claim_path, fs=fs)
     return dest
 
 
@@ -368,7 +357,7 @@ def retire(
             child_pid=child_pid,
             fs=fs,
         )
-        return _place(claim_path, dest_lane, name)
+        return _place(claim_path, dest_lane, name, fs=fs)
 
     if outcome.outcome is OutcomeClass.FAILED:
         dest_lane = watch_abs / ".failed"
@@ -382,7 +371,7 @@ def retire(
             child_pid=child_pid,
             fs=fs,
         )
-        placed = _place(claim_path, dest_lane, name)
+        placed = _place(claim_path, dest_lane, name, fs=fs)
         _tombstone(watch_abs, name, fs=fs)
         return placed
 
@@ -404,15 +393,14 @@ def retire(
             durable_unlink(src_ptr, fs=fs)
         _tombstone(watch_abs, name, fs=fs)
         return None
-    placed = _place(claim_path, watch_abs / ".done", name)
+    placed = _place(claim_path, watch_abs / ".done", name, fs=fs)
     if src_ptr.is_file():
         durable_unlink(src_ptr, fs=fs)
     _tombstone(watch_abs, name, fs=fs)
     return placed
 
 
-
-def unclaim(watch_abs: Path, claim_path: Path) -> Path:
+def unclaim(watch_abs: Path, claim_path: Path, *, fs: Any = None) -> Path:
     """Return a claimed item to the watch-dir root (mint refusal: not an outcome).
 
     Leaves any claim-side pointer in place only if present — callers should not have
@@ -421,7 +409,7 @@ def unclaim(watch_abs: Path, claim_path: Path) -> Path:
     """
     watch_abs = Path(watch_abs)
     claim_path = Path(claim_path)
-    return _place(claim_path, watch_abs, claim_path.name)
+    return _place(claim_path, watch_abs, claim_path.name, fs=fs)
 
 
 def stuck_claims(watch_abs: Path) -> list[Path]:
@@ -544,17 +532,23 @@ def _repair_pointer_item_pair(
             return dest, None
         return None, None
 
-    # Pointer without item anywhere: keep pointer only if run.json validates.
+    # Pointer without item anywhere: keep pointer only if run.json is schema-validated
+    # (T4: "validated run.json" — load_run, not a bare existence check).
     try:
         rec = read_pointer(pointer)
         run_dir = Path(rec["run_dir"]) if rec.get("run_dir") else None
     except (OSError, ValueError, json.JSONDecodeError, KeyError):
         run_dir = None
-    if run_dir is not None and (run_dir / "run.json").is_file():
-        return None, (
-            f"pointer {pointer.name} has no item in any ledger lane but run.json exists "
-            f"at {run_dir} — left for operator/audit"
-        )
+    if run_dir is not None:
+        try:
+            load_run(run_dir)
+        except (OSError, ValueError, ConfigError, json.JSONDecodeError):
+            pass  # no validated run — fall through to orphan delete
+        else:
+            return None, (
+                f"pointer {pointer.name} has no item in any ledger lane but a validated "
+                f"run.json exists at {run_dir} — left for operator/audit"
+            )
     # No item, no validated run — drop orphan pointer.
     durable_unlink(pointer, fs=fs)
     return None, f"deleted orphan pointer {pointer.name} (no item, no validated run.json)"
