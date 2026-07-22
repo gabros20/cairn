@@ -114,6 +114,37 @@ def test_queue_ledger_imports_neither_sibling():
         }, f"queue_ledger.__dict__[{key!r}] is sibling module"
 
 
+def test_trigger_host_does_not_import_queue_drain():
+    """trigger_host must not import queue_drain (would cycle: host → drain → host).
+
+    Mirror of test_queue_ledger_imports_neither_sibling for the middle layer's
+    one-way constraint (trigger_host.py module docstring; review-T5-quality-r1).
+    """
+    src = Path(trigger_host.__file__).read_text(encoding="utf-8")
+    imported = _imported_modules(src)
+
+    forbidden = "queue_drain"
+    offenders = {
+        name
+        for name in imported
+        if forbidden in name.split(".") or name == forbidden
+    }
+    assert not offenders, f"trigger_host imports queue_drain: {offenders}"
+
+    for node in ast.walk(ast.parse(src)):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            chunk = ast.get_source_segment(src, node) or ""
+            assert "queue_drain" not in chunk, chunk
+
+    for key, value in vars(trigger_host).items():
+        if key.startswith("__"):
+            continue
+        modname = getattr(value, "__name__", "") or ""
+        assert modname != "cairn.kernel.queue_drain", (
+            f"trigger_host.__dict__[{key!r}] is queue_drain module"
+        )
+
+
 def test_facade_and_home_module_share_object_identity():
     for name, home in _HOME.items():
         facade_obj = getattr(triggerkit, name)
