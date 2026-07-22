@@ -20,6 +20,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
+from cairn.kernel import durafs
 from cairn.kernel.errors import CairnError, ConfigError
 from cairn.kernel.schemas import get_schema
 
@@ -51,23 +52,15 @@ def _validate(doc: dict) -> None:
 
 
 def _atomic_write(path: Path, doc: dict) -> None:
-    """Durably replace `path` with `doc`: write tmp, fsync it, rename, fsync the dir.
+    """Durably replace `path` with `doc` via :func:`cairn.kernel.durafs.atomic_write_json`.
 
     run.json is a state authority (like the trail). Atomic alone isn't enough — without
     fsyncing the tmp file before the rename, a power loss can land an empty or truncated
-    manifest. The directory fsync makes the rename itself durable.
+    manifest. The directory fsync makes the rename itself durable. The single fsync
+    discipline lives in ``durafs`` (T0, D2); this wrapper keeps the local name so call
+    sites stay stable.
     """
-    tmp = path.with_name(path.name + ".tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        fh.write(json.dumps(doc, indent=2, ensure_ascii=False))
-        fh.flush()
-        os.fsync(fh.fileno())
-    os.replace(tmp, path)
-    dir_fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(dir_fd)
-    finally:
-        os.close(dir_fd)
+    durafs.atomic_write_json(path, doc)
 
 
 def create_run(runs_root: Path, run_id: str, payload: dict) -> Path:
