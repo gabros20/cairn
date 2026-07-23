@@ -1,10 +1,10 @@
 """cairn CLI — the argparse frame plus the thin wiring that turns the kernel into a tool.
 
 Every subcommand parses its flags, wires kernel objects together, and prints; the logic
-stays in the kernel. Verbs (docs/API.md §9): plan/run/resume/gate/validate/trail/ps/inbox/
-doctor/test/compose/new plus the fleet verbs batch/learnings/gc/schedule/trigger are all
-live — each is a thin binding over its kernel module (batchkit/learnkit/gckit/schedkit/
-triggerkit).
+stays in the kernel. Verbs (docs/API.md §9): plan/run/resume/gate/validate/trail/ps/stats/
+inbox/doctor/test/compose/new plus the fleet verbs batch/learnings/gc/schedule/trigger are
+all live — each is a thin binding over its kernel module (batchkit/statskit/learnkit/gckit/
+schedkit/triggerkit).
 
 Guard wiring (the pinned contract): in run/resume, a plan's ``shim``-enforced guards get a
 fresh PATH-shim dir per run (:func:`~cairn.kernel.guards.build_shims`), and every executor is
@@ -48,6 +48,7 @@ from cairn.kernel.gatekit import (
 from cairn.kernel.gckit import apply_gc, plan_gc
 from cairn.kernel.guards import build_shims
 from cairn.kernel.learnkit import collect_learnings, render_learnings
+from cairn.kernel.statskit import collect_stats, render_stats
 from cairn.kernel.plan import (
     GateNode,
     LoopNode,
@@ -115,6 +116,7 @@ SUBCOMMANDS: list[str] = [
     "validate",
     "trail",
     "ps",
+    "stats",
     "inbox",
     "doctor",
     "test",
@@ -1000,6 +1002,51 @@ def _cmd_ps(args: argparse.Namespace) -> int:
     print(f"{'RUN':30} {'STATUS':9} {'NODE':12} {'LAST EVENT':16} AGE")
     for r in rows:
         print(f"{r['run']:30} {r['status']:9} {r['node']:12} {r['last_event']:16} {r['age']}")
+    return int(ExitCode.OK)
+
+
+# --------------------------------------------------------------------------- #
+# stats — read-only factory gauge board (FACTORY-PLAN W7)
+# --------------------------------------------------------------------------- #
+
+
+def _cmd_stats(args: argparse.Namespace) -> int:
+    """Read-only metrics over the runs root (+ trigger ledgers). Never mutates."""
+    ws = _workspace(args)
+    try:
+        config = load_config(ws)
+    except ConfigError as exc:
+        return _print_config_error(exc)
+    runs_root = _runs_root(ws, config)
+
+    trigger_watches: dict[str, Path] = {}
+    try:
+        triggers = load_triggers(ws)
+    except ConfigError:
+        # Malformed triggers.yaml must not crash the runs-side gauges; depth
+        # metrics simply omit trigger rows.
+        triggers = {}
+    for name, trig in triggers.items():
+        try:
+            trigger_watches[name] = watch_dir(trig, ws)
+        except ConfigError:
+            continue
+
+    try:
+        report = collect_stats(
+            runs_root,
+            now=_now(),
+            since=getattr(args, "since", None),
+            trigger_watches=trigger_watches or None,
+        )
+    except ValueError as exc:
+        print(f"cairn: invalid --since {args.since!r}: {exc}", file=sys.stderr)
+        return int(ExitCode.CONFIG)
+
+    if args.json:
+        print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    else:
+        print(render_stats(report))
     return int(ExitCode.OK)
 
 
@@ -2578,6 +2625,20 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--workspace", default=".")
     sp.add_argument("--json", action="store_true")
     sp.set_defaults(func=_cmd_ps)
+
+    # stats — read-only factory gauge board (FACTORY-PLAN W7)
+    sp = sub.add_parser(
+        "stats",
+        help="read-only factory gauge board (throughput, gate latency, human-answered share)",
+    )
+    sp.add_argument("--workspace", default=".")
+    sp.add_argument("--json", action="store_true", help="emit stable structured metrics")
+    sp.add_argument(
+        "--since",
+        metavar="DATE",
+        help="only count runs/events on/after this ISO date/datetime (default: all time)",
+    )
+    sp.set_defaults(func=_cmd_stats)
 
     # inbox — cross-run judgment drain (FACTORY-PLAN W2)
     sp = sub.add_parser("inbox", help="cross-run judgment drain (answer gates/manuals, resume)")
