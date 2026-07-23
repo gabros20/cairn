@@ -53,7 +53,10 @@ from cairn.kernel.queue_ledger import (
     claim,
     count_by_class,
     effective_lease_ttl,
+    is_circuit_open,
+    note_circuit_outcome,
     pointer_path,
+    read_circuit,
     read_pointer,
     release_orphan_reservations,
     retire,
@@ -266,6 +269,16 @@ def _has_admit_caps(trigger: Trigger) -> bool:
     )
 
 
+def _is_dark_lane(trigger: Trigger) -> bool:
+    """Whether this trigger's lane is a dark (non-park) autonomy profile.
+
+    Dark = ``lane:`` is set and is not the reserved park profile ``lit``. Used by
+    the circuit breaker: only dark-lane FAILED runs increment consecutive_failures;
+    a DONE run (dark recovery or a lit pass if ever possible) resets.
+    """
+    return trigger.lane is not None and trigger.lane != "lit"
+
+
 def _cap_stop_reason(trigger: Trigger, depths: dict[str, int]) -> str | None:
     """If a cap is full NOW, return one diagnostic naming which; else None.
 
@@ -283,6 +296,25 @@ def _cap_stop_reason(trigger: Trigger, depths: dict[str, int]) -> str | None:
     if trigger.wip_max is not None and depths["inflight"] >= trigger.wip_max:
         return f"wip full ({depths['inflight']} inflight) — not claiming"
     return None
+
+
+def _circuit_stop_reason(trigger: Trigger, watch_abs: Path) -> str | None:
+    """If the dark-lane circuit breaker is OPEN, return one diagnostic; else None.
+
+    Same admission-pause idiom as a full cap: diagnostic, stop claiming, exit 0
+    (back pressure, not failure). Only triggers with ``lane_circuit: {failures: N}``.
+    """
+    threshold = trigger.lane_circuit_failures
+    if threshold is None:
+        return None
+    if not is_circuit_open(watch_abs, threshold):
+        return None
+    n = int(read_circuit(watch_abs).get("consecutive_failures", 0))
+    return (
+        f"lane circuit open for {trigger.name!r}: {n} consecutive dark "
+        f"failures — admission paused; fix the lane or "
+        f"`cairn trigger reset {trigger.name}`"
+    )
 
 
 def _process_claimed(
@@ -374,6 +406,18 @@ def _process_claimed(
             child_pid=child_pid,
             run_dir=run_dir,
         )
+        # W5 circuit breaker: only when lane_circuit is authored on this trigger.
+        if trigger.lane_circuit_failures is not None:
+            try:
+                note_circuit_outcome(
+                    watch_abs,
+                    outcome,
+                    is_dark=_is_dark_lane(trigger),
+                    failures_threshold=trigger.lane_circuit_failures,
+                    now_iso=format_at(now),
+                )
+            except Exception:  # noqa: BLE001 — breaker bookkeeping never fails the drain
+                pass
     except Exception as exc:
         # Spawn / retire hazard after claim — stuck claim, not silent retry.
         print(
@@ -497,6 +541,11 @@ def _drain_serial(
     """
     any_failed = False
     for candidate in candidates:
+        # W5: open circuit pauses admission the same way a full cap does.
+        circuit_reason = _circuit_stop_reason(trigger, watch_abs)
+        if circuit_reason is not None:
+            print(f"cairn: trigger {name!r}: {circuit_reason}", file=diag)
+            break
         if check_caps:
             depths = count_by_class(watch_abs, glob=trigger.glob)
             reason = _cap_stop_reason(trigger, depths)
@@ -594,6 +643,12 @@ def _drain_pooled(
         """Claim at most one candidate into the pool. Returns True if a future was added."""
         nonlocal stop_admit
         if stop_admit or len(pending) >= trigger.concurrency:
+            return False
+        # W5: open circuit pauses admission the same way a full cap does.
+        circuit_reason = _circuit_stop_reason(trigger, watch_abs)
+        if circuit_reason is not None:
+            print(f"cairn: trigger {name!r}: {circuit_reason}", file=diag)
+            stop_admit = True
             return False
         if check_caps:
             depths = count_by_class(watch_abs, glob=trigger.glob)

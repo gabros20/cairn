@@ -47,6 +47,8 @@ _IDS_SUBDIR = ".ids"
 _DEFERRED_SUBDIR = ".deferred"
 _REJECTED_SUBDIR = ".rejected"
 _LEASES_SUBDIR = ".leases"
+# W5 dark-lane circuit breaker state (dot-file at watch root; scans/counts ignore dots).
+CIRCUIT_STATE_NAME = ".circuit"
 
 # Upgrade-safety marker (FACTORY-PLAN T8). A drain/reconcile REFUSES a watch dir
 # whose ledger-version is NEWER than this binary understands.
@@ -536,6 +538,122 @@ def effective_lease_ttl(lease_ttl_s: int, concurrency: int) -> int | None:
     if concurrency > 1:
         return DEFAULT_LEASE_TTL_S
     return None
+
+
+# --------------------------------------------------------------------------- #
+# Dark-lane circuit breaker (FACTORY-PLAN W5 / v5)
+# --------------------------------------------------------------------------- #
+
+
+def circuit_path(watch_abs: Path) -> Path:
+    """``<watch>/.circuit`` — durable consecutive-failure state (dot-file, out of scans)."""
+    return Path(watch_abs) / CIRCUIT_STATE_NAME
+
+
+def read_circuit(watch_abs: Path) -> dict[str, Any]:
+    """Return breaker state ``{consecutive_failures, opened_at?}``; closed default if absent.
+
+    Corrupt / unreadable files fail closed to a fresh closed state (0 consecutive) —
+    an operator can still ``cairn trigger reset``; a bad file never invents failures.
+    """
+    path = circuit_path(watch_abs)
+    if not path.is_file():
+        return {"consecutive_failures": 0}
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+        if not text:
+            return {"consecutive_failures": 0}
+        doc = json.loads(text.splitlines()[0])
+        if not isinstance(doc, dict):
+            return {"consecutive_failures": 0}
+        n = doc.get("consecutive_failures", 0)
+        if not isinstance(n, int) or isinstance(n, bool) or n < 0:
+            n = 0
+        out: dict[str, Any] = {"consecutive_failures": n}
+        opened = doc.get("opened_at")
+        if isinstance(opened, str) and opened:
+            out["opened_at"] = opened
+        return out
+    except (OSError, ValueError, json.JSONDecodeError):
+        return {"consecutive_failures": 0}
+
+
+def write_circuit(
+    watch_abs: Path,
+    *,
+    consecutive_failures: int,
+    opened_at: str | None = None,
+    fs: Any = None,
+) -> Path:
+    """Durably write ``<watch>/.circuit`` (JSON object, one line)."""
+    path = circuit_path(watch_abs)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rec: dict[str, Any] = {"consecutive_failures": int(consecutive_failures)}
+    if opened_at:
+        rec["opened_at"] = opened_at
+    atomic_write_text(path, json.dumps(rec, ensure_ascii=False) + "\n", fs=fs)
+    return path
+
+
+def reset_circuit(watch_abs: Path, *, fs: Any = None) -> None:
+    """Operator / recovery close: consecutive_failures→0, drop opened_at (write closed state)."""
+    write_circuit(watch_abs, consecutive_failures=0, opened_at=None, fs=fs)
+
+
+def is_circuit_open(watch_abs: Path, failures_threshold: int) -> bool:
+    """True when consecutive dark failures ≥ the trigger's ``lane_circuit.failures``."""
+    if failures_threshold < 1:
+        return False
+    return int(read_circuit(watch_abs).get("consecutive_failures", 0)) >= failures_threshold
+
+
+def note_circuit_outcome(
+    watch_abs: Path,
+    outcome: RunOutcome,
+    *,
+    is_dark: bool,
+    failures_threshold: int,
+    now_iso: str | None = None,
+    fs: Any = None,
+) -> dict[str, Any]:
+    """Update breaker state from a retired run's classified outcome (W5).
+
+    Counting rules (consecutive only):
+    - FAILED + dark-lane run → increment; stamp ``opened_at`` when crossing threshold
+    - DONE → reset to 0 (lane recovered — dark pass or lit pass both close)
+    - WAITING (6/8/9) → no change (parked, not a verdict)
+    - FAILED + not dark → no change (only dark failures count toward the breaker)
+
+    Dark detection is the caller's job (trigger.lane at spawn: set and not ``lit``).
+    Returns the post-update state dict.
+    """
+    state = read_circuit(watch_abs)
+    n = int(state.get("consecutive_failures", 0))
+    opened_at = state.get("opened_at") if isinstance(state.get("opened_at"), str) else None
+
+    if outcome.outcome is OutcomeClass.DONE:
+        write_circuit(watch_abs, consecutive_failures=0, opened_at=None, fs=fs)
+        return {"consecutive_failures": 0}
+
+    if outcome.outcome is OutcomeClass.WAITING:
+        return state
+
+    # FAILED
+    if not is_dark:
+        return state
+    n += 1
+    if n >= failures_threshold and not opened_at:
+        opened_at = now_iso
+    write_circuit(
+        watch_abs,
+        consecutive_failures=n,
+        opened_at=opened_at if n >= failures_threshold else None,
+        fs=fs,
+    )
+    out: dict[str, Any] = {"consecutive_failures": n}
+    if n >= failures_threshold and opened_at:
+        out["opened_at"] = opened_at
+    return out
 
 
 def child_is_dead(

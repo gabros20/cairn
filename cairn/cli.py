@@ -67,6 +67,7 @@ from cairn.kernel.queue_ledger import (
     pointer_path,
     prepare_failed_retry,
     read_pointer,
+    reset_circuit,
     retire,
     sweep,
 )
@@ -2098,6 +2099,41 @@ def _refuse_unsafe_watch_dirs(
     return int(ExitCode.CONFIG)
 
 
+def _cmd_trigger_reset(args: argparse.Namespace) -> int:
+    """``cairn trigger reset <name>`` — close the dark-lane circuit breaker (W5).
+
+    Clears ``<watch>/.circuit`` consecutive_failures→0 so admission resumes after
+    an operator fixes the dark lane. A subsequent DONE dark run also auto-closes.
+    """
+    if not args.name:
+        print("cairn: `cairn trigger reset` needs a trigger name", file=sys.stderr)
+        return int(ExitCode.CONFIG)
+    ws = _workspace(args)
+    triggers = load_triggers(ws)
+    if args.name not in triggers:
+        print(
+            f"cairn: no trigger named {args.name!r} in triggers.yaml "
+            f"(declared: {', '.join(sorted(triggers)) or '(none)'})",
+            file=sys.stderr,
+        )
+        return int(ExitCode.CONFIG)
+    trigger = triggers[args.name]
+    if trigger.lane_circuit_failures is None:
+        print(
+            f"cairn: trigger {args.name!r} has no lane_circuit configured "
+            f"(nothing to reset)",
+            file=sys.stderr,
+        )
+        return int(ExitCode.CONFIG)
+    watch_abs = watch_dir(trigger, ws)
+    reset_circuit(watch_abs)
+    print(
+        f"cairn: trigger {args.name!r}: lane circuit reset "
+        f"(consecutive dark failures → 0; admission resumes)"
+    )
+    return int(ExitCode.OK)
+
+
 def _cmd_trigger_retry(args: argparse.Namespace) -> int:
     """``cairn trigger retry <trigger> <item>`` — identity-safe FAILED re-entry (W4 SG3).
 
@@ -2239,6 +2275,9 @@ def _cmd_trigger(args: argparse.Namespace) -> int:
         if args.action == "retry":
             return _cmd_trigger_retry(args)
 
+        if args.action == "reset":
+            return _cmd_trigger_reset(args)
+
         if args.action == "run":
             if not args.name:
                 print("cairn: `cairn trigger run` needs a trigger name", file=sys.stderr)
@@ -2347,6 +2386,10 @@ def _trigger_status_json(status: TriggerStatus) -> dict[str, Any]:
         "lease_ages_s": list(status.lease_ages_s),
         "expired_live": status.expired_live,
         "missing_lease": status.missing_lease,
+        # W5 dark-lane circuit breaker (null threshold = not configured).
+        "circuit_failures": status.circuit_failures,
+        "circuit_consecutive": status.circuit_consecutive,
+        "circuit_open": status.circuit_open,
     }
 
 
@@ -2368,8 +2411,14 @@ def _print_trigger_list(statuses: list[TriggerStatus], backend: str) -> None:
             for v in (s.waiting_max, s.blocked_max, s.capacity_max, s.wip_max, s.inbox_max)
         )
         has_lease = s.lease_ttl_s is not None or s.lease_ages_s or s.expired_live
+        has_circuit = s.circuit_failures is not None
         if s.declared and (
-            has_depth or has_caps or has_lease or s.concurrency != 1 or s.order != "name"
+            has_depth
+            or has_caps
+            or has_lease
+            or has_circuit
+            or s.concurrency != 1
+            or s.order != "name"
         ):
             print(
                 f"      waiting={s.waiting} failed={s.failed} done={s.done} "
@@ -2397,6 +2446,12 @@ def _print_trigger_list(statuses: list[TriggerStatus], backend: str) -> None:
                 print(
                     f"      lease_ttl={ttl} ages=[{ages}] "
                     f"expired_live={s.expired_live} missing_lease={s.missing_lease}"
+                )
+            if has_circuit:
+                state = "open" if s.circuit_open else "closed"
+                print(
+                    f"      circuit={state} consecutive={s.circuit_consecutive}/"
+                    f"{s.circuit_failures}"
                 )
         for claim_path in s.stuck:
             print(f"      ! stuck claim (never auto-retried): {claim_path}")
@@ -2608,13 +2663,16 @@ def _build_parser() -> argparse.ArgumentParser:
     # trigger — sync triggers.yaml into the host watcher + identity-safe retry
     sp = sub.add_parser(
         "trigger",
-        help="sync triggers.yaml → host watcher (sync/list/remove/run/retry)",
+        help="sync triggers.yaml → host watcher (sync/list/remove/run/retry/reset)",
     )
-    sp.add_argument("action", choices=["sync", "list", "remove", "run", "retry"])
+    sp.add_argument(
+        "action",
+        choices=["sync", "list", "remove", "run", "retry", "reset"],
+    )
     sp.add_argument(
         "name",
         nargs="?",
-        help="trigger name (required for remove/run/retry)",
+        help="trigger name (required for remove/run/retry/reset)",
     )
     sp.add_argument(
         "item",

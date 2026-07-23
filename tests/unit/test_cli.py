@@ -1893,6 +1893,10 @@ def test_trigger_sync_list_remove_launchd_roundtrip(hello_ws, monkeypatch, tmp_p
             "lease_ages_s": [],
             "expired_live": 0,
             "missing_lease": 0,
+            # W5 circuit breaker (absent lane_circuit → not configured).
+            "circuit_failures": None,
+            "circuit_consecutive": 0,
+            "circuit_open": False,
         }
     ]
 

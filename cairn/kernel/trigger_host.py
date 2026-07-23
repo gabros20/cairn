@@ -26,8 +26,10 @@ from cairn.kernel.queue_ledger import (
     LEASE_TTL_OFF,
     count_by_class,
     effective_lease_ttl,
+    is_circuit_open,
     ledger_counts,
     lease_status,
+    read_circuit,
     stamp_ledger_version,
     stuck_claims,
 )
@@ -63,6 +65,8 @@ _TRIGGER_KEYS = frozenset({
     "lease",
     # W5 autonomy lane: optional name → child `cairn run --lane <name>`
     "lane",
+    # W5 dark-lane circuit breaker: {failures: N} after N consecutive FAILED dark runs
+    "lane_circuit",
 })
 _ON_DONE_VALUES = frozenset({"done", "delete"})
 _ORDER_VALUES = frozenset({"name", "aged"})
@@ -135,6 +139,11 @@ class Trigger:
     ``lane`` (W5): optional autonomy-profile name. When set, the host-watcher argv
     and each child ``cairn run`` receive ``--lane <name>`` (the pipeline must declare
     that lane). Absent = today's behavior (no lane selection).
+
+    ``lane_circuit_failures`` (W5): optional positive int from ``lane_circuit:
+    {failures: N}``. After N consecutive FAILED dark-lane runs, admission pauses
+    for this trigger (diagnostic, exit 0). Requires a non-``lit`` ``lane:``
+    (ConfigError otherwise). Absent = no breaker (byte-identical to pre-W5).
     """
 
     name: str
@@ -155,6 +164,8 @@ class Trigger:
     # LEASE_TTL_DEFAULT (-1) = policy; LEASE_TTL_OFF (0) = off; >0 = explicit ttl.
     lease_ttl_s: int = LEASE_TTL_DEFAULT
     lane: str | None = None
+    # None = no breaker; positive int = N consecutive FAILED dark runs before open.
+    lane_circuit_failures: int | None = None
 
 
 def _fail(message: str, file: Path) -> NoReturn:
@@ -337,6 +348,8 @@ def _parse_trigger(name: str, entry: Any, workspace_dir: Path, file: Path) -> Tr
                 file,
             )
 
+    lane_circuit_failures = _parse_lane_circuit(name, entry, lane=lane, file=file)
+
     return Trigger(
         name=name,
         pipeline=pipeline,
@@ -355,7 +368,61 @@ def _parse_trigger(name: str, entry: Any, workspace_dir: Path, file: Path) -> Tr
         max_item_bytes=max_item_bytes,
         lease_ttl_s=lease_ttl_s,
         lane=lane,
+        lane_circuit_failures=lane_circuit_failures,
     )
+
+
+def _parse_lane_circuit(
+    name: str,
+    entry: dict[str, Any],
+    *,
+    lane: str | None,
+    file: Path,
+) -> int | None:
+    """Parse ``lane_circuit: {failures: N}`` → positive int, or None when absent.
+
+    Non-dark rule (ConfigError): a circuit breaker is only meaningful on a dark
+    autonomy lane — requires ``lane:`` set to something other than the reserved
+    park profile ``lit``. A bare ``lane_circuit`` without a dark ``lane:`` is a
+    load-time error (not a silent no-op).
+    """
+    if "lane_circuit" not in entry:
+        return None
+    raw = entry["lane_circuit"]
+    if not isinstance(raw, dict):
+        _fail(
+            f"trigger {name!r}: 'lane_circuit' must be a mapping "
+            f"{{failures: N}}, got {raw!r}",
+            file,
+        )
+    unknown = set(raw) - {"failures"}
+    if unknown:
+        _fail(
+            f"trigger {name!r}: 'lane_circuit' unknown key(s) "
+            f"{', '.join(sorted(repr(k) for k in unknown))} "
+            f"(allowed: 'failures')",
+            file,
+        )
+    if "failures" not in raw:
+        _fail(
+            f"trigger {name!r}: 'lane_circuit' requires 'failures' (positive int)",
+            file,
+        )
+    failures = _parse_positive_int(name, "lane_circuit.failures", raw["failures"], file)
+    # Dark-only: no lane, or lit (park) → ConfigError.
+    if lane is None:
+        _fail(
+            f"trigger {name!r}: 'lane_circuit' requires a dark 'lane:' "
+            f"(a circuit breaker without an autonomy lane cannot count dark failures)",
+            file,
+        )
+    if lane == "lit":
+        _fail(
+            f"trigger {name!r}: 'lane_circuit' is only meaningful on a dark lane "
+            f"(got lane: lit — the park profile never fails-closed dark)",
+            file,
+        )
+    return failures
 
 
 def _parse_lease(name: str, entry: dict[str, Any], file: Path) -> int:
@@ -882,6 +949,10 @@ class TriggerStatus:
     expired_live: int = 0
     missing_lease: int = 0
     reaped: int = 0  # filled by reconcile summaries; list leaves 0
+    # W5 dark-lane circuit breaker (None = no breaker configured on this trigger).
+    circuit_failures: int | None = None  # threshold N from lane_circuit
+    circuit_consecutive: int = 0
+    circuit_open: bool = False
 
 
 def sync_triggers(
@@ -1579,6 +1650,9 @@ def list_installed_triggers(
         lease_ttl: int | None = None
         lease_ages: tuple[float, ...] = ()
         expired_live = missing_lease = 0
+        circuit_failures: int | None = None
+        circuit_consecutive = 0
+        circuit_open = False
         if trigger is not None:
             watch_abs = watch_dir(trigger, workspace_dir)
             stuck = tuple(stuck_claims(watch_abs))
@@ -1605,6 +1679,11 @@ def list_installed_triggers(
                 lease_ages = tuple(ls["lease_ages_s"])
                 expired_live = int(ls["expired_live"])
                 missing_lease = int(ls["missing_lease"])
+            if trigger.lane_circuit_failures is not None:
+                circuit_failures = trigger.lane_circuit_failures
+                circ = read_circuit(watch_abs)
+                circuit_consecutive = int(circ.get("consecutive_failures", 0))
+                circuit_open = is_circuit_open(watch_abs, circuit_failures)
         statuses.append(
             TriggerStatus(
                 name=name,
@@ -1630,6 +1709,9 @@ def list_installed_triggers(
                 lease_ages_s=lease_ages,
                 expired_live=expired_live,
                 missing_lease=missing_lease,
+                circuit_failures=circuit_failures,
+                circuit_consecutive=circuit_consecutive,
+                circuit_open=circuit_open,
             )
         )
     return statuses
