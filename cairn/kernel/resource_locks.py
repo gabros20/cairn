@@ -35,7 +35,6 @@ from pathlib import Path
 from typing import Any
 
 from cairn.kernel.agent_slots import (
-    DEFAULT_HEARTBEAT_STALE_S,
     DEFAULT_POLL_S,
     _holder_live,
     _now_ts,
@@ -57,6 +56,18 @@ DEFAULT_HUNG_HOLDER_S = 3600.0
 # Age threshold used only with heartbeat-staleness for dead-holder reap (same spirit
 # as W6 slot aging). Absent aging would leave leaked locks until pid dies.
 DEFAULT_LOCK_MAX_AGE_S = 7200.0
+
+# Heartbeat-staleness floor for lock age-reap (W8-T1 r1). A live holder is NEVER
+# falsely reaped: the walker pins lock-refresh cadence to ≤ this floor / MARGIN
+# so ``[defaults] heartbeat`` can never open a gap where heartbeat reads stale
+# while the holder is still alive. See :func:`lock_refresh_interval_s`.
+DEFAULT_LOCK_HEARTBEAT_STALE_S = 120.0
+
+# Refresh must land ≥ this many times inside the stale window (W6-T2 principle).
+LOCK_REFRESH_MARGIN = 4
+
+# Default lock-refresh cadence when trail heartbeats are off (matches slot beat).
+DEFAULT_LOCK_REFRESH_S = 30.0  # = DEFAULT_LOCK_HEARTBEAT_STALE_S / LOCK_REFRESH_MARGIN
 
 _REPO_PREFIX = "repo:"
 # Opaque lock names: filesystem-safe (no path separators / nulls).
@@ -180,6 +191,60 @@ def resolve_lock_names(
 
 
 # --------------------------------------------------------------------------- #
+# Refresh cadence pin (W8-T1 r1 — live holder never age-reaped)
+# --------------------------------------------------------------------------- #
+
+
+def lock_refresh_interval_s(
+    trail_heartbeat_s: float | None = None,
+    *,
+    stale_floor_s: float = DEFAULT_LOCK_HEARTBEAT_STALE_S,
+    default_refresh_s: float = DEFAULT_LOCK_REFRESH_S,
+    margin: int = LOCK_REFRESH_MARGIN,
+) -> float:
+    """Pin the lock-refresh cadence so trail heartbeat can NEVER open a reap gap.
+
+    ``refresh = min(desired_beat, stale_floor / margin)`` where ``desired_beat`` is
+    the trail ``[defaults] heartbeat`` when set, else ``default_refresh_s`` (30s).
+
+    With ``stale_floor=120`` and ``margin=4``, refresh is **at most 30s** even when
+    an operator sets ``heartbeat = 200s``. A live holder therefore always refreshes
+    well inside the stale window — age-reap of a live lock-holder is impossible.
+    """
+    desired = (
+        float(trail_heartbeat_s)
+        if trail_heartbeat_s is not None and float(trail_heartbeat_s) > 0
+        else float(default_refresh_s)
+    )
+    if margin < 1:
+        margin = 1
+    cap = float(stale_floor_s) / float(margin)
+    if cap <= 0:
+        return desired
+    return min(desired, cap)
+
+
+def lock_heartbeat_stale_s(
+    *,
+    refresh_interval_s: float | None = None,
+    stale_floor_s: float = DEFAULT_LOCK_HEARTBEAT_STALE_S,
+    margin: int = LOCK_REFRESH_MARGIN,
+) -> float:
+    """Stale threshold for lock age-reap: ``max(floor, margin × actual refresh)``.
+
+    Paired with :func:`lock_refresh_interval_s` (which caps refresh at floor/margin)
+    this always equals the floor in production. Exposed so tests can assert the
+    dual formulation and so a custom refresh seam still widens stale if needed.
+    """
+    floor = float(stale_floor_s)
+    if refresh_interval_s is None or float(refresh_interval_s) <= 0:
+        return floor
+    if margin < 1:
+        margin = 1
+    return max(floor, float(refresh_interval_s) * float(margin))
+
+
+# --------------------------------------------------------------------------- #
 # Acquire / release / refresh / wait (O_EXCL + heartbeat-stale reap)
 # --------------------------------------------------------------------------- #
 
@@ -193,7 +258,7 @@ def try_acquire_lock(
     fs: Any = None,
     kill: Callable[[int, int], None] | None = None,
     lock_max_age_s: float | None = DEFAULT_LOCK_MAX_AGE_S,
-    heartbeat_stale_s: float | None = DEFAULT_HEARTBEAT_STALE_S,
+    heartbeat_stale_s: float | None = DEFAULT_LOCK_HEARTBEAT_STALE_S,
 ) -> bool:
     """Try once to claim ``lock_name`` via O_EXCL. True when acquired.
 
@@ -281,7 +346,7 @@ def wait_acquire_lock(
     kill: Callable[[int, int], None] | None = None,
     on_wait_start: Callable[[], None] | None = None,
     lock_max_age_s: float | None = DEFAULT_LOCK_MAX_AGE_S,
-    heartbeat_stale_s: float | None = DEFAULT_HEARTBEAT_STALE_S,
+    heartbeat_stale_s: float | None = DEFAULT_LOCK_HEARTBEAT_STALE_S,
 ) -> bool:
     """Acquire one lock, polling until success or ``wait_s`` elapses.
 
@@ -341,7 +406,7 @@ def wait_acquire_locks(
     kill: Callable[[int, int], None] | None = None,
     on_wait_start: Callable[[str], None] | None = None,
     lock_max_age_s: float | None = DEFAULT_LOCK_MAX_AGE_S,
-    heartbeat_stale_s: float | None = DEFAULT_HEARTBEAT_STALE_S,
+    heartbeat_stale_s: float | None = DEFAULT_LOCK_HEARTBEAT_STALE_S,
 ) -> tuple[str, ...]:
     """Acquire every lock in **sorted** order (caller should pre-sort).
 
@@ -419,7 +484,7 @@ def list_locks(
     kill: Callable[[int, int], None] | None = None,
     hung_holder_s: float = DEFAULT_HUNG_HOLDER_S,
     lock_max_age_s: float | None = DEFAULT_LOCK_MAX_AGE_S,
-    heartbeat_stale_s: float | None = DEFAULT_HEARTBEAT_STALE_S,
+    heartbeat_stale_s: float | None = DEFAULT_LOCK_HEARTBEAT_STALE_S,
 ) -> list[LockStatus]:
     """List held locks under ``locks_dir`` (default: machine locks dir).
 
@@ -494,6 +559,16 @@ def step_touches_git(
 
     Manual / gate nodes never count. A docs-only workspace (not a git repo) is never
     flagged.
+
+    **Known scope (deliberate, W8-T1):**
+
+    * **False-positive (by design):** a pure-reasoning agent step in a git workspace
+      is treated as git-touching even if it never runs ``git``. Concurrent/dark
+      pipelines must declare ``locks:`` (or split the work out of the git workspace).
+      Static analysis cannot prove no-touch; fail-closed is the contract.
+    * **False-negative:** out-of-workspace git mutation (an agent that ``cd``s into an
+      unrelated repo) is not detected — current cwd policy is ``run_dir`` under the
+      workspace. There is no per-step cwd to catch external paths.
     """
     kind = getattr(step, "kind", None)
     if kind not in ("agent", "run"):

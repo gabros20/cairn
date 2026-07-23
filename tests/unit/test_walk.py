@@ -2369,3 +2369,225 @@ def test_multi_lock_sort_order_on_walk(ws: Path, tmp_path: Path) -> None:
         _Walk._locks_dir = original_dir  # type: ignore[method-assign]
     assert order == ["alpha", "zebra"]
     assert not list(locks_root.iterdir())
+
+
+# --------------------------------------------------------------------------- #
+# W8-T1 r1 — full-hold refresh + lock⇄slot order + in-step park release
+# --------------------------------------------------------------------------- #
+
+
+def test_lock_heartbeat_refreshed_during_held_step(ws: Path, tmp_path: Path) -> None:
+    """Lock heartbeat advances for the full hold (mirror W6 slot-refresh test)."""
+    locks_root = tmp_path / "locks"
+    locks_root.mkdir()
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    step = _with_locks(agent_step("s", produces=["a"]), "shared")
+    plan = make_plan([step], arts, resolved_models=models_for("s"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    saw_refresh = threading.Event()
+
+    def on_invoke(inv, _n):
+        path = locks_root / "shared"
+        assert path.is_file(), "lock must be held during invoke"
+        before = json.loads(path.read_text(encoding="utf-8"))["heartbeat"]
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+            if rec["heartbeat"] > before:
+                saw_refresh.set()
+                break
+            time.sleep(0.005)
+        assert saw_refresh.is_set(), "lock heartbeat never advanced during hold"
+        (inv.cwd / "a.txt").write_text("ok")
+        return done_result()
+
+    original_dir = _Walk._locks_dir
+    original_refresh = _Walk._lock_refresh_interval_s
+    _Walk._locks_dir = lambda self: locks_root  # type: ignore[method-assign]
+    _Walk._lock_refresh_interval_s = lambda self: 0.01  # type: ignore[method-assign]
+    try:
+        code = _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)})
+    finally:
+        _Walk._locks_dir = original_dir  # type: ignore[method-assign]
+        _Walk._lock_refresh_interval_s = original_refresh  # type: ignore[method-assign]
+
+    assert code == ExitCode.OK
+    assert saw_refresh.is_set()
+    assert not (locks_root / "shared").is_file()
+
+
+def test_trail_heartbeat_gt_stale_does_not_open_lock_reap_gap(
+    ws: Path, tmp_path: Path
+) -> None:
+    """[defaults] heartbeat > stale floor still pins lock refresh ≤ stale/4."""
+    from cairn.kernel.resource_locks import (
+        DEFAULT_LOCK_HEARTBEAT_STALE_S,
+        DEFAULT_LOCK_REFRESH_S,
+        lock_refresh_interval_s,
+    )
+
+    # Author a large trail heartbeat on the workspace config.
+    path = ws / "cairn.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8") + '\n[defaults]\nheartbeat = "200s"\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(ws)
+    assert cfg.defaults.heartbeat_s == 200
+    # Pinned cadence independent of the 200s trail heartbeat.
+    assert lock_refresh_interval_s(cfg.defaults.heartbeat_s) == DEFAULT_LOCK_REFRESH_S
+    assert lock_refresh_interval_s(cfg.defaults.heartbeat_s) <= (
+        DEFAULT_LOCK_HEARTBEAT_STALE_S / 4
+    )
+
+    locks_root = tmp_path / "locks"
+    locks_root.mkdir()
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    step = _with_locks(agent_step("s", produces=["a"]), "shared")
+    plan = make_plan([step], arts, resolved_models=models_for("s"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    observed: list[float] = []
+
+    def on_invoke(inv, _n):
+        # Walker's _lock_refresh_interval_s must still be the pin (not 200).
+        observed.append(1.0)
+        (inv.cwd / "a.txt").write_text("ok")
+        return done_result()
+
+    original_dir = _Walk._locks_dir
+    _Walk._locks_dir = lambda self: locks_root  # type: ignore[method-assign]
+    try:
+        # Capture the instance method via a probe: replace with recording wrapper.
+        probe: list[float] = []
+        real = _Walk._lock_refresh_interval_s
+
+        def _probe(self):  # type: ignore[no-untyped-def]
+            v = real(self)
+            probe.append(v)
+            return v
+
+        _Walk._lock_refresh_interval_s = _probe  # type: ignore[method-assign]
+        try:
+            assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
+        finally:
+            _Walk._lock_refresh_interval_s = real  # type: ignore[method-assign]
+    finally:
+        _Walk._locks_dir = original_dir  # type: ignore[method-assign]
+
+    assert observed == [1.0]
+    assert probe  # called at least once for the hold
+    assert all(v <= DEFAULT_LOCK_REFRESH_S + 1e-9 for v in probe)
+
+
+def test_locks_acquired_before_slots_capacity_releases_lock(
+    ws: Path, tmp_path: Path
+) -> None:
+    """Lock⇄slot order: locks first; CAPACITY on slot-wait releases the lock.
+
+    Global order is locks (outer) → slots (inner). Exhausting the slot pool while
+    holding a lock must park CAPACITY with the lock file gone.
+    """
+    _enable_slots(ws, max_agents=1, slot_wait="0s")
+    locks_root = tmp_path / "locks"
+    locks_root.mkdir()
+    # Exhaust the only agent slot with this process's live pid.
+    slots = ws / "state" / "agents"
+    slots.mkdir(parents=True)
+    now_ts = time.time()
+    (slots / "slot-0").write_text(
+        json.dumps({"pid": os.getpid(), "acquired_at": now_ts, "heartbeat": now_ts})
+        + "\n",
+        encoding="utf-8",
+    )
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    step = _with_locks(agent_step("s", produces=["a"]), "shared")
+    plan = make_plan([step], arts, resolved_models=models_for("s"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    invoked: list[int] = []
+
+    def on_invoke(inv, _n):
+        invoked.append(1)
+        (inv.cwd / "a.txt").write_text("ok")
+        return done_result()
+
+    original_dir = _Walk._locks_dir
+    _Walk._locks_dir = lambda self: locks_root  # type: ignore[method-assign]
+    try:
+        code = _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)})
+    finally:
+        _Walk._locks_dir = original_dir  # type: ignore[method-assign]
+
+    assert code == ExitCode.CAPACITY
+    assert invoked == []  # never reached invoke — blocked on slot after lock
+    # RELEASE-BEFORE-PARK: lock gone even though park was slot-CAPACITY.
+    assert not (locks_root / "shared").is_file()
+    assert load_run(run_dir).get("held_locks") in (None, [])
+    # Slot was never ours — seeded slot still present.
+    assert (slots / "slot-0").is_file()
+    events = list(read_trail(run_dir))
+    assert any(e["event"] == "agent-slot-wait" for e in events)
+
+
+def test_release_before_park_on_timeout_while_holding(
+    ws: Path, tmp_path: Path
+) -> None:
+    """In-step TIMEOUT while holding a lock → lock file gone at park."""
+    from cairn.executors.base import ExecTimeout
+
+    locks_root = tmp_path / "locks"
+    locks_root.mkdir()
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    step = _with_locks(agent_step("s", produces=["a"]), "shared")
+    plan = make_plan([step], arts, resolved_models=models_for("s"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    def on_invoke(inv, _n):
+        assert (locks_root / "shared").is_file()
+        raise ExecTimeout("slow")
+
+    original_dir = _Walk._locks_dir
+    _Walk._locks_dir = lambda self: locks_root  # type: ignore[method-assign]
+    try:
+        code = _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)})
+    finally:
+        _Walk._locks_dir = original_dir  # type: ignore[method-assign]
+
+    assert code == ExitCode.TIMEOUT
+    assert not (locks_root / "shared").is_file()
+    assert load_run(run_dir).get("held_locks") in (None, [])
+
+
+def test_release_before_park_on_blocked_while_holding(
+    ws: Path, tmp_path: Path
+) -> None:
+    """In-step BLOCKED(9) while holding a lock → lock file gone at park."""
+    locks_root = tmp_path / "locks"
+    locks_root.mkdir()
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    step = _with_locks(agent_step("s", produces=["a"]), "shared")
+    plan = make_plan([step], arts, resolved_models=models_for("s"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    def on_invoke(inv, _n):
+        assert (locks_root / "shared").is_file()
+        inv.log_path.parent.mkdir(parents=True, exist_ok=True)
+        inv.log_path.write_text(
+            "Error: not logged in. Please run `claude /login`.\n", encoding="utf-8"
+        )
+        (inv.cwd / "a.txt").write_text("would-be-valid", encoding="utf-8")
+        return Result(
+            step={"status": "done", "summary": "ok", "artifacts": []},
+            exit_code=1,
+            duration_s=1.0,
+        )
+
+    original_dir = _Walk._locks_dir
+    _Walk._locks_dir = lambda self: locks_root  # type: ignore[method-assign]
+    try:
+        code = _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)})
+    finally:
+        _Walk._locks_dir = original_dir  # type: ignore[method-assign]
+
+    assert code == ExitCode.BLOCKED
+    assert not (locks_root / "shared").is_file()
+    assert load_run(run_dir).get("held_locks") in (None, [])

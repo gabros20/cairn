@@ -19,10 +19,17 @@ from cairn.kernel.plan import Plan, StepNode
 from cairn.kernel.proc import RunResult, RunnerBase
 from cairn.kernel.resource_locks import (
     DEFAULT_HUNG_HOLDER_S,
+    DEFAULT_LOCK_HEARTBEAT_STALE_S,
+    DEFAULT_LOCK_MAX_AGE_S,
+    DEFAULT_LOCK_REFRESH_S,
+    LOCK_REFRESH_MARGIN,
     enforce_repo_locks,
     list_locks,
+    lock_heartbeat_stale_s,
     lock_path,
+    lock_refresh_interval_s,
     machine_locks_dir,
+    refresh_lock,
     release_lock,
     resolve_lock_name,
     resolve_lock_names,
@@ -288,6 +295,96 @@ def test_machine_locks_dir_is_sibling_of_agents(monkeypatch: pytest.MonkeyPatch,
     from cairn.kernel.agent_slots import machine_slots_dir
 
     assert machine_slots_dir().parent == machine_locks_dir().parent
+
+
+# --------------------------------------------------------------------------- #
+# W8-T1 r1 — live holder never age-reaped (cadence pin + aged span)
+# --------------------------------------------------------------------------- #
+
+
+def test_lock_refresh_interval_pinned_independent_of_trail_heartbeat() -> None:
+    """[defaults] heartbeat > stale floor must NOT open a reap gap."""
+    floor = DEFAULT_LOCK_HEARTBEAT_STALE_S  # 120
+    # Large trail heartbeat (the bug config) → refresh capped at floor/4.
+    assert lock_refresh_interval_s(200.0) == floor / LOCK_REFRESH_MARGIN
+    assert lock_refresh_interval_s(200.0) == DEFAULT_LOCK_REFRESH_S  # 30
+    # Off / unset → default 30s.
+    assert lock_refresh_interval_s(None) == DEFAULT_LOCK_REFRESH_S
+    # Tiny trail heartbeat is allowed (still ≤ cap).
+    assert lock_refresh_interval_s(5.0) == 5.0
+    # Stale threshold ≥ 4× actual refresh.
+    r = lock_refresh_interval_s(200.0)
+    assert lock_heartbeat_stale_s(refresh_interval_s=r) >= r * LOCK_REFRESH_MARGIN
+    assert lock_heartbeat_stale_s(refresh_interval_s=r) == floor
+
+
+def test_live_holder_not_reaped_across_aged_span_with_fresh_heartbeat(
+    tmp_path: Path,
+) -> None:
+    """Lock held past lock_max_age with a refreshed heartbeat is NOT reaped."""
+    clock = _Clock(t=1000.0)
+    assert try_acquire_lock(
+        tmp_path, "R", pid=1, now=clock.now, kill=_alive_kill
+    )
+    # Advance past age threshold; refresh heartbeat so it stays fresh.
+    clock.t += DEFAULT_LOCK_MAX_AGE_S + 60.0
+    refresh_lock(tmp_path, "R", now=clock.now)
+    # Live holder + fresh heartbeat → not reaped even though aged.
+    assert not try_acquire_lock(
+        tmp_path,
+        "R",
+        pid=2,
+        now=clock.now,
+        kill=_alive_kill,
+        lock_max_age_s=DEFAULT_LOCK_MAX_AGE_S,
+        heartbeat_stale_s=DEFAULT_LOCK_HEARTBEAT_STALE_S,
+    )
+    rec = json.loads(lock_path(tmp_path, "R").read_text(encoding="utf-8"))
+    assert rec["pid"] == 1
+
+
+def test_dead_holder_reaped_even_when_aged_and_stale(tmp_path: Path) -> None:
+    """Dead holder's lock IS reaped (pid-dead path)."""
+    clock = _Clock(t=1000.0)
+    assert try_acquire_lock(
+        tmp_path, "R", pid=99999, now=clock.now, kill=_alive_kill
+    )
+    clock.t += DEFAULT_LOCK_MAX_AGE_S + 60.0
+    # No refresh — heartbeat is also stale; dead kill reaps regardless.
+    assert try_acquire_lock(
+        tmp_path,
+        "R",
+        pid=42,
+        now=clock.now,
+        kill=_dead_kill,
+        lock_max_age_s=DEFAULT_LOCK_MAX_AGE_S,
+        heartbeat_stale_s=DEFAULT_LOCK_HEARTBEAT_STALE_S,
+    )
+    rec = json.loads(lock_path(tmp_path, "R").read_text(encoding="utf-8"))
+    assert rec["pid"] == 42
+
+
+def test_aged_stale_live_pid_reaped_only_when_heartbeat_frozen(
+    tmp_path: Path,
+) -> None:
+    """Age-reap requires BOTH age AND stale heartbeat (leaked / non-refreshing)."""
+    clock = _Clock(t=1000.0)
+    assert try_acquire_lock(
+        tmp_path, "R", pid=7, now=clock.now, kill=_alive_kill
+    )
+    # Advance past age AND stale without refresh → age-reapable even if pid "alive".
+    clock.t += DEFAULT_LOCK_MAX_AGE_S + DEFAULT_LOCK_HEARTBEAT_STALE_S + 10.0
+    assert try_acquire_lock(
+        tmp_path,
+        "R",
+        pid=8,
+        now=clock.now,
+        kill=_alive_kill,
+        lock_max_age_s=DEFAULT_LOCK_MAX_AGE_S,
+        heartbeat_stale_s=DEFAULT_LOCK_HEARTBEAT_STALE_S,
+    )
+    rec = json.loads(lock_path(tmp_path, "R").read_text(encoding="utf-8"))
+    assert rec["pid"] == 8
 
 
 # --------------------------------------------------------------------------- #

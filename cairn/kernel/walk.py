@@ -67,8 +67,10 @@ from cairn.kernel.agent_slots import (
     wait_acquire_slot,
 )
 from cairn.kernel.resource_locks import (
+    DEFAULT_LOCK_HEARTBEAT_STALE_S,
     DEFAULT_LOCK_WAIT_S,
     effective_step_locks,
+    lock_refresh_interval_s,
     machine_locks_dir,
     refresh_lock,
     release_locks,
@@ -646,24 +648,27 @@ class _Walk:
         # invoke AND run: command). Wait is CAPACITY-class — excluded from
         # step.timeout_s. Multiple locks in canonical sort order. RELEASE-BEFORE-
         # PARK: finally always drops them (a parked run must never hold a repo).
+        # Lock heartbeat starts at ACQUIRE and covers the FULL hold (slot-wait +
+        # invoke + retry gaps) so a live holder can never go heartbeat-stale.
         held_locks, locks_dir = self._acquire_step_locks(step, cycle=cycle)
         try:
-            self._execute_step_body(
-                step,
-                cycle,
-                executor=executor,
-                make_prompt=make_prompt,
-                env=env,
-                model=model,
-                effort=effort,
-                model_str=model_str,
-                retry_attempts=retry_attempts,
-                feedback=feedback,
-                reasons=reasons,
-                attempt=attempt,
-                held_locks=held_locks,
-                locks_dir=locks_dir,
-            )
+            with self._lock_heartbeat(held_locks, locks_dir):
+                self._execute_step_body(
+                    step,
+                    cycle,
+                    executor=executor,
+                    make_prompt=make_prompt,
+                    env=env,
+                    model=model,
+                    effort=effort,
+                    model_str=model_str,
+                    retry_attempts=retry_attempts,
+                    feedback=feedback,
+                    reasons=reasons,
+                    attempt=attempt,
+                    held_locks=held_locks,
+                    locks_dir=locks_dir,
+                )
         finally:
             self._release_step_locks(held_locks, locks_dir)
 
@@ -721,6 +726,8 @@ class _Walk:
                     step, attempt=attempt, cycle=cycle
                 )
             try:
+                # Lock refresh is the outer _lock_heartbeat (full hold). This
+                # beat only covers slot + trail heartbeats around invoke.
                 with self._heartbeat(
                     step.id,
                     attempt,
@@ -728,8 +735,6 @@ class _Walk:
                     log_path,
                     slot_name=slot_name,
                     slots_dir=slots_dir,
-                    lock_names=held_locks,
-                    locks_dir=locks_dir,
                 ):
                     result = executor.invoke(inv)
             except ExecTimeout as exc:
@@ -1538,6 +1543,15 @@ class _Walk:
         """How long a step waits for a free lock before CAPACITY. Default 15m."""
         return DEFAULT_LOCK_WAIT_S
 
+    def _lock_refresh_interval_s(self) -> float:
+        """Lock-refresh cadence, pinned independent of trail heartbeat (W8-T1 r1).
+
+        Always ≤ ``DEFAULT_LOCK_HEARTBEAT_STALE_S / 4`` so a live holder cannot
+        go heartbeat-stale no matter what ``[defaults] heartbeat`` is set to.
+        Tests assign a tiny value so refresh is observable without real waits.
+        """
+        return lock_refresh_interval_s(self.config.defaults.heartbeat_s)
+
     def _record_held_locks(self, lock_names: tuple[str, ...]) -> None:
         """Persist currently-held locks on run.json (crash-reap + release-before-park)."""
         names = list(lock_names)
@@ -1606,6 +1620,7 @@ class _Walk:
             sleep=self._slot_sleep,
             poll_s=DEFAULT_POLL_S,
             on_wait_start=on_wait_start,
+            heartbeat_stale_s=DEFAULT_LOCK_HEARTBEAT_STALE_S,
         )
         if not held:
             raise _Halt(
@@ -1624,6 +1639,47 @@ class _Walk:
             return
         release_locks(locks_dir, held_locks)
         self._record_held_locks(())
+
+    @contextmanager
+    def _lock_heartbeat(
+        self,
+        lock_names: tuple[str, ...],
+        locks_dir: Path | None,
+    ) -> Iterator[None]:
+        """Refresh every held lock for the FULL hold (acquire → release).
+
+        W8-T1 r1: starts at acquire, covers slot-wait + invoke + retry gaps — not
+        only the invoke window. Cadence is :meth:`_lock_refresh_interval_s` (pinned
+        so ``[defaults] heartbeat`` cannot open a stale gap). Zero-cost when no locks.
+        """
+        if not lock_names or locks_dir is None:
+            yield
+            return
+
+        interval = float(self._lock_refresh_interval_s())
+        if interval <= 0:
+            interval = DEFAULT_LOCK_HEARTBEAT_STALE_S / 4.0
+
+        stop = threading.Event()
+
+        def beat() -> None:
+            while not stop.wait(interval):
+                for ln in lock_names:
+                    refresh_lock(locks_dir, ln, now=self._slot_now)
+
+        # Immediate refresh so the hold starts with a known-fresh heartbeat.
+        for ln in lock_names:
+            refresh_lock(locks_dir, ln, now=self._slot_now)
+
+        thread = threading.Thread(
+            target=beat, name="cairn-lock-heartbeat", daemon=True
+        )
+        thread.start()
+        try:
+            yield
+        finally:
+            stop.set()
+            thread.join(timeout=5)
 
     # -- agent slots (FACTORY-PLAN §9 / W6) --------------------------------- #
 
@@ -1734,8 +1790,6 @@ class _Walk:
         *,
         slot_name: str | None = None,
         slots_dir: Path | None = None,
-        lock_names: tuple[str, ...] = (),
-        locks_dir: Path | None = None,
     ) -> Iterator[None]:
         """Emit a periodic ``heartbeat`` while a blocking step runs.
 
@@ -1751,36 +1805,33 @@ class _Walk:
         slot's heartbeat timestamp so a live holder is never reaped as stale.
         ``slots_dir`` is the same path acquire used (local or machine pool).
 
-        When ``lock_names`` is set (W8 resource locks held), each beat also refreshes
-        every lock's heartbeat so a live step is never age-reaped as stale.
+        W8 resource-lock refresh is **not** here — it lives in :meth:`_lock_heartbeat`,
+        which spans the full hold (acquire → release), including slot-wait and retry
+        gaps that this invoke-scoped beat does not cover.
         """
         interval = self.config.defaults.heartbeat_s
-        # Slot/lock refresh needs a beat loop even when trail heartbeats are off — a
-        # tiny interval keeps holders live without emitting trail events when
-        # heartbeat_s is unset. When all are off (no slot, no locks), zero-cost yield.
-        need_refresh = bool(slot_name) or bool(lock_names)
+        # Slot refresh needs a beat loop even when trail heartbeats are off — a
+        # tiny interval keeps the slot live without emitting trail events when
+        # heartbeat_s is unset. When both are off (no slot), zero-cost yield.
+        need_refresh = bool(slot_name)
         if (not interval or interval <= 0) and not need_refresh:
             yield
             return
 
         stop = threading.Event()
         started = time.monotonic()
-        # Trail heartbeats only when configured; slot/lock refresh uses the same cadence
-        # (or _slot_beat_interval_s when trail heartbeats are off but a holder is held).
+        # Trail heartbeats only when configured; slot refresh uses the same cadence
+        # (or _slot_beat_interval_s when trail heartbeats are off but a slot is held).
         beat_interval = (
             interval if interval and interval > 0 else self._slot_beat_interval_s()
         )
         emit_trail = bool(interval and interval > 0)
         refresh_dir = slots_dir if slot_name else None
-        lock_refresh_dir = locks_dir if lock_names else None
 
         def beat() -> None:
             while not stop.wait(beat_interval):
                 if slot_name is not None and refresh_dir is not None:
                     refresh_slot(refresh_dir, slot_name, now=self._slot_now)
-                if lock_refresh_dir is not None:
-                    for ln in lock_names:
-                        refresh_lock(lock_refresh_dir, ln, now=self._slot_now)
                 if not emit_trail:
                     continue
                 log_bytes, last_line = _tail_log(log_path)
