@@ -55,7 +55,7 @@ from cairn.kernel.proc import Runner
 from cairn.kernel.queue_ledger import (
     DEFAULT_MAX_ITEM_BYTES,
     admit_strict,
-    audit_ledger,
+    audit_and_quarantine,
     boot_id,
     check_ledger_version,
     circuit_path,
@@ -1222,11 +1222,12 @@ def reconcile_workspace(
                 hazarded = True
                 diags.append(f"sweep hazarded: {exc}")
 
-            # T8 audit AFTER repair passes so residual violations are what surface
-            # (sweep/orphan release may have fixed transient claim↔pointer gaps).
-            # Surface + flag; do NOT auto-delete (over-preserve).
+            # T8/SG6 audit AFTER repair passes so residual violations are what
+            # quarantine (sweep/orphan release may have fixed transient gaps).
+            # Settled violations → .quarantine/ (refuse process); never auto-delete.
+            # In-grace claims stay put (audit_ledger excludes them).
             try:
-                for issue in audit_ledger(
+                for issue in audit_and_quarantine(
                     watch_abs, now=now_ts, current_boot_id=cur_boot
                 ):
                     diags.append(f"audit: {issue}")

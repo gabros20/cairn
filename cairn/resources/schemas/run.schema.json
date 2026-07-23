@@ -52,6 +52,10 @@
       "description": "Canonical resource-lock names currently held by this run (W8). Empty/absent when none; cleared before any park.",
       "items": { "type": "string" }
     },
+    "worktree": {
+      "type": "string",
+      "description": "Absolute path of this run's per-run git worktree (W8-T2). Optional/additive; absent when the run does not use a worktree. Scaffold furniture records it; apply_gc prunes it when the run is collected."
+    },
     "nodes": {
       "type": "object",
       "additionalProperties": {

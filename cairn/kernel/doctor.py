@@ -22,7 +22,7 @@ from cairn.kernel.config import Config, load_config, requires_satisfied
 from cairn.kernel.errors import ConfigError
 from cairn.kernel.fssafety import check_watch_fs_safety
 from cairn.kernel.plan import plan as build_plan
-from cairn.kernel.queue_ledger import audit_ledger
+from cairn.kernel.queue_ledger import audit_and_quarantine
 from cairn.kernel.toolcheck import run_tool_check
 
 _OK = "✔"
@@ -234,7 +234,8 @@ def _doctor_factory(
             else:
                 out(f"  ! factory {name}  {f.message}")
         try:
-            issues = audit_ledger(watch_abs, now=now_ts)
+            # SG6: quarantine settled violations (not surface-only); never auto-delete.
+            issues = audit_and_quarantine(watch_abs, now=now_ts)
         except Exception as exc:  # noqa: BLE001
             out(f"{_BAD} factory {name}  ledger audit failed: {exc}")
             errs += 1

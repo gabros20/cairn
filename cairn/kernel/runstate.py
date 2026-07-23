@@ -125,6 +125,49 @@ def set_node_status(
     run_dict.setdefault("nodes", {})[node_id] = entry
 
 
+def record_worktree(run_dir: Path, worktree: str | Path | None) -> dict:
+    """Record or clear this run's per-run git worktree path on ``run.json`` (W8-T2).
+
+    Scaffold furniture creates the worktree (``git worktree add``) and calls this
+    so the path is durable for gc pruning. ``None`` or empty clears the field
+    (e.g. after the scaffold removes the worktree itself). Kernel does not create
+    worktrees — only tracks them (D5). Absent field = no worktree = D7 unchanged.
+    """
+    path_s: str | None
+    if worktree is None or worktree == "":
+        path_s = None
+    else:
+        path_s = str(Path(worktree))
+
+    def mutate(doc: dict) -> None:
+        if path_s is None:
+            doc.pop("worktree", None)
+        else:
+            doc["worktree"] = path_s
+
+    return update_run(Path(run_dir), mutate)
+
+
+def read_worktree(run_dir: Path) -> str | None:
+    """Return the recorded worktree path from ``run.json``, or None if absent/unreadable.
+
+    Best-effort (no schema validation): gc must still see a worktree path on a
+    partial/legacy run.json so it can prune. Validation lives in
+    :func:`record_worktree` / :func:`load_run`.
+    """
+    path = Path(run_dir) / RUN_JSON
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        return None
+    if not isinstance(doc, dict):
+        return None
+    raw = doc.get("worktree")
+    if isinstance(raw, str) and raw:
+        return raw
+    return None
+
+
 @contextmanager
 def run_lock(run_dir: Path) -> Iterator[None]:
     """Exclusive advisory lock on `run_dir/.cairn.lock` (flock, non-blocking).

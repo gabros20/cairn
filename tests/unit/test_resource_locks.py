@@ -61,15 +61,42 @@ class _Clock:
 
 
 class _FakeGitRunner(RunnerBase):
-    """Maps path → common-dir string (or None for non-repo)."""
+    """Maps path → common-dir string (or None for non-repo).
 
-    def __init__(self, mapping: dict[str, str | None]) -> None:
+    Optional ``git_dirs`` / ``toplevels`` maps support W8-T2 linked-worktree
+    resolution (``--git-dir`` / ``--show-toplevel``). When absent, ``--git-dir``
+    defaults to the common-dir (main worktree behaviour) so existing tests stay
+    byte-identical.
+    """
+
+    def __init__(
+        self,
+        mapping: dict[str, str | None],
+        *,
+        git_dirs: dict[str, str] | None = None,
+        toplevels: dict[str, str] | None = None,
+    ) -> None:
         # Keys are resolved absolute path strings of the -C argument.
         self.mapping = {str(Path(k).resolve()): v for k, v in mapping.items()}
+        self.git_dirs = {
+            str(Path(k).resolve()): v for k, v in (git_dirs or {}).items()
+        }
+        self.toplevels = {
+            str(Path(k).resolve()): v for k, v in (toplevels or {}).items()
+        }
         self.calls: list[list[str]] = []
 
     def spawn(self, argv, *, input=None, cwd=None):  # pragma: no cover - use run
         raise NotImplementedError
+
+    def _lookup(self, mapping: dict[str, str | None], path: str) -> str | None:
+        val = mapping.get(path)
+        if val is not None or path in mapping:
+            return val
+        for k, v in mapping.items():
+            if Path(k).resolve() == Path(path).resolve():
+                return v
+        return None
 
     def run(self, argv, *, input=None, cwd=None) -> RunResult:
         self.calls.append(list(argv))
@@ -77,17 +104,29 @@ class _FakeGitRunner(RunnerBase):
             argv[0] == "git" and argv[1] == "-C"
         )
         path = str(Path(argv[2]).resolve())
-        if argv[3:] == ["rev-parse", "--git-common-dir"]:
-            common = self.mapping.get(path)
-            if common is None:
-                # Also try matching by the raw -C path without re-resolve quirks.
-                for k, v in self.mapping.items():
-                    if Path(k).resolve() == Path(path).resolve():
-                        common = v
-                        break
+        rest = argv[3:]
+        if rest == ["rev-parse", "--git-common-dir"]:
+            common = self._lookup(self.mapping, path)
             if common is None:
                 return RunResult(returncode=128, stdout="", stderr="not a git repo")
             return RunResult(returncode=0, stdout=common + "\n", stderr="")
+        if rest == ["rev-parse", "--git-dir"]:
+            gdir = self._lookup(self.git_dirs, path)
+            if gdir is None:
+                # Default: main worktree — git-dir == common-dir.
+                common = self._lookup(self.mapping, path)
+                if common is None:
+                    return RunResult(returncode=128, stdout="", stderr="not a git repo")
+                gdir = common
+            return RunResult(returncode=0, stdout=gdir + "\n", stderr="")
+        if rest == ["rev-parse", "--show-toplevel"]:
+            top = self._lookup(self.toplevels, path)
+            if top is None:
+                # Default: the -C path itself is the toplevel.
+                if self._lookup(self.mapping, path) is None:
+                    return RunResult(returncode=128, stdout="", stderr="not a git repo")
+                top = path
+            return RunResult(returncode=0, stdout=top + "\n", stderr="")
         return RunResult(returncode=1, stdout="", stderr="unexpected")
 
 
@@ -482,3 +521,101 @@ def test_enforcement_lit_lane_not_dark(tmp_path: Path) -> None:
     runner = _FakeGitRunner({str(ws.resolve()): str((ws / ".git").resolve())})
     plan = _plan([_agent("build")])
     enforce_repo_locks(plan, workspace_dir=ws, concurrency=1, lane="lit", runner=runner)
+
+
+def test_enforcement_worktree_pattern_ok_without_step_locks(tmp_path: Path) -> None:
+    """W8-T2: pipeline worktree: true exempts unlocked implement steps."""
+    from dataclasses import replace
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    runner = _FakeGitRunner({str(ws.resolve()): str((ws / ".git").resolve())})
+    plan = replace(_plan([_agent("build")]), worktree=True)
+    enforce_repo_locks(plan, workspace_dir=ws, concurrency=2, runner=runner)
+
+
+# --------------------------------------------------------------------------- #
+# W8-T2 M3 — linked worktree locks are distinct (two worktrees don't serialize)
+# --------------------------------------------------------------------------- #
+
+
+def test_linked_worktrees_resolve_to_distinct_locks(tmp_path: Path) -> None:
+    """repo:<worktree> must NOT collapse to the main common-dir lock (M3)."""
+    main = tmp_path / "repo"
+    main.mkdir()
+    common = main / ".git"
+    common.mkdir()
+    wt_a = tmp_path / "wt-a"
+    wt_b = tmp_path / "wt-b"
+    wt_a.mkdir()
+    wt_b.mkdir()
+    # Linked worktrees: common-dir shared, git-dir under .git/worktrees/<name>.
+    gdir_a = common / "worktrees" / "a"
+    gdir_b = common / "worktrees" / "b"
+    gdir_a.mkdir(parents=True)
+    gdir_b.mkdir(parents=True)
+    runner = _FakeGitRunner(
+        {
+            str(main.resolve()): str(common.resolve()),
+            str(wt_a.resolve()): str(common.resolve()),
+            str(wt_b.resolve()): str(common.resolve()),
+        },
+        git_dirs={
+            str(main.resolve()): str(common.resolve()),
+            str(wt_a.resolve()): str(gdir_a.resolve()),
+            str(wt_b.resolve()): str(gdir_b.resolve()),
+        },
+        toplevels={
+            str(main.resolve()): str(main.resolve()),
+            str(wt_a.resolve()): str(wt_a.resolve()),
+            str(wt_b.resolve()): str(wt_b.resolve()),
+        },
+    )
+    main_lock = resolve_lock_name(f"repo:{main}", workspace_dir=tmp_path, runner=runner)
+    a_lock = resolve_lock_name(f"repo:{wt_a}", workspace_dir=tmp_path, runner=runner)
+    b_lock = resolve_lock_name(f"repo:{wt_b}", workspace_dir=tmp_path, runner=runner)
+    assert main_lock.startswith("repo#")
+    assert a_lock.startswith("worktree#")
+    assert b_lock.startswith("worktree#")
+    assert a_lock != b_lock
+    assert a_lock != main_lock
+    assert b_lock != main_lock
+
+
+def test_two_worktree_locks_do_not_serialize(tmp_path: Path) -> None:
+    """Two runs holding distinct worktree locks both acquire (no over-serialization)."""
+    main = tmp_path / "repo"
+    main.mkdir()
+    common = main / ".git"
+    common.mkdir()
+    wt_a = tmp_path / "wt-a"
+    wt_b = tmp_path / "wt-b"
+    wt_a.mkdir()
+    wt_b.mkdir()
+    gdir_a = common / "worktrees" / "a"
+    gdir_b = common / "worktrees" / "b"
+    gdir_a.mkdir(parents=True)
+    gdir_b.mkdir(parents=True)
+    runner = _FakeGitRunner(
+        {
+            str(wt_a.resolve()): str(common.resolve()),
+            str(wt_b.resolve()): str(common.resolve()),
+        },
+        git_dirs={
+            str(wt_a.resolve()): str(gdir_a.resolve()),
+            str(wt_b.resolve()): str(gdir_b.resolve()),
+        },
+        toplevels={
+            str(wt_a.resolve()): str(wt_a.resolve()),
+            str(wt_b.resolve()): str(wt_b.resolve()),
+        },
+    )
+    a_lock = resolve_lock_name(f"repo:{wt_a}", workspace_dir=tmp_path, runner=runner)
+    b_lock = resolve_lock_name(f"repo:{wt_b}", workspace_dir=tmp_path, runner=runner)
+    clock = _Clock()
+    locks_dir = tmp_path / "locks"
+    assert try_acquire_lock(locks_dir, a_lock, pid=1, now=clock.now, kill=_alive_kill)
+    # Second worktree lock must succeed while first is still held.
+    assert try_acquire_lock(locks_dir, b_lock, pid=2, now=clock.now, kill=_alive_kill)
+    release_lock(locks_dir, a_lock)
+    release_lock(locks_dir, b_lock)

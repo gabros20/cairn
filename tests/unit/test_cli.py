@@ -1897,6 +1897,8 @@ def test_trigger_sync_list_remove_launchd_roundtrip(hello_ws, monkeypatch, tmp_p
             "circuit_failures": None,
             "circuit_consecutive": 0,
             "circuit_open": False,
+            # SG6 audit quarantine count.
+            "quarantined": 0,
         }
     ]
 

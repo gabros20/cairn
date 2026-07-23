@@ -132,8 +132,8 @@ def test_cli_new_source_prints_snippets(ws: Path, monkeypatch, capsys):
     assert "identity: strict" in out
     assert "lease: 60m" in out
     assert "schedules.yaml" in out
-    assert "attended posture" in out
-    assert "W8" in out
+    assert "SG6" in out or "quarantine" in out.lower()
+    assert "worktree" in out.lower()
 
 
 def test_cli_unknown_provider_config_exit(ws: Path, monkeypatch, capsys):

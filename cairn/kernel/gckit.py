@@ -39,7 +39,8 @@ from pathlib import Path
 from typing import Any
 
 from cairn.kernel.durafs import atomic_write_text, durable_unlink
-from cairn.kernel.runstate import LOCK_NAME, RUN_JSON
+from cairn.kernel.proc import Runner, SubprocessRunner
+from cairn.kernel.runstate import LOCK_NAME, RUN_JSON, read_worktree
 from cairn.kernel.trail import TRAIL_NAME, derive_status, last_trail_terminal
 from cairn.kernel.types import OutcomeClass, classify_exit
 
@@ -406,7 +407,55 @@ def _stat_size(path: Path) -> int:
         return 0
 
 
-def apply_gc(plan: GcPlan) -> GcResult:
+def prune_run_worktree(
+    run_dir: Path,
+    *,
+    runner: Runner | None = None,
+) -> str | None:
+    """Remove a run's recorded git worktree via injected Runner (W8-T2).
+
+    Reads ``run.json``'s optional ``worktree`` field. Absent → no-op (returns None).
+    Present → ``git worktree remove --force <path>`` from the worktree's parent
+    repo context. An already-gone worktree is tolerated (no error). Returns a
+    short diagnostic string when a remove was attempted, else None.
+
+    Does **not** delete the run dir — :func:`apply_gc` calls this before rmtree
+    on a full delete so the worktree is not left as a disk leak / stale git ref.
+    """
+    wt = read_worktree(run_dir)
+    if not wt:
+        return None
+    wt_path = Path(wt)
+    r = runner if runner is not None else SubprocessRunner()
+    # Prefer removing from the worktree path itself (git finds common-dir).
+    # If the path is already gone, treat as clean success (scaffold may have
+    # removed it, or a prior gc attempt got the worktree but not the run dir).
+    if not wt_path.exists():
+        return f"worktree already gone: {wt}"
+    try:
+        result = r.run(
+            ["git", "-C", str(wt_path), "worktree", "remove", "--force", str(wt_path)]
+        )
+    except OSError as exc:
+        # Best-effort: don't block run-dir deletion on a flaky git; surface.
+        return f"worktree prune failed: {wt} ({exc})"
+    if result.returncode != 0:
+        # Fallback: try from parent repo if the worktree dir is half-broken.
+        err = (result.stderr or result.stdout or "").strip()
+        # Common "not a working tree" / already removed → tolerate.
+        low = err.lower()
+        if (
+            "not a working tree" in low
+            or "is not a working tree" in low
+            or "no such file" in low
+            or "does not exist" in low
+        ):
+            return f"worktree already gone: {wt}"
+        return f"worktree prune failed: {wt} ({err or f'exit {result.returncode}'})"
+    return f"worktree pruned: {wt}"
+
+
+def apply_gc(plan: GcPlan, *, runner: Runner | None = None) -> GcResult:
     """Execute a plan's deletions — the only path that removes anything.
 
     Each candidate is re-checked for its advisory lock at apply time (a run may have been
@@ -418,6 +467,10 @@ def apply_gc(plan: GcPlan) -> GcResult:
     operator action on runs already judged dead, not a concurrent-safe primitive.
     Full delete removes the run dir; `artifacts_only` slims it to the audit skeleton. A
     candidate whose dir escaped `plan.runs_root` is refused — apply never deletes outside root.
+
+    W8-T2: on full delete, a recorded per-run git worktree is pruned first via
+    :func:`prune_run_worktree` (Runner seam). Absent ``worktree`` → unchanged.
+    ``artifacts_only`` keeps the run (and thus the worktree meta) — no prune.
     """
     deleted: list[str] = []
     errors: list[tuple[str, str]] = []
@@ -452,6 +505,8 @@ def apply_gc(plan: GcPlan) -> GcResult:
             if cand.artifacts_only:
                 freed += _slim(run_dir)
             else:
+                # Prune recorded worktree before rmtree (disk leak + stale git ref).
+                prune_run_worktree(run_dir, runner=runner)
                 freed += _dir_bytes(run_dir)
                 shutil.rmtree(run_dir)
             deleted.append(cand.run_id)

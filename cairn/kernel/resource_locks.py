@@ -94,6 +94,31 @@ def lock_path(locks_dir: Path, lock_name: str) -> Path:
 # --------------------------------------------------------------------------- #
 
 
+def _git_rev_parse(
+    path: Path,
+    *args: str,
+    runner: Runner | None = None,
+) -> Path | None:
+    """Run ``git -C path rev-parse <args>`` and resolve a path result, or None."""
+    r = runner if runner is not None else SubprocessRunner()
+    path = Path(path)
+    try:
+        result = r.run(["git", "-C", str(path), "rev-parse", *args])
+    except OSError:
+        return None
+    if result.returncode != 0:
+        return None
+    out = (result.stdout or "").strip()
+    if not out:
+        return None
+    resolved = Path(out)
+    if not resolved.is_absolute():
+        resolved = (path / resolved).resolve()
+    else:
+        resolved = resolved.resolve()
+    return resolved
+
+
 def git_common_dir(
     path: Path,
     *,
@@ -104,23 +129,29 @@ def git_common_dir(
     Uses the injected :class:`Runner` (production: :class:`SubprocessRunner`). Never
     raises on a non-repo / missing git — returns None.
     """
-    r = runner if runner is not None else SubprocessRunner()
-    path = Path(path)
-    try:
-        result = r.run(["git", "-C", str(path), "rev-parse", "--git-common-dir"])
-    except OSError:
-        return None
-    if result.returncode != 0:
-        return None
-    out = (result.stdout or "").strip()
-    if not out:
-        return None
-    common = Path(out)
-    if not common.is_absolute():
-        common = (path / common).resolve()
-    else:
-        common = common.resolve()
-    return common
+    return _git_rev_parse(path, "--git-common-dir", runner=runner)
+
+
+def git_dir(
+    path: Path,
+    *,
+    runner: Runner | None = None,
+) -> Path | None:
+    """Absolute resolved ``git-dir`` for ``path``, or None if not a git repo.
+
+    Linked worktrees have a git-dir under ``<common>/worktrees/<name>`` that
+    differs from the common-dir; the main worktree's git-dir equals the common-dir.
+    """
+    return _git_rev_parse(path, "--git-dir", runner=runner)
+
+
+def git_toplevel(
+    path: Path,
+    *,
+    runner: Runner | None = None,
+) -> Path | None:
+    """Absolute resolved work-tree root (``--show-toplevel``), or None."""
+    return _git_rev_parse(path, "--show-toplevel", runner=runner)
 
 
 def is_git_repo(path: Path, *, runner: Runner | None = None) -> bool:
@@ -128,10 +159,36 @@ def is_git_repo(path: Path, *, runner: Runner | None = None) -> bool:
     return git_common_dir(path, runner=runner) is not None
 
 
+def is_linked_worktree(path: Path, *, runner: Runner | None = None) -> bool:
+    """True when ``path`` is inside a *linked* git worktree (not the main worktree).
+
+    Detection: ``git-dir`` and ``git-common-dir`` resolve to different paths.
+    Main worktree → False; non-repo → False.
+    """
+    common = git_common_dir(path, runner=runner)
+    if common is None:
+        return False
+    gdir = git_dir(path, runner=runner)
+    if gdir is None:
+        return False
+    return gdir != common
+
+
 def _repo_lock_name(common_dir: Path) -> str:
     """Stable machine-wide lock name for a git common-dir (hash of resolved path)."""
     digest = hashlib.sha256(str(common_dir).encode("utf-8")).hexdigest()[:24]
     return f"repo#{digest}"
+
+
+def _worktree_lock_name(toplevel: Path) -> str:
+    """Stable lock name for one linked worktree's working tree (W8-T2 M3).
+
+    Distinct from the main-repo ``repo#…`` lock so two per-run worktrees do not
+    serialize on the shared common-dir. Shared refs ops (push / branch-create /
+    PR) must still take ``repo:<main>`` (common-dir scoped).
+    """
+    digest = hashlib.sha256(str(toplevel).encode("utf-8")).hexdigest()[:24]
+    return f"worktree#{digest}"
 
 
 def resolve_lock_name(
@@ -142,9 +199,14 @@ def resolve_lock_name(
 ) -> str:
     """Resolve one authored lock name to its canonical machine-wide form.
 
-    * ``repo:<path>`` → ``repo#<hash>`` of the absolute git common-dir.
-      Path may be workspace-relative or absolute. Three spellings of the same
-      repo always map to the same lock. Path not in a git repo → ConfigError.
+    * ``repo:<path>`` —
+      - **Main worktree** (git-dir == common-dir) → ``repo#<hash of common-dir>``.
+        Three spellings of the same main repo always map to the same lock.
+      - **Linked worktree** (git-dir ≠ common-dir) → ``worktree#<hash of toplevel>``
+        (W8-T2 M3). Per-run worktrees get *distinct* locks so concurrent implement
+        steps do not over-serialize on the shared common-dir. Delivery / shared-refs
+        steps must lock the main checkout (``repo:.`` / ``repo:<main>``).
+      Path may be workspace-relative or absolute. Path not in a git repo → ConfigError.
     * Opaque names pass through (must be filesystem-safe).
     """
     if not isinstance(name, str) or not name:
@@ -164,6 +226,11 @@ def resolve_lock_name(
                 f"lock {name!r}: path {p} is not inside a git repository "
                 f"(git rev-parse --git-common-dir failed)"
             )
+        # M3: linked worktree → distinct lock (do not collapse to main common-dir).
+        gdir = git_dir(p, runner=runner)
+        if gdir is not None and gdir != common:
+            top = git_toplevel(p, runner=runner) or p
+            return _worktree_lock_name(top)
         return _repo_lock_name(common)
     if not _OPAQUE_NAME_RE.match(name):
         raise ConfigError(
@@ -616,7 +683,13 @@ def enforce_repo_locks(
       AND
     * a step touches a git dir (see :func:`step_touches_git`),
       AND
-    * that step has neither ``locks:`` nor (W8-T2) a worktree pattern.
+    * that step has neither ``locks:`` nor the W8-T2 worktree pattern.
+
+    **Worktree pattern (W8-T2):** pipeline-level ``worktree: true`` means implement
+    steps work in per-run linked worktrees (isolated working trees — no shared
+    ``repo:`` lock needed). Only the delivery / shared-refs step takes
+    ``locks: [repo:.]``. Unlocked git-touch steps are allowed when the pipeline
+    declares the pattern; they are **not** flagged.
 
     Docs-only (workspace not a git repo) never errors. Concurrent/dark + locks → ok.
     """
@@ -628,6 +701,10 @@ def enforce_repo_locks(
     ws_git = is_git_repo(workspace_dir, runner=runner)
     if not ws_git:
         return  # docs-only / non-git workspace — never enforce
+
+    # W8-T2: worktree-pattern pipeline — isolated implement steps need no lock.
+    if getattr(plan, "worktree", False):
+        return
 
     pipeline_locks = tuple(getattr(plan, "pipeline_locks", ()) or ())
 
@@ -647,11 +724,11 @@ def enforce_repo_locks(
         ):
             continue
         locks = effective_step_locks(step, pipeline_locks=pipeline_locks)
-        # W8-T2 worktree pattern not yet built — locks: is the only escape.
         if locks:
             continue
         sid = getattr(step, "id", "?")
         raise ConfigError(
             f"step '{sid}' mutates a git repo under concurrency/dark without a lock — "
-            f"add locks: [repo:<path>] or use a per-run worktree."
+            f"add locks: [repo:<path>] or use a per-run worktree "
+            f"(pipeline worktree: true + lock only the delivery step)."
         )

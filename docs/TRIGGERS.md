@@ -194,13 +194,12 @@ pullers are workspace scripts that honour this contract. Scaffolds that *generat
 pullers (`cairn new source`, default `triggers.yaml` rows — see walkthrough below)
 implement this contract.
 
-**Attended posture (SG6 defer).** Source pullers run in an **attended** posture
-today: `identity: strict` (SG1), fail-closed notify markers (SG5), and ledger
-invariant audit *surfacing* via `cairn doctor` / `cairn factory reconcile`. That
-audit reports violating identities but does **not** yet auto-quarantine them —
-admission-refusing enforcement lands with W8's lights-out / dark-lane work. Until
-then, do **not** run source pullers fully unattended (headless cron with no
-operator watching reconcile/doctor).
+**SG6 audit quarantine.** Source pullers run under `identity: strict` (SG1),
+fail-closed notify markers (SG5), and ledger invariant audit via
+`cairn doctor` / `cairn factory reconcile`. Settled violations are **quarantined**
+into the watch dir's `.quarantine/` (durable; never auto-deleted) so the drain
+refuses the affected identity; in-grace claims (fresh mtime / live lease) are
+left alone as transient. `trigger list` surfaces a `quarantined=` count.
 
 **Work-item file.** One JSON object per inbox drop. Schema:
 `schemas/work-item.json` (`id`, `source`, `title`, `url`, `prio` 0–9, `created`,

@@ -2452,6 +2452,8 @@ def _trigger_status_json(status: TriggerStatus) -> dict[str, Any]:
         "circuit_failures": status.circuit_failures,
         "circuit_consecutive": status.circuit_consecutive,
         "circuit_open": status.circuit_open,
+        # SG6 audit quarantine count.
+        "quarantined": status.quarantined,
     }
 
 
@@ -2483,7 +2485,15 @@ def _print_trigger_list(statuses: list[TriggerStatus], backend: str) -> None:
         else:
             note = "- installed, not declared"
         print(f"  {note:32} {s.name}")
-        has_depth = s.waiting or s.failed or s.done or s.stuck or s.spool or s.inflight
+        has_depth = (
+            s.waiting
+            or s.failed
+            or s.done
+            or s.stuck
+            or s.spool
+            or s.inflight
+            or s.quarantined
+        )
         has_caps = any(
             v is not None
             for v in (s.waiting_max, s.blocked_max, s.capacity_max, s.wip_max, s.inbox_max)
@@ -2500,7 +2510,7 @@ def _print_trigger_list(statuses: list[TriggerStatus], backend: str) -> None:
         ):
             print(
                 f"      waiting={s.waiting} failed={s.failed} done={s.done} "
-                f"stuck={len(s.stuck)}"
+                f"stuck={len(s.stuck)} quarantined={s.quarantined}"
             )
             print(
                 f"      needs-human={s.needs_human} blocked={s.blocked} "

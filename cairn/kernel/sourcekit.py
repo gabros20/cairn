@@ -186,8 +186,10 @@ def new_source(provider: str, workspace_dir: Path) -> SourceScaffoldResult:
         "triggers.yaml / schedules.yaml are NOT edited — paste the snippets below",
         f"ship-gates: identity:strict (SG1), lease: {spec.lease} (SG4), "
         "fail-closed notify markers (SG5)",
-        "attended posture: do not run source pullers fully unattended until W8 "
-        "(ledger audit surfaces via doctor/reconcile; no auto-quarantine yet — SG6)",
+        "SG6: ledger invariant audit QUARANTINES settled violations to "
+        ".quarantine/ (never auto-deletes); in-grace claims left alone",
+        "W8 worktree pattern: fix pipeline sets worktree: true — implement in a "
+        "per-run git worktree, record path on run.json, lock only deliver",
     )
     return SourceScaffoldResult(
         provider=provider,
@@ -260,6 +262,18 @@ def _fix_pipeline(spec: ProviderSpec) -> str:
             # upstream status (T6b), do the work, deliver via fail-closed notify (SG5).
             # Scaffolded by `cairn new source __PROVIDER__`.
             #
+            # WORKTREE PATTERN (W8-T2 — furniture, not kernel git-wrapping):
+            #   worktree: true marks this pipeline as per-run-worktree. Implement
+            #   steps work in an isolated linked worktree (no shared repo: lock).
+            #   Only deliver takes locks: [repo:.] for the shared-refs op (push /
+            #   branch / PR). Mirror self-improve-open-pr.py:
+            #     1. git worktree add -b <branch> <path>   (keyed by work-item id)
+            #     2. record path: cairn.kernel.runstate.record_worktree(run_dir, path)
+            #     3. edit only under the worktree (safe-target-under-worktree check)
+            #     4. deliver under locks: [repo:.] ; gc prunes the worktree later
+            #   Cairn provides the lease + run.json worktree field + gc prune;
+            #   the scaffold does the git (D5).
+            #
             # The work step is a PLACEHOLDER run: — replace with agent: or a real
             # command once the adapter is wired. A closed source-status skips work
             # and delivery (run completes without a delivery artifact).
@@ -267,6 +281,7 @@ def _fix_pipeline(spec: ProviderSpec) -> str:
             # Fired by the triggers.yaml work-queue entry (identity:strict + lease).
             pipeline: fix-__PROVIDER__
             version: 1
+            worktree: true
 
             params:
               event: { type: string, required: true }  # absolute path of the claimed inbox file
@@ -308,20 +323,25 @@ def _fix_pipeline(spec: ProviderSpec) -> str:
                 produces: [source-status]
 
               # 3. work — PLACEHOLDER. Replace with agent: or a real run: command.
-              #    Skipped when upstream is closed.
+              #    Worktree pattern: create/record a per-run worktree (no repo: lock —
+              #    isolated working tree). Skipped when upstream is closed.
               - step: work
                 when: "artifacts.source-status.status != 'closed'"
                 run: >-
                   python3 -c "import pathlib,sys;
                   pathlib.Path(sys.argv[1]).write_text(
-                    'TODO: implement fix work for this source\\n', encoding='utf-8')"
+                    'TODO: implement fix work for this source in a per-run git worktree\\n'
+                    '(git worktree add → record_worktree → edit under worktree only)\\n',
+                    encoding='utf-8')"
                   "$CAIRN_RUN_DIR/work-notes.txt"
                 needs: [source-status]
 
-              # 4. deliver — fail-closed notify (SG5). Skipped when closed.
-              #    Ordered after work by list position (needs names artifacts/gates only).
+              # 4. deliver — fail-closed notify (SG5). SHARED-REFS step: holds
+              #    locks: [repo:.] so concurrent deliverers serialize on the main
+              #    repo. Skipped when closed.
               - step: deliver
                 when: "artifacts.source-status.status != 'closed'"
+                locks: [repo:.]
                 run: >-
                   python3 "$CAIRN_WORKSPACE/scripts/notify___PROVIDER__.py"
                   "{artifact:work-item}" "{artifact:delivery}"
@@ -388,12 +408,10 @@ Backpressure: if work/inbox depth >= inbox_max, skip the poll, emit a paused
 poll-report (complete:true, paused:true, emitted:0), leave cursor.next
 untouched, exit 0.
 
-Attended posture (SG6 defer): this puller runs under identity:strict +
-fail-closed markers + audit SURFACING via `cairn doctor` / `cairn factory
-reconcile`. The ledger invariant audit surfaces violating identities but does
-NOT yet auto-quarantine them (that enforcement lands with W8 lights-out /
-dark-lane work). Do NOT run source pullers FULLY UNATTENDED (headless cron
-with no operator watching reconcile/doctor) until W8.
+SG6: ledger invariant audit QUARANTINES settled violations to `.quarantine/`
+(never auto-deletes; in-grace claims left alone). Pullers still run under
+identity:strict + fail-closed markers; operator watches reconcile/doctor for
+quarantine counts.
 
 Stdlib + cairn.kernel.work_item; pure helpers below are unit-tested with a
 seamed fetch_items (no live network in tests).

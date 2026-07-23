@@ -954,6 +954,8 @@ class TriggerStatus:
     circuit_failures: int | None = None  # threshold N from lane_circuit
     circuit_consecutive: int = 0
     circuit_open: bool = False
+    # SG6: settled audit violations isolated under .quarantine/ (never auto-deleted).
+    quarantined: int = 0
 
 
 def sync_triggers(
@@ -1670,6 +1672,7 @@ def list_installed_triggers(
         trigger = triggers.get(name)
         stuck: tuple[Path, ...] = ()
         waiting = failed = done = 0
+        quarantined = 0
         needs_human = blocked = capacity = inflight = spool = 0
         concurrency = 1
         order = "name"
@@ -1687,6 +1690,7 @@ def list_installed_triggers(
             waiting = counts["waiting"]
             failed = counts["failed"]
             done = counts["done"]
+            quarantined = int(counts.get("quarantined", 0))
             depths = count_by_class(watch_abs, glob=trigger.glob)
             needs_human = depths["needs_human"]
             blocked = depths["blocked"]
@@ -1739,6 +1743,7 @@ def list_installed_triggers(
                 circuit_failures=circuit_failures,
                 circuit_consecutive=circuit_consecutive,
                 circuit_open=circuit_open,
+                quarantined=quarantined,
             )
         )
     return statuses

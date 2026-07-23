@@ -207,7 +207,10 @@ class Plan:
     is the range-scoped subset of ``[tools]`` (see :class:`ToolRequirement`) — the hard-stop set
     ``cairn run`` verifies before it mints or walks anything. ``lanes`` is the optional autonomy
     profile table (absent/empty = today's behavior). ``pipeline_locks`` is the optional
-    top-level ``locks:`` list (W8) — applied to every step in addition to per-step locks."""
+    top-level ``locks:`` list (W8) — applied to every step in addition to per-step locks.
+    ``worktree`` (W8-T2) marks the worktree-per-run pattern: implement steps use
+    isolated linked worktrees; only the delivery/shared-refs step takes ``repo:``
+    locks. Absent/False = today's behavior (D7)."""
 
     pipeline: str
     version: int
@@ -224,6 +227,7 @@ class Plan:
     tool_requirements: tuple[ToolRequirement, ...] = ()
     lanes: dict[str, LaneProfile] = field(default_factory=dict)
     pipeline_locks: tuple[str, ...] = ()
+    worktree: bool = False
 
 
 # --------------------------------------------------------------------------- #
@@ -1976,7 +1980,7 @@ def _tool_requirements(
 
 _KNOWN_TOP_LEVEL = {
     "pipeline", "version", "params", "dims", "run_id", "artifacts", "guards", "steps",
-    "lanes", "locks",
+    "lanes", "locks", "worktree",
 }
 
 
@@ -2092,6 +2096,20 @@ def plan(
         doc.get("locks"), "pipeline", file=str(pfile)
     )
 
+    # W8-T2 worktree pattern: pipeline declares per-run linked worktrees so
+    # concurrent/dark implement steps need no shared repo: lock (only delivery does).
+    # Absent / false → D7 unchanged.
+    worktree_raw = doc.get("worktree")
+    if worktree_raw is None:
+        pipeline_worktree = False
+    elif isinstance(worktree_raw, bool):
+        pipeline_worktree = worktree_raw
+    else:
+        _err(
+            f"pipeline {pipeline_name!r}: worktree must be a boolean, got {worktree_raw!r}",
+            str(pfile),
+        )
+
     # claude-F10: honest enforcement — warn (never error) when a guard's declared enforce
     # layers yield no effective pre-execution block for THIS plan's resolved executor(s), or
     # when agent steps run wholly unguarded. Only in range guards + resolved_models are used.
@@ -2131,6 +2149,7 @@ def plan(
         tool_requirements=tool_requirements,
         lanes=lanes,
         pipeline_locks=pipeline_locks,
+        worktree=pipeline_worktree,
     )
 
 

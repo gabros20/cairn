@@ -46,6 +46,7 @@ _TOMBSTONE_SUBDIR = "tombstones"
 _IDS_SUBDIR = ".ids"
 _DEFERRED_SUBDIR = ".deferred"
 _REJECTED_SUBDIR = ".rejected"
+_QUARANTINE_SUBDIR = ".quarantine"  # SG6: settled invariant violations (never auto-delete)
 _LEASES_SUBDIR = ".leases"
 # W5 dark-lane circuit breaker state (dot-file at watch root; scans/counts ignore dots).
 CIRCUIT_STATE_NAME = ".circuit"
@@ -225,7 +226,8 @@ def audit_ledger(
     to ``time.time()``); doctor/reconcile pass their clock.
 
     Over-preserve: returns issues only — never mutates. Callers (doctor, reconcile)
-    surface + may quarantine affected identities; they do NOT auto-delete.
+    surface and :func:`audit_and_quarantine` moves settled violations into
+    ``.quarantine/``; neither auto-deletes. In-grace claims are never reported.
     """
     from cairn.kernel.gckit import QUEUE_PIN_NAME
 
@@ -332,6 +334,197 @@ def audit_ledger(
                 )
 
     return issues
+
+
+def quarantine_dir(watch_abs: Path) -> Path:
+    """``.quarantine/`` — settled audit violations (SG6). Dot-prefixed; scan-excluded."""
+    return Path(watch_abs) / _QUARANTINE_SUBDIR
+
+
+def count_quarantined(watch_abs: Path) -> int:
+    """Count quarantined ledger entries (item files, not ``*.issue`` sidecars)."""
+    q = quarantine_dir(watch_abs)
+    if not q.is_dir():
+        return 0
+    n = 0
+    for p in q.iterdir():
+        if not p.is_file() or p.name.startswith("."):
+            continue
+        if p.name.endswith(".issue"):
+            continue
+        n += 1
+    return n
+
+
+def _quarantine_dest(qdir: Path, name: str) -> Path:
+    """Collision-safe destination under ``.quarantine/`` (never destroy prior evidence)."""
+    dest = qdir / name
+    if not dest.exists():
+        return dest
+    stem, ext = Path(name).stem, Path(name).suffix
+    n = 2
+    while (qdir / f"{stem}-v{n}{ext}").exists():
+        n += 1
+    return qdir / f"{stem}-v{n}{ext}"
+
+
+def _move_to_quarantine(
+    src: Path,
+    qdir: Path,
+    *,
+    issue: str,
+    fs: Any = None,
+) -> str | None:
+    """Durable-move ``src`` into ``qdir`` and write a sibling ``.issue`` note.
+
+    Returns a short diagnostic, or None when src was already gone (lost race).
+    Never deletes evidence.
+    """
+    if not src.is_file():
+        return None
+    qdir.mkdir(parents=True, exist_ok=True)
+    dest = _quarantine_dest(qdir, src.name)
+    try:
+        durable_move(src, dest, fs=fs)
+    except FileNotFoundError:
+        return None
+    except FileExistsError:
+        # Racer landed first — drop our copy only if hard-link same content is impossible;
+        # over-preserve: leave src if move failed due to collision that suffix didn't catch.
+        try:
+            durable_unlink(src, fs=fs)
+        except FileNotFoundError:
+            pass
+        return f"quarantined {src.name} (already present) — {issue}"
+    issue_path = Path(str(dest) + ".issue")
+    try:
+        atomic_write_text(issue_path, issue + "\n", fs=fs)
+    except OSError:
+        # Entry moved; issue note is best-effort.
+        pass
+    return f"quarantined {src.name} → {_QUARANTINE_SUBDIR}/ — {issue}"
+
+
+def _paths_for_audit_issue(watch_abs: Path, issue: str) -> list[Path]:
+    """Resolve ledger file paths affected by one audit issue string.
+
+    Returns item and/or pointer paths that should leave live lanes so the drain
+    cannot process the corrupt identity. Over-preserves: never invents paths.
+    """
+    watch_abs = Path(watch_abs)
+    paths: list[Path] = []
+
+    # pointer without item: {lane}/{name}
+    if issue.startswith("pointer without item: "):
+        loc = issue[len("pointer without item: ") :].strip()
+        if "/" in loc:
+            lane, name = loc.split("/", 1)
+            paths.append(pointer_dir(watch_abs / lane) / name)
+        return paths
+
+    # item without pointer: {lane}/{name}
+    if issue.startswith("item without pointer: "):
+        loc = issue[len("item without pointer: ") :].strip()
+        if "/" in loc:
+            lane, name = loc.split("/", 1)
+            paths.append(watch_abs / lane / name)
+            # Also move a stray pointer if one appeared between audit and move.
+            ptr = pointer_dir(watch_abs / lane) / name
+            if ptr.is_file():
+                paths.append(ptr)
+        return paths
+
+    # claim without reservation: {name} (identity {id})
+    if issue.startswith("claim without reservation: "):
+        rest = issue[len("claim without reservation: ") :]
+        name = rest.split(" (", 1)[0].strip()
+        if name:
+            paths.append(watch_abs / ".claim" / name)
+            ptr = pointer_dir(watch_abs / ".claim") / name
+            if ptr.is_file():
+                paths.append(ptr)
+        return paths
+
+    # identity in two live states: {identity} at {lane}/{name}, {lane}/{name}
+    if issue.startswith("identity in two live states: "):
+        rest = issue[len("identity in two live states: ") :]
+        if " at " in rest:
+            locs_s = rest.split(" at ", 1)[1]
+            for loc in locs_s.split(", "):
+                loc = loc.strip()
+                if "/" not in loc:
+                    continue
+                lane, name = loc.split("/", 1)
+                item = watch_abs / lane / name
+                if item.is_file():
+                    paths.append(item)
+                ptr = pointer_dir(watch_abs / lane) / name
+                if ptr.is_file():
+                    paths.append(ptr)
+        return paths
+
+    # terminal-ledger run still pinned: {lane}/{name} -> {run_dir}
+    if issue.startswith("terminal-ledger run still pinned: "):
+        rest = issue[len("terminal-ledger run still pinned: ") :]
+        loc = rest.split(" -> ", 1)[0].strip()
+        if "/" in loc:
+            lane, name = loc.split("/", 1)
+            item = watch_abs / lane / name
+            if item.is_file():
+                paths.append(item)
+            ptr = pointer_dir(watch_abs / lane) / name
+            if ptr.is_file():
+                paths.append(ptr)
+        return paths
+
+    return paths
+
+
+def audit_and_quarantine(
+    watch_abs: Path,
+    *,
+    now: float | None = None,
+    current_boot_id: str | None = None,
+    kill: Callable[[int, int], None] | None = None,
+    fs: Any = None,
+) -> list[str]:
+    """Audit ledger invariants and QUARANTINE settled violations (SG6).
+
+    1. :func:`audit_ledger` (pure) finds settled issues — in-grace claims are
+       already excluded (transient, left alone).
+    2. For each issue, move affected ledger entries into ``.quarantine/`` with a
+       sibling ``*.issue`` note (durable; never auto-delete).
+    3. Return diagnostics for surface (reconcile diags / doctor / trigger list).
+
+    A clean ledger → ``[]`` and no ``.quarantine/`` writes (byte-identical, D7).
+    Drain refuses quarantined identities because they no longer sit in live lanes.
+    """
+    watch_abs = Path(watch_abs)
+    issues = audit_ledger(
+        watch_abs, now=now, current_boot_id=current_boot_id, kill=kill
+    )
+    if not issues:
+        return []
+
+    qdir = quarantine_dir(watch_abs)
+    diags: list[str] = []
+    moved: set[str] = set()  # absolute path strings — de-dupe multi-issue hits
+    for issue in issues:
+        diags.append(issue)
+        for src in _paths_for_audit_issue(watch_abs, issue):
+            key = str(src.resolve()) if src.exists() else str(src)
+            if key in moved:
+                continue
+            note = _move_to_quarantine(src, qdir, issue=issue, fs=fs)
+            if note is not None:
+                moved.add(key)
+                diags.append(note)
+    if moved:
+        diags.append(
+            f"quarantined {len(moved)} ledger path(s) under {_QUARANTINE_SUBDIR}/ "
+            f"(operator must inspect; never auto-deleted)"
+        )
+    return diags
 
 
 # --------------------------------------------------------------------------- #
@@ -2515,6 +2708,7 @@ def ledger_counts(watch_abs: Path) -> dict[str, int]:
         "failed": _count_files(".failed"),
         "done": _count_files(".done"),
         "stuck": len(stuck_claims(watch_abs)),
+        "quarantined": count_quarantined(watch_abs),
     }
 
 
