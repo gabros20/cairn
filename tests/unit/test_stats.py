@@ -11,9 +11,11 @@ import pytest
 
 from cairn.cli import main
 from cairn.kernel import newkit
+from cairn.kernel.gatekeys import compute_mac, ensure_run_key
 from cairn.kernel.queue_ledger import pointer_path, write_circuit, write_pointer
 from cairn.kernel.statskit import (
     HUMAN_ANSWERED_LABEL,
+    HUMAN_ANSWERED_SCOPE,
     collect_stats,
     render_stats,
 )
@@ -72,11 +74,23 @@ def _write_trail(run_dir: Path, run_id: str, events: list[tuple]) -> None:
     (run_dir / "trail.jsonl").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def _write_gate(run_dir: Path, name: str, *, by: str, at: str, choice: str = "yes") -> None:
+def _write_gate(
+    run_dir: Path,
+    name: str,
+    *,
+    by: str,
+    at: str,
+    choice: str = "yes",
+    sign: bool = False,
+) -> None:
     gdir = run_dir / "gates"
     gdir.mkdir(parents=True, exist_ok=True)
+    payload: dict = {"choice": choice, "by": by, "at": at}
+    if sign:
+        secret = ensure_run_key(run_dir)
+        payload["mac"] = compute_mac(secret, run_dir, name, choice, by, at)
     (gdir / f"{name}.json").write_text(
-        json.dumps({"choice": choice, "by": by, "at": at}, ensure_ascii=False),
+        json.dumps(payload, ensure_ascii=False),
         encoding="utf-8",
     )
 
@@ -89,6 +103,7 @@ def _mk_run(
     pipeline: str = "ship",
     origin: str | None = None,
     gates: list[tuple] | None = None,
+    sign_gates: bool = False,
     meta_extra: dict | None = None,
 ) -> Path:
     run_dir = root / run_id
@@ -99,8 +114,9 @@ def _mk_run(
     (run_dir / "run.json").write_text(json.dumps(doc), encoding="utf-8")
     _write_trail(run_dir, run_id, events)
     for g in gates or []:
-        name, by, at = g
-        _write_gate(run_dir, name, by=by, at=at)
+        # (name, by, at) or (name, by, at, choice)
+        name, by, at = g[0], g[1], g[2]
+        _write_gate(run_dir, name, by=by, at=at, sign=sign_gates)
     return run_dir
 
 
@@ -132,6 +148,7 @@ def test_empty_runs_root_is_clean(tmp_path: Path):
     report = collect_stats(root, now=NOW)
     assert report.runs_scanned == 0
     assert report.completed == 0
+    assert report.step_success_rate is None
     assert report.validator_pass_rate is None
     assert report.human_answered_share is None
     assert "no runs" in render_stats(report)
@@ -141,8 +158,8 @@ def test_missing_runs_root_is_clean(tmp_path: Path):
     report = collect_stats(tmp_path / "nope", now=NOW)
     assert report.runs_scanned == 0
     d = report.to_dict()
-    assert d["schema_version"] == 1
-    assert d["runs"]["scanned"] == 0
+    assert d["schema_version"] == 2
+    assert d["aggregates"]["runs"]["scanned"] == 0
 
 
 def test_throughput_by_pipeline_and_origin(tmp_path: Path):
@@ -169,7 +186,6 @@ def test_throughput_by_pipeline_and_origin(tmp_path: Path):
         pipeline="docs",
         origin=None,
     )
-    # Halted — not throughput
     _mk_run(
         root,
         "d",
@@ -185,16 +201,55 @@ def test_throughput_by_pipeline_and_origin(tmp_path: Path):
     assert report.halted == 1
     assert report.throughput_by_pipeline == {"ship": 2, "docs": 1}
     assert report.throughput_by_origin == {"trigger:inbox": 2, "(none)": 1}
+    # Window from earliest done (2026-07-21) to NOW is > 1 day → per_day set.
+    assert report.window_days is not None and report.window_days >= 1.0
     assert report.completed_per_day is not None
-    assert report.completed_per_day > 0
+    assert report.completed_per_day == pytest.approx(3 / report.window_days)
 
 
-def test_validator_pass_rate_from_step_done_retry_and_fail(tmp_path: Path):
+def test_per_day_not_inflated_on_sub_day_window(tmp_path: Path):
+    """I2: a run done 1h ago must not report per_day≈24 under a sub-day window."""
+    root = tmp_path / "runs"
+    root.mkdir()
+    _mk_run(
+        root,
+        "fresh",
+        _done_events(
+            start="2026-07-23T16:00:00.000Z",
+            done="2026-07-23T17:00:00.000Z",
+        ),
+        meta_extra={"created_at": "2026-07-23T16:00:00.000Z"},
+    )
+    report = collect_stats(root, now=NOW)
+    assert report.completed == 1
+    assert report.window_days is not None
+    assert report.window_days < 1.0
+    assert report.completed_per_day is None  # no ×24 inflation
+    text = render_stats(report)
+    assert "window_days=" in text
+    assert "per_day=n/a" in text
+    assert "sub-day" in text or "< 1d" in text
+    d = report.to_dict()
+    assert d["window"]["days"] == pytest.approx(report.window_days)
+    assert d["window"]["from"] is not None
+    assert d["aggregates"]["throughput"]["per_day"] is None
+    assert d["aggregates"]["throughput"]["completed"] == 1
+
+
+def test_step_success_vs_validator_pass_distinction(tmp_path: Path):
+    """I1: bare step-done counts toward step_success but NOT validator_pass."""
     root = tmp_path / "runs"
     root.mkdir()
     steps = [
-        ("2026-07-21T10:01:00.000Z", "step-done", "build", {"artifacts": []}),
-        ("2026-07-21T10:02:00.000Z", "step-done", "test", {"artifacts": []}),
+        # No produces → empty artifacts → step success only
+        ("2026-07-21T10:01:00.000Z", "step-done", "greet", {"artifacts": []}),
+        # Real produces check → validator pass
+        (
+            "2026-07-21T10:02:00.000Z",
+            "step-done",
+            "build",
+            {"artifacts": ["artifacts/out.json"]},
+        ),
         (
             "2026-07-21T10:03:00.000Z",
             "retry",
@@ -218,18 +273,47 @@ def test_validator_pass_rate_from_step_done_retry_and_fail(tmp_path: Path):
         ],
     )
     report = collect_stats(root, now=NOW)
-    # 2 step-done passes; retry + terminal step-fail with validator_reasons = 2 fails
-    assert report.validator_passes == 2
+    # step success: 2 done + 2 fails (retry + terminal fail)
+    assert report.step_success_passes == 2
+    assert report.step_success_fails == 2
+    assert report.step_success_rate == pytest.approx(0.5)
+    # validator: only the build step-done with artifacts; fails = retry + step-fail
+    assert report.validator_passes == 1
     assert report.validator_fails == 2
-    assert report.validator_pass_rate == pytest.approx(0.5)
-    assert report.retry_events == 1
-    assert report.retry_by_node == {"qa": 1}
+    assert report.validator_pass_rate == pytest.approx(1 / 3)
+    d = report.to_dict()
+    assert "step_success" in d["aggregates"]
+    assert d["aggregates"]["step_success"]["pass_rate"] == pytest.approx(0.5)
+    assert d["aggregates"]["validator"]["pass_rate"] == pytest.approx(1 / 3)
 
 
-def test_gate_latency_pending_to_decision_at(tmp_path: Path):
+def test_no_validator_run_step_success_only(tmp_path: Path):
+    """A pipeline with no produces: step_success=100%, validator rate n/a."""
     root = tmp_path / "runs"
     root.mkdir()
-    # pending at T+0, decision at T+120s → latency 120
+    _mk_run(
+        root,
+        "bare",
+        _done_events(
+            steps=[
+                ("2026-07-21T10:01:00.000Z", "step-done", "a", {"artifacts": []}),
+                ("2026-07-21T10:02:00.000Z", "step-done", "b", {}),
+            ],
+        ),
+    )
+    report = collect_stats(root, now=NOW)
+    assert report.step_success_passes == 2
+    assert report.step_success_fails == 0
+    assert report.step_success_rate == pytest.approx(1.0)
+    assert report.validator_passes == 0
+    assert report.validator_fails == 0
+    assert report.validator_pass_rate is None
+
+
+def test_gate_latency_prefers_gate_answered_trail_event(tmp_path: Path):
+    """M1: gate-answered.at beats file at / mtime."""
+    root = tmp_path / "runs"
+    root.mkdir()
     _mk_run(
         root,
         "g1",
@@ -241,45 +325,41 @@ def test_gate_latency_pending_to_decision_at(tmp_path: Path):
                     "shipit",
                     {"question": "?", "options": ["yes", "no"]},
                 ),
+                (
+                    "2026-07-21T10:12:00.000Z",
+                    "gate-answered",
+                    "shipit",
+                    {"choice": "yes", "by": "tty"},
+                ),
             ],
             done="2026-07-21T10:30:00.000Z",
         ),
-        gates=[("shipit", "tty", "2026-07-21T10:12:00.000Z")],
+        # Deliberately different file at — trail event must win (120s not 600s)
+        gates=[("shipit", "tty", "2026-07-21T10:20:00.000Z")],
     )
     report = collect_stats(root, now=NOW)
     assert len(report.gate_latencies_s) == 1
     assert report.gate_latencies_s[0] == pytest.approx(120.0)
-    assert report.gate_latency_mean == pytest.approx(120.0)
-    assert report.gate_latency_median == pytest.approx(120.0)
-    assert report.gate_latency_p90 == pytest.approx(120.0)
 
 
-def test_human_answered_share_splits_human_vs_machine_including_lane(
-    tmp_path: Path,
-):
+def test_human_answered_share_from_gate_answered_and_verified_file(tmp_path: Path):
     root = tmp_path / "runs"
     root.mkdir()
-    # Done run with mixed by: values
-    _mk_run(
-        root,
-        "done-mixed",
-        _done_events(
-            extras=[
-                ("2026-07-21T10:10:00.000Z", "gate-pending", "a", {}),
-                ("2026-07-21T10:11:00.000Z", "gate-pending", "b", {}),
-                ("2026-07-21T10:12:00.000Z", "gate-pending", "c", {}),
-                ("2026-07-21T10:13:00.000Z", "gate-pending", "d", {}),
-                ("2026-07-21T10:14:00.000Z", "gate-pending", "e", {}),
-            ],
-        ),
-        gates=[
-            ("a", "tty", "2026-07-21T10:15:00.000Z"),
-            ("b", "external", "2026-07-21T10:16:00.000Z"),
-            ("c", "default", "2026-07-21T10:17:00.000Z"),
-            ("d", "flag", "2026-07-21T10:18:00.000Z"),
-            ("e", "lane:lit", "2026-07-21T10:19:00.000Z"),
-        ],
-    )
+    # Mix of by values via trail gate-answered (primary honest source)
+    extras = [
+        ("2026-07-21T10:10:00.000Z", "gate-pending", "a", {}),
+        ("2026-07-21T10:11:00.000Z", "gate-pending", "b", {}),
+        ("2026-07-21T10:12:00.000Z", "gate-pending", "c", {}),
+        ("2026-07-21T10:13:00.000Z", "gate-pending", "d", {}),
+        ("2026-07-21T10:14:00.000Z", "gate-pending", "e", {}),
+        ("2026-07-21T10:15:00.000Z", "gate-answered", "a", {"choice": "y", "by": "tty"}),
+        ("2026-07-21T10:16:00.000Z", "gate-answered", "b", {"choice": "y", "by": "external"}),
+        ("2026-07-21T10:17:00.000Z", "gate-answered", "c", {"choice": "y", "by": "default"}),
+        ("2026-07-21T10:18:00.000Z", "gate-answered", "d", {"choice": "y", "by": "flag"}),
+        ("2026-07-21T10:19:00.000Z", "gate-answered", "e", {"choice": "y", "by": "lane:lit"}),
+    ]
+    _mk_run(root, "done-mixed", _done_events(extras=extras))
+
     # Halted run's gates must NOT enter the human-share denominator
     _mk_run(
         root,
@@ -287,26 +367,66 @@ def test_human_answered_share_splits_human_vs_machine_including_lane(
         [
             ("2026-07-21T11:00:00.000Z", "run-start", None, None),
             ("2026-07-21T11:01:00.000Z", "gate-pending", "x", {}),
-            ("2026-07-21T11:02:00.000Z", "run-halt", "x", {"exit_code": 6}),
+            ("2026-07-21T11:02:00.000Z", "gate-answered", "x", {"choice": "y", "by": "tty"}),
+            ("2026-07-21T11:03:00.000Z", "run-halt", "x", {"exit_code": 6}),
         ],
-        gates=[("x", "tty", "2026-07-21T11:03:00.000Z")],
     )
 
     report = collect_stats(root, now=NOW)
-    assert report.human_gates == 2  # tty + external
-    assert report.machine_gates == 3  # default + flag + lane:lit
-    assert report.other_gates == 0
+    assert report.human_gates == 2
+    assert report.machine_gates == 3
     assert report.human_answered_share == pytest.approx(2 / 5)
     d = report.to_dict()
-    assert d["human_answered_share"]["label"] == HUMAN_ANSWERED_LABEL
-    assert "presence, not comprehension" in d["human_answered_share"]["label"]
-    assert "lane:*" in d["human_answered_share"]["machine_by"]
+    has = d["aggregates"]["human_answered_share"]
+    assert has["label"] == HUMAN_ANSWERED_LABEL
+    assert has["scope"] == HUMAN_ANSWERED_SCOPE
+    assert "completed runs" in has["scope"]
+    text = render_stats(report)
+    assert "completed runs" in text
 
 
-def test_blocked_time_from_halt_9_to_next_event_or_now(tmp_path: Path):
+def test_unsigned_gate_file_does_not_skew_human_share(tmp_path: Path):
+    """M2: raw unverified by on disk must not count as human/machine."""
     root = tmp_path / "runs"
     root.mkdir()
-    # Parked 60s then resumed (next event)
+    _mk_run(
+        root,
+        "forged",
+        _done_events(
+            extras=[("2026-07-21T10:10:00.000Z", "gate-pending", "g", {})],
+        ),
+        # unsigned gate file claiming tty
+        gates=[("g", "tty", "2026-07-21T10:12:00.000Z")],
+        sign_gates=False,
+    )
+    report = collect_stats(root, now=NOW)
+    assert report.human_gates == 0
+    assert report.machine_gates == 0
+    assert report.other_gates == 1  # present but unverified
+
+
+def test_mac_verified_gate_file_counts_when_no_trail_answered(tmp_path: Path):
+    root = tmp_path / "runs"
+    root.mkdir()
+    _mk_run(
+        root,
+        "signed",
+        _done_events(
+            extras=[("2026-07-21T10:10:00.000Z", "gate-pending", "g", {})],
+        ),
+        gates=[("g", "external", "2026-07-21T10:12:00.000Z")],
+        sign_gates=True,
+    )
+    report = collect_stats(root, now=NOW)
+    assert report.human_gates == 1
+    assert report.machine_gates == 0
+
+
+def test_blocked_time_resolved_vs_currently_blocked_snapshot(tmp_path: Path):
+    """I3: still-parked parks are snapshot only — not in resolved mean."""
+    root = tmp_path / "runs"
+    root.mkdir()
+    # Parked 60s then resumed
     _mk_run(
         root,
         "blocked-resume",
@@ -317,7 +437,7 @@ def test_blocked_time_from_halt_9_to_next_event_or_now(tmp_path: Path):
             ("2026-07-21T10:03:00.000Z", "run-done", None, None),
         ],
     )
-    # Still parked — span to NOW (2026-07-23 18:00)
+    # Still parked — snapshot only
     _mk_run(
         root,
         "blocked-parked",
@@ -326,7 +446,7 @@ def test_blocked_time_from_halt_9_to_next_event_or_now(tmp_path: Path):
             ("2026-07-23T17:30:00.000Z", "run-halt", "auth", {"exit_code": 9}),
         ],
     )
-    # NEEDS_HUMAN(6) must not count as blocked-time
+    # NEEDS_HUMAN must not count
     _mk_run(
         root,
         "needs-human",
@@ -337,18 +457,25 @@ def test_blocked_time_from_halt_9_to_next_event_or_now(tmp_path: Path):
     )
 
     report = collect_stats(root, now=NOW)
-    assert report.blocked_time_runs == 2
-    # 60s + 30min = 1860s
-    assert report.blocked_time_total_s == pytest.approx(60.0 + 1800.0)
-    assert report.blocked_time_mean_s == pytest.approx((60.0 + 1800.0) / 2)
+    assert report.blocked_time_resolved_runs == 1
+    assert report.blocked_time_resolved_s == pytest.approx(60.0)
+    assert report.blocked_time_resolved_mean_s == pytest.approx(60.0)
+    assert report.currently_blocked_count == 1
+    assert report.currently_blocked_oldest_age_s == pytest.approx(1800.0)
+    d = report.to_dict()
+    assert d["aggregates"]["blocked_time_resolved_s"]["total"] == pytest.approx(60.0)
+    assert d["snapshots"]["currently_blocked"]["count"] == 1
+    assert "snapshot" in d["snapshots"]["currently_blocked"]["label"]
+    text = render_stats(report)
+    assert "SNAPSHOTS" in text
+    assert "WINDOW AGGREGATES" in text
+    assert "CURRENTLY BLOCKED" in text
 
 
 def test_corrupt_run_skipped_not_crashed(tmp_path: Path):
     root = tmp_path / "runs"
     root.mkdir()
-    # Good run
     _mk_run(root, "good", _done_events())
-    # Corrupt run.json
     bad = root / "bad"
     bad.mkdir()
     (bad / "run.json").write_text("{not json", encoding="utf-8")
@@ -367,7 +494,6 @@ def test_corrupt_run_skipped_not_crashed(tmp_path: Path):
         + "\n",
         encoding="utf-8",
     )
-    # Trail without run.json but with trail → skipped
     orphan = root / "orphan-trail"
     orphan.mkdir()
     (orphan / "trail.jsonl").write_text("{}\n", encoding="utf-8")
@@ -376,8 +502,7 @@ def test_corrupt_run_skipped_not_crashed(tmp_path: Path):
     assert report.completed == 1
     assert report.runs_skipped >= 1
     assert "bad" in report.skipped_ids
-    # Never raises; metrics still computable
-    assert report.to_dict()["runs"]["completed"] == 1
+    assert report.to_dict()["aggregates"]["runs"]["completed"] == 1
 
 
 def test_since_window_filters_old_runs(tmp_path: Path):
@@ -405,6 +530,7 @@ def test_since_window_filters_old_runs(tmp_path: Path):
     assert report.completed == 1
     assert report.runs_in_window == 1
     assert report.since == "2026-07-20"
+    assert report.window_from is not None
 
 
 def test_trigger_depths_circuit_and_leases(tmp_path: Path):
@@ -414,7 +540,6 @@ def test_trigger_depths_circuit_and_leases(tmp_path: Path):
     watch.mkdir()
     (watch / ".waiting").mkdir()
     (watch / ".waiting" / ".runs").mkdir(parents=True)
-    # One blocked waiting pointer (exit 9)
     (watch / ".waiting" / "item.json").write_text("{}", encoding="utf-8")
     write_pointer(
         pointer_path(watch / ".waiting", "item.json"),
@@ -424,19 +549,13 @@ def test_trigger_depths_circuit_and_leases(tmp_path: Path):
     )
     write_circuit(watch, consecutive_failures=3, opened_at="2026-07-23T12:00:00.000Z")
 
-    report = collect_stats(
-        root,
-        now=NOW,
-        trigger_watches={"inbox": watch},
-    )
+    report = collect_stats(root, now=NOW, trigger_watches={"inbox": watch})
     assert "inbox" in report.triggers
     t = report.triggers["inbox"]
     assert t["depths"]["blocked"] >= 1
-    assert t["depths"]["waiting"] >= 1
     assert t["circuit"]["consecutive_failures"] == 3
     assert t["circuit"]["opened"] is True
-    assert "leases" in t
-    assert t["leases"]["historical_reaped"] is None  # not durable on disk
+    assert report.to_dict()["snapshots"]["triggers"]["inbox"]["depths"]["blocked"] >= 1
 
 
 def test_json_schema_shape_stable(tmp_path: Path):
@@ -444,23 +563,19 @@ def test_json_schema_shape_stable(tmp_path: Path):
     root.mkdir()
     _mk_run(root, "r1", _done_events())
     d = collect_stats(root, now=NOW).to_dict()
-    assert set(d.keys()) == {
-        "schema_version",
-        "window",
-        "runs",
-        "throughput",
-        "validator",
-        "retry",
-        "gate_latency_s",
-        "human_answered_share",
-        "blocked_time_s",
-        "triggers",
-    }
-    assert d["schema_version"] == 1
-    assert "label" in d["human_answered_share"]
-    assert d["validator"]["signal"]
-    assert d["gate_latency_s"]["signal"]
-    assert d["blocked_time_s"]["signal"]
+    assert set(d.keys()) == {"schema_version", "window", "aggregates", "snapshots"}
+    assert d["schema_version"] == 2
+    assert "from" in d["window"] and "until" in d["window"] and "days" in d["window"]
+    ag = d["aggregates"]
+    assert "step_success" in ag
+    assert "validator" in ag
+    assert "blocked_time_resolved_s" in ag
+    assert "throughput" in ag
+    assert "human_answered_share" in ag
+    assert ag["human_answered_share"]["scope"]
+    sn = d["snapshots"]
+    assert "currently_blocked" in sn
+    assert "triggers" in sn
 
 
 def test_stats_is_strictly_read_only(tmp_path: Path):
@@ -471,9 +586,13 @@ def test_stats_is_strictly_read_only(tmp_path: Path):
         root,
         "ro",
         _done_events(
-            extras=[("2026-07-21T10:10:00.000Z", "gate-pending", "g", {})],
+            extras=[
+                ("2026-07-21T10:10:00.000Z", "gate-pending", "g", {}),
+                ("2026-07-21T10:12:00.000Z", "gate-answered", "g", {"choice": "y", "by": "tty"}),
+            ],
         ),
         gates=[("g", "tty", "2026-07-21T10:12:00.000Z")],
+        sign_gates=True,
     )
     watch = tmp_path / "inbox"
     watch.mkdir()
@@ -482,7 +601,6 @@ def test_stats_is_strictly_read_only(tmp_path: Path):
     def snapshot(base: Path) -> dict[str, tuple[int, bytes]]:
         out: dict[str, tuple[int, bytes]] = {}
         for dirpath, dirnames, filenames in os.walk(base):
-            # stable order
             dirnames.sort()
             filenames.sort()
             for fn in filenames:
@@ -490,7 +608,6 @@ def test_stats_is_strictly_read_only(tmp_path: Path):
                 rel = str(p.relative_to(base))
                 st = p.stat()
                 out[rel] = (st.st_mtime_ns, p.read_bytes())
-            # also record empty dirs so create is visible
             for dn in dirnames:
                 p = Path(dirpath) / dn
                 rel = str(p.relative_to(base)) + "/"
@@ -507,7 +624,6 @@ def test_stats_is_strictly_read_only(tmp_path: Path):
 def test_no_divide_by_zero_on_empty_metrics(tmp_path: Path):
     root = tmp_path / "runs"
     root.mkdir()
-    # Halted with no steps/gates
     _mk_run(
         root,
         "empty-ish",
@@ -517,12 +633,13 @@ def test_no_divide_by_zero_on_empty_metrics(tmp_path: Path):
         ],
     )
     report = collect_stats(root, now=NOW)
+    assert report.step_success_rate is None
     assert report.validator_pass_rate is None
     assert report.human_answered_share is None
     assert report.gate_latency_mean is None
     assert report.retry_per_run == pytest.approx(0.0)
     text = render_stats(report)
-    assert "n/a" in text or "VALIDATOR" in text
+    assert "STEP SUCCESS" in text and "VALIDATOR" in text
 
 
 # --------------------------------------------------------------------------- #
@@ -539,8 +656,9 @@ def test_cli_stats_json_and_table(tmp_path: Path, monkeypatch, capsys):
         "cli-run",
         _done_events(
             extras=[
-                ("2026-07-21T10:10:00.000Z", "step-done", "greet", {}),
+                ("2026-07-21T10:10:00.000Z", "step-done", "greet", {"artifacts": []}),
                 ("2026-07-21T10:11:00.000Z", "gate-pending", "ok", {}),
+                ("2026-07-21T10:11:05.000Z", "gate-answered", "ok", {"choice": "y", "by": "default"}),
             ],
         ),
         pipeline="hello",
@@ -551,15 +669,20 @@ def test_cli_stats_json_and_table(tmp_path: Path, monkeypatch, capsys):
     assert main(["stats", "--json"]) == int(ExitCode.OK)
     out = capsys.readouterr().out
     doc = json.loads(out)
-    assert doc["schema_version"] == 1
-    assert doc["runs"]["completed"] == 1
-    assert doc["human_answered_share"]["machine"] == 1
-    assert "presence, not comprehension" in doc["human_answered_share"]["label"]
+    assert doc["schema_version"] == 2
+    assert doc["aggregates"]["runs"]["completed"] == 1
+    assert doc["aggregates"]["step_success"]["passes"] == 1
+    assert doc["aggregates"]["validator"]["passes"] == 0  # empty artifacts
+    assert doc["aggregates"]["human_answered_share"]["machine"] == 1
+    assert "presence, not comprehension" in doc["aggregates"]["human_answered_share"]["label"]
+    assert "aggregates" in doc and "snapshots" in doc
 
     assert main(["stats"]) == int(ExitCode.OK)
     table = capsys.readouterr().out
     assert "THROUGHPUT" in table
-    assert "HUMAN-ANSWERED SHARE" in table or "presence" in table.lower()
+    assert "STEP SUCCESS" in table
+    assert "WINDOW AGGREGATES" in table
+    assert "SNAPSHOTS" in table
 
 
 def test_cli_stats_empty_workspace(tmp_path: Path, monkeypatch, capsys):
