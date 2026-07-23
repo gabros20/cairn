@@ -61,6 +61,12 @@ def check(doc: object, schema: dict | None = None) -> list[str]:
     checked = doc.get("checked_rev")
     if not isinstance(checked, str) or not checked:
         reasons.append("source-status requires non-empty string 'checked_rev'")
+    if status == "changed":
+        upstream = doc.get("upstream_rev")
+        if not isinstance(upstream, str) or not upstream:
+            reasons.append(
+                "source-status status=changed requires non-empty string 'upstream_rev'"
+            )
     if schema is not None and jsonschema is not None:
         validator = jsonschema.Draft202012Validator(schema)
         for err in sorted(validator.iter_errors(doc), key=lambda e: list(e.path)):

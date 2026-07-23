@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "cairn:source-status",
   "title": "source-status",
-  "description": "T6b refresh output: always current|changed|closed — never a bare skippable (W4).",
+  "description": "T6b refresh output: always current|changed|closed — never a bare skippable (W4). When status is changed, upstream_rev is required.",
   "type": "object",
   "required": ["status", "checked_rev"],
   "additionalProperties": true,
@@ -22,5 +22,12 @@
       "minLength": 1,
       "description": "Upstream rev when status is changed (the newer one)."
     }
+  },
+  "if": {
+    "properties": { "status": { "const": "changed" } },
+    "required": ["status"]
+  },
+  "then": {
+    "required": ["upstream_rev"]
   }
 }

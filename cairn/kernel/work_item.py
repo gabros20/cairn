@@ -11,14 +11,19 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-# Zero-pad width for the optional provider version tiebreak. Sources that use
-# ``version=`` MUST pass it on every emit (including 0) so pure-digit integer
-# order stays monotonic; mixing bare-epoch revs with versioned revs for the
-# same source is undefined.
-REV_VERSION_WIDTH = 6
+# Fixed-width encoding so pure-digit integer comparison is monotonic for every
+# pair of revs this helper emits — bare (version default 0) and versioned share
+# the same digit count. Variable width was a silent correctness bug: a 16-digit
+# 2024 versioned rev outranked a 10-digit 2026 bare rev under rev_is_newer.
+#
+# Layout under the grammar ``r`` marker:
+#   <epoch zero-padded to REV_EPOCH_WIDTH><version zero-padded to REV_VERSION_WIDTH>
+# Example (epoch width 11, version width 6): r0001705320000000000
+REV_EPOCH_WIDTH = 11  # covers through year ~5138 (10**11 − 1 seconds)
+REV_VERSION_WIDTH = 6  # 0 .. 999_999 versions within one second
 
-# Max exclusive version under :data:`REV_VERSION_WIDTH` (10**W).
-_REV_VERSION_MAX = 10**REV_VERSION_WIDTH
+_REV_EPOCH_MAX = 10**REV_EPOCH_WIDTH  # exclusive upper bound
+_REV_VERSION_MAX = 10**REV_VERSION_WIDTH  # exclusive upper bound
 
 
 def _epoch_seconds(updated_at: str) -> int:
@@ -43,35 +48,51 @@ def _epoch_seconds(updated_at: str) -> int:
 
 
 def work_item_rev(updated_at: str, version: int | None = None) -> str:
-    """Derive a sortable work-item rev token ``r<epoch>[version]``.
+    """Derive a fixed-width sortable work-item rev token ``r<epoch><version>``.
 
     Parameters
     ----------
     updated_at:
         Provider ``updated_at`` as ISO-8601 (``Z`` or offset). Converted to
-        integer UTC epoch seconds.
+        integer UTC epoch seconds. Must be ≥ 1970-01-01 (non-negative epoch);
+        pre-epoch timestamps raise :class:`ValueError` (fail loud — the
+        grammar cannot encode a leading ``-``).
     version:
-        Optional provider version counter for same-second tiebreaks. When
-        set, zero-padded to :data:`REV_VERSION_WIDTH` digits and appended so
-        the digits under the ``r`` marker remain pure-digit and compare
-        correctly under :func:`cairn.kernel.queue_ledger.rev_is_newer`.
+        Optional provider version counter for same-second tiebreaks. Defaults
+        to ``0`` when omitted so every emit shares one width. Must be in
+        ``0 .. 10**REV_VERSION_WIDTH - 1``; overflow raises :class:`ValueError`
+        (never silently wraps).
 
     Returns
     -------
     str
         A token starting with ``r`` suitable for the filename slot
-        ``…-<token>.json`` (i.e. the grammar's ``r`` marker plus the captured
-        rev digits). Example: ``r1705320000`` or ``r1705320000000001``.
+        ``…-<token>.json``. Digits under the marker are always
+        ``REV_EPOCH_WIDTH + REV_VERSION_WIDTH`` long, zero-padded:
 
-    The captured rev digits (everything after the leading ``r``) are pure
-    digits so :func:`~cairn.kernel.queue_ledger.rev_order` /
-    :func:`~cairn.kernel.queue_ledger.rev_is_newer` order them numerically:
-    later ``updated_at`` → strictly newer rev; higher ``version`` at the same
-    second → strictly newer rev.
+        ``r{epoch:0{REV_EPOCH_WIDTH}d}{version:0{REV_VERSION_WIDTH}d}``
+
+        Example with defaults: ``r0001705320000000000``.
+
+    Ordering under :func:`~cairn.kernel.queue_ledger.rev_is_newer` (unchanged
+    pure-digit integer compare): later ``updated_at`` → strictly newer rev
+    regardless of whether either side passed an explicit ``version``; higher
+    ``version`` at the same second → strictly newer rev. High-order epoch
+    digits dominate the version suffix by construction of the fixed layout.
     """
     epoch = _epoch_seconds(updated_at)
+    if epoch < 0:
+        raise ValueError(
+            f"updated_at is before the Unix epoch (got {updated_at!r} → {epoch}); "
+            "work_item_rev requires non-negative UTC seconds so the rev stays pure digits"
+        )
+    if epoch >= _REV_EPOCH_MAX:
+        raise ValueError(
+            f"updated_at epoch {epoch} exceeds REV_EPOCH_WIDTH={REV_EPOCH_WIDTH} "
+            f"(max {_REV_EPOCH_MAX - 1}); refuse rather than wrap"
+        )
     if version is None:
-        return f"r{epoch}"
+        version = 0
     if not isinstance(version, int) or isinstance(version, bool):
         raise ValueError(f"version must be a non-negative int, got {version!r}")
     if version < 0 or version >= _REV_VERSION_MAX:
@@ -79,4 +100,7 @@ def work_item_rev(updated_at: str, version: int | None = None) -> str:
             f"version must be in 0..{_REV_VERSION_MAX - 1} "
             f"(REV_VERSION_WIDTH={REV_VERSION_WIDTH}), got {version}"
         )
-    return f"r{epoch}{version:0{REV_VERSION_WIDTH}d}"
+    return (
+        f"r{epoch:0{REV_EPOCH_WIDTH}d}"
+        f"{version:0{REV_VERSION_WIDTH}d}"
+    )

@@ -37,9 +37,9 @@
     },
     "prio": {
       "type": "integer",
-      "minimum": 1,
+      "minimum": 0,
       "maximum": 9,
-      "description": "Single-digit priority 1–9; body field name is prio (canonical — matches filename p digit and kernel _body_agrees)."
+      "description": "Single-digit priority 0–9 (kernel grammar + FACTORY-PLAN T1); body field name is prio (canonical — matches filename p digit and kernel _body_agrees)."
     },
     "created": {
       "type": "string",
