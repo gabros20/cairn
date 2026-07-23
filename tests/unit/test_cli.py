@@ -1894,6 +1894,19 @@ def test_trigger_sync_list_remove_launchd_roundtrip(hello_ws, monkeypatch, tmp_p
             "waiting": 0,
             "failed": 0,
             "done": 0,
+            # W3 additive depths + caps (defaults when no caps authored).
+            "needs_human": 0,
+            "blocked": 0,
+            "capacity": 0,
+            "inflight": 0,
+            "spool": 0,
+            "concurrency": 1,
+            "order": "name",
+            "waiting_max": None,
+            "blocked_max": None,
+            "capacity_max": None,
+            "wip_max": None,
+            "inbox_max": None,
         }
     ]
 

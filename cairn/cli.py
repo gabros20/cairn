@@ -2110,6 +2110,19 @@ def _trigger_status_json(status: TriggerStatus) -> dict[str, Any]:
         "waiting": status.waiting,
         "failed": status.failed,
         "done": status.done,
+        # W3 additive depths + caps (absent caps serialize as null).
+        "needs_human": status.needs_human,
+        "blocked": status.blocked,
+        "capacity": status.capacity,
+        "inflight": status.inflight,
+        "spool": status.spool,
+        "concurrency": status.concurrency,
+        "order": status.order,
+        "waiting_max": status.waiting_max,
+        "blocked_max": status.blocked_max,
+        "capacity_max": status.capacity_max,
+        "wip_max": status.wip_max,
+        "inbox_max": status.inbox_max,
     }
 
 
@@ -2125,11 +2138,32 @@ def _print_trigger_list(statuses: list[TriggerStatus], backend: str) -> None:
         else:
             note = "- installed, not declared"
         print(f"  {note:32} {s.name}")
-        if s.declared and (s.waiting or s.failed or s.done or s.stuck):
+        has_depth = s.waiting or s.failed or s.done or s.stuck or s.spool or s.inflight
+        has_caps = any(
+            v is not None
+            for v in (s.waiting_max, s.blocked_max, s.capacity_max, s.wip_max, s.inbox_max)
+        )
+        if s.declared and (has_depth or has_caps or s.concurrency != 1 or s.order != "name"):
             print(
                 f"      waiting={s.waiting} failed={s.failed} done={s.done} "
                 f"stuck={len(s.stuck)}"
             )
+            print(
+                f"      needs-human={s.needs_human} blocked={s.blocked} "
+                f"capacity={s.capacity} inflight={s.inflight} spool={s.spool}"
+            )
+            caps: list[str] = [f"concurrency={s.concurrency}", f"order={s.order}"]
+            if s.waiting_max is not None:
+                caps.append(f"waiting_max={s.waiting_max}")
+            if s.blocked_max is not None:
+                caps.append(f"blocked_max={s.blocked_max}")
+            if s.capacity_max is not None:
+                caps.append(f"capacity_max={s.capacity_max}")
+            if s.wip_max is not None:
+                caps.append(f"wip_max={s.wip_max}")
+            if s.inbox_max is not None:
+                caps.append(f"inbox_max={s.inbox_max}")
+            print(f"      {' '.join(caps)}")
         for claim_path in s.stuck:
             print(f"      ! stuck claim (never auto-retried): {claim_path}")
 

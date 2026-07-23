@@ -20,13 +20,28 @@ import yaml
 
 from cairn.kernel.errors import ConfigError
 from cairn.kernel.proc import Runner
-from cairn.kernel.queue_ledger import ledger_counts, stuck_claims
+from cairn.kernel.queue_ledger import count_by_class, ledger_counts, stuck_claims
 from cairn.kernel.types import Finding
 
 TRIGGERS_YAML = "triggers.yaml"
 
-_TRIGGER_KEYS = frozenset({"pipeline", "watch", "param", "glob", "on_done"})
+_TRIGGER_KEYS = frozenset({
+    "pipeline",
+    "watch",
+    "param",
+    "glob",
+    "on_done",
+    # W3 optional back-pressure / admission keys (absent = today's serial unbounded drain)
+    "concurrency",
+    "order",
+    "waiting_max",
+    "blocked_max",
+    "capacity_max",
+    "wip_max",
+    "inbox_max",
+})
 _ON_DONE_VALUES = frozenset({"done", "delete"})
+_ORDER_VALUES = frozenset({"name", "aged"})
 
 # A trigger name becomes a launchd job label segment and a systemd unit filename stem
 # (trigger_launchd_label / trigger_systemd_unit_names) — both are structural identifiers,
@@ -55,7 +70,22 @@ _CONTROL_CHARS = ("\n", "\r", "\0")
 class Trigger:
     """One declared trigger: a pipeline to fire, a directory to watch, and how a claimed
     event's outcome is retired. ``watch`` is stored verbatim as authored (workspace-
-    relative); resolve it with :func:`watch_dir`."""
+    relative); resolve it with :func:`watch_dir`.
+
+    Optional W3 admission / back-pressure keys (all optional; absent = today's behavior —
+    serial drain, no caps, name order). Example ``triggers.yaml`` fragment::
+
+        handle-reply:
+          pipeline: handle-reply
+          watch: inbox/replies/
+          # concurrency: 1          # max children at once (default 1 = serial; >1 = pool)
+          # order: name             # "name" lexicographic (default) | "aged" priority aging
+          # waiting_max: 5          # stop admitting when needs-human depth reaches this
+          # blocked_max: 5          # stop on blocked depth (default = waiting_max when set)
+          # capacity_max: 10        # stop on capacity-park depth
+          # wip_max: 20             # stop when inflight (claimed + all waiting) reaches this
+          # inbox_max: 50           # spool cap for pullers (W4); list-only here, not an admit gate
+    """
 
     name: str
     pipeline: str
@@ -63,6 +93,13 @@ class Trigger:
     param: str = "event"
     glob: str = "*"
     on_done: str = "done"  # "done" | "delete"
+    concurrency: int = 1
+    order: str = "name"  # "name" | "aged"
+    waiting_max: int | None = None
+    blocked_max: int | None = None
+    capacity_max: int | None = None
+    wip_max: int | None = None
+    inbox_max: int | None = None
 
 
 def _fail(message: str, file: Path) -> NoReturn:
@@ -151,7 +188,60 @@ def _parse_trigger(name: str, entry: Any, workspace_dir: Path, file: Path) -> Tr
             file,
         )
 
-    return Trigger(name=name, pipeline=pipeline, watch=watch, param=param, glob=glob, on_done=on_done)
+    concurrency = 1
+    if "concurrency" in entry:
+        concurrency = _parse_positive_int(name, "concurrency", entry["concurrency"], file)
+
+    order = entry.get("order", "name")
+    if order not in _ORDER_VALUES:
+        _fail(
+            f"trigger {name!r}: 'order' must be one of "
+            f"{sorted(_ORDER_VALUES)}, got {order!r}",
+            file,
+        )
+
+    waiting_max = _parse_optional_positive_int(name, "waiting_max", entry, file)
+    blocked_max = _parse_optional_positive_int(name, "blocked_max", entry, file)
+    # Default blocked_max = waiting_max when only the judgment-lane cap is authored.
+    if blocked_max is None and waiting_max is not None:
+        blocked_max = waiting_max
+    capacity_max = _parse_optional_positive_int(name, "capacity_max", entry, file)
+    wip_max = _parse_optional_positive_int(name, "wip_max", entry, file)
+    inbox_max = _parse_optional_positive_int(name, "inbox_max", entry, file)
+
+    return Trigger(
+        name=name,
+        pipeline=pipeline,
+        watch=watch,
+        param=param,
+        glob=glob,
+        on_done=on_done,
+        concurrency=concurrency,
+        order=order,
+        waiting_max=waiting_max,
+        blocked_max=blocked_max,
+        capacity_max=capacity_max,
+        wip_max=wip_max,
+        inbox_max=inbox_max,
+    )
+
+
+def _parse_positive_int(name: str, key: str, value: Any, file: Path) -> int:
+    """Positive int (>0). Rejects bool (YAML ``true`` is an int subclass)."""
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        _fail(
+            f"trigger {name!r}: {key!r} must be a positive integer, got {value!r}",
+            file,
+        )
+    return value
+
+
+def _parse_optional_positive_int(
+    name: str, key: str, entry: dict[str, Any], file: Path
+) -> int | None:
+    if key not in entry:
+        return None
+    return _parse_positive_int(name, key, entry[key], file)
 
 
 def _validate_watch(name: str, watch: str, file: Path) -> None:
@@ -497,11 +587,16 @@ def _require_ownership(path: Path, trigger_name: str, classify: Callable[[Path],
 class TriggerStatus:
     """One trigger's status as ``trigger list`` reports it (TRIGGERS-PLAN.md §2/§3):
     declared in ``triggers.yaml``, installed on the host watcher, ledger depths
-    (waiting/failed/done), and any files sitting in ``.claim/`` from a crash mid-firing
-    — surfaced here so the operator can re-drop or discard them; never auto-retried.
-    ``stuck`` and the depth counts are only ever non-empty for a DECLARED trigger (its
-    ``watch:`` must resolve); a trigger that's installed but no longer declared has no
-    ``watch:`` left to check.
+    (waiting/failed/done + W3 class depths), and any files sitting in ``.claim/`` from a
+    crash mid-firing — surfaced here so the operator can re-drop or discard them; never
+    auto-retried. ``stuck`` and the depth counts are only ever non-empty for a DECLARED
+    trigger (its ``watch:`` must resolve); a trigger that's installed but no longer
+    declared has no ``watch:`` left to check.
+
+    W3 additive fields (defaults 0 / None so older callers keep working):
+    ``needs_human`` / ``blocked`` / ``capacity`` (waiting-class splits), ``inflight``
+    (claimed + all waiting), ``spool`` (inbox candidates), plus the authored caps when
+    the trigger is declared.
     """
 
     name: str
@@ -511,6 +606,18 @@ class TriggerStatus:
     waiting: int = 0
     failed: int = 0
     done: int = 0
+    needs_human: int = 0
+    blocked: int = 0
+    capacity: int = 0
+    inflight: int = 0
+    spool: int = 0
+    concurrency: int = 1
+    order: str = "name"
+    waiting_max: int | None = None
+    blocked_max: int | None = None
+    capacity_max: int | None = None
+    wip_max: int | None = None
+    inbox_max: int | None = None
 
 
 def sync_triggers(
@@ -765,6 +872,10 @@ def list_installed_triggers(
         trigger = triggers.get(name)
         stuck: tuple[Path, ...] = ()
         waiting = failed = done = 0
+        needs_human = blocked = capacity = inflight = spool = 0
+        concurrency = 1
+        order = "name"
+        waiting_max = blocked_max = capacity_max = wip_max = inbox_max = None
         if trigger is not None:
             watch_abs = watch_dir(trigger, workspace_dir)
             stuck = tuple(stuck_claims(watch_abs))
@@ -772,6 +883,19 @@ def list_installed_triggers(
             waiting = counts["waiting"]
             failed = counts["failed"]
             done = counts["done"]
+            depths = count_by_class(watch_abs, glob=trigger.glob)
+            needs_human = depths["needs_human"]
+            blocked = depths["blocked"]
+            capacity = depths["capacity"]
+            inflight = depths["inflight"]
+            spool = depths["spool"]
+            concurrency = trigger.concurrency
+            order = trigger.order
+            waiting_max = trigger.waiting_max
+            blocked_max = trigger.blocked_max
+            capacity_max = trigger.capacity_max
+            wip_max = trigger.wip_max
+            inbox_max = trigger.inbox_max
         statuses.append(
             TriggerStatus(
                 name=name,
@@ -781,6 +905,18 @@ def list_installed_triggers(
                 waiting=waiting,
                 failed=failed,
                 done=done,
+                needs_human=needs_human,
+                blocked=blocked,
+                capacity=capacity,
+                inflight=inflight,
+                spool=spool,
+                concurrency=concurrency,
+                order=order,
+                waiting_max=waiting_max,
+                blocked_max=blocked_max,
+                capacity_max=capacity_max,
+                wip_max=wip_max,
+                inbox_max=inbox_max,
             )
         )
     return statuses

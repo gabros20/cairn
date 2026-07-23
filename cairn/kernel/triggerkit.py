@@ -21,6 +21,7 @@ from cairn.kernel.queue_drain import run_trigger
 from cairn.kernel.queue_ledger import (
     SweepReport,
     claim,
+    count_by_class,
     ledger_counts,
     retire,
     scan_candidates,
@@ -47,6 +48,7 @@ __all__ = [
     "Trigger",
     "TriggerStatus",
     "claim",
+    "count_by_class",
     "ledger_counts",
     "list_installed_triggers",
     "load_triggers",

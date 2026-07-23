@@ -478,6 +478,70 @@ def ledger_counts(watch_abs: Path) -> dict[str, int]:
     }
 
 
+def count_by_class(watch_abs: Path, *, glob: str = "*") -> dict[str, int]:
+    """Live depth counts from ledger pointer outcome classes (D8) + spool.
+
+    Cheap: one readdir per lane + pointer JSON reads — never opens trails.
+    Waiting-class splits (needs_human / blocked / capacity) come from
+    ``.waiting/.runs/`` pointer ``exit_code`` via :func:`classify_exit`.
+    Items in ``.waiting/`` whose pointer is missing or unclassifiable still
+    count toward ``waiting`` / ``inflight`` / ``wip`` but not a specific class.
+
+    Returns keys:
+    - ``needs_human``, ``blocked``, ``capacity`` — waiting-class depths
+    - ``claimed`` — top-level files in ``.claim/`` (inflight children / stuck)
+    - ``waiting`` — all files in ``.waiting/``
+    - ``inflight`` — ``claimed + waiting`` (live WIP)
+    - ``spool`` — inbox candidates matching ``glob`` (pre-claim)
+    - ``failed``, ``done``, ``stuck`` — same as :func:`ledger_counts`
+    """
+    watch_abs = Path(watch_abs)
+    base = ledger_counts(watch_abs)
+    claimed = base["stuck"]  # top-level .claim/ files
+    waiting_total = base["waiting"]
+
+    needs_human = blocked = capacity = 0
+    waiting_lane = watch_abs / ".waiting"
+    runs = pointer_dir(waiting_lane)
+    if runs.is_dir():
+        for ptr in runs.iterdir():
+            if not ptr.is_file():
+                continue
+            # Skip quarantine artifacts from corrupt-pointer repairs.
+            if ptr.name.endswith(".corrupt") or ".corrupt-v" in ptr.name:
+                continue
+            try:
+                rec = read_pointer(ptr)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            code = rec.get("exit_code")
+            if not isinstance(code, int):
+                continue
+            outcome = classify_exit(code)
+            if outcome.outcome is not OutcomeClass.WAITING or outcome.waiting_kind is None:
+                continue
+            if outcome.waiting_kind == "needs_human":
+                needs_human += 1
+            elif outcome.waiting_kind == "blocked":
+                blocked += 1
+            elif outcome.waiting_kind == "capacity":
+                capacity += 1
+
+    spool = len(scan_candidates(watch_abs, glob))
+    return {
+        "needs_human": needs_human,
+        "blocked": blocked,
+        "capacity": capacity,
+        "claimed": claimed,
+        "waiting": waiting_total,
+        "inflight": claimed + waiting_total,
+        "spool": spool,
+        "failed": base["failed"],
+        "done": base["done"],
+        "stuck": base["stuck"],
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Sweep — advance .waiting/ from trail evidence (FACTORY-PLAN T6)
 # --------------------------------------------------------------------------- #
