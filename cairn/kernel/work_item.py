@@ -1,14 +1,18 @@
-"""Work-item contract helpers (W4) — canonical rev derivation for source pullers.
+"""Work-item contract helpers (W4) — rev derivation + identity-safe filenames.
 
 Pullers emit work-item filenames ``p<prio>-<source>-<id>-r<rev>.json`` where
 ``rev`` is sortable pure digits under the grammar's ``r`` marker. This module
-is the single place that derives that rev from a provider ``updated_at``.
+is the single place that derives that rev from a provider ``updated_at`` and
+that sanitizes untrusted upstream ids into the kernel identity grammar
+(``safe_item_id`` / ``work_item_filename``) so a hostile id cannot path-traverse
+out of the inbox or wedge a puller.
 
 See docs/TRIGGERS.md § Source puller contract and docs/FACTORY-PLAN.md §2 T1.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 # Fixed-width encoding so pure-digit integer comparison is monotonic for every
@@ -24,6 +28,15 @@ REV_VERSION_WIDTH = 6  # 0 .. 999_999 versions within one second
 
 _REV_EPOCH_MAX = 10**REV_EPOCH_WIDTH  # exclusive upper bound
 _REV_VERSION_MAX = 10**REV_VERSION_WIDTH  # exclusive upper bound
+
+# Identity-strict grammar (queue_ledger._ITEM_NAME_RE) — id segment only:
+#   [a-z0-9]([a-z0-9._-]*[a-z0-9])?
+# source segment: [a-z][a-z0-9]*
+_ID_DISALLOWED = re.compile(r"[^a-z0-9._-]+")
+_ID_SEP_RUN = re.compile(r"[._-]{2,}")
+_ID_GRAMMAR = re.compile(r"^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$")
+_SOURCE_DISALLOWED = re.compile(r"[^a-z0-9]+")
+_SOURCE_GRAMMAR = re.compile(r"^[a-z][a-z0-9]*$")
 
 
 def _epoch_seconds(updated_at: str) -> int:
@@ -104,3 +117,94 @@ def work_item_rev(updated_at: str, version: int | None = None) -> str:
         f"r{epoch:0{REV_EPOCH_WIDTH}d}"
         f"{version:0{REV_VERSION_WIDTH}d}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# Identity-safe id + filename (untrusted upstream → grammar token)
+# --------------------------------------------------------------------------- #
+
+
+def safe_item_id(raw: object) -> str:
+    """Sanitize an untrusted upstream id into the identity-strict id grammar.
+
+    Kernel grammar (queue_ledger / FACTORY-PLAN T1)::
+
+        [a-z0-9]([a-z0-9._-]*[a-z0-9])?
+
+    Steps: stringify → lowercase → replace disallowed chars with ``-`` →
+    collapse separator runs → strip leading/trailing separators. Path separators
+    (``/``, ``\\``) and ``..`` sequences are destroyed by construction — the
+    result is always a single path segment with no ``/``.
+
+    Raises :class:`ValueError` when nothing salvageable remains (empty, pure
+    punctuation/unicode with no alnum). Fail-loud rather than emit a nonconforming
+    or empty id that would break admission or wedge a puller.
+    """
+    if raw is None:
+        raise ValueError("item id is empty/unsalvageable after sanitization: None")
+    s = str(raw).strip().lower()
+    if not s:
+        raise ValueError(f"item id is empty/unsalvageable after sanitization: {raw!r}")
+    # Drop path separators and every char outside the grammar charset.
+    s = _ID_DISALLOWED.sub("-", s)
+    s = _ID_SEP_RUN.sub("-", s)
+    s = s.strip("._-")
+    if not s or not _ID_GRAMMAR.fullmatch(s):
+        raise ValueError(f"item id is empty/unsalvageable after sanitization: {raw!r}")
+    return s
+
+
+def safe_source(raw: object) -> str:
+    """Sanitize a source name into ``[a-z][a-z0-9]*`` (identity-strict source)."""
+    if raw is None:
+        raise ValueError("source is empty/unsalvageable after sanitization: None")
+    s = str(raw).strip().lower()
+    s = _SOURCE_DISALLOWED.sub("", s)
+    if not s or not _SOURCE_GRAMMAR.fullmatch(s):
+        raise ValueError(f"source is empty/unsalvageable after sanitization: {raw!r}")
+    return s
+
+
+def clamp_prio(prio: object) -> int:
+    """Clamp a priority to a single digit 0–9 (identity-strict prio slot)."""
+    try:
+        p = int(prio)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"prio must be an int 0-9, got {prio!r}") from exc
+    if isinstance(prio, bool):
+        raise ValueError(f"prio must be an int 0-9, got {prio!r}")
+    return max(0, min(9, p))
+
+
+def work_item_filename(
+    prio: object,
+    source: object,
+    item_id: object,
+    rev: object,
+) -> str:
+    """Build an identity-strict inbox filename ``p<prio>-<source>-<id>-r<rev>.json``.
+
+    - ``prio`` is clamped to 0–9 (a seam-supplied 42 becomes 9, never ``p42-…``).
+    - ``source`` and ``item_id`` go through :func:`safe_source` / :func:`safe_item_id`
+      so untrusted upstream strings cannot path-traverse or break the grammar.
+    - ``rev`` may be a bare digit string or a full ``r…`` token; the ``r`` marker
+      is ensured exactly once.
+
+    The returned basename is always a single path segment (no ``/``) and matches
+    :func:`~cairn.kernel.queue_ledger.parse_item_name`.
+    """
+    p = clamp_prio(prio)
+    src = safe_source(source)
+    iid = safe_item_id(item_id)
+    if rev is None:
+        raise ValueError("rev is required")
+    rev_s = str(rev).strip()
+    if not rev_s:
+        raise ValueError("rev is required")
+    if not rev_s.startswith("r"):
+        rev_s = "r" + rev_s
+    # Digits under the marker must be non-empty grammar-safe.
+    rev_body = rev_s[1:]
+    if not rev_body or not re.fullmatch(r"[a-z0-9][a-z0-9._-]*", rev_body):
+        raise ValueError(f"rev is not identity-strict: {rev!r}")
+    return f"p{p}-{src}-{iid}-{rev_s}.json"

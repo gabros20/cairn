@@ -7,6 +7,7 @@ Puller scaffolds / write-back markers are W4-T3.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -18,6 +19,10 @@ from cairn.kernel.queue_ledger import parse_item_name, rev_is_newer
 from cairn.kernel.work_item import (
     REV_EPOCH_WIDTH,
     REV_VERSION_WIDTH,
+    clamp_prio,
+    safe_item_id,
+    safe_source,
+    work_item_filename,
     work_item_rev,
 )
 
@@ -114,6 +119,61 @@ def test_work_item_rev_rejects_pre_epoch_fail_loud():
     """I1: pre-1970 → negative epoch must raise, not emit r-NN (grammar-breaking)."""
     with pytest.raises(ValueError, match="Unix epoch|pre-epoch|non-negative"):
         work_item_rev("1969-12-31T23:59:00Z")
+
+
+# --------------------------------------------------------------------------- #
+# safe_item_id / work_item_filename — untrusted upstream → grammar token
+# --------------------------------------------------------------------------- #
+
+
+def test_safe_item_id_path_traversal_becomes_safe_token():
+    """C1: ../../state/pwned must not retain slashes or escape the inbox."""
+    out = safe_item_id("../../state/pwned")
+    assert "/" not in out and "\\" not in out
+    assert ".." not in out
+    assert out == "state-pwned"
+    assert re.fullmatch(r"[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?", out)
+    # Filename is a single segment under inbox — no traversal.
+    name = work_item_filename(5, "github", "../../state/pwned", "0001705320000000000")
+    assert "/" not in name
+    assert name == f"p5-github-state-pwned-r0001705320000000000.json"
+    item = parse_item_name(name)
+    assert item is not None
+    assert item.id == "state-pwned"
+
+
+def test_safe_item_id_spaces_and_unicode_sanitized():
+    assert safe_item_id("Hello World") == "hello-world"
+    assert safe_item_id("  Ticket#42  ") == "ticket-42"
+    # Unicode dropped as disallowed; remaining alnum + separators.
+    assert safe_item_id("café-42") == "caf-42"
+    # Pure punctuation / unsalvageable → ValueError (fail loud).
+    with pytest.raises(ValueError, match="unsalvageable|empty"):
+        safe_item_id("")
+    with pytest.raises(ValueError, match="unsalvageable|empty"):
+        safe_item_id("///")
+    with pytest.raises(ValueError, match="unsalvageable|empty"):
+        safe_item_id("你好")
+    with pytest.raises(ValueError, match="unsalvageable|empty"):
+        safe_item_id(None)
+
+
+def test_work_item_filename_clamps_prio_and_round_trips():
+    """prio=42 must not produce p42-… (identity:strict single digit)."""
+    name = work_item_filename(42, "GitHub", "Issue-7", work_item_rev("2024-01-15T12:00:00Z"))
+    assert name.startswith("p9-")  # clamped to 9
+    item = parse_item_name(name)
+    assert item is not None
+    assert item.prio == 9
+    assert item.source == "github"
+    assert item.id == "issue-7"
+    assert clamp_prio(42) == 9
+    assert clamp_prio(-3) == 0
+    assert clamp_prio(5) == 5
+    with pytest.raises(ValueError):
+        safe_source("")
+    with pytest.raises(ValueError):
+        safe_source("123")  # must start with a letter
 
 
 # --------------------------------------------------------------------------- #

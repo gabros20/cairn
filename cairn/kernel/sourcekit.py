@@ -401,11 +401,34 @@ from pathlib import Path
 from typing import Any, Callable, Mapping
 
 try:
-    from cairn.kernel.work_item import work_item_rev as _work_item_rev
+    from cairn.kernel.work_item import (
+        clamp_prio as _clamp_prio,
+        safe_item_id as _safe_item_id,
+        safe_source as _safe_source,
+        work_item_filename as _work_item_filename,
+        work_item_rev as _work_item_rev,
+    )
 except ImportError:  # pragma: no cover
     def _work_item_rev(updated_at: str, version: int | None = None) -> str:
         raise RuntimeError("cairn.kernel.work_item.work_item_rev is required")
 
+    def _safe_item_id(raw: object) -> str:
+        raise RuntimeError("cairn.kernel.work_item.safe_item_id is required")
+
+    def _safe_source(raw: object) -> str:
+        raise RuntimeError("cairn.kernel.work_item.safe_source is required")
+
+    def _clamp_prio(prio: object) -> int:
+        raise RuntimeError("cairn.kernel.work_item.clamp_prio is required")
+
+    def _work_item_filename(prio, source, item_id, rev) -> str:
+        raise RuntimeError("cairn.kernel.work_item.work_item_filename is required")
+
+
+# Re-export kernel helpers so tests / customizations import from this script.
+safe_item_id = _safe_item_id
+work_item_filename = _work_item_filename
+clamp_prio = _clamp_prio
 
 SOURCE = __SOURCE_REPR__
 PROVIDER = __PROVIDER_REPR__
@@ -414,6 +437,8 @@ DEFAULT_INBOX_MAX = __INBOX_MAX__
 OVERLAP_SECONDS = __OVERLAP__
 TOKEN_ENV = __TOKEN_ENV_REPR__
 TOKEN_ENV_ALT = __TOKEN_ENV_ALT_REPR__
+# Bound hung provider calls so a stuck gh cannot hang the poll forever.
+GH_TIMEOUT_S = 30
 
 
 def parse_cursor(raw: str) -> dict[str, str] | None:
@@ -476,15 +501,6 @@ def should_skip_for_backpressure(depth: int, inbox_max: int) -> bool:
     return depth >= inbox_max
 
 
-def work_item_filename(prio: int, source: str, item_id: str, rev_token: str) -> str:
-    """identity:strict filename p<prio>-<source>-<id>-r<rev>.json."""
-    if not rev_token.startswith("r"):
-        rev_token = "r" + rev_token
-    src = source.lower()
-    iid = item_id.lower()
-    return f"p{int(prio)}-{src}-{iid}-{rev_token}.json"
-
-
 def build_work_item(
     *,
     item_id: str,
@@ -497,22 +513,30 @@ def build_work_item(
     source: str = SOURCE,
     rev_fn: Callable[[str], str] | None = None,
 ) -> tuple[str, dict[str, Any]]:
-    """Build (filename, body) for one upstream item. Pure given rev_fn."""
+    """Build (filename, body) for one upstream item.
+
+    Untrusted ids go through cairn.kernel.work_item.safe_item_id /
+    work_item_filename — never hand-rolled .lower(). A fully-unsalvageable id
+    raises ValueError (caller skips the item; does not wedge the pull).
+    """
     rev_fn = rev_fn or _work_item_rev
     rev_token = rev_fn(updated_at)
+    safe_id = _safe_item_id(item_id)
+    safe_src = _safe_source(source)
+    safe_prio = _clamp_prio(prio)
     rev_digits = rev_token[1:] if rev_token.startswith("r") else rev_token
     body = {
-        "id": item_id.lower(),
-        "source": source,
+        "id": safe_id,
+        "source": safe_src,
         "title": title,
         "url": url,
-        "prio": int(prio),
+        "prio": safe_prio,
         "created": created,
         "updated_at": updated_at,
         "rev": rev_digits,
         "payload": payload,
     }
-    name = work_item_filename(prio, source, item_id, rev_token)
+    name = _work_item_filename(safe_prio, safe_src, safe_id, rev_token)
     return name, body
 
 
@@ -599,37 +623,62 @@ def run_pull(
         return 0
 
     emitted = 0
+    skipped = 0
+    skip_reasons: list[str] = []
     high_ua = cursor["updated_at"] if cursor else ""
     high_id = cursor["id"] if cursor else ""
+    inbox_resolved = inbox.resolve()
     for raw in items:
-        item_id = str(raw["id"])
-        updated_at = str(raw["updated_at"])
-        name, body = build_work_item(
-            item_id=item_id,
-            title=str(raw.get("title") or ""),
-            url=str(raw.get("url") or ""),
-            created=str(raw.get("created") or updated_at),
-            updated_at=updated_at,
-            payload=dict(raw.get("payload") or {}),
-            prio=int(raw.get("prio") or DEFAULT_PRIO),
-            source=SOURCE,
-            rev_fn=rev_fn,
-        )
-        dest = inbox / name
-        if not dest.exists():
-            dest.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
-            emitted += 1
-        if (not high_ua) or updated_at > high_ua or (
-            updated_at == high_ua and item_id > high_id
-        ):
-            high_ua, high_id = updated_at, item_id
+        raw_id = raw.get("id") if isinstance(raw, dict) else None
+        try:
+            if not isinstance(raw, dict):
+                raise ValueError(f"item is not an object: {type(raw).__name__}")
+            item_id = str(raw["id"])
+            updated_at = str(raw["updated_at"])
+            name, body = build_work_item(
+                item_id=item_id,
+                title=str(raw.get("title") or ""),
+                url=str(raw.get("url") or ""),
+                created=str(raw.get("created") or updated_at),
+                updated_at=updated_at,
+                payload=dict(raw.get("payload") or {}),
+                prio=int(raw.get("prio") if raw.get("prio") is not None else DEFAULT_PRIO),
+                source=SOURCE,
+                rev_fn=rev_fn,
+            )
+            # Basename only after safe_item_id; belt-and-braces resolve check.
+            if "/" in name or "\\" in name or name in (".", ".."):
+                raise ValueError(f"refusing path metachar in filename {name!r}")
+            dest = inbox / name
+            if not dest.resolve().is_relative_to(inbox_resolved):
+                raise ValueError(f"refusing path escape for filename {name!r}")
+            if not dest.exists():
+                dest.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
+                emitted += 1
+            # High-water uses the sanitized id (body["id"]), never the raw upstream string.
+            safe_id = body["id"]
+            if (not high_ua) or updated_at > high_ua or (
+                updated_at == high_ua and safe_id > high_id
+            ):
+                high_ua, high_id = updated_at, safe_id
+        except Exception as exc:
+            # One poison item must not wedge the pull (no cursor advance on crash,
+            # no missing poll-report). Skip + diagnose; loop continues.
+            skipped += 1
+            reason = f"{raw_id!r}: {exc}"
+            skip_reasons.append(reason)
+            print(f"pull: skip item {reason}", file=sys.stderr)
+            continue
 
     if not high_ua:
         new_cursor = cursor or {"updated_at": "", "id": ""}
     else:
-        new_cursor = {"updated_at": high_ua, "id": high_id.lower()}
+        new_cursor = {"updated_at": high_ua, "id": high_id}
 
     report = complete_poll_report(SOURCE, new_cursor, emitted, complete=True)
+    if skipped:
+        report["skipped"] = skipped
+        report["skip_reasons"] = skip_reasons[:20]  # bound size
     poll_report_path.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     if new_cursor.get("updated_at"):
         cursor_next.parent.mkdir(parents=True, exist_ok=True)
@@ -679,9 +728,13 @@ def fetch_items(
             return runner(argv)
         import subprocess
         try:
-            res = subprocess.run(argv, capture_output=True, text=True, check=False)
+            res = subprocess.run(
+                argv, capture_output=True, text=True, check=False, timeout=GH_TIMEOUT_S
+            )
         except FileNotFoundError as exc:
             raise RuntimeError("'gh' not found on PATH") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"gh timed out after {GH_TIMEOUT_S}s") from exc
         if res.returncode != 0:
             raise RuntimeError(f"gh failed: {res.stderr.strip() or res.stdout.strip()}")
         return res.stdout
@@ -760,6 +813,12 @@ def fetch_items(
     #   id, title, url, created, updated_at, payload (dict), optional prio
     # Honor `since` (overlap lower bound) and skip items <= cursor watermark.
     # Raise on hard API failure so run_pull emits complete:false.
+    #
+    # Id safety: prefer grammar-safe ids ([a-z0-9]([a-z0-9._-]*[a-z0-9])?).
+    # run_pull ALWAYS passes each id through cairn.kernel.work_item.safe_item_id
+    # / work_item_filename — never hand-roll .lower(). Hostile or unsalvageable
+    # ids are skipped per-item (diagnostic + skipped count); they must NOT wedge
+    # the pull or path-traverse out of work/inbox/.
     """
     read_token(environ)
     _ = (since, cursor, runner)  # seam placeholders
@@ -918,7 +977,12 @@ def lookup_upstream(
         if runner is not None:
             return runner(argv)
         import subprocess
-        res = subprocess.run(argv, capture_output=True, text=True, check=False)
+        try:
+            res = subprocess.run(
+                argv, capture_output=True, text=True, check=False, timeout=30
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError("gh timed out after 30s") from exc
         if res.returncode != 0:
             raise RuntimeError(res.stderr.strip() or res.stdout.strip() or "gh failed")
         return res.stdout
@@ -1146,6 +1210,10 @@ if __name__ == "__main__":
 
 
 _GITHUB_EFFECTS = r'''
+# Bound hung provider calls; timeout -> UNCERTAIN (find) / failure (create).
+GH_TIMEOUT_S = 30
+
+
 def find_existing(
     *,
     marker: str,
@@ -1153,9 +1221,10 @@ def find_existing(
     environ: Mapping[str, str] | None = None,
     runner: Callable[..., str] | None = None,
 ) -> str:
-    """Return absent|present|uncertain for the marker (PR branch / comment tag).
+    """Return absent|present|uncertain for the marker (issue comment tag).
 
-    Any API/transport error -> uncertain (fail closed; never create on doubt).
+    Lookup matches create_effect: issue comments only (no PR-branch path).
+    Any API/transport/timeout error -> uncertain (fail closed; never create).
     """
     try:
         read_token(environ)
@@ -1171,28 +1240,17 @@ def find_existing(
             return 0, out, ""
         import subprocess
         try:
-            res = subprocess.run(argv, capture_output=True, text=True, check=False)
+            res = subprocess.run(
+                argv, capture_output=True, text=True, check=False, timeout=GH_TIMEOUT_S
+            )
         except FileNotFoundError:
             return 127, "", "gh not found"
+        except subprocess.TimeoutExpired:
+            # Hung provider -> UNCERTAIN so run_notify exits BLOCKED(9).
+            return 124, "", "gh timeout"
         return res.returncode, res.stdout, res.stderr
 
-    # 1. PR whose head ref matches the marker
-    rc, out, _err = _run([
-        "gh", "pr", "list",
-        "--head", marker,
-        "--state", "all",
-        "--json", "url,number,headRefName",
-    ])
-    if rc != 0:
-        return "uncertain"
-    try:
-        rows = json.loads(out) if out.strip() else []
-    except json.JSONDecodeError:
-        return "uncertain"
-    if isinstance(rows, list) and len(rows) > 0:
-        return "present"
-
-    # 2. Issue comment containing the marker tag
+    # Issue comment containing the marker tag (matches create_effect).
     issue = str(work_item.get("id") or "")
     if not issue:
         return "uncertain"
@@ -1237,7 +1295,12 @@ def create_effect(
         if runner is not None:
             return runner(argv)
         import subprocess
-        res = subprocess.run(argv, capture_output=True, text=True, check=False)
+        try:
+            res = subprocess.run(
+                argv, capture_output=True, text=True, check=False, timeout=GH_TIMEOUT_S
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RuntimeError(f"gh timed out after {GH_TIMEOUT_S}s") from exc
         if res.returncode != 0:
             raise RuntimeError(res.stderr.strip() or res.stdout.strip() or "gh failed")
         return res.stdout

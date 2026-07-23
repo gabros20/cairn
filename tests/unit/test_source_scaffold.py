@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import py_compile
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -23,7 +24,7 @@ from cairn.kernel.plan import plan as build_plan
 from cairn.kernel.queue_ledger import parse_item_name
 from cairn.kernel.trigger_host import load_triggers
 from cairn.kernel.types import ExitCode
-from cairn.kernel.work_item import work_item_rev
+from cairn.kernel.work_item import safe_item_id, work_item_rev
 
 REPO = Path(__file__).parents[2]
 NOW = datetime(2026, 7, 3, tzinfo=timezone.utc)
@@ -91,8 +92,26 @@ def test_new_source_seam_providers_have_todo_marker(ws: Path, tmp_path: Path):
         pull = (w / f"scripts/pull_{provider}.py").read_text(encoding="utf-8")
         notify = (w / f"scripts/notify_{provider}.py").read_text(encoding="utf-8")
         assert f"TODO: your {provider} API call here" in pull
+        assert "safe_item_id" in pull  # seam docs + import — id sanitization is kernel-side
         assert "uncertain" in notify  # fail-closed default until seam filled
         assert any("scaffold seam" in n for n in result.notes)
+
+
+@pytest.mark.parametrize("provider", list(sourcekit.KNOWN_PROVIDERS))
+def test_all_providers_compile_and_plan(tmp_path: Path, provider: str):
+    """I1: every provider's generated .py compiles and every pipeline plans.
+
+    Catches embedded-template syntax rot for linear/jira/notion (75% of surface)
+    without requiring a templates/<kind>/ tree migration.
+    """
+    w = newkit.new_workspace(f"ws-{provider}", tmp_path / provider)
+    sourcekit.new_source(provider, w)
+    scripts = list((w / "scripts").glob(f"*_{provider}.py"))
+    assert len(scripts) == 3, scripts
+    for script in scripts:
+        py_compile.compile(str(script), doraise=True)
+    build_plan(w, f"pull-{provider}", {}, now=NOW)
+    build_plan(w, f"fix-{provider}", {"event": "/tmp/item.json"}, now=NOW)
 
 
 def test_unknown_provider_refused(ws: Path):
@@ -363,6 +382,83 @@ def test_run_pull_emits_work_items_via_seamed_fetch(github_ws: Path, tmp_path: P
     assert cur["id"] == "7"
 
 
+def test_hostile_upstream_id_sanitized_not_traversal_or_wedge(
+    github_ws: Path, tmp_path: Path
+):
+    """C1 repro: seamed fetch with ../../state/pwned must not traverse or crash."""
+    pull = _load_module(
+        github_ws / "scripts/pull_github-issues.py", "cairn_test_pull_hostile"
+    )
+    workspace = tmp_path / "ws"
+    inbox = workspace / "work" / "inbox"
+    inbox.mkdir(parents=True)
+    state = workspace / "state"
+    state.mkdir(parents=True)
+    # Sentinel: if traversal writes here, the test fails.
+    (state / "pwned").write_text("untouched\n", encoding="utf-8")
+
+    def hostile_fetch(*, since, cursor, environ=None, runner=None):
+        return [
+            {
+                "id": "../../state/pwned",
+                "title": "evil",
+                "url": "x",
+                "created": "2024-01-01T00:00:00Z",
+                "updated_at": "2024-01-01T00:00:00Z",
+                "prio": 5,
+                "payload": {},
+            },
+            {
+                "id": "good-1",
+                "title": "ok",
+                "url": "y",
+                "created": "2024-01-02T00:00:00Z",
+                "updated_at": "2024-01-02T00:00:00Z",
+                "prio": 3,
+                "payload": {},
+            },
+            {
+                "id": "///",  # unsalvageable → skip, not wedge
+                "title": "poison",
+                "url": "z",
+                "created": "2024-01-03T00:00:00Z",
+                "updated_at": "2024-01-03T00:00:00Z",
+                "prio": 1,
+                "payload": {},
+            },
+        ]
+
+    report_path = tmp_path / "report.json"
+    cursor_next = tmp_path / "cursor.next"
+    rc = pull.run_pull(
+        workspace=workspace,
+        cursor_value="",
+        cursor_next=cursor_next,
+        poll_report_path=report_path,
+        fetch=hostile_fetch,
+        rev_fn=work_item_rev,
+        environ={"GH_TOKEN": "t"},
+    )
+    assert rc == 0
+    # No path traversal into state/
+    assert (state / "pwned").read_text(encoding="utf-8") == "untouched\n"
+    # Files only under inbox, no slashes in basenames
+    written = list(inbox.glob("*.json"))
+    assert all("/" not in p.name for p in written)
+    names = {p.name for p in written}
+    # Hostile id salvaged to state-pwned; good-1 emitted; /// skipped
+    assert any("state-pwned" in n for n in names)
+    assert any("good-1" in n for n in names)
+    for p in written:
+        assert parse_item_name(p.name) is not None
+        assert p.resolve().is_relative_to(inbox.resolve())
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["complete"] is True
+    assert report["emitted"] >= 2
+    assert report.get("skipped", 0) >= 1  # /// unsalvageable
+    assert cursor_next.is_file()  # pull not wedged — cursor advances past good items
+
+
 def test_overlap_since_rewinds_watermark(github_ws: Path):
     pull = _load_module(
         github_ws / "scripts/pull_github-issues.py", "cairn_test_pull_ov"
@@ -593,3 +689,29 @@ def test_github_scripts_never_hardcode_token(github_ws: Path):
         assert "GH_TOKEN" in text
         # Values come from os.environ / environ mapping only.
         assert "os.environ" in text or "environ" in text
+
+
+def test_github_scripts_use_gh_timeout(github_ws: Path):
+    """Minor: hung gh → timeout; find path treats it as uncertain → BLOCKED."""
+    pull = (github_ws / "scripts/pull_github-issues.py").read_text(encoding="utf-8")
+    notify = (github_ws / "scripts/notify_github-issues.py").read_text(encoding="utf-8")
+    assert "timeout=" in pull and "GH_TIMEOUT" in pull
+    assert "timeout=" in notify
+    assert "TimeoutExpired" in pull or "timeout" in pull.lower()
+    # PR-lookup path removed — create_effect only issues comments.
+    assert "gh pr list" not in notify
+    assert "issue" in notify and "comment" in notify
+
+
+def test_generated_pull_imports_kernel_safe_item_id(github_ws: Path):
+    text = (github_ws / "scripts/pull_github-issues.py").read_text(encoding="utf-8")
+    assert "from cairn.kernel.work_item import" in text
+    assert "safe_item_id" in text
+    assert "work_item_filename" in text
+    # No hand-rolled .lower()-only filename builder left as the authority.
+    pull = _load_module(
+        github_ws / "scripts/pull_github-issues.py", "cairn_test_pull_import"
+    )
+    assert pull.safe_item_id is safe_item_id or pull.safe_item_id("../../x") == safe_item_id(
+        "../../x"
+    )
