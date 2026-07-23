@@ -23,6 +23,7 @@ from cairn.kernel.queue_ledger import (
     audit_ledger,
     count_quarantined,
     quarantine_dir,
+    release_quarantine,
     write_pointer,
 )
 from cairn.kernel.runstate import record_worktree, read_worktree
@@ -282,6 +283,53 @@ def test_audit_never_auto_deletes(tmp_path: Path) -> None:
     audit_and_quarantine(watch, now=old + AUDIT_GRACE_S + 1)
     q_item = quarantine_dir(watch) / "keep-me.json"
     assert q_item.read_text(encoding="utf-8") == body
+
+
+def test_release_quarantine_returns_to_inbox(tmp_path: Path) -> None:
+    """Operator release path: .quarantine/ → inbox for re-admission (M3)."""
+    watch = tmp_path / "inbox"
+    claim = watch / ".claim"
+    claim.mkdir(parents=True)
+    body = '{"id": "x"}\n'
+    item = claim / "p1-jira-abc-r10.json"
+    item.write_text(body, encoding="utf-8")
+    old = 1_000_000.0
+    os.utime(item, (old, old))
+    audit_and_quarantine(watch, now=old + AUDIT_GRACE_S + 1)
+    assert count_quarantined(watch) == 1
+    assert not item.exists()
+
+    diags = release_quarantine(watch, "p1-jira-abc-r10.json")
+    assert any("released quarantine" in d for d in diags)
+    assert count_quarantined(watch) == 0
+    inbox_item = watch / "p1-jira-abc-r10.json"
+    assert inbox_item.is_file()
+    assert inbox_item.read_text(encoding="utf-8") == body
+    # issue sidecar gone
+    assert not (quarantine_dir(watch) / "p1-jira-abc-r10.json.issue").exists()
+
+
+def test_release_quarantine_clean_is_noop(tmp_path: Path) -> None:
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    assert release_quarantine(watch) == []
+    diags = release_quarantine(watch, "missing.json")
+    assert len(diags) == 1
+    assert "no quarantine entry" in diags[0]
+
+
+def test_release_quarantine_all(tmp_path: Path) -> None:
+    watch = tmp_path / "inbox"
+    q = quarantine_dir(watch)
+    q.mkdir(parents=True)
+    (q / "a.json").write_text("{}", encoding="utf-8")
+    (q / "a.json.issue").write_text("issue a\n", encoding="utf-8")
+    (q / "b.json").write_text("{}", encoding="utf-8")
+    diags = release_quarantine(watch)
+    assert len([d for d in diags if "released" in d]) == 2
+    assert count_quarantined(watch) == 0
+    assert (watch / "a.json").is_file()
+    assert (watch / "b.json").is_file()
 
 
 # --------------------------------------------------------------------------- #

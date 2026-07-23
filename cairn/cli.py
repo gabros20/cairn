@@ -68,6 +68,7 @@ from cairn.kernel.queue_ledger import (
     pointer_path,
     prepare_failed_retry,
     read_pointer,
+    release_quarantine,
     reset_circuit,
     retire,
     sweep,
@@ -2158,14 +2159,17 @@ def _refuse_unsafe_watch_dirs(
 
 
 def _cmd_trigger_reset(args: argparse.Namespace) -> int:
-    """``cairn trigger reset <name>`` — close the dark-lane circuit breaker (W5).
+    """``cairn trigger reset <name>`` — circuit breaker (W5) and/or quarantine release (SG6).
 
-    Clears ``<watch>/.circuit`` consecutive_failures→0 so admission resumes after
-    an operator fixes the dark lane. A subsequent DONE dark run also auto-closes.
+    * Default: close the dark-lane circuit breaker (clear consecutive failures).
+    * ``--quarantine``: move ``.quarantine/`` entries back to the inbox so the
+      drain can re-admit after the operator fixed the underlying invariant issue.
+      Optional positional ``item`` releases one entry; omit to release all.
+      Clean trigger (empty quarantine) → no-op success.
 
-    Race vs a concurrent drain: last-writer-wins. Reset while a live failing
-    streak is still retiring may be immediately re-incremented — expected when
-    the lane is still broken (fix first, then reset).
+    Race vs a concurrent drain: last-writer-wins on the circuit file. Reset while
+    a live failing streak is still retiring may be immediately re-incremented —
+    expected when the lane is still broken (fix first, then reset).
     """
     if not args.name:
         print("cairn: `cairn trigger reset` needs a trigger name", file=sys.stderr)
@@ -2180,14 +2184,30 @@ def _cmd_trigger_reset(args: argparse.Namespace) -> int:
         )
         return int(ExitCode.CONFIG)
     trigger = triggers[args.name]
+    watch_abs = watch_dir(trigger, ws)
+    want_quarantine = bool(getattr(args, "quarantine", False))
+
+    if want_quarantine:
+        item = getattr(args, "item", None)
+        diags = release_quarantine(watch_abs, item if item else None)
+        if not diags:
+            print(
+                f"cairn: trigger {args.name!r}: quarantine empty "
+                f"(nothing to release)"
+            )
+        else:
+            for line in diags:
+                print(f"cairn: trigger {args.name!r}: {line}")
+        return int(ExitCode.OK)
+
+    # Default path: dark-lane circuit breaker (W5).
     if trigger.lane_circuit_failures is None:
         print(
             f"cairn: trigger {args.name!r} has no lane_circuit configured "
-            f"(nothing to reset)",
+            f"(nothing to reset; use --quarantine to release SG6 quarantine entries)",
             file=sys.stderr,
         )
         return int(ExitCode.CONFIG)
-    watch_abs = watch_dir(trigger, ws)
     reset_circuit(watch_abs)
     print(
         f"cairn: trigger {args.name!r}: lane circuit reset "
@@ -2541,6 +2561,12 @@ def _print_trigger_list(statuses: list[TriggerStatus], backend: str) -> None:
                     f"      circuit={state} consecutive={s.circuit_consecutive}/"
                     f"{s.circuit_failures}"
                 )
+            if s.quarantined:
+                print(
+                    f"      ! quarantined={s.quarantined} "
+                    f"(release: cairn trigger reset {s.name} --quarantine "
+                    f"[item]; never auto-deleted)"
+                )
         for claim_path in s.stuck:
             print(f"      ! stuck claim (never auto-retried): {claim_path}")
     # W8: machine-wide resource locks + hung-holder flag (never force-broken).
@@ -2784,13 +2810,20 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "item",
         nargs="?",
-        help="work-item name (required for retry; from `cairn inbox --failed`)",
+        help="work-item name (required for retry; optional for reset --quarantine; "
+             "from `cairn inbox --failed` or `.quarantine/`)",
     )
     sp.add_argument("--backend", choices=["cron", "launchd", "systemd"], default="cron", help="host backend (default cron)")
     sp.add_argument("--launchd-dir", help="override the launchd LaunchAgents dir")
     sp.add_argument("--systemd-dir", help="override the systemd user-unit dir")
     sp.add_argument("--workspace", default=".", help="workspace root (default .)")
     sp.add_argument("--json", action="store_true", help="list: machine-readable output")
+    sp.add_argument(
+        "--quarantine",
+        action="store_true",
+        help="reset: release SG6 .quarantine/ entries back to the inbox "
+             "(optional item name; omit to release all). Never auto-deletes.",
+    )
     sp.add_argument(
         "--unsafe-synced-fs",
         action="store_true",

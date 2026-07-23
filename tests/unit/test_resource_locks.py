@@ -523,14 +523,50 @@ def test_enforcement_lit_lane_not_dark(tmp_path: Path) -> None:
     enforce_repo_locks(plan, workspace_dir=ws, concurrency=1, lane="lit", runner=runner)
 
 
-def test_enforcement_worktree_pattern_ok_without_step_locks(tmp_path: Path) -> None:
-    """W8-T2: pipeline worktree: true exempts unlocked implement steps."""
+def test_enforcement_worktree_pattern_ok_with_delivery_repo_lock(
+    tmp_path: Path,
+) -> None:
+    """W8-T2 r1: worktree: true + deliver locks: [repo:.] → implement steps exempt."""
+    from dataclasses import replace
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    runner = _FakeGitRunner({str(ws.resolve()): str((ws / ".git").resolve())})
+    plan = replace(
+        _plan(
+            [
+                _agent("build"),  # unlocked implement — ok under worktree
+                _agent("deliver", locks=("repo:.",)),  # shared-refs lock present
+            ]
+        ),
+        worktree=True,
+    )
+    enforce_repo_locks(plan, workspace_dir=ws, concurrency=2, runner=runner)
+
+
+def test_enforcement_worktree_pattern_no_repo_lock_errors(tmp_path: Path) -> None:
+    """W8-T2 r1: worktree: true with ZERO repo: locks → ConfigError (I1)."""
     from dataclasses import replace
 
     ws = tmp_path / "ws"
     ws.mkdir()
     runner = _FakeGitRunner({str(ws.resolve()): str((ws / ".git").resolve())})
     plan = replace(_plan([_agent("build")]), worktree=True)
+    with pytest.raises(ConfigError, match="declares no repo: lock"):
+        enforce_repo_locks(plan, workspace_dir=ws, concurrency=2, runner=runner)
+
+
+def test_enforcement_worktree_pipeline_lock_counts(tmp_path: Path) -> None:
+    """Pipeline-level locks: [repo:.] also satisfies the worktree delivery guard."""
+    from dataclasses import replace
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    runner = _FakeGitRunner({str(ws.resolve()): str((ws / ".git").resolve())})
+    plan = replace(
+        _plan([_agent("build")], pipeline_locks=("repo:.",)),
+        worktree=True,
+    )
     enforce_repo_locks(plan, workspace_dir=ws, concurrency=2, runner=runner)
 
 

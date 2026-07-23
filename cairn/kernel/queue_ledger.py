@@ -343,17 +343,86 @@ def quarantine_dir(watch_abs: Path) -> Path:
 
 def count_quarantined(watch_abs: Path) -> int:
     """Count quarantined ledger entries (item files, not ``*.issue`` sidecars)."""
+    return len(list_quarantined(watch_abs))
+
+
+def list_quarantined(watch_abs: Path) -> list[Path]:
+    """Quarantined ledger item paths under ``.quarantine/`` (excludes ``*.issue``)."""
     q = quarantine_dir(watch_abs)
     if not q.is_dir():
-        return 0
-    n = 0
-    for p in q.iterdir():
-        if not p.is_file() or p.name.startswith("."):
+        return []
+    return sorted(
+        p
+        for p in q.iterdir()
+        if p.is_file() and not p.name.startswith(".") and not p.name.endswith(".issue")
+    )
+
+
+def release_quarantine(
+    watch_abs: Path,
+    item_name: str | None = None,
+    *,
+    fs: Any = None,
+) -> list[str]:
+    """Operator path out of SG6 quarantine — move entries back to the inbox.
+
+    After the operator has fixed the underlying invariant issue, this durable-
+    moves ``.quarantine/<item>`` (and drops the sibling ``*.issue`` note) to the
+    watch root so a subsequent drain can re-admit. Never auto-called.
+
+    * ``item_name`` set → release that one entry (ConfigError-style diagnostic
+      if missing).
+    * ``item_name`` None → release every quarantined item file.
+
+    Returns human-readable diagnostics (empty when nothing was quarantined —
+    clean no-op). Does not re-create pointers/reservations; re-admission runs
+    the normal envelope path.
+    """
+    watch_abs = Path(watch_abs)
+    qdir = quarantine_dir(watch_abs)
+    diags: list[str] = []
+    if not qdir.is_dir():
+        if item_name:
+            diags.append(f"no quarantine entry {item_name!r} (`.quarantine/` empty)")
+        return diags
+
+    if item_name is not None:
+        targets = [qdir / item_name]
+    else:
+        targets = list_quarantined(watch_abs)
+
+    if not targets:
+        return diags  # clean no-op
+
+    for src in targets:
+        if not src.is_file():
+            diags.append(f"no quarantine entry {src.name!r}")
             continue
-        if p.name.endswith(".issue"):
+        dest = watch_abs / src.name
+        # Collision in inbox: suffix so we never destroy an existing candidate.
+        if dest.exists():
+            stem, ext = Path(src.name).stem, Path(src.name).suffix
+            n = 2
+            while (watch_abs / f"{stem}-v{n}{ext}").exists():
+                n += 1
+            dest = watch_abs / f"{stem}-v{n}{ext}"
+        try:
+            durable_move(src, dest, fs=fs)
+        except FileNotFoundError:
+            diags.append(f"quarantine entry {src.name!r} vanished before release")
             continue
-        n += 1
-    return n
+        except FileExistsError:
+            diags.append(f"inbox already holds {dest.name!r} — left in quarantine")
+            continue
+        # Drop the issue sidecar (why-note no longer needed once released).
+        # durable_move left it under qdir next to the old basename.
+        issue_path = qdir / f"{src.name}.issue"
+        try:
+            durable_unlink(issue_path, fs=fs)
+        except FileNotFoundError:
+            pass
+        diags.append(f"released quarantine {src.name} → inbox ({dest.name})")
+    return diags
 
 
 def _quarantine_dest(qdir: Path, name: str) -> Path:
@@ -389,8 +458,10 @@ def _move_to_quarantine(
     except FileNotFoundError:
         return None
     except FileExistsError:
-        # Racer landed first — drop our copy only if hard-link same content is impossible;
-        # over-preserve: leave src if move failed due to collision that suffix didn't catch.
+        # Concurrent racer already moved this same src to dest (identical content
+        # preserved there). Drop our leftover src copy — evidence lives at dest;
+        # both copies never vanish. (_quarantine_dest pre-avoids name collisions,
+        # so this arm is only the same-src race.)
         try:
             durable_unlink(src, fs=fs)
         except FileNotFoundError:

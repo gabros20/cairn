@@ -687,9 +687,11 @@ def enforce_repo_locks(
 
     **Worktree pattern (W8-T2):** pipeline-level ``worktree: true`` means implement
     steps work in per-run linked worktrees (isolated working trees — no shared
-    ``repo:`` lock needed). Only the delivery / shared-refs step takes
-    ``locks: [repo:.]``. Unlocked git-touch steps are allowed when the pipeline
-    declares the pattern; they are **not** flagged.
+    ``repo:`` lock needed on those steps). Unlocked git-touch steps are allowed
+    **only when** the pipeline also declares at least one ``repo:`` lock somewhere
+    (pipeline-level or any step) — the delivery / shared-refs step must still
+    lock the shared push. A worktree pipeline with **zero** ``repo:`` locks →
+    ConfigError (hand-authored pipelines that forget deliver must not race).
 
     Docs-only (workspace not a git repo) never errors. Concurrent/dark + locks → ok.
     """
@@ -702,11 +704,8 @@ def enforce_repo_locks(
     if not ws_git:
         return  # docs-only / non-git workspace — never enforce
 
-    # W8-T2: worktree-pattern pipeline — isolated implement steps need no lock.
-    if getattr(plan, "worktree", False):
-        return
-
     pipeline_locks = tuple(getattr(plan, "pipeline_locks", ()) or ())
+    worktree_pattern = bool(getattr(plan, "worktree", False))
 
     def _walk_nodes(nodes: Any) -> Any:
         for node in nodes:
@@ -718,7 +717,32 @@ def enforce_repo_locks(
             elif hasattr(node, "body"):  # LoopNode
                 yield from _walk_nodes(node.body)
 
-    for step in _walk_nodes(getattr(plan, "nodes", ()) or ()):
+    nodes = list(_walk_nodes(getattr(plan, "nodes", ()) or ()))
+
+    # W8-T2 r1: worktree isolation covers implement steps, NOT the shared push.
+    # Require at least one repo: lock somewhere so delivery still serializes.
+    if worktree_pattern:
+        has_repo_lock = any(
+            isinstance(n, str) and n.startswith(_REPO_PREFIX) for n in pipeline_locks
+        )
+        if not has_repo_lock:
+            for step in nodes:
+                step_locks = tuple(getattr(step, "locks", ()) or ())
+                if any(
+                    isinstance(n, str) and n.startswith(_REPO_PREFIX) for n in step_locks
+                ):
+                    has_repo_lock = True
+                    break
+        if not has_repo_lock:
+            pname = getattr(plan, "pipeline", "?")
+            raise ConfigError(
+                f"worktree pipeline {pname!r} declares no repo: lock — the delivery "
+                f"step that pushes to the shared repo must lock it (locks: [repo:.]); "
+                f"worktree isolation covers the implement steps, not the shared push."
+            )
+        return  # implement steps exempt; delivery lock present
+
+    for step in nodes:
         if not step_touches_git(
             step, workspace_dir=workspace_dir, runner=runner, workspace_is_git=ws_git
         ):
