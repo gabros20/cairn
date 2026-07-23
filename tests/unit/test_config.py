@@ -137,12 +137,50 @@ def test_factory_max_agents_negative_raises(tmp_path):
 
 def test_factory_unknown_key_warns(tmp_path):
     (tmp_path / "cairn.toml").write_text(
-        '[workspace]\nname = "w"\n[factory]\nmax_agents = 1\nmachine_pool = true\n',
+        '[workspace]\nname = "w"\n[factory]\nmax_agents = 1\nnot_a_real_key = true\n',
         encoding="utf-8",
     )
     cfg = load_config(tmp_path)
     assert cfg.factory.max_agents == 1
-    assert any(f.level == "warning" and "machine_pool" in f.message for f in cfg.warnings)
+    assert any(f.level == "warning" and "not_a_real_key" in f.message for f in cfg.warnings)
+
+
+def test_factory_machine_pool_parses(tmp_path):
+    (tmp_path / "cairn.toml").write_text(
+        '[workspace]\nname = "w"\n[factory]\nmax_agents = 2\nmachine_pool = true\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.factory.max_agents == 2
+    assert cfg.factory.machine_pool is True
+
+
+def test_factory_machine_pool_false_opts_out(tmp_path):
+    (tmp_path / "cairn.toml").write_text(
+        '[workspace]\nname = "w"\n[factory]\nmax_agents = 1\nmachine_pool = false\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.factory.machine_pool is False
+
+
+def test_factory_machine_pool_absent_is_none(tmp_path):
+    (tmp_path / "cairn.toml").write_text(
+        '[workspace]\nname = "w"\n[factory]\nmax_agents = 1\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.factory.machine_pool is None
+
+
+def test_factory_machine_pool_non_bool_raises(tmp_path):
+    (tmp_path / "cairn.toml").write_text(
+        '[workspace]\nname = "w"\n[factory]\nmachine_pool = "yes"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_config(tmp_path)
+    assert "machine_pool" in str(exc.value)
 
 
 # ---- value-type validation (review MINOR 1) ----

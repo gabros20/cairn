@@ -987,6 +987,32 @@ def sync_triggers(
     # Stamp ledger-version on every declared watch dir (upgrade-safety marker).
     for trigger in triggers.values():
         stamp_ledger_version(watch_dir(trigger, workspace_dir))
+    # W6-T2: bootstrap the shared machine agent-pool dir when the machine pool
+    # is in effect for this workspace, so it exists before the first drain.
+    # Factory keys = [factory] present and/or machine.toml pool; join-by-presence
+    # decides. Slot-pool opt-out never opts out of W8 repo locks (boundary only).
+    try:
+        from cairn.kernel.agent_slots import (
+            ensure_machine_pool_dir,
+            load_machine_config,
+        )
+        from cairn.kernel.config import load_config
+
+        try:
+            cfg = load_config(workspace_dir)
+            factory_mp = cfg.factory.machine_pool
+        except Exception:  # noqa: BLE001 — sync must not fail on config oddities
+            factory_mp = None
+        try:
+            machine = load_machine_config()
+        except Exception:  # noqa: BLE001
+            machine = None
+        ensure_machine_pool_dir(
+            factory_machine_pool=factory_mp,
+            machine=machine,
+        )
+    except Exception:  # noqa: BLE001 — bootstrap is best-effort
+        pass
     if backend == "cron":
         _cron_unsupported()
     if backend == "launchd":

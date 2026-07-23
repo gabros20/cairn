@@ -287,15 +287,25 @@ class SecretConfig:
 class FactoryConfig:
     """``[factory]`` workspace knobs (FACTORY-PLAN §9 / W6).
 
-    ``max_agents`` absent (None) ⇒ agent-slot pool OFF ⇒ unbounded concurrent
-    agent spawns (byte-identical to pre-W6). When set, a positive int bounds
-    concurrent AGENT-step invokes via the numbered O_EXCL slot pool.
+    ``max_agents`` absent (None) ⇒ agent-slot pool OFF (unless a machine pool is
+    in effect — see :func:`cairn.kernel.agent_slots.effective_max_agents`) ⇒
+    unbounded concurrent agent spawns (byte-identical to pre-W6). When set, a
+    positive int bounds concurrent AGENT-step invokes via the numbered O_EXCL
+    slot pool (workspace-local unless the machine pool is joined).
     ``slot_wait_s`` is how long an agent step waits for a free slot before
     parking ``CAPACITY(8)`` (default 15m); only meaningful when slots are ON.
+
+    ``machine_pool`` join-by-presence (W6-T2):
+    - ``None`` (key absent) → join the shared machine pool only when
+      ``~/.cairn/machine.toml`` (XDG) is present with a pool.
+    - ``True`` → force-join the shared machine slots dir.
+    - ``False`` → explicit opt-out; always use workspace-local ``state/agents/``.
+    Slot-pool opt-out NEVER opts out of W8 repo locks (boundary note; W8 not built).
     """
 
     max_agents: int | None = None
     slot_wait_s: int = 900
+    machine_pool: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -503,7 +513,9 @@ def _parse_factory(raw: Any, file: Path, warnings: list[Finding]) -> FactoryConf
     if raw is None:
         return FactoryConfig()
     table = _require_table(raw, "factory", file)
-    _warn_unknown(table, {"max_agents", "slot_wait"}, "factory", warnings)
+    _warn_unknown(
+        table, {"max_agents", "slot_wait", "machine_pool"}, "factory", warnings
+    )
 
     max_agents: int | None = None
     if "max_agents" in table:
@@ -518,7 +530,21 @@ def _parse_factory(raw: Any, file: Path, warnings: list[Finding]) -> FactoryConf
         if slot_wait_s < 0:
             _fail(f"factory.slot_wait must be non-negative, got {slot_wait_s!r}", file)
 
-    return FactoryConfig(max_agents=max_agents, slot_wait_s=slot_wait_s)
+    machine_pool: bool | None = None
+    if "machine_pool" in table:
+        v = table["machine_pool"]
+        if not isinstance(v, bool):
+            _fail(
+                f"factory.machine_pool must be a boolean, got {v!r}",
+                file,
+            )
+        machine_pool = v
+
+    return FactoryConfig(
+        max_agents=max_agents,
+        slot_wait_s=slot_wait_s,
+        machine_pool=machine_pool,
+    )
 
 
 def load_config(workspace_dir: Path) -> Config:

@@ -109,6 +109,110 @@ def test_sweep_capacity_and_blocked_stay(tmp_path):
     assert len(report.left) == 2
 
 
+def test_sweep_capacity_resumes_when_free_slots(tmp_path):
+    """W6-T2: CAPACITY park is re-driven when free_slots > 0; trail run-done → retire."""
+    watch = _watch(tmp_path)
+    run_dir = tmp_path / "runs" / "t-cap"
+    _park(watch, "cap.json", run_dir, exit_code=8)
+    _write_trail(run_dir, [{"event": "run-halt", "data": {"exit_code": 8}}])
+
+    resumed: list[Path] = []
+
+    def resume(rd: Path) -> None:
+        resumed.append(rd)
+        # Simulate a successful resume that finishes the run.
+        _write_trail(
+            rd,
+            [
+                {"event": "run-halt", "data": {"exit_code": 8}},
+                {"event": "run-done", "data": {"nodes": 1}},
+            ],
+        )
+
+    report = sweep(
+        watch,
+        on_done="done",
+        free_slots=1,
+        resume_capacity=resume,
+    )
+    assert resumed == [run_dir]
+    assert (watch / ".done" / "cap.json").is_file()
+    assert not (watch / ".waiting" / "cap.json").exists()
+    assert any(p.name == "cap.json" for p in report.capacity_resumed)
+    assert any(p.name == "cap.json" for p in report.moved)
+
+
+def test_sweep_capacity_stays_when_no_free_slots(tmp_path):
+    """W6-T2: zero free slots → leave capacity park for the next beat (no strand forever only when free)."""
+    watch = _watch(tmp_path)
+    run_dir = tmp_path / "runs" / "t-cap0"
+    _park(watch, "cap.json", run_dir, exit_code=8)
+    _write_trail(run_dir, [{"event": "run-halt", "data": {"exit_code": 8}}])
+    called: list[Path] = []
+
+    report = sweep(
+        watch,
+        on_done="done",
+        free_slots=0,
+        resume_capacity=lambda rd: called.append(rd),
+    )
+    assert called == []
+    assert (watch / ".waiting" / "cap.json").is_file()
+    assert any(p.name == "cap.json" for p in report.left)
+    assert report.capacity_resumed == ()
+
+
+def test_sweep_capacity_resume_budget_limits_herd(tmp_path):
+    """At most free_slots capacity parks resumed per beat (FACTORY-PLAN T6 budget)."""
+    watch = _watch(tmp_path)
+    for i in range(3):
+        rd = tmp_path / "runs" / f"t-c{i}"
+        _park(watch, f"c{i}.json", rd, exit_code=8)
+        _write_trail(rd, [{"event": "run-halt", "data": {"exit_code": 8}}])
+
+    resumed: list[str] = []
+
+    def resume(rd: Path) -> None:
+        resumed.append(rd.name)
+        _write_trail(
+            rd,
+            [
+                {"event": "run-halt", "data": {"exit_code": 8}},
+                {"event": "run-done", "data": {"nodes": 1}},
+            ],
+        )
+
+    report = sweep(
+        watch,
+        on_done="done",
+        free_slots=2,
+        resume_capacity=resume,
+    )
+    assert len(resumed) == 2
+    assert len(report.capacity_resumed) == 2
+    # One capacity park left for the next beat.
+    waiting = list((watch / ".waiting").iterdir()) if (watch / ".waiting").is_dir() else []
+    assert sum(1 for p in waiting if p.is_file()) == 1
+
+
+def test_sweep_blocked_not_resumed_by_capacity_path(tmp_path):
+    """BLOCKED parks are not capacity-resumed even when free_slots > 0."""
+    watch = _watch(tmp_path)
+    run_dir = tmp_path / "runs" / "t-blk"
+    _park(watch, "blk.json", run_dir, exit_code=9)
+    _write_trail(run_dir, [{"event": "run-halt", "data": {"exit_code": 9}}])
+    called: list[Path] = []
+    report = sweep(
+        watch,
+        on_done="done",
+        free_slots=5,
+        resume_capacity=lambda rd: called.append(rd),
+    )
+    assert called == []
+    assert (watch / ".waiting" / "blk.json").is_file()
+    assert report.capacity_resumed == ()
+
+
 def test_sweep_vanished_run_dir_fails_with_gc_diagnostic(tmp_path):
     watch = _watch(tmp_path)
     run_dir = tmp_path / "runs" / "t-gone"

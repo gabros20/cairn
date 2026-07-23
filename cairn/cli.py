@@ -2477,6 +2477,9 @@ def _cmd_factory(args: argparse.Namespace) -> int:
             now=_now(),
             out=sys.stdout,
             err=sys.stderr,
+            # W6-T2: capacity-park resume budget on the reconcile beat.
+            runner=_SubprocessRunner(),
+            cairn_bin=_resolve_cairn_bin(),
         )
     except ConfigError as exc:
         return _print_config_error(exc)

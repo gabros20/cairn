@@ -39,6 +39,14 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterator, TextIO
 
+from cairn.kernel.agent_slots import (
+    effective_max_agents,
+    effective_slot_max_age_s,
+    free_slot_count,
+    load_machine_config,
+    machine_pool_active,
+    resolve_slots_dir,
+)
 from cairn.kernel.config import load_config
 from cairn.kernel.errors import CairnError, ConfigError
 from cairn.kernel.gckit import write_queue_pin
@@ -81,6 +89,62 @@ from cairn.kernel.types import Finding, OutcomeClass, classify_exit
 # prefix default to declared_prio=5 (middle of 0–9). Tiebreak: filename lexicographic.
 AGE_STEP_SECONDS = 3600.0
 _PRIO_RE = re.compile(r"^p([0-9])-")
+
+
+def _workspace_free_slots(workspace_dir: Path) -> int | None:
+    """Free agent-slot count for the capacity-resume budget, or None when slots OFF.
+
+    Reads ``[factory]`` + optional ``machine.toml`` (join-by-presence). Used by
+    drain/reconcile sweep so a CAPACITY(8) park is re-driven when a slot frees
+    (FACTORY-PLAN T6 resume budget ≤ free_slots per beat).
+    """
+    try:
+        cfg = load_config(workspace_dir)
+    except ConfigError:
+        return None
+    machine = load_machine_config()
+    n = effective_max_agents(
+        factory_max_agents=cfg.factory.max_agents,
+        factory_machine_pool=cfg.factory.machine_pool,
+        machine=machine,
+    )
+    if n is None:
+        return None
+    slots_dir = resolve_slots_dir(
+        workspace_dir,
+        factory_machine_pool=cfg.factory.machine_pool,
+        machine=machine,
+    )
+    age = effective_slot_max_age_s(
+        factory_machine_pool=cfg.factory.machine_pool,
+        machine=machine,
+    )
+    global_n = (
+        n
+        if machine_pool_active(
+            factory_machine_pool=cfg.factory.machine_pool, machine=machine
+        )
+        else None
+    )
+    return free_slot_count(
+        slots_dir,
+        n,
+        slot_max_age_s=age,
+        global_n=global_n,
+    )
+
+
+def _spawn_capacity_resume(
+    run_dir: Path,
+    *,
+    workspace_dir: Path,
+    runner: Runner,
+    cairn_bin: str,
+) -> None:
+    """Re-drive a CAPACITY-parked run (``cairn resume``) so the walk can re-acquire a slot."""
+    argv = [cairn_bin, "resume", str(run_dir)]
+    handle = runner.spawn(argv, cwd=workspace_dir)
+    handle.wait()
 
 
 def run_dir_for_item(
@@ -843,7 +907,22 @@ def run_trigger(
     check_ledger_version(watch_abs)
     stamp_ledger_version(watch_abs)
 
-    # T6/T13: sweep FIRST — lease reap + advance .waiting/ + mop stranded deferred.
+    # T6/T13/W6: sweep FIRST — lease reap + advance .waiting/ + capacity resume
+    # when free agent slots exist + mop stranded deferred.
+    free_slots = _workspace_free_slots(workspace_dir)
+    resume_capacity = None
+    if free_slots is not None and free_slots > 0:
+
+        def _resume_capacity(run_dir: Path) -> None:
+            _spawn_capacity_resume(
+                run_dir,
+                workspace_dir=workspace_dir,
+                runner=runner,
+                cairn_bin=cairn_bin,
+            )
+
+        resume_capacity = _resume_capacity
+
     try:
         report = sweep(
             watch_abs,
@@ -851,6 +930,8 @@ def run_trigger(
             now=now_ts,
             lease_ttl_s=lease_ttl,
             current_boot_id=cur_boot,
+            free_slots=free_slots,
+            resume_capacity=resume_capacity,
         )
     except Exception as exc:  # noqa: BLE001 — sweep must never abort the drain
         any_failed = True
@@ -992,12 +1073,15 @@ def reconcile_workspace(
     now: datetime,
     out: TextIO | None = None,
     err: TextIO | None = None,
+    runner: Runner | None = None,
+    cairn_bin: str | None = None,
 ) -> ReconcileReport:
-    """Single-flight health pass over every declared trigger (T13 / D1).
+    """Single-flight health pass over every declared trigger (T13 / D1 / W6).
 
     No daemon: host-woken or manual. For each trigger:
     - release aged orphan reservations
-    - sweep (lease reap + waiting advance + stranded-deferred mop)
+    - sweep (lease reap + waiting advance + capacity resume when free slots
+      exist and ``runner``/``cairn_bin`` are provided + stranded-deferred mop)
     - report one-line summary (waiting/blocked/capacity/reaped)
 
     Contention on the workspace reconcile lock → ``already_running=True``
@@ -1015,6 +1099,24 @@ def reconcile_workspace(
     out_s = out if out is not None else sys.stdout
     now_ts = now.timestamp()
     cur_boot = boot_id()
+    free_slots = _workspace_free_slots(workspace_dir)
+    resume_capacity = None
+    if (
+        free_slots is not None
+        and free_slots > 0
+        and runner is not None
+        and cairn_bin is not None
+    ):
+
+        def _resume_capacity(run_dir: Path) -> None:
+            _spawn_capacity_resume(
+                run_dir,
+                workspace_dir=workspace_dir,
+                runner=runner,
+                cairn_bin=cairn_bin,
+            )
+
+        resume_capacity = _resume_capacity
 
     with _reconcile_lock(workspace_dir) as held:
         if not held:
@@ -1064,12 +1166,17 @@ def reconcile_workspace(
                 diags.append(f"orphan-reservation sweep hazarded: {exc}")
 
             try:
+                # W6-T2: capacity parks resume on the beat when free slots exist
+                # (budget ≤ free_slots). Runner+cairn_bin optional for library
+                # callers; CLI passes both so the reconcile timer closes the loop.
                 report = sweep(
                     watch_abs,
                     on_done=trigger.on_done,
                     now=now_ts,
                     lease_ttl_s=lease_ttl,
                     current_boot_id=cur_boot,
+                    free_slots=free_slots,
+                    resume_capacity=resume_capacity,
                 )
                 reaped_n = len(report.reaped)
                 flagged_n = len(report.flagged_live)

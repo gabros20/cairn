@@ -1,33 +1,53 @@
-"""Numbered O_EXCL agent-slot pool (FACTORY-PLAN §9 / W6-T1).
+"""Numbered O_EXCL agent-slot pool (FACTORY-PLAN §9 / W6).
 
-A workspace-local pool of ``slot-0``..``slot-(N-1)`` under ``state/agents/`` bounds
-how many coding-agent CLIs may spawn at once. Acquire one slot to invoke an
-agent step; at the cap the walker WAITS (bounded); wait expiry parks
-``CAPACITY(8)``. Stale slots (holder pid dead) are reaped on acquire.
+A pool of ``slot-0``..``slot-(N-1)`` bounds how many coding-agent CLIs may spawn
+at once. Acquire one slot to invoke an agent step; at the cap the walker WAITS
+(bounded); wait expiry parks ``CAPACITY(8)``. Stale slots (holder pid dead) are
+reaped on acquire. W6-T2 adds a machine-wide pool, per-executor sub-pools, and
+an aging backstop that reaps a slot past a max lifetime regardless of pid
+(closing the pid-reuse under-cap strand).
 
-**Reap is pid-dead-only** (see :func:`acquire_slot` / :func:`_reap_if_stale`): a
-leaked slot whose numeric pid was reused by an unrelated live process is never
-reaped and the pool runs *under* cap — the safe direction (throttles more, never
-double-runs). W6-T2 machine-pool aging is the intended backstop (reap a slot
-older than a max lifetime regardless of pid).
+**Reap criteria** (see :func:`acquire_slot` / :func:`_reap_if_stale`):
 
-Opt-in: absent ``[factory] max_agents`` ⇒ slots OFF ⇒ unbounded (D7). The machine
-pool (``~/.cairn/machine.toml``, per-executor sub-pools) is W6-T2.
+1. **Pid-dead** — holder pid is not alive (W6-T1).
+2. **Aging** (W6-T2) — ``acquired_at`` older than ``slot_max_age_s``, *regardless*
+   of pid. Closes the pid-reuse strand: a leaked slot whose numeric pid was
+   reused by an unrelated live process is eventually reaped. Aging can also
+   reap a genuinely long-running agent, so the default (2h) exceeds a plausible
+   max agent runtime and is configurable via ``machine.toml`` ``slot_max_age``.
+
+**Join-by-presence / slots-dir resolution** (see :func:`resolve_slots_dir`):
+
+1. ``[factory] machine_pool = false`` → workspace-local ``state/agents/`` (opt-out).
+2. Machine pool in effect (``machine.toml`` with ``max_agents``, OR
+   ``[factory] machine_pool = true``) → shared machine dir
+   (``$XDG_STATE_HOME/cairn/agents`` / ``~/.local/state/cairn/agents`` /
+   ``~/.cairn/agents`` — same XDG ladder as gatekeys).
+3. Else → workspace-local ``state/agents/`` (W6-T1).
+
+Opt-in: absent ``[factory] max_agents`` AND no machine pool ⇒ slots OFF ⇒
+unbounded (D7). Slot-pool opt-out NEVER opts out of W8 repo locks (boundary
+note only; W8 not built).
 
 Tests inject ``fs=`` / ``kill=`` / ``now=`` / ``sleep=`` seams — never monkeypatch
-``os.*`` (D10).
+``os.*`` (D10). Machine home is env-injectable via ``XDG_STATE_HOME`` / ``HOME``.
 """
 
 from __future__ import annotations
 
 import json
-import time
+import os
+import tomllib
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from cairn.kernel.config import parse_duration
 from cairn.kernel.durafs import atomic_write_text, durable_unlink, exclusive_create
+from cairn.kernel.errors import ConfigError
 from cairn.kernel.queue_ledger import pid_alive
+from cairn.kernel.types import Finding
 
 # Default bound on how long an agent step waits for a free slot (15 minutes).
 DEFAULT_SLOT_WAIT_S = 900.0
@@ -38,29 +58,340 @@ DEFAULT_POLL_S = 0.25
 # Workspace-relative default pool dir (machine-wide pool is W6-T2).
 DEFAULT_SLOTS_REL = Path("state") / "agents"
 
+# Aging default: 2 hours. Must exceed a plausible max agent runtime (coding agents
+# routinely run 30–90m); shorter would false-reap live work. Configurable via
+# machine.toml ``slot_max_age`` (duration string) or ``slot_max_age_s`` (int).
+DEFAULT_SLOT_MAX_AGE_S = 7200.0
+
+# Per-executor sub-pool table name in machine.toml (TOML cannot have max_agents
+# as both an int and a table; brief's ``[max_agents] claude = 2`` is expressed here).
+_EXECUTOR_CAPS_KEY = "executor_max_agents"
+
+
+# --------------------------------------------------------------------------- #
+# Machine state home (XDG ladder — same shape as gatekeys)
+# --------------------------------------------------------------------------- #
+
+
+def cairn_state_home() -> Path:
+    """User-level cairn state dir (gatekeys / machine.toml / machine agents).
+
+    Location ladder (first that applies):
+        ``$XDG_STATE_HOME/cairn``
+        ``~/.local/state/cairn``   (HOME set, XDG_STATE_HOME not)
+        ``~/.cairn``               (neither set)
+    """
+    xdg = os.environ.get("XDG_STATE_HOME", "").strip()
+    if xdg:
+        return Path(xdg) / "cairn"
+    home = os.environ.get("HOME", "").strip()
+    if home:
+        return Path(home) / ".local" / "state" / "cairn"
+    return Path.home() / ".cairn"
+
+
+def machine_toml_path() -> Path:
+    """``<cairn_state_home>/machine.toml`` — machine pool authority (absent ⇒ no machine pool)."""
+    return cairn_state_home() / "machine.toml"
+
+
+def machine_slots_dir() -> Path:
+    """Shared machine-wide agent-slots directory (``…/cairn/agents``)."""
+    return cairn_state_home() / "agents"
+
+
+# --------------------------------------------------------------------------- #
+# machine.toml loader
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class MachineConfig:
+    """Parsed ``~/.cairn/machine.toml`` (or XDG equivalent).
+
+    ``max_agents`` is the machine-wide total cap. ``executor_max_agents`` is an
+    optional per-executor sub-pool (vendor rate limits are per-vendor). When a
+    sub-pool is absent for an executor, that executor may use the global
+    ``max_agents`` budget (still subject to the two-level total).
+    """
+
+    max_agents: int
+    executor_max_agents: dict[str, int] = field(default_factory=dict)
+    slot_max_age_s: float = DEFAULT_SLOT_MAX_AGE_S
+    path: Path | None = None
+
+
+def load_machine_config(
+    path: Path | None = None,
+    *,
+    warnings: list[Finding] | None = None,
+) -> MachineConfig | None:
+    """Load machine pool authority. Absent / empty file ⇒ ``None`` (no machine pool).
+
+    ``path`` defaults to :func:`machine_toml_path` (env-injectable home for tests).
+    Raises :class:`ConfigError` on malformed content when the file exists and is
+    non-empty.
+    """
+    file = Path(path) if path is not None else machine_toml_path()
+    if not file.is_file():
+        return None
+    try:
+        raw_text = file.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    if not raw_text.strip():
+        return None
+    try:
+        raw = tomllib.loads(raw_text)
+    except tomllib.TOMLDecodeError as exc:
+        raise ConfigError(
+            f"invalid machine.toml at {file}: {exc}",
+            findings=[Finding("error", f"invalid machine.toml: {exc}")],
+            file=str(file),
+        ) from exc
+    if not isinstance(raw, dict):
+        raise ConfigError(
+            f"machine.toml root must be a table at {file}",
+            findings=[Finding("error", "machine.toml root must be a table")],
+            file=str(file),
+        )
+
+    known = {"max_agents", "slot_max_age", "slot_max_age_s", _EXECUTOR_CAPS_KEY}
+    if warnings is not None:
+        for key in raw:
+            if key not in known:
+                warnings.append(
+                    Finding("warning", f"unknown key in machine.toml: {key!r}")
+                )
+
+    if "max_agents" not in raw:
+        # File present but no pool size → no machine pool (join-by-presence needs a pool).
+        return None
+    n = raw["max_agents"]
+    if isinstance(n, bool) or not isinstance(n, int) or n < 1:
+        raise ConfigError(
+            f"machine.toml max_agents must be a positive integer, got {n!r}",
+            findings=[Finding("error", "machine.toml max_agents must be a positive integer")],
+            file=str(file),
+        )
+
+    executor_caps: dict[str, int] = {}
+    caps_raw = raw.get(_EXECUTOR_CAPS_KEY)
+    if caps_raw is not None:
+        if not isinstance(caps_raw, dict):
+            raise ConfigError(
+                f"machine.toml [{_EXECUTOR_CAPS_KEY}] must be a table",
+                findings=[Finding("error", f"[{_EXECUTOR_CAPS_KEY}] must be a table")],
+                file=str(file),
+            )
+        for name, cap in caps_raw.items():
+            if isinstance(cap, bool) or not isinstance(cap, int) or cap < 1:
+                raise ConfigError(
+                    f"machine.toml {_EXECUTOR_CAPS_KEY}.{name} must be a positive integer, "
+                    f"got {cap!r}",
+                    findings=[
+                        Finding(
+                            "error",
+                            f"{_EXECUTOR_CAPS_KEY}.{name} must be a positive integer",
+                        )
+                    ],
+                    file=str(file),
+                )
+            executor_caps[str(name)] = cap
+
+    age_s = DEFAULT_SLOT_MAX_AGE_S
+    if "slot_max_age_s" in raw:
+        v = raw["slot_max_age_s"]
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0:
+            raise ConfigError(
+                f"machine.toml slot_max_age_s must be a positive number, got {v!r}",
+                findings=[Finding("error", "slot_max_age_s must be a positive number")],
+                file=str(file),
+            )
+        age_s = float(v)
+    elif "slot_max_age" in raw:
+        v = raw["slot_max_age"]
+        if isinstance(v, bool) or isinstance(v, int):
+            if isinstance(v, bool) or v <= 0:
+                raise ConfigError(
+                    f"machine.toml slot_max_age must be a positive duration, got {v!r}",
+                    findings=[Finding("error", "slot_max_age must be a positive duration")],
+                    file=str(file),
+                )
+            age_s = float(v)
+        elif isinstance(v, str):
+            try:
+                age_s = float(parse_duration(v))
+            except ValueError as exc:
+                raise ConfigError(
+                    f"machine.toml slot_max_age: {exc}",
+                    findings=[Finding("error", f"slot_max_age: {exc}")],
+                    file=str(file),
+                ) from exc
+            if age_s <= 0:
+                raise ConfigError(
+                    f"machine.toml slot_max_age must be positive, got {v!r}",
+                    findings=[Finding("error", "slot_max_age must be positive")],
+                    file=str(file),
+                )
+        else:
+            raise ConfigError(
+                f"machine.toml slot_max_age must be a duration string or seconds, got {v!r}",
+                findings=[Finding("error", "slot_max_age must be a duration")],
+                file=str(file),
+            )
+
+    return MachineConfig(
+        max_agents=n,
+        executor_max_agents=executor_caps,
+        slot_max_age_s=age_s,
+        path=file,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Join-by-presence / effective pool resolution
+# --------------------------------------------------------------------------- #
+
+
+def machine_pool_active(
+    *,
+    factory_machine_pool: bool | None,
+    machine: MachineConfig | None,
+) -> bool:
+    """Whether this workspace joins the shared machine agent pool.
+
+    Precedence:
+    - ``factory_machine_pool is False`` → never (explicit opt-out).
+    - ``factory_machine_pool is True`` → yes (shared dir; size from machine.toml
+      or falls back to workspace ``max_agents`` at the call site).
+    - ``factory_machine_pool is None`` (key absent) → yes iff ``machine.toml``
+      is present with a pool (``machine is not None``).
+    """
+    if factory_machine_pool is False:
+        return False
+    if factory_machine_pool is True:
+        return True
+    return machine is not None
+
 
 def slots_dir_for(workspace_dir: Path) -> Path:
-    """Resolve the workspace-local agent-slots directory."""
+    """Resolve the workspace-local agent-slots directory (W6-T1)."""
     return Path(workspace_dir) / DEFAULT_SLOTS_REL
 
 
+def resolve_slots_dir(
+    workspace_dir: Path,
+    *,
+    factory_machine_pool: bool | None = None,
+    machine: MachineConfig | None = None,
+) -> Path:
+    """Effective slots directory for this workspace (join-by-presence).
+
+    See module docstring for the full precedence. When the machine pool is
+    active the shared machine dir is used; otherwise workspace-local
+    ``state/agents/``.
+    """
+    if machine_pool_active(factory_machine_pool=factory_machine_pool, machine=machine):
+        return machine_slots_dir()
+    return slots_dir_for(workspace_dir)
+
+
+def effective_max_agents(
+    *,
+    factory_max_agents: int | None,
+    factory_machine_pool: bool | None,
+    machine: MachineConfig | None,
+) -> int | None:
+    """Pool size for this workspace, or ``None`` when slots are OFF.
+
+    - Machine pool active + machine.toml present → machine ``max_agents`` (authority).
+    - Machine pool active via ``machine_pool=true`` without machine.toml →
+      workspace ``max_agents`` (must be set or slots stay OFF).
+    - Local pool → workspace ``max_agents``.
+    """
+    if machine_pool_active(factory_machine_pool=factory_machine_pool, machine=machine):
+        if machine is not None:
+            return machine.max_agents
+        return factory_max_agents
+    return factory_max_agents
+
+
+def effective_slot_max_age_s(
+    *,
+    factory_machine_pool: bool | None,
+    machine: MachineConfig | None,
+) -> float | None:
+    """Aging threshold, or ``None`` when aging is off (workspace-local W6-T1).
+
+    Aging is the W6-T2 backstop and applies when the machine pool is active so
+    D7 holds for pure workspace-local pools (no aging unless machine pool).
+    """
+    if not machine_pool_active(factory_machine_pool=factory_machine_pool, machine=machine):
+        return None
+    if machine is not None:
+        return float(machine.slot_max_age_s)
+    return DEFAULT_SLOT_MAX_AGE_S
+
+
+def effective_executor_cap(
+    executor: str | None,
+    *,
+    machine: MachineConfig | None,
+    global_n: int,
+) -> int:
+    """Per-executor sub-pool size, falling back to ``global_n`` when unset."""
+    if executor and machine is not None:
+        cap = machine.executor_max_agents.get(executor)
+        if cap is not None:
+            return min(int(cap), int(global_n))
+    return int(global_n)
+
+
+def ensure_machine_pool_dir(
+    *,
+    factory_machine_pool: bool | None = None,
+    machine: MachineConfig | None = None,
+) -> Path | None:
+    """Create the shared machine slots dir when the machine pool is in effect.
+
+    Returns the dir path when created/ensured, else ``None``. Used by
+    ``trigger sync`` bootstrap so the dir exists before the first drain.
+    """
+    if not machine_pool_active(factory_machine_pool=factory_machine_pool, machine=machine):
+        return None
+    d = machine_slots_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+# --------------------------------------------------------------------------- #
+# Slot file primitives
+# --------------------------------------------------------------------------- #
+
+
 def slot_path(slots_dir: Path, slot_name: str) -> Path:
-    """``<slots_dir>/<slot_name>`` — e.g. ``state/agents/slot-0``."""
+    """``<slots_dir>/<slot_name>`` — e.g. ``state/agents/slot-0`` or ``…/claude/slot-0``."""
     return Path(slots_dir) / slot_name
 
 
-def slot_name_for(index: int) -> str:
-    return f"slot-{index}"
+def slot_name_for(index: int, *, executor: str | None = None) -> str:
+    """Flat ``slot-N`` (local) or ``<executor>/slot-N`` (machine sub-pool)."""
+    base = f"slot-{index}"
+    if executor:
+        return f"{executor}/{base}"
+    return base
 
 
-def _slot_record(pid: int, now_ts: float) -> str:
-    return (
-        json.dumps(
-            {"pid": int(pid), "acquired_at": float(now_ts), "heartbeat": float(now_ts)},
-            ensure_ascii=False,
-        )
-        + "\n"
-    )
+def _slot_record(pid: int, now_ts: float, *, executor: str | None = None) -> str:
+    doc: dict[str, Any] = {
+        "pid": int(pid),
+        "acquired_at": float(now_ts),
+        "heartbeat": float(now_ts),
+    }
+    if executor:
+        doc["executor"] = executor
+    return json.dumps(doc, ensure_ascii=False) + "\n"
 
 
 def _read_slot(path: Path) -> dict[str, Any] | None:
@@ -80,22 +411,51 @@ def _read_slot(path: Path) -> dict[str, Any] | None:
     return doc
 
 
+def _now_ts(now: float | Callable[[], float] | None) -> float:
+    if now is None:
+        import time
+
+        return time.time()
+    return float(now() if callable(now) else now)
+
+
+def _slot_aged(
+    rec: dict[str, Any],
+    *,
+    now_ts: float,
+    slot_max_age_s: float | None,
+) -> bool:
+    """True when ``acquired_at`` is older than the aging threshold."""
+    if slot_max_age_s is None:
+        return False
+    try:
+        acquired = float(rec.get("acquired_at", 0.0))
+    except (TypeError, ValueError):
+        return True  # corrupt timestamp → treat as aged/reapable
+    return (now_ts - acquired) > float(slot_max_age_s)
+
+
 def _holder_live(
     path: Path,
     *,
     kill: Callable[[int, int], None] | None,
+    now_ts: float | None = None,
+    slot_max_age_s: float | None = None,
 ) -> bool:
-    """True when the slot file names a still-live holder pid.
+    """True when the slot file names a still-live, non-aged holder.
 
     Missing, corrupt, or unreadable content → False (reapable).
+    Aged past ``slot_max_age_s`` → False regardless of pid (W6-T2 backstop).
 
-    **Pid-reuse caveat:** liveness is numeric-pid only. If a crashed holder's pid
-    is later reused by an unrelated process, this returns True and the slot looks
-    held — fail-toward under-cap (safe; never false-reaps a live agent). Heartbeat
-    aging for that strand is W6-T2.
+    **Pid-reuse caveat (when aging is off):** liveness is numeric-pid only. If a
+    crashed holder's pid is later reused by an unrelated process, this returns
+    True and the slot looks held — fail-toward under-cap (safe). Aging is the
+    backstop for that strand when ``slot_max_age_s`` is set.
     """
     rec = _read_slot(path)
     if rec is None:
+        return False
+    if now_ts is not None and _slot_aged(rec, now_ts=now_ts, slot_max_age_s=slot_max_age_s):
         return False
     try:
         pid = int(rec["pid"])
@@ -109,17 +469,18 @@ def _reap_if_stale(
     *,
     kill: Callable[[int, int], None] | None,
     fs: Any,
+    now_ts: float | None = None,
+    slot_max_age_s: float | None = None,
 ) -> bool:
-    """Remove a dead/corrupt slot. True if the path is free afterwards.
+    """Remove a dead/corrupt/aged slot. True if the path is free afterwards.
 
-    Reap criterion is **pid-dead only** (plus corrupt/missing content) — the
-    ``heartbeat`` field is never consulted. A leaked slot whose pid was reused
-    by a live process is therefore *not* reaped here; the pool runs under cap
-    (safe). W6-T2 machine-pool aging is the backstop for that strand.
+    Reap criteria: pid-dead, corrupt/missing content, OR (when configured)
+    ``acquired_at`` older than ``slot_max_age_s`` regardless of pid. The
+    ``heartbeat`` field is never consulted for reap decisions.
     """
     if not path.is_file():
         return True
-    if _holder_live(path, kill=kill):
+    if _holder_live(path, kill=kill, now_ts=now_ts, slot_max_age_s=slot_max_age_s):
         return False
     try:
         durable_unlink(path, fs=fs)
@@ -130,6 +491,47 @@ def _reap_if_stale(
     return not path.is_file()
 
 
+def _count_live_slots(
+    slots_dir: Path,
+    *,
+    kill: Callable[[int, int], None] | None,
+    now_ts: float,
+    slot_max_age_s: float | None,
+    executor: str | None = None,
+) -> int:
+    """Count live (non-aged) slot files under ``slots_dir`` (optionally one executor)."""
+    slots_dir = Path(slots_dir)
+    if not slots_dir.is_dir():
+        return 0
+    live = 0
+    if executor is not None:
+        root = slots_dir / executor
+        if not root.is_dir():
+            return 0
+        for path in root.iterdir():
+            if path.is_file() and path.name.startswith("slot-"):
+                if _holder_live(
+                    path, kill=kill, now_ts=now_ts, slot_max_age_s=slot_max_age_s
+                ):
+                    live += 1
+        return live
+    # Global: flat slots + every per-executor subdir.
+    for path in slots_dir.iterdir():
+        if path.is_file() and path.name.startswith("slot-"):
+            if _holder_live(
+                path, kill=kill, now_ts=now_ts, slot_max_age_s=slot_max_age_s
+            ):
+                live += 1
+        elif path.is_dir():
+            for child in path.iterdir():
+                if child.is_file() and child.name.startswith("slot-"):
+                    if _holder_live(
+                        child, kill=kill, now_ts=now_ts, slot_max_age_s=slot_max_age_s
+                    ):
+                        live += 1
+    return live
+
+
 def acquire_slot(
     slots_dir: Path,
     n: int,
@@ -138,33 +540,62 @@ def acquire_slot(
     now: float | Callable[[], float],
     fs: Any = None,
     kill: Callable[[int, int], None] | None = None,
+    executor: str | None = None,
+    global_n: int | None = None,
+    slot_max_age_s: float | None = None,
 ) -> str | None:
     """Try to claim one of ``slot-0``..``slot-(n-1)`` via O_EXCL.
 
-    Returns the acquired slot name, or None when all N are held by LIVE holders.
-    A slot whose holder pid is dead (or whose content is corrupt) is reaped and
-    reacquired. Caller must ensure ``n >= 1``.
+    Returns the acquired slot name, or None when all N are held by LIVE holders
+    (or the two-level global cap is saturated). A slot whose holder pid is dead,
+    whose content is corrupt, or whose ``acquired_at`` is past ``slot_max_age_s``
+    is reaped and reacquired. Caller must ensure ``n >= 1``.
 
-    **Pid-reuse / under-cap caveat:** reap is pid-dead-only. A leaked slot file
-    whose recorded pid was reused by an unrelated live process (same-boot reuse
-    or another machine sharing the FS) still looks live, so it is never reaped
-    and the pool permanently runs under the configured cap — the *safe*
-    direction (throttles more, never double-runs a live agent past N). There is
-    no heartbeat-staleness reap in W6-T1; W6-T2 machine-pool aging is the
-    intended backstop (reap a slot older than a max lifetime regardless of pid).
+    **Executor sub-pools (W6-T2):** when ``executor`` is set, slots live under
+    ``<slots_dir>/<executor>/slot-i`` and ``n`` is the per-executor cap. When
+    ``global_n`` is also set, the total live slots across all executors must
+    stay ≤ ``global_n`` (two-level cap: per-executor AND total).
+
+    **Pid-reuse / under-cap caveat (aging off):** reap is pid-dead-only when
+    ``slot_max_age_s`` is None. A leaked slot whose recorded pid was reused by
+    an unrelated live process still looks live, so the pool permanently runs
+    under the configured cap — the *safe* direction. Pass ``slot_max_age_s``
+    (machine pool default 2h) to close that strand.
     """
     if n < 1:
         return None
     slots_dir = Path(slots_dir)
     slots_dir.mkdir(parents=True, exist_ok=True)
-    now_ts = float(now() if callable(now) else now)
-    body = _slot_record(pid, now_ts)
+    now_ts = _now_ts(now)
+    body = _slot_record(pid, now_ts, executor=executor)
+
+    # Two-level global cap: refuse before probing when the machine total is full.
+    if global_n is not None and global_n >= 1:
+        if (
+            _count_live_slots(
+                slots_dir,
+                kill=kill,
+                now_ts=now_ts,
+                slot_max_age_s=slot_max_age_s,
+            )
+            >= global_n
+        ):
+            return None
+
+    if executor:
+        (slots_dir / executor).mkdir(parents=True, exist_ok=True)
 
     for i in range(n):
-        name = slot_name_for(i)
+        name = slot_name_for(i, executor=executor)
         path = slot_path(slots_dir, name)
         if path.is_file():
-            if not _reap_if_stale(path, kill=kill, fs=fs):
+            if not _reap_if_stale(
+                path,
+                kill=kill,
+                fs=fs,
+                now_ts=now_ts,
+                slot_max_age_s=slot_max_age_s,
+            ):
                 continue  # live holder
             # reaped (or raced away) — fall through to exclusive_create
         if exclusive_create(path, body, fs=fs):
@@ -199,13 +630,13 @@ def refresh_slot(
     """Bump the heartbeat timestamp on a held slot (walker heartbeat loop).
 
     No-op when the slot file is missing (already released) or unreadable.
-    Preserves ``pid`` / ``acquired_at``; only ``heartbeat`` advances.
+    Preserves ``pid`` / ``acquired_at`` / ``executor``; only ``heartbeat`` advances.
     """
     path = slot_path(Path(slots_dir), slot_name)
     rec = _read_slot(path)
     if rec is None:
         return
-    now_ts = float(now() if callable(now) else now)
+    now_ts = _now_ts(now)
     rec["heartbeat"] = float(now_ts)
     try:
         atomic_write_text(
@@ -221,26 +652,42 @@ def free_slot_count(
     slots_dir: Path,
     n: int,
     *,
-    now: float | Callable[[], float] | None = None,  # reserved for W6-T2 aging
+    now: float | Callable[[], float] | None = None,
     kill: Callable[[int, int], None] | None = None,
+    executor: str | None = None,
+    global_n: int | None = None,
+    slot_max_age_s: float | None = None,
 ) -> int:
-    """How many of ``slot-0``..``slot-(n-1)`` are free (absent or dead holder).
+    """How many of ``slot-0``..``slot-(n-1)`` are free (absent, dead, or aged).
 
-    Live-holder-aware. Exposed for W3 admission / the beat (wiring is W6-T2).
-    ``now`` is accepted for API symmetry with acquire; unused today.
+    Live-holder-aware. Exposed for W3 admission and the capacity-resume beat.
+    When ``executor`` is set, counts that sub-pool only. When ``global_n`` is set
+    (two-level cap), free count is also bounded by remaining global capacity:
+    ``min(per-executor free, global_n − live_total)``.
     """
-    del now  # reserved
     if n < 1:
         return 0
     slots_dir = Path(slots_dir)
+    now_ts = _now_ts(now)
     free = 0
     for i in range(n):
-        path = slot_path(slots_dir, slot_name_for(i))
+        path = slot_path(slots_dir, slot_name_for(i, executor=executor))
         if not path.is_file():
             free += 1
             continue
-        if not _holder_live(path, kill=kill):
+        if not _holder_live(
+            path, kill=kill, now_ts=now_ts, slot_max_age_s=slot_max_age_s
+        ):
             free += 1
+    if global_n is not None and global_n >= 1:
+        live_total = _count_live_slots(
+            slots_dir,
+            kill=kill,
+            now_ts=now_ts,
+            slot_max_age_s=slot_max_age_s,
+        )
+        global_free = max(0, int(global_n) - live_total)
+        free = min(free, global_free)
     return free
 
 
@@ -256,6 +703,9 @@ def wait_acquire_slot(
     fs: Any = None,
     kill: Callable[[int, int], None] | None = None,
     on_wait_start: Callable[[], None] | None = None,
+    executor: str | None = None,
+    global_n: int | None = None,
+    slot_max_age_s: float | None = None,
 ) -> str | None:
     """Acquire a slot, polling until success or ``wait_s`` elapses.
 
@@ -271,7 +721,17 @@ def wait_acquire_slot(
     if base_poll <= 0:
         raise ValueError(f"poll_s must be positive, got {poll_s!r}")
 
-    slot = acquire_slot(slots_dir, n, pid=pid, now=now, fs=fs, kill=kill)
+    slot = acquire_slot(
+        slots_dir,
+        n,
+        pid=pid,
+        now=now,
+        fs=fs,
+        kill=kill,
+        executor=executor,
+        global_n=global_n,
+        slot_max_age_s=slot_max_age_s,
+    )
     if slot is not None:
         return slot
 
@@ -285,7 +745,17 @@ def wait_acquire_slot(
         if remaining <= 0:
             break
         sleep(min(base_poll, remaining))
-        slot = acquire_slot(slots_dir, n, pid=pid, now=now, fs=fs, kill=kill)
+        slot = acquire_slot(
+            slots_dir,
+            n,
+            pid=pid,
+            now=now,
+            fs=fs,
+            kill=kill,
+            executor=executor,
+            global_n=global_n,
+            slot_max_age_s=slot_max_age_s,
+        )
         if slot is not None:
             return slot
     return None

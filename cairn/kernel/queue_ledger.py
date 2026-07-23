@@ -2604,6 +2604,8 @@ class SweepReport:
     ``reaped`` (expired+dead claims resumed or requeued), ``flagged_live``
     (expired but child still alive — never killed), ``promoted_deferred``
     (T12 stranded-deferred mop diagnostics).
+    W6-T2: ``capacity_resumed`` — capacity-class parks the beat re-drove when a
+    free agent slot was available.
     """
 
     moved: tuple[Path, ...] = ()
@@ -2613,6 +2615,7 @@ class SweepReport:
     reaped: tuple[Path, ...] = ()
     flagged_live: tuple[Path, ...] = ()
     promoted_deferred: tuple[str, ...] = ()
+    capacity_resumed: tuple[Path, ...] = ()
 
 
 def _ledger_item_locations(watch_abs: Path, name: str) -> list[Path]:
@@ -2772,8 +2775,10 @@ def sweep(
     lease_ttl_s: int | None = None,
     current_boot_id: str | None = None,
     kill: Callable[[int, int], None] | None = None,
+    free_slots: int | None = None,
+    resume_capacity: Callable[[Path], None] | None = None,
 ) -> SweepReport:
-    """Advance ledger health for one watch dir (FACTORY-PLAN T6 + T13).
+    """Advance ledger health for one watch dir (FACTORY-PLAN T6 + T13 + W6-T2).
 
     Order:
     1. **Lease reap** (only when ``lease_ttl_s`` is not None — lease-enabled
@@ -2787,7 +2792,12 @@ def sweep(
 
     For each waiting item: read its pointer and the run's trail; route by the last
     terminal event — ``run-done`` → retire DONE; failure-class ``run-halt`` → FAILED;
-    waiting-class halt → leave. Vanished run dir → FAILED + diagnostic naming gc.
+    waiting-class halt → leave — **except CAPACITY(8)** when ``free_slots`` and
+    ``resume_capacity`` are provided (W6-T2 capacity-loop closure): at most
+    ``free_slots`` capacity parks are re-driven per beat (resume budget); after
+    resume the trail is re-read and re-routed. Zero free slots → leave for the
+    next beat (must not strand forever once capacity frees). BLOCKED/needs_human
+    still leave.
 
     **Drain-vs-reconcile concurrency (I1 / T13 r1):** reconcile's flock serializes
     reconcile-vs-reconcile only. A drain's ``sweep`` and a concurrent
@@ -2797,8 +2807,8 @@ def sweep(
     items go to ``.waiting/`` and resume under T6's nonblocking run-lock (no
     double-drive). No cross-process admission lock is added (D-doctrine).
 
-    ``now`` / ``current_boot_id`` / ``kill`` are injectable seams for tests (do not
-    monkeypatch ``os.kill`` or ``time.time`` globally).
+    ``now`` / ``current_boot_id`` / ``kill`` / ``resume_capacity`` are injectable
+    seams for tests (do not monkeypatch ``os.kill`` or ``time.time`` globally).
 
     Per-item isolation: one item's hazard is recorded in ``diagnostics`` and the sweep
     continues (same posture as ``run_trigger``'s per-candidate loop). An uncaught
@@ -2813,6 +2823,13 @@ def sweep(
     reaped: list[Path] = []
     flagged_live: list[Path] = []
     promoted: list[str] = []
+    capacity_resumed: list[Path] = []
+    # Resume budget: at most free_slots capacity items per beat (FACTORY-PLAN T6).
+    resume_budget = (
+        max(0, int(free_slots))
+        if free_slots is not None and resume_capacity is not None
+        else 0
+    )
 
     # --- W3 lease reap (opt-in; serial default triggers pass lease_ttl_s=None) ---
     if lease_ttl_s is not None:
@@ -2917,6 +2934,71 @@ def sweep(
                 if kind == "halt" and halt_code is not None:
                     outcome = classify_exit(halt_code)
                     if outcome.outcome is OutcomeClass.WAITING:
+                        # W6-T2: CAPACITY parks resume when a free agent slot exists
+                        # (budget = free_slots per beat). Other waiting kinds leave.
+                        if (
+                            outcome.waiting_kind == "capacity"
+                            and resume_budget > 0
+                            and resume_capacity is not None
+                        ):
+                            try:
+                                resume_capacity(run_dir)
+                                resume_budget -= 1
+                                capacity_resumed.append(item)
+                                diagnostics.append(
+                                    f"waiting item {item.name}: capacity resume "
+                                    f"attempted (run_dir={run_dir})"
+                                )
+                            except Exception as exc:  # noqa: BLE001 — per-item
+                                diagnostics.append(
+                                    f"waiting item {item.name}: capacity resume "
+                                    f"hazarded: {exc}"
+                                )
+                                left.append(item)
+                                continue
+                            # Re-read trail after resume; route by new terminal.
+                            kind2, halt_code2 = last_trail_terminal(run_dir)
+                            if kind2 == "done":
+                                dest = retire(
+                                    watch_abs,
+                                    item,
+                                    outcome=RunOutcome(outcome=OutcomeClass.DONE),
+                                    on_done=on_done,
+                                    exit_code=0,
+                                    child_pid=rec.get("child_pid"),
+                                    run_dir=run_dir,
+                                    fs=fs,
+                                )
+                                if dest is not None:
+                                    moved.append(dest)
+                                elif on_done == "delete":
+                                    moved.append(item)
+                                continue
+                            if kind2 == "halt" and halt_code2 is not None:
+                                outcome2 = classify_exit(halt_code2)
+                                if outcome2.outcome is OutcomeClass.WAITING:
+                                    left.append(item)
+                                    continue
+                                dest = retire(
+                                    watch_abs,
+                                    item,
+                                    outcome=outcome2,
+                                    on_done=on_done,
+                                    exit_code=halt_code2,
+                                    child_pid=rec.get("child_pid"),
+                                    run_dir=run_dir,
+                                    fs=fs,
+                                )
+                                if dest is not None:
+                                    moved.append(dest)
+                                elif (
+                                    outcome2.outcome is OutcomeClass.DONE
+                                    and on_done == "delete"
+                                ):
+                                    moved.append(item)
+                                continue
+                            left.append(item)
+                            continue
                         left.append(item)
                         continue
                     dest = retire(
@@ -2956,4 +3038,5 @@ def sweep(
         reaped=tuple(reaped),
         flagged_live=tuple(flagged_live),
         promoted_deferred=tuple(promoted),
+        capacity_resumed=tuple(capacity_resumed),
     )
