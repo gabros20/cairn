@@ -16,6 +16,7 @@ import fnmatch
 import json
 import os
 import re
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -48,6 +49,11 @@ NAME_MAX = 255
 # Default admission byte cap for identity:strict triggers (overridable per trigger).
 DEFAULT_MAX_ITEM_BYTES = 1_048_576  # 1 MiB
 
+# Orphan-reservation grace (FACTORY-PLAN T1): protect the sub-second reserve→claim
+# gap from a concurrent drain's orphan sweeper. Over-holding is safe; only release
+# a reservation with no live item AND mtime older than this window.
+RESERVATION_GRACE_S = 60.0
+
 # --------------------------------------------------------------------------- #
 # Filename grammar (identity:strict) — FACTORY-PLAN §2 T1
 # --------------------------------------------------------------------------- #
@@ -57,7 +63,7 @@ DEFAULT_MAX_ITEM_BYTES = 1_048_576  # 1 MiB
 #   prio   — single digit 0–9
 #   source — [a-z][a-z0-9]*          (lowercase; first hyphen-separated segment)
 #   id     — [a-z0-9]([a-z0-9._-]*[a-z0-9])?   (lowercase; may contain hyphens)
-#   rev    — [a-z0-9][a-z0-9._-]*    (sortable string; W4 uses epoch digits)
+#   rev    — [a-z0-9][a-z0-9._-]*    (W4: pure epoch digits under the ``r`` marker)
 #
 # Identity = ``<source>-<id>`` (lowercased by construction — case-safe; uppercase
 # is nonconforming). Traversal names (``..``, ``/``) cannot appear: names come
@@ -69,8 +75,9 @@ DEFAULT_MAX_ITEM_BYTES = 1_048_576  # 1 MiB
 #   tombstone    ``.done/tombstones/<identity>-r<rev>``
 #   pointer/item full filename (with prio + .json)
 #
-# Rev ordering here is **lexical string compare**. True monotonic rev ordering
-# is W4's ``r<epoch>`` puller contract; until then lexically-greater wins.
+# Rev ordering: numeric when both revs are pure digits (W4 ``r<epoch>``); when
+# either side is non-numeric, comparison is *incomparable* and callers FAIL SAFE
+# (admit / keep the arriving item — never skip/delete on doubt).
 
 _ITEM_NAME_RE = re.compile(
     r"^p(?P<prio>[0-9])-"
@@ -157,22 +164,54 @@ def _tombstone_dir(watch_abs: Path) -> Path:
     return Path(watch_abs) / ".done" / _TOMBSTONE_SUBDIR
 
 
-def highest_tombstoned_rev(watch_abs: Path, identity: str) -> str | None:
-    """Highest lexical rev among ``.done/tombstones/<identity>-r*`` markers, or None."""
+def _tombstone_revs(watch_abs: Path, identity: str) -> list[str]:
+    """All revs among ``.done/tombstones/<identity>-r*`` markers."""
     tomb_dir = _tombstone_dir(watch_abs)
     if not tomb_dir.is_dir():
-        return None
+        return []
     prefix = f"{identity}-r"
-    best: str | None = None
+    found: list[str] = []
     for p in tomb_dir.iterdir():
         if not p.is_file() or not p.name.startswith(prefix):
             continue
         rev = p.name[len(prefix) :]
-        if not rev:
+        if rev:
+            found.append(rev)
+    return found
+
+
+def highest_tombstoned_rev(watch_abs: Path, identity: str) -> str | None:
+    """Highest safely-orderable rev among tombstones for ``identity``, or None.
+
+    Pure-digit revs compare numerically (W4 epoch). When no pure-digit revs
+    exist, returns one marker for diagnostics only — callers that skip on
+    ``<=`` must use :func:`tombstone_covers` (fail-safe) instead of raw ``<=``.
+    """
+    revs = _tombstone_revs(watch_abs, identity)
+    if not revs:
+        return None
+    best: str | None = None
+    for rev in revs:
+        if best is None:
+            best = rev
             continue
-        if best is None or rev > best:
+        order = rev_order(rev, best)
+        if order is not None and order > 0:
             best = rev
     return best
+
+
+def tombstone_covers(watch_abs: Path, identity: str, rev: str) -> str | None:
+    """Return a covering tombstone rev if ``rev`` is confidently ≤ some marker.
+
+    Fail-safe: when no tombstone can be safely ordered against ``rev`` (or all
+    comparable markers are older), return None — caller must ADMIT, never skip.
+    """
+    for t_rev in _tombstone_revs(watch_abs, identity):
+        order = rev_order(rev, t_rev)
+        if order is not None and order <= 0:
+            return t_rev
+    return None
 
 
 def _live_identities(watch_abs: Path) -> set[str]:
@@ -207,24 +246,42 @@ def release_reservation(watch_abs: Path, identity: str, *, fs: Any = None) -> No
         pass
 
 
-def release_orphan_reservations(watch_abs: Path, *, fs: Any = None) -> list[str]:
-    """Release ``.claim/.ids/*`` with no live claim/waiting item (T1 orphan recovery).
+def release_orphan_reservations(
+    watch_abs: Path,
+    *,
+    now: float | None = None,
+    fs: Any = None,
+) -> list[str]:
+    """Release aged ``.claim/.ids/*`` with no live claim/waiting item (T1).
 
-    Called at drain start (after sweep). Over-holding is safe; this only drops a
-    reservation whose identity has no file in ``.claim/`` or ``.waiting/`` — the
-    crash window between reserve and claim. Aggressive multi-observer grace and
-    reconcile-time audits are T13. Returns diagnostic strings.
+    Both conditions required (FACTORY-PLAN T1 grace period):
+    (a) no live item for the identity in ``.claim/`` or ``.waiting/``, AND
+    (b) reservation mtime is older than :data:`RESERVATION_GRACE_S`.
+
+    The grace cleanly separates a live reserve→claim gap (protected — concurrent
+    drains must not release a just-created reservation) from a real crash orphan
+    (released). ``now`` is an injectable unix timestamp (drain passes
+    ``now.timestamp()``); default ``time.time()``. Over-holding is safe.
     """
     watch_abs = Path(watch_abs)
     ids_dir = watch_abs / ".claim" / _IDS_SUBDIR
     if not ids_dir.is_dir():
         return []
+    now_ts = time.time() if now is None else float(now)
     live = _live_identities(watch_abs)
     diags: list[str] = []
     for entry in sorted(ids_dir.iterdir()):
         if not entry.is_file():
             continue
         if entry.name in live:
+            continue
+        try:
+            mtime = entry.stat().st_mtime
+        except OSError:
+            continue
+        age = now_ts - mtime
+        if age < RESERVATION_GRACE_S:
+            # Fresh reservation — protect reserve→claim gap (C1).
             continue
         try:
             durable_unlink(entry, fs=fs)
@@ -239,7 +296,7 @@ def _read_item_fields(path: Path) -> ItemId | None:
     try:
         raw = path.read_bytes()
         body = json.loads(raw.decode("utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
         return None
     if not isinstance(body, dict):
         return None
@@ -254,9 +311,31 @@ def _read_item_fields(path: Path) -> ItemId | None:
     return parse_item_name(f"p{prio}-{source}-{id_}-r{rev}.json")
 
 
-def _rev_cmp_gt(a: str, b: str) -> bool:
-    """Lexical rev compare (W4 epoch digits will order; document limitation)."""
-    return a > b
+def rev_order(a: str, b: str) -> int | None:
+    """Compare two rev strings: -1 if a<b, 0 if equal, 1 if a>b; None if unsafe.
+
+    Pure-digit revs (W4 ``r<epoch>`` captured digits) compare as integers so
+    ``10`` > ``9``. When either side is non-numeric, return None — callers MUST
+    fail safe (admit / keep-arriving; never skip or delete on doubt).
+    """
+    if a == b:
+        return 0
+    if a.isdigit() and b.isdigit():
+        ai, bi = int(a), int(b)
+        if ai < bi:
+            return -1
+        if ai > bi:
+            return 1
+        return 0
+    return None
+
+
+def rev_is_newer(a: str, b: str) -> bool | None:
+    """True if a > b, False if a ≤ b, None if not safely orderable."""
+    order = rev_order(a, b)
+    if order is None:
+        return None
+    return order > 0
 
 
 def park_deferred(
@@ -266,10 +345,11 @@ def park_deferred(
     *,
     fs: Any = None,
 ) -> str:
-    """Move ``candidate`` into ``.deferred/<identity>``; latest lexical rev wins.
+    """Move ``candidate`` into ``.deferred/<identity>``; newest numeric rev wins.
 
-    Returns a diagnostic. Drops the candidate (no park) when an equal-or-greater
-    rev is already parked.
+    Drops the candidate only when an already-parked rev is confidently ≥ arriving
+    (numeric). On incomparable revs: replace with arriving (fail-safe — never
+    silently delete the new drop as "older").
     """
     watch_abs = Path(watch_abs)
     candidate = Path(candidate)
@@ -277,17 +357,19 @@ def park_deferred(
     dest.parent.mkdir(parents=True, exist_ok=True)
     if dest.is_file():
         existing = _read_item_fields(dest)
-        if existing is not None and not _rev_cmp_gt(item.rev, existing.rev):
-            # Already have equal or newer — drop the inbox duplicate.
-            try:
-                durable_unlink(candidate, fs=fs)
-            except FileNotFoundError:
-                pass
-            return (
-                f"deferred drop {candidate.name}: parked rev {existing.rev!r} "
-                f">= arriving {item.rev!r}"
-            )
-        # Replace with newer rev.
+        if existing is not None:
+            newer = rev_is_newer(item.rev, existing.rev)
+            if newer is False:
+                # Confidently not newer (equal or older) — drop arriving.
+                try:
+                    durable_unlink(candidate, fs=fs)
+                except FileNotFoundError:
+                    pass
+                return (
+                    f"deferred drop {candidate.name}: parked rev {existing.rev!r} "
+                    f">= arriving {item.rev!r}"
+                )
+            # newer is True OR None (incomparable) → replace with arriving.
         try:
             durable_unlink(dest, fs=fs)
         except FileNotFoundError:
@@ -310,30 +392,37 @@ def promote_deferred(
     *,
     fs: Any = None,
 ) -> str | None:
-    """After terminal retire of ``item``: promote or drop ``.deferred/<identity>``.
+    """Promote or drop ``.deferred/<identity>`` while reservation is still held.
 
-    If deferred rev > just-retired rev → install into inbox under the canonical
-    filename for the next drain. Else drop (already delivered / stale). Returns
-    a diagnostic or None when no deferred file existed.
+    Call BEFORE :func:`release_reservation` (plan T1: transfer then release).
+    If deferred rev is confidently > retired rev → install into inbox. If
+    confidently ≤ retired → drop + tombstone. If incomparable → promote
+    (fail-safe admit-on-doubt). Returns a diagnostic or None when no deferred.
     """
     watch_abs = Path(watch_abs)
     parked = deferred_path(watch_abs, item.identity)
     if not parked.is_file():
         return None
     deferred_item = _read_item_fields(parked)
-    if deferred_item is None or not _rev_cmp_gt(deferred_item.rev, item.rev):
+    if deferred_item is None:
         try:
             durable_unlink(parked, fs=fs)
         except FileNotFoundError:
             pass
-        # Also tombstone a ≤ retired deferred (plan: already delivered).
-        if deferred_item is not None:
-            _tombstone(watch_abs, deferred_item.tombstone_name, fs=fs)
+        return f"dropped deferred {item.identity} (unreadable body)"
+    newer = rev_is_newer(deferred_item.rev, item.rev)
+    if newer is False:
+        # Confidently ≤ retired — already delivered.
+        try:
+            durable_unlink(parked, fs=fs)
+        except FileNotFoundError:
+            pass
+        _tombstone(watch_abs, deferred_item.tombstone_name, fs=fs)
         return (
             f"dropped deferred {item.identity} "
-            f"(rev {(deferred_item.rev if deferred_item else '?')!r} "
-            f"<= retired {item.rev!r})"
+            f"(rev {deferred_item.rev!r} <= retired {item.rev!r})"
         )
+    # newer is True OR None (incomparable) → promote to inbox (fail-safe).
     inbox_name = deferred_item.filename
     dest = watch_abs / inbox_name
     if dest.exists():
@@ -466,14 +555,38 @@ def admit_strict(
                 fs=fs,
             ),
         )
+    # Envelope parse/validate: ANY failure quarantines to .rejected/ (I2 — never
+    # leave a hostile file wedging every subsequent drain via uncaught RecursionError).
     try:
         raw = candidate.read_bytes()
         text = raw.decode("utf-8")
+        body = json.loads(text)
     except UnicodeDecodeError:
         return AdmitResult(
             "reject",
             diagnostic=_reject_candidate(
                 watch_abs, candidate, reason="not UTF-8", fs=fs
+            ),
+        )
+    except json.JSONDecodeError:
+        return AdmitResult(
+            "reject",
+            diagnostic=_reject_candidate(
+                watch_abs, candidate, reason="not JSON", fs=fs
+            ),
+        )
+    except RecursionError:
+        return AdmitResult(
+            "reject",
+            diagnostic=_reject_candidate(
+                watch_abs, candidate, reason="JSON too deeply nested (RecursionError)", fs=fs
+            ),
+        )
+    except ValueError as exc:
+        return AdmitResult(
+            "reject",
+            diagnostic=_reject_candidate(
+                watch_abs, candidate, reason=f"JSON/value error: {exc}", fs=fs
             ),
         )
     except OSError as exc:
@@ -483,13 +596,11 @@ def admit_strict(
                 watch_abs, candidate, reason=f"read failed: {exc}", fs=fs
             ),
         )
-    try:
-        body = json.loads(text)
-    except json.JSONDecodeError:
+    except Exception as exc:  # noqa: BLE001 — envelope boundary: quarantine anything
         return AdmitResult(
             "reject",
             diagnostic=_reject_candidate(
-                watch_abs, candidate, reason="not JSON", fs=fs
+                watch_abs, candidate, reason=f"parse/validation failed: {type(exc).__name__}: {exc}", fs=fs
             ),
         )
     if not isinstance(body, dict):
@@ -519,9 +630,9 @@ def admit_strict(
             ),
         )
 
-    # --- tombstone dedupe: rev ≤ any tombstoned rev → already delivered ---
-    tomb_rev = highest_tombstoned_rev(watch_abs, item.identity)
-    if tomb_rev is not None and item.rev <= tomb_rev:
+    # --- tombstone dedupe: only skip when confidently ≤ a tombstone (fail-safe) ---
+    covering = tombstone_covers(watch_abs, item.identity, item.rev)
+    if covering is not None:
         try:
             durable_unlink(candidate, fs=fs)
         except FileNotFoundError:
@@ -530,7 +641,7 @@ def admit_strict(
             "skip",
             item=item,
             diagnostic=(
-                f"dedupe skip {name}: rev {item.rev!r} <= tombstoned {tomb_rev!r}"
+                f"dedupe skip {name}: rev {item.rev!r} <= tombstoned {covering!r}"
             ),
         )
 
@@ -549,17 +660,19 @@ def release_identity_on_terminal(
     *,
     fs: Any = None,
 ) -> list[str]:
-    """On terminal retire: release reservation + promote/drop deferred (T1).
+    """On terminal retire: promote/drop deferred FIRST, then release reservation (T1).
 
-    No-op when ``item_name`` does not parse as a strict identity filename (so
-    identity:off retires of arbitrary names stay byte-identical). Returns
-    diagnostics from promote/drop.
+    Order is load-bearing (C2): promote while the reservation still covers the
+    identity ("transfer ownership, then release") so a concurrent drain cannot
+    re-admit between free and promote. No-op when ``item_name`` does not parse
+    as a strict identity filename. Returns diagnostics from promote/drop.
     """
     item = parse_item_name(item_name)
     if item is None:
         return []
-    release_reservation(watch_abs, item.identity, fs=fs)
+    # Promote (or drop) under the still-held reservation, THEN release.
     diag = promote_deferred(watch_abs, item, fs=fs)
+    release_reservation(watch_abs, item.identity, fs=fs)
     return [diag] if diag else []
 
 

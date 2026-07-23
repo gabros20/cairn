@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import textwrap
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,13 +22,18 @@ from cairn.kernel.queue_drain import run_trigger
 from cairn.kernel.queue_ledger import (
     DEFAULT_MAX_ITEM_BYTES,
     NAME_MAX,
+    RESERVATION_GRACE_S,
     ItemId,
     admit_strict,
     claim,
     parse_item_name,
+    promote_deferred,
+    release_identity_on_terminal,
     release_orphan_reservations,
+    release_reservation,
     reservation_path,
     retire,
+    rev_order,
     scan_candidates,
 )
 from cairn.kernel.trigger_host import load_triggers
@@ -495,20 +501,78 @@ def test_deferred_latest_rev_wins_when_parking(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
-# Orphan reservation released by later drain
+# Orphan reservation — grace period (C1)
 # --------------------------------------------------------------------------- #
 
 
-def test_orphan_reservation_released_by_later_drain(tmp_path, monkeypatch):
+def _age_reservation(path: Path, *, age_s: float, now_ts: float) -> None:
+    """Set reservation mtime to now_ts - age_s (deterministic; no sleep)."""
+    mtime = now_ts - age_s
+    os.utime(path, (mtime, mtime))
+
+
+def test_orphan_fresh_reservation_not_released(tmp_path):
+    """C1: mtime = now, no live item → still within grace → NOT released."""
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    ids = watch / ".claim" / ".ids"
+    ids.mkdir(parents=True)
+    res = ids / "github-fresh"
+    res.write_text("", encoding="utf-8")
+    now_ts = NOW.timestamp()
+    _age_reservation(res, age_s=0.0, now_ts=now_ts)
+
+    diags = release_orphan_reservations(watch, now=now_ts)
+    assert diags == []
+    assert res.is_file()
+
+
+def test_orphan_aged_reservation_released(tmp_path):
+    """C1: mtime older than grace, no live item → released."""
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    ids = watch / ".claim" / ".ids"
+    ids.mkdir(parents=True)
+    res = ids / "github-aged"
+    res.write_text("", encoding="utf-8")
+    now_ts = NOW.timestamp()
+    _age_reservation(res, age_s=RESERVATION_GRACE_S + 1.0, now_ts=now_ts)
+
+    diags = release_orphan_reservations(watch, now=now_ts)
+    assert any("github-aged" in d for d in diags)
+    assert not res.exists()
+
+
+def test_orphan_live_item_never_released_even_if_aged(tmp_path):
+    """C1: reserve-then-claim in progress (item in .claim/) — never released."""
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    a = _drop(watch, 1, "github", "1", "1")
+    assert admit_strict(watch, a).disposition == "admit"
+    claim(watch, a)
+    res = reservation_path(watch, "github-1")
+    assert res.is_file()
+    now_ts = NOW.timestamp()
+    _age_reservation(res, age_s=RESERVATION_GRACE_S + 100.0, now_ts=now_ts)
+
+    diags = release_orphan_reservations(watch, now=now_ts)
+    assert diags == []
+    assert res.is_file()
+
+
+def test_orphan_reservation_released_by_later_drain_when_aged(tmp_path, monkeypatch):
     ws = _strict_ws(tmp_path)
     _stub_mint(monkeypatch, ws)
     watch = ws / "inbox" / "replies"
     watch.mkdir(parents=True)
 
-    # Simulate crash after reserve, before claim: reservation present, no live item.
+    # Crash after reserve, before claim: aged reservation, no live item.
     ids = watch / ".claim" / ".ids"
     ids.mkdir(parents=True)
-    (ids / "github-99").write_text("", encoding="utf-8")
+    res = ids / "github-99"
+    res.write_text("", encoding="utf-8")
+    now_ts = NOW.timestamp()
+    _age_reservation(res, age_s=RESERVATION_GRACE_S + 5.0, now_ts=now_ts)
 
     err = io.StringIO()
     code = run_trigger(
@@ -520,7 +584,7 @@ def test_orphan_reservation_released_by_later_drain(tmp_path, monkeypatch):
         err=err,
     )
     assert code == 0
-    assert not (ids / "github-99").exists()
+    assert not res.exists()
     assert "orphan reservation github-99" in err.getvalue()
 
 
@@ -530,9 +594,12 @@ def test_release_orphan_reservations_keeps_live(tmp_path):
     a = _drop(watch, 1, "github", "1", "1")
     assert admit_strict(watch, a).disposition == "admit"
     claim(watch, a)
-    # Seed a true orphan alongside.
-    (watch / ".claim" / ".ids" / "github-orphan").write_text("", encoding="utf-8")
-    diags = release_orphan_reservations(watch)
+    # Seed a true aged orphan alongside.
+    orphan = watch / ".claim" / ".ids" / "github-orphan"
+    orphan.write_text("", encoding="utf-8")
+    now_ts = NOW.timestamp()
+    _age_reservation(orphan, age_s=RESERVATION_GRACE_S + 1.0, now_ts=now_ts)
+    diags = release_orphan_reservations(watch, now=now_ts)
     assert any("github-orphan" in d for d in diags)
     assert reservation_path(watch, "github-1").is_file()  # still live
     assert not reservation_path(watch, "github-orphan").exists()
@@ -670,3 +737,170 @@ def test_scan_candidates_excludes_rejected_and_deferred(tmp_path):
 
 def test_default_max_item_bytes_is_1mib():
     assert DEFAULT_MAX_ITEM_BYTES == 1_048_576
+
+
+# --------------------------------------------------------------------------- #
+# C2 — promote before release (no double-admit window)
+# --------------------------------------------------------------------------- #
+
+
+def test_promote_before_release_deferred_lands_reservation_gone(tmp_path):
+    """Terminal retire: deferred newer rev is in inbox AND reservation released."""
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    a = _drop(watch, 1, "github", "42", "10")
+    assert admit_strict(watch, a).disposition == "admit"
+    claimed = claim(watch, a)
+    assert claimed is not None
+    b = _drop(watch, 1, "github", "42", "20")
+    assert admit_strict(watch, b).disposition == "defer"
+
+    retire(watch, claimed, outcome=_done(), on_done="done", exit_code=0)
+    assert (watch / "p1-github-42-r20.json").is_file()
+    assert not reservation_path(watch, "github-42").exists()
+    assert not (watch / ".deferred" / "github-42").exists()
+
+
+def test_promote_while_reservation_held_blocks_concurrent_admit(tmp_path):
+    """C2: between promote and release the reservation still covers the identity.
+
+    Simulates the load-bearing order without sleeps: promote first (reservation
+    still held) → concurrent admit of another rev must DEFER; only after release
+    can a fresh admit succeed. Proves no double-admit interleaving window.
+    """
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    a = _drop(watch, 1, "github", "42", "10")
+    assert admit_strict(watch, a).disposition == "admit"
+    claimed = claim(watch, a)
+    assert claimed is not None
+    # Park newer deferred while live.
+    b = _drop(watch, 1, "github", "42", "20")
+    assert admit_strict(watch, b).disposition == "defer"
+    item = parse_item_name(claimed.name)
+    assert item is not None
+
+    # Step 1 only: promote under held reservation (plan T1 transfer).
+    diag = promote_deferred(watch, item)
+    assert diag is not None and "promoted" in diag
+    assert (watch / "p1-github-42-r20.json").is_file()
+    assert reservation_path(watch, "github-42").is_file()  # STILL held
+
+    # Concurrent admit of yet another rev while reservation held → defer, not admit.
+    c = _drop(watch, 1, "github", "42", "30")
+    r = admit_strict(watch, c)
+    assert r.disposition == "defer"
+    assert reservation_path(watch, "github-42").is_file()
+
+    # Step 2: release — only now is the identity free.
+    release_reservation(watch, "github-42")
+    assert not reservation_path(watch, "github-42").exists()
+
+    # Promoted inbox item can now reserve (single admission path).
+    promoted = watch / "p1-github-42-r20.json"
+    r2 = admit_strict(watch, promoted)
+    assert r2.disposition == "admit"
+    assert reservation_path(watch, "github-42").is_file()
+
+
+def test_release_identity_on_terminal_orders_promote_then_release(tmp_path):
+    """release_identity_on_terminal promotes first then drops reservation."""
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    a = _drop(watch, 1, "github", "7", "1")
+    assert admit_strict(watch, a).disposition == "admit"
+    claimed = claim(watch, a)
+    _drop(watch, 1, "github", "7", "2")
+    assert admit_strict(watch, watch / "p1-github-7-r2.json").disposition == "defer"
+
+    diags = release_identity_on_terminal(watch, claimed.name)
+    assert any("promoted" in d for d in diags)
+    assert (watch / "p1-github-7-r2.json").is_file()
+    assert not reservation_path(watch, "github-7").exists()
+
+
+# --------------------------------------------------------------------------- #
+# I1 — numeric fail-safe rev compare
+# --------------------------------------------------------------------------- #
+
+
+def test_rev_order_numeric_10_gt_9():
+    assert rev_order("10", "9") == 1
+    assert rev_order("9", "10") == -1
+    assert rev_order("10", "10") == 0
+
+
+def test_rev_order_non_numeric_incomparable():
+    assert rev_order("a1", "b2") is None
+    assert rev_order("10", "a1") is None
+    assert rev_order("a1", "10") is None
+
+
+def test_tombstone_numeric_rev10_admits_after_rev9(tmp_path):
+    """I1: rev 10 is newer than tombstoned 9 — admits (lexical would wrongly skip)."""
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    a = _drop(watch, 1, "github", "42", "9")
+    assert admit_strict(watch, a).disposition == "admit"
+    claimed = claim(watch, a)
+    retire(watch, claimed, outcome=_done(), on_done="done", exit_code=0)
+    assert (watch / ".done" / "tombstones" / "github-42-r9").is_file()
+
+    b = _drop(watch, 1, "github", "42", "10")
+    r = admit_strict(watch, b)
+    assert r.disposition == "admit"
+    assert b.is_file() or reservation_path(watch, "github-42").is_file()
+
+
+def test_tombstone_non_numeric_rev_fails_safe_admits(tmp_path):
+    """I1: non-numeric rev pair cannot be ordered → admit (never skip/delete)."""
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    a = _drop(watch, 1, "github", "42", "a1")
+    assert admit_strict(watch, a).disposition == "admit"
+    claimed = claim(watch, a)
+    retire(watch, claimed, outcome=_done(), on_done="done", exit_code=0)
+
+    b = _drop(watch, 1, "github", "42", "b2")
+    r = admit_strict(watch, b)
+    assert r.disposition == "admit"  # fail-safe: not skipped
+
+
+def test_deferred_numeric_10_wins_over_9(tmp_path):
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    a = _drop(watch, 1, "github", "42", "1")
+    assert admit_strict(watch, a).disposition == "admit"
+    claim(watch, a)
+
+    _drop(watch, 1, "github", "42", "9")
+    assert admit_strict(watch, watch / "p1-github-42-r9.json").disposition == "defer"
+    _drop(watch, 1, "github", "42", "10")
+    assert admit_strict(watch, watch / "p1-github-42-r10.json").disposition == "defer"
+    deferred = json.loads((watch / ".deferred" / "github-42").read_text(encoding="utf-8"))
+    assert deferred["rev"] == "10"  # numeric win, not lexical "9" > "10"
+
+
+# --------------------------------------------------------------------------- #
+# I2 — hostile deeply-nested JSON quarantined
+# --------------------------------------------------------------------------- #
+
+
+def test_deeply_nested_json_quarantined_to_rejected(tmp_path):
+    """I2: RecursionError from nested JSON → .rejected/, not left to re-hazard."""
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    # Deep nesting under the byte cap; exceeds Python's default recursion (~1000).
+    depth = 2000
+    payload = "[" * depth + "]" * depth
+    assert len(payload) < DEFAULT_MAX_ITEM_BYTES
+    cand = watch / "p1-github-1-r1.json"
+    cand.write_text(payload, encoding="utf-8")
+
+    r = admit_strict(watch, cand)
+    assert r.disposition == "reject"
+    assert not cand.exists()
+    assert (watch / ".rejected" / "p1-github-1-r1.json").is_file()
+    assert "nested" in (r.diagnostic or "").lower() or "RecursionError" in (
+        r.diagnostic or ""
+    )

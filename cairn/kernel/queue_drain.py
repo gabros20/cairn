@@ -677,9 +677,10 @@ def run_trigger(
             print(f"cairn: trigger {name!r}: sweep: {line}", file=diag)
 
     # T1: release orphan reservations (reserve-without-claim crash window) before
-    # new admits. Only meaningful for identity:strict; cheap no-op otherwise.
+    # new admits. Grace-gated (RESERVATION_GRACE_S) so a concurrent drain cannot
+    # free a live reserve→claim gap. Cheap no-op when no .ids/ present.
     try:
-        for line in release_orphan_reservations(watch_abs):
+        for line in release_orphan_reservations(watch_abs, now=now.timestamp()):
             print(f"cairn: trigger {name!r}: {line}", file=diag)
     except Exception as exc:  # noqa: BLE001 — never abort the drain
         print(
