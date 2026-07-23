@@ -172,19 +172,22 @@ def test_boot_id_via_injected_runner():
 
 
 def test_child_is_dead_different_boot_id():
-    lease = {"child_pid": 99999, "boot_id": "boot-A"}
+    lease = {"child_pid": 99999, "drain_pid": 1, "boot_id": "boot-A"}
     assert child_is_dead(lease, current_boot_id="boot-B", kill=_alive_kill) is True
 
 
 def test_child_is_dead_same_boot_consults_pid():
-    lease = {"child_pid": 42, "boot_id": "boot-A"}
+    lease = {"child_pid": 42, "drain_pid": 1, "boot_id": "boot-A"}
     assert child_is_dead(lease, current_boot_id="boot-A", kill=_alive_kill) is False
     assert child_is_dead(lease, current_boot_id="boot-A", kill=_dead_kill) is True
 
 
-def test_child_is_dead_missing_child_pid():
-    lease = {"child_pid": None, "boot_id": "boot-A"}
-    assert child_is_dead(lease, current_boot_id="boot-A") is True
+def test_child_is_dead_none_child_uses_drain_pid():
+    """C1: child_pid=None is the claim→spawn window — consult drain_pid, not 'dead'."""
+    live_drain = {"child_pid": None, "drain_pid": 42, "boot_id": "boot-A"}
+    assert child_is_dead(live_drain, current_boot_id="boot-A", kill=_alive_kill) is False
+    dead_drain = {"child_pid": None, "drain_pid": 42, "boot_id": "boot-A"}
+    assert child_is_dead(dead_drain, current_boot_id="boot-A", kill=_dead_kill) is True
 
 
 # --------------------------------------------------------------------------- #
@@ -402,6 +405,91 @@ def test_missing_lease_under_lease_enabled_stuck_not_reaped(tmp_path):
     assert not flagged
     assert (watch / ".claim" / "nolease.json").is_file()
     assert any("missing lease" in d for d in diags)
+
+
+def test_reap_expired_none_child_live_drain_not_reaped(tmp_path):
+    """C1 race: expired lease, child_pid=None, LIVE drain_pid → flag, never reap.
+
+    Models a concurrent reconcile sweep during the claim→spawn window while the
+    original drain is still minting. Must leave the claim (and any reservation)
+    intact so the live drain can finish spawn.
+    """
+    watch = _watch(tmp_path)
+    item = watch / "p1-github-99-r1.json"
+    item.write_text(
+        json.dumps({"source": "github", "id": "99", "rev": "1", "prio": 1}),
+        encoding="utf-8",
+    )
+    claimed = claim(watch, item)
+    assert claimed is not None
+    assert reserve_identity(watch, "github-99")
+    live_drain = os.getpid()  # known-live
+    write_lease(
+        watch,
+        claimed.name,
+        drain_pid=live_drain,
+        child_pid=None,  # not yet spawned
+        boot_id="boot-1",
+        claimed_at=NOW_TS - 120,
+        ttl_s=60,
+    )
+    def kill_only_live_drain(pid: int, sig: int) -> None:
+        if pid == live_drain:
+            return  # alive
+        raise ProcessLookupError(errno.ESRCH, "No such process")
+
+    reaped, flagged, diags = reap_expired_leases(
+        watch,
+        on_done="done",
+        now=NOW_TS,
+        current_boot_id="boot-1",
+        kill=kill_only_live_drain,
+    )
+    assert not reaped
+    assert any(p.name == claimed.name for p in flagged)
+    assert (watch / ".claim" / claimed.name).is_file()
+    assert (watch / ".claim" / ".ids" / "github-99").is_file()  # reservation retained
+    assert any("claim→spawn" in d or "not yet spawned" in d for d in diags)
+
+
+def test_reap_expired_none_child_dead_drain_to_inbox(tmp_path):
+    """C1 legitimate orphan: child_pid=None + DEAD drain_pid → reap to inbox.
+
+    Drain crashed between claim and spawn — no validated run.json, release
+    reservation, return item to inbox (T4 redelivery).
+    """
+    watch = _watch(tmp_path)
+    item = watch / "p1-github-88-r1.json"
+    item.write_text(
+        json.dumps({"source": "github", "id": "88", "rev": "1", "prio": 1}),
+        encoding="utf-8",
+    )
+    claimed = claim(watch, item)
+    assert claimed is not None
+    assert reserve_identity(watch, "github-88")
+    dead_drain = 999_999_999  # known-dead via kill seam
+    write_lease(
+        watch,
+        claimed.name,
+        drain_pid=dead_drain,
+        child_pid=None,
+        boot_id="boot-1",
+        claimed_at=NOW_TS - 120,
+        ttl_s=60,
+    )
+    reaped, flagged, diags = reap_expired_leases(
+        watch,
+        on_done="done",
+        now=NOW_TS,
+        current_boot_id="boot-1",
+        kill=_dead_kill,
+    )
+    assert any(p.name == claimed.name for p in reaped)
+    assert not flagged
+    assert (watch / claimed.name).is_file()  # back in inbox
+    assert not (watch / ".claim" / claimed.name).exists()
+    assert not (watch / ".claim" / ".ids" / "github-88").exists()  # reservation released
+    assert any("inbox" in d for d in diags)
 
 
 def test_sweep_passes_lease_ttl_and_reaps(tmp_path):

@@ -881,6 +881,13 @@ def reconcile_workspace(
 
     Contention on the workspace reconcile lock → ``already_running=True``
     (caller exits 0). Real hazards set ``hazarded=True`` (nonzero exit).
+
+    **Concurrency (I1 / T13 r1):** the flock serializes reconcile-vs-reconcile
+    only. Drain-vs-reconcile sweep overlap is accepted and safe by construction
+    (T6 lost-race ledger moves; C1 drain_pid liveness so a live claim→spawn
+    window is never reaped; reaped runs park in ``.waiting/`` and resume under
+    T6's nonblocking run-lock — no double-drive). No cross-process admission
+    lock is added (D-doctrine).
     """
     workspace_dir = Path(workspace_dir)
     diag = err if err is not None else sys.stderr

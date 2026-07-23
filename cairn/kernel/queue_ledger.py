@@ -285,11 +285,25 @@ def child_is_dead(
     current_boot_id: str,
     kill: Callable[[int, int], None] | None = None,
 ) -> bool:
-    """Whether the lease's child is definitionally dead for reap purposes.
+    """Whether a claim is reapable (holder dead) for lease-reap purposes (T13 C1).
 
-    A different ``boot_id`` means the machine rebooted → pid is dead regardless
-    of ``pid_alive``. Same boot (or unknown) → consult :func:`pid_alive`.
-    Missing/None ``child_pid`` → dead (never spawned or pre-spawn crash).
+    Uses the full lease (``drain_pid`` + ``child_pid`` + ``boot_id``), not just
+    the child. ``child_pid is None`` is the entire claim→spawn window
+    (write_lease → mint → pointer → spawn → update_lease_child_pid), not only
+    "never spawned" — a concurrent sweep must not reap a live drain mid-mint.
+
+    Four-case table (same boot; different ``boot_id`` → always dead):
+
+    1. ``child_pid`` PRESENT + alive → live run → **not dead** (flag, never reap)
+    2. ``child_pid`` PRESENT + dead → orphan child → **dead** (reap via T4)
+    3. ``child_pid`` None + ``drain_pid`` ALIVE → drain still minting/about to
+       spawn → **not dead** (flag — same path as "child ALIVE")
+    4. ``child_pid`` None + ``drain_pid`` DEAD → drain crashed pre-spawn →
+       **dead** (reap → inbox, no validated run)
+
+    When ``boot_id`` is :data:`BOOT_ID_UNKNOWN` on either side, reboot detection
+    is skipped and we fall through to ``pid_alive`` (fails safe — M1: weaker
+    coverage, never forces a false reap on boot mismatch alone).
     """
     lease_boot = str(lease.get("boot_id") or "")
     if (
@@ -298,15 +312,31 @@ def child_is_dead(
         and current_boot_id != BOOT_ID_UNKNOWN
         and lease_boot != current_boot_id
     ):
-        return True
+        return True  # machine rebooted → every pid from the old boot is dead
+
     child = lease.get("child_pid")
-    if child is None:
-        return True
+    if child is not None:
+        try:
+            child_i = int(child)
+        except (TypeError, ValueError):
+            child_i = None
+        if child_i is not None and child_i > 0:
+            # Cases 1–2: child was spawned — its liveness decides.
+            return not pid_alive(child_i, kill=kill)
+        # Unparseable / non-positive child_pid: fall through to drain_pid.
+
+    # Cases 3–4: not yet spawned (or spawn record corrupt). Drain process is
+    # the liveness signal for the claim→spawn window.
+    drain = lease.get("drain_pid")
     try:
-        child_i = int(child)
+        drain_i = int(drain) if drain is not None else None
     except (TypeError, ValueError):
+        drain_i = None
+    if drain_i is None or drain_i <= 0:
+        # No drain to consult — treat as dead (malformed lease / crash before
+        # drain_pid was recorded, which cannot happen on the write_lease path).
         return True
-    return not pid_alive(child_i, kill=kill)
+    return not pid_alive(drain_i, kill=kill)
 
 
 def _validated_run_dir(run_dir: Path | str | None) -> Path | None:
@@ -333,14 +363,25 @@ def reap_expired_leases(
     """Reap expired+dead claims under ``.claim/`` (lease-enabled watch dirs only).
 
     Caller only invokes this when the trigger has leases enabled. Decision table
-    (FACTORY-PLAN T4 + T13):
+    (FACTORY-PLAN T4 + T13 r1 — uses full lease liveness, not child_pid alone):
 
     - missing lease under lease-enabled → stuck (surface, never auto-reap)
     - not expired → leave
-    - expired + child ALIVE (same boot) → FLAG only (never kill, never reap)
-    - expired + child DEAD (or different boot_id) → reap:
-        - validated ``run.json`` → move to ``.waiting/`` for resume
+    - expired + holder ALIVE (see :func:`child_is_dead` 4-case table) → FLAG only
+      (never kill, never reap). Includes: child alive; **and** child_pid=None
+      with live drain_pid (claim→spawn window — C1).
+    - expired + holder DEAD (child dead, or child_pid=None with dead drain_pid,
+      or different boot_id) → reap:
+        - validated ``run.json`` → move to ``.waiting/`` for resume as
+          needs_human/exit-6 (intentional conservative class — M2: liveness was
+          uncertain, so force human/resume review rather than auto-drive)
         - no validated run → unclaim back to inbox (never ran)
+
+    Per-claim cost is one lease-file read + up to two ``pid_alive`` probes (M3);
+    bounded by live WIP depth, acceptable at factory scale.
+
+    When ``current_boot_id`` (or the process cache) is :data:`BOOT_ID_UNKNOWN`,
+    reboot detection is skipped (M1 — fails safe, weaker coverage).
 
     Returns ``(reaped_paths, flagged_live_paths, diagnostics)``.
     """
@@ -354,6 +395,13 @@ def reap_expired_leases(
     claim_dir = watch_abs / ".claim"
     if not claim_dir.is_dir():
         return reaped, flagged, diagnostics
+
+    if cur_boot == BOOT_ID_UNKNOWN:
+        # M1: surface silent degradation once per pass (not per claim).
+        diagnostics.append(
+            "boot_id unresolved (unknown) — pid-reuse-across-reboot detection "
+            "disabled; reap falls back to pid_alive only"
+        )
 
     for item in sorted(p for p in claim_dir.iterdir() if p.is_file()):
         name = item.name
@@ -380,9 +428,19 @@ def reap_expired_leases(
 
         if not child_is_dead(lease, current_boot_id=cur_boot, kill=kill):
             flagged.append(item)
+            child = lease.get("child_pid")
+            drain = lease.get("drain_pid")
+            if child is None:
+                reason = (
+                    f"child not yet spawned and drain pid {drain} still alive "
+                    f"(claim→spawn window) — flagged, not reaped"
+                )
+            else:
+                reason = (
+                    f"child pid {child} still alive — flagged, not reaped"
+                )
             diagnostics.append(
-                f"claim {name}: lease expired (age={age:.0f}s > ttl={ttl_s}s) but "
-                f"child pid {lease.get('child_pid')} still alive — flagged, not reaped"
+                f"claim {name}: lease expired (age={age:.0f}s > ttl={ttl_s}s) but {reason}"
             )
             continue
 
@@ -406,6 +464,8 @@ def reap_expired_leases(
         try:
             if validated is not None:
                 # Mid-run / parked: move to .waiting for resume (T4).
+                # needs_human/exit-6 is intentional (M2) — force resume/review
+                # rather than guessing capacity/blocked when liveness was lost.
                 dest = retire(
                     watch_abs,
                     item,
@@ -1888,8 +1948,9 @@ def sweep(
 
     Order:
     1. **Lease reap** (only when ``lease_ttl_s`` is not None — lease-enabled
-       triggers): expired+dead claims → T4 resume-or-requeue; expired+alive →
-       flag only; missing lease → stuck surface, never auto-reap.
+       triggers): expired+dead claims → T4 resume-or-requeue; expired+alive
+       (including claim→spawn window: child_pid=None + live drain_pid) → flag
+       only; missing lease → stuck surface, never auto-reap.
     2. **Pointer repair** across lanes (T5 crash between pointer move and item).
     3. **Waiting advance** from trail evidence (T6).
     4. **Stranded deferred mop** (T12 residual): free-identity ``.deferred/``
@@ -1898,6 +1959,14 @@ def sweep(
     For each waiting item: read its pointer and the run's trail; route by the last
     terminal event — ``run-done`` → retire DONE; failure-class ``run-halt`` → FAILED;
     waiting-class halt → leave. Vanished run dir → FAILED + diagnostic naming gc.
+
+    **Drain-vs-reconcile concurrency (I1 / T13 r1):** reconcile's flock serializes
+    reconcile-vs-reconcile only. A drain's ``sweep`` and a concurrent
+    ``reconcile_workspace`` may both sweep the same watch dir. That overlap is
+    accepted and safe by construction: T6 lost-race discipline covers ledger
+    moves; C1 drain_pid liveness closes the live-reap window; reaped mid-run
+    items go to ``.waiting/`` and resume under T6's nonblocking run-lock (no
+    double-drive). No cross-process admission lock is added (D-doctrine).
 
     ``now`` / ``current_boot_id`` / ``kill`` are injectable seams for tests (do not
     monkeypatch ``os.kill`` or ``time.time`` globally).
