@@ -16,7 +16,9 @@ import fnmatch
 import json
 import os
 import re
+import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -42,6 +44,7 @@ _TOMBSTONE_SUBDIR = "tombstones"
 _IDS_SUBDIR = ".ids"
 _DEFERRED_SUBDIR = ".deferred"
 _REJECTED_SUBDIR = ".rejected"
+_LEASES_SUBDIR = ".leases"
 
 # POSIX NAME_MAX floor; identity + every ledger-derived name must fit (FACTORY-PLAN T1).
 NAME_MAX = 255
@@ -53,6 +56,495 @@ DEFAULT_MAX_ITEM_BYTES = 1_048_576  # 1 MiB
 # gap from a concurrent drain's orphan sweeper. Over-holding is safe; only release
 # a reservation with no live item AND mtime older than this window.
 RESERVATION_GRACE_S = 60.0
+
+# Claim leases (FACTORY-PLAN W3 / T13): default ttl when leases auto-enable
+# (concurrency > 1). Serial default-concurrency triggers stay stuck-forever (D7)
+# unless ``lease:`` is set explicitly.
+DEFAULT_LEASE_TTL_S = 3600  # 60m
+
+# Sentinel for Trigger.lease_ttl_s when the key is absent (default policy).
+LEASE_TTL_DEFAULT = -1
+# Explicit ``lease: off``.
+LEASE_TTL_OFF = 0
+
+# Process-cached boot identity. ``"unknown"`` disables pid-reuse detection
+# (different-boot reap still works only when a real id is available).
+_BOOT_ID_CACHE: str | None = None
+BOOT_ID_UNKNOWN = "unknown"
+
+
+# --------------------------------------------------------------------------- #
+# Liveness helpers (FACTORY-PLAN W3 / T13)
+# --------------------------------------------------------------------------- #
+
+
+def boot_id(*, runner: Any = None, _reset: bool = False) -> str:
+    """Stable host boot identity for lease liveness (pid-reuse detection).
+
+    Resolution order:
+    1. Linux: ``/proc/sys/kernel/random/boot_id``
+    2. macOS: ``sysctl -n kern.boottime`` (via injected ``runner.run`` or
+       subprocess — never reads credential files)
+    3. Fallback sentinel :data:`BOOT_ID_UNKNOWN` — pid-reuse detection is
+       disabled (same-boot ``pid_alive`` still works; a different-boot
+       comparison against ``"unknown"`` never forces a reap on its own)
+
+    Cached per process. Pass ``_reset=True`` only from tests.
+    """
+    global _BOOT_ID_CACHE
+    if _reset:
+        _BOOT_ID_CACHE = None
+    if _BOOT_ID_CACHE is not None:
+        return _BOOT_ID_CACHE
+
+    # Linux boot id (kernel random uuid, stable for the boot).
+    linux_path = Path("/proc/sys/kernel/random/boot_id")
+    try:
+        if linux_path.is_file():
+            text = linux_path.read_text(encoding="utf-8").strip()
+            if text:
+                _BOOT_ID_CACHE = text
+                return _BOOT_ID_CACHE
+    except OSError:
+        pass
+
+    # macOS / BSD: kern.boottime string is unique per boot. Tried whenever Linux
+    # path is absent (Linux already returned above when the file was readable).
+    try:
+        if runner is not None:
+            result = runner.run(["sysctl", "-n", "kern.boottime"])
+            text = (result.stdout or "").strip()
+            if getattr(result, "returncode", 0) != 0 or not text:
+                text = ""
+        else:
+            completed = subprocess.run(
+                ["sysctl", "-n", "kern.boottime"],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            text = (completed.stdout or "").strip() if completed.returncode == 0 else ""
+        if text:
+            _BOOT_ID_CACHE = text
+            return _BOOT_ID_CACHE
+    except (OSError, AttributeError):
+        pass
+
+    _BOOT_ID_CACHE = BOOT_ID_UNKNOWN
+    return _BOOT_ID_CACHE
+
+
+def pid_alive(
+    pid: int | None,
+    *,
+    kill: Callable[[int, int], None] | None = None,
+) -> bool:
+    """Return whether ``pid`` is a live process.
+
+    Uses ``os.kill(pid, 0)`` (or the injected ``kill`` seam — tests must NOT
+    monkeypatch ``os.kill`` globally). Semantics:
+    - success or EPERM (PermissionError) → alive (process exists, maybe not ours)
+    - ESRCH (ProcessLookupError) → dead
+    - ``pid`` is None or ≤ 0 → False
+    """
+    if pid is None or pid <= 0:
+        return False
+    kill_fn = kill if kill is not None else os.kill
+    try:
+        kill_fn(int(pid), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError as exc:
+        if exc.errno == errno.ESRCH:
+            return False
+        if exc.errno == errno.EPERM:
+            return True
+        raise
+
+
+# --------------------------------------------------------------------------- #
+# Claim leases (FACTORY-PLAN W3 / T13)
+# --------------------------------------------------------------------------- #
+
+
+def lease_dir(watch_abs: Path) -> Path:
+    """``.claim/.leases/`` — per-claim liveness records (dot-dir, out of scan/counts)."""
+    return Path(watch_abs) / ".claim" / _LEASES_SUBDIR
+
+
+def lease_path(watch_abs: Path, item_name: str) -> Path:
+    """Lease file for a claimed work-item basename."""
+    return lease_dir(watch_abs) / item_name
+
+
+def write_lease(
+    watch_abs: Path,
+    item_name: str,
+    *,
+    drain_pid: int,
+    child_pid: int | None,
+    boot_id: str,
+    claimed_at: float,
+    ttl_s: int,
+    fs: Any = None,
+) -> Path:
+    """Durably write ``.claim/.leases/<item_name>`` (JSON object, one line).
+
+    Fields: ``drain_pid``, ``child_pid`` (filled once spawned), ``boot_id``,
+    ``claimed_at`` (unix epoch), ``ttl_s``.
+    """
+    path = lease_path(watch_abs, item_name)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    rec = {
+        "drain_pid": drain_pid,
+        "child_pid": child_pid,
+        "boot_id": boot_id,
+        "claimed_at": float(claimed_at),
+        "ttl_s": int(ttl_s),
+    }
+    atomic_write_text(path, json.dumps(rec, ensure_ascii=False) + "\n", fs=fs)
+    return path
+
+
+def read_lease(path: Path) -> dict[str, Any]:
+    """Parse a lease file; raises ``ValueError`` on missing/corrupt content."""
+    path = Path(path)
+    text = path.read_text(encoding="utf-8").strip()
+    if not text:
+        raise ValueError(f"empty lease {path}")
+    line = text.splitlines()[0]
+    doc = json.loads(line)
+    if not isinstance(doc, dict):
+        raise ValueError(f"lease {path} is not an object")
+    for key in ("drain_pid", "boot_id", "claimed_at", "ttl_s"):
+        if key not in doc:
+            raise ValueError(f"lease {path} missing {key}")
+    return doc
+
+
+def update_lease_child_pid(
+    watch_abs: Path,
+    item_name: str,
+    child_pid: int,
+    *,
+    fs: Any = None,
+) -> None:
+    """Fill ``child_pid`` on an existing lease after spawn (mirrors pointer update)."""
+    path = lease_path(watch_abs, item_name)
+    if not path.is_file():
+        return
+    try:
+        rec = read_lease(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return
+    write_lease(
+        watch_abs,
+        item_name,
+        drain_pid=int(rec["drain_pid"]),
+        child_pid=int(child_pid),
+        boot_id=str(rec["boot_id"]),
+        claimed_at=float(rec["claimed_at"]),
+        ttl_s=int(rec["ttl_s"]),
+        fs=fs,
+    )
+
+
+def clear_lease(watch_abs: Path, item_name: str, *, fs: Any = None) -> None:
+    """Best-effort drop of the lease file (terminal retire / unclaim reap)."""
+    path = lease_path(watch_abs, item_name)
+    try:
+        durable_unlink(path, fs=fs)
+    except FileNotFoundError:
+        pass
+
+
+def effective_lease_ttl(lease_ttl_s: int, concurrency: int) -> int | None:
+    """Resolve trigger lease config → ttl seconds, or None when leases are off.
+
+    - ``LEASE_TTL_OFF`` (0) → disabled (``lease: off``)
+    - positive → explicit ttl (always on)
+    - ``LEASE_TTL_DEFAULT`` (-1) → on with :data:`DEFAULT_LEASE_TTL_S` iff
+      ``concurrency > 1``; serial default stays stuck-forever (D7)
+    """
+    if lease_ttl_s == LEASE_TTL_OFF:
+        return None
+    if lease_ttl_s > 0:
+        return int(lease_ttl_s)
+    # Default policy.
+    if concurrency > 1:
+        return DEFAULT_LEASE_TTL_S
+    return None
+
+
+def child_is_dead(
+    lease: dict[str, Any],
+    *,
+    current_boot_id: str,
+    kill: Callable[[int, int], None] | None = None,
+) -> bool:
+    """Whether the lease's child is definitionally dead for reap purposes.
+
+    A different ``boot_id`` means the machine rebooted → pid is dead regardless
+    of ``pid_alive``. Same boot (or unknown) → consult :func:`pid_alive`.
+    Missing/None ``child_pid`` → dead (never spawned or pre-spawn crash).
+    """
+    lease_boot = str(lease.get("boot_id") or "")
+    if (
+        lease_boot
+        and lease_boot != BOOT_ID_UNKNOWN
+        and current_boot_id != BOOT_ID_UNKNOWN
+        and lease_boot != current_boot_id
+    ):
+        return True
+    child = lease.get("child_pid")
+    if child is None:
+        return True
+    try:
+        child_i = int(child)
+    except (TypeError, ValueError):
+        return True
+    return not pid_alive(child_i, kill=kill)
+
+
+def _validated_run_dir(run_dir: Path | str | None) -> Path | None:
+    """Return ``run_dir`` if it holds a validated ``run.json``, else None."""
+    if not run_dir:
+        return None
+    path = Path(run_dir)
+    try:
+        load_run(path)
+    except (OSError, ValueError, ConfigError, json.JSONDecodeError):
+        return None
+    return path
+
+
+def reap_expired_leases(
+    watch_abs: Path,
+    *,
+    on_done: str,
+    now: float | None = None,
+    current_boot_id: str | None = None,
+    kill: Callable[[int, int], None] | None = None,
+    fs: Any = None,
+) -> tuple[list[Path], list[Path], list[str]]:
+    """Reap expired+dead claims under ``.claim/`` (lease-enabled watch dirs only).
+
+    Caller only invokes this when the trigger has leases enabled. Decision table
+    (FACTORY-PLAN T4 + T13):
+
+    - missing lease under lease-enabled → stuck (surface, never auto-reap)
+    - not expired → leave
+    - expired + child ALIVE (same boot) → FLAG only (never kill, never reap)
+    - expired + child DEAD (or different boot_id) → reap:
+        - validated ``run.json`` → move to ``.waiting/`` for resume
+        - no validated run → unclaim back to inbox (never ran)
+
+    Returns ``(reaped_paths, flagged_live_paths, diagnostics)``.
+    """
+    watch_abs = Path(watch_abs)
+    now_ts = time.time() if now is None else float(now)
+    cur_boot = current_boot_id if current_boot_id is not None else boot_id()
+    reaped: list[Path] = []
+    flagged: list[Path] = []
+    diagnostics: list[str] = []
+
+    claim_dir = watch_abs / ".claim"
+    if not claim_dir.is_dir():
+        return reaped, flagged, diagnostics
+
+    for item in sorted(p for p in claim_dir.iterdir() if p.is_file()):
+        name = item.name
+        lpath = lease_path(watch_abs, name)
+        if not lpath.is_file():
+            diagnostics.append(
+                f"claim {name}: missing lease under lease-enabled trigger — "
+                f"stuck (never auto-reaped)"
+            )
+            continue
+        try:
+            lease = read_lease(lpath)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            diagnostics.append(
+                f"claim {name}: unreadable lease ({exc}) — stuck (never auto-reaped)"
+            )
+            continue
+
+        claimed_at = float(lease["claimed_at"])
+        ttl_s = int(lease["ttl_s"])
+        age = now_ts - claimed_at
+        if age <= ttl_s:
+            continue  # not expired
+
+        if not child_is_dead(lease, current_boot_id=cur_boot, kill=kill):
+            flagged.append(item)
+            diagnostics.append(
+                f"claim {name}: lease expired (age={age:.0f}s > ttl={ttl_s}s) but "
+                f"child pid {lease.get('child_pid')} still alive — flagged, not reaped"
+            )
+            continue
+
+        # Reap: T4 resume-or-requeue.
+        run_dir_s: str | None = None
+        ptr = pointer_path(claim_dir, name)
+        exit_code: int | None = None
+        child_pid_rec: int | None = None
+        if ptr.is_file():
+            try:
+                rec = read_pointer(ptr)
+                run_dir_s = rec.get("run_dir") or None
+                ec = rec.get("exit_code")
+                exit_code = ec if isinstance(ec, int) else None
+                cp = rec.get("child_pid")
+                child_pid_rec = int(cp) if isinstance(cp, int) else None
+            except (OSError, ValueError, json.JSONDecodeError):
+                run_dir_s = None
+
+        validated = _validated_run_dir(run_dir_s)
+        try:
+            if validated is not None:
+                # Mid-run / parked: move to .waiting for resume (T4).
+                dest = retire(
+                    watch_abs,
+                    item,
+                    outcome=RunOutcome(
+                        outcome=OutcomeClass.WAITING, waiting_kind="needs_human"
+                    ),
+                    on_done=on_done,
+                    exit_code=exit_code if exit_code is not None else 6,
+                    child_pid=child_pid_rec,
+                    run_dir=validated,
+                    fs=fs,
+                )
+                clear_lease(watch_abs, name, fs=fs)
+                if dest is not None:
+                    reaped.append(dest)
+                diagnostics.append(
+                    f"reaped claim {name}: expired+dead → .waiting/ for resume "
+                    f"(run.json at {validated})"
+                )
+            else:
+                # Never minted a validated run — return to inbox (T4 redelivery).
+                # Drop claim-side pointer if present (husks must not resume).
+                if ptr.is_file():
+                    try:
+                        durable_unlink(ptr, fs=fs)
+                    except FileNotFoundError:
+                        pass
+                clear_lease(watch_abs, name, fs=fs)
+                dest = unclaim(watch_abs, item, fs=fs)
+                # Free the identity reservation: claim is gone and nothing is in
+                # .waiting/, so holding it would only force the requeued item
+                # through orphan-grace before re-admit (strict identity).
+                parsed = parse_item_name(name)
+                if parsed is not None:
+                    release_reservation(watch_abs, parsed.identity, fs=fs)
+                reaped.append(dest)
+                diagnostics.append(
+                    f"reaped claim {name}: expired+dead → inbox (no validated run.json)"
+                )
+        except Exception as exc:  # noqa: BLE001 — per-item isolation
+            diagnostics.append(f"reap of claim {name} hazarded: {exc}")
+
+    return reaped, flagged, diagnostics
+
+
+def mop_stranded_deferred(watch_abs: Path, *, fs: Any = None) -> list[str]:
+    """Promote ``.deferred/*`` whose identity has no live claim/waiting (T12 residual).
+
+    When an orphan reservation is released (or a claim reaped without terminal
+    retire), a parked newer rev can strand in ``.deferred/`` forever because
+    :func:`promote_deferred` only runs on terminal retire. Reconcile (and sweep)
+    mop that residual: free-identity deferreds move to the inbox; orphan
+    reservations for those identities are released.
+    """
+    watch_abs = Path(watch_abs)
+    deferred = watch_abs / _DEFERRED_SUBDIR
+    if not deferred.is_dir():
+        return []
+    live = _live_identities(watch_abs)
+    diags: list[str] = []
+    for entry in sorted(p for p in deferred.iterdir() if p.is_file()):
+        identity = entry.name
+        if identity in live:
+            continue
+        deferred_item = _read_item_fields(entry)
+        if deferred_item is None:
+            try:
+                durable_unlink(entry, fs=fs)
+            except FileNotFoundError:
+                pass
+            diags.append(f"dropped unreadable stranded deferred {identity}")
+            continue
+        inbox_name = deferred_item.filename
+        dest = watch_abs / inbox_name
+        if dest.exists():
+            diags.append(
+                f"stranded deferred {identity} not promoted: inbox already has {inbox_name}"
+            )
+            continue
+        try:
+            durable_move(entry, dest, fs=fs)
+        except (FileNotFoundError, FileExistsError) as exc:
+            diags.append(f"stranded deferred promote of {identity} failed: {exc}")
+            continue
+        release_reservation(watch_abs, identity, fs=fs)
+        diags.append(
+            f"promoted stranded deferred {identity} rev {deferred_item.rev} → inbox {inbox_name}"
+        )
+    return diags
+
+
+def lease_status(
+    watch_abs: Path,
+    *,
+    now: float | None = None,
+    current_boot_id: str | None = None,
+    kill: Callable[[int, int], None] | None = None,
+) -> dict[str, Any]:
+    """Lease ages + expired-live counts for ``trigger list`` (additive, no reaps)."""
+    watch_abs = Path(watch_abs)
+    now_ts = time.time() if now is None else float(now)
+    cur_boot = current_boot_id if current_boot_id is not None else boot_id()
+    ages: list[float] = []
+    expired_live = 0
+    missing = 0
+    claim_dir = watch_abs / ".claim"
+    if not claim_dir.is_dir():
+        return {
+            "lease_ages_s": ages,
+            "expired_live": 0,
+            "missing_lease": 0,
+            "lease_count": 0,
+        }
+    for item in claim_dir.iterdir():
+        if not item.is_file():
+            continue
+        lpath = lease_path(watch_abs, item.name)
+        if not lpath.is_file():
+            missing += 1
+            continue
+        try:
+            lease = read_lease(lpath)
+        except (OSError, ValueError, json.JSONDecodeError):
+            missing += 1
+            continue
+        age = now_ts - float(lease["claimed_at"])
+        ages.append(age)
+        ttl_s = int(lease["ttl_s"])
+        if age > ttl_s and not child_is_dead(
+            lease, current_boot_id=cur_boot, kill=kill
+        ):
+            expired_live += 1
+    return {
+        "lease_ages_s": ages,
+        "expired_live": expired_live,
+        "missing_lease": missing,
+        "lease_count": len(ages),
+    }
+
 
 # --------------------------------------------------------------------------- #
 # Filename grammar (identity:strict) — FACTORY-PLAN §2 T1
@@ -1021,7 +1513,10 @@ def retire(
             child_pid=child_pid,
             fs=fs,
         )
-        return _place(claim_path, dest_lane, name, fs=fs)
+        placed = _place(claim_path, dest_lane, name, fs=fs)
+        # Lease covers .claim/ only — drop on park (child has exited by construction).
+        clear_lease(watch_abs, name, fs=fs)
+        return placed
 
     if outcome.outcome is OutcomeClass.FAILED:
         dest_lane = watch_abs / ".failed"
@@ -1037,6 +1532,7 @@ def retire(
         )
         placed = _place(claim_path, dest_lane, name, fs=fs)
         _tombstone(watch_abs, name, fs=fs)
+        clear_lease(watch_abs, name, fs=fs)
         # T3 pin-release: terminal ledger placement FIRST, then clear pin.
         if run_dir_s:
             clear_queue_pin(Path(run_dir_s), fs=fs)
@@ -1067,6 +1563,7 @@ def retire(
             except FileNotFoundError:
                 pass
         _tombstone(watch_abs, name, fs=fs)
+        clear_lease(watch_abs, name, fs=fs)
         if run_dir_s:
             clear_queue_pin(Path(run_dir_s), fs=fs)
         release_identity_on_terminal(watch_abs, name, fs=fs)
@@ -1078,6 +1575,7 @@ def retire(
         except FileNotFoundError:
             pass
     _tombstone(watch_abs, name, fs=fs)
+    clear_lease(watch_abs, name, fs=fs)
     # T3 pin-release: terminal ledger placement FIRST, then clear pin.
     if run_dir_s:
         clear_queue_pin(Path(run_dir_s), fs=fs)
@@ -1211,12 +1709,21 @@ def count_by_class(watch_abs: Path, *, glob: str = "*") -> dict[str, int]:
 
 @dataclass(frozen=True)
 class SweepReport:
-    """Outcome of one :func:`sweep` pass over a watch dir's ``.waiting/`` lane."""
+    """Outcome of one :func:`sweep` pass over a watch dir.
+
+    W3/T13 additive fields (default empty so older callers keep working):
+    ``reaped`` (expired+dead claims resumed or requeued), ``flagged_live``
+    (expired but child still alive — never killed), ``promoted_deferred``
+    (T12 stranded-deferred mop diagnostics).
+    """
 
     moved: tuple[Path, ...] = ()
     left: tuple[Path, ...] = ()
     repaired: tuple[Path, ...] = ()
     diagnostics: tuple[str, ...] = ()
+    reaped: tuple[Path, ...] = ()
+    flagged_live: tuple[Path, ...] = ()
+    promoted_deferred: tuple[str, ...] = ()
 
 
 def _ledger_item_locations(watch_abs: Path, name: str) -> list[Path]:
@@ -1367,17 +1874,33 @@ def _repair_pointer_item_pair(
     return None, f"deleted orphan pointer {pointer.name} (no item, no validated run.json)"
 
 
-def sweep(watch_abs: Path, *, on_done: str, fs: Any = None) -> SweepReport:
-    """Advance ``.waiting/`` entries from trail evidence (FACTORY-PLAN T6).
+def sweep(
+    watch_abs: Path,
+    *,
+    on_done: str,
+    fs: Any = None,
+    now: float | None = None,
+    lease_ttl_s: int | None = None,
+    current_boot_id: str | None = None,
+    kill: Callable[[int, int], None] | None = None,
+) -> SweepReport:
+    """Advance ledger health for one watch dir (FACTORY-PLAN T6 + T13).
+
+    Order:
+    1. **Lease reap** (only when ``lease_ttl_s`` is not None — lease-enabled
+       triggers): expired+dead claims → T4 resume-or-requeue; expired+alive →
+       flag only; missing lease → stuck surface, never auto-reap.
+    2. **Pointer repair** across lanes (T5 crash between pointer move and item).
+    3. **Waiting advance** from trail evidence (T6).
+    4. **Stranded deferred mop** (T12 residual): free-identity ``.deferred/``
+       entries promoted to inbox.
 
     For each waiting item: read its pointer and the run's trail; route by the last
     terminal event — ``run-done`` → retire DONE; failure-class ``run-halt`` → FAILED;
     waiting-class halt → leave. Vanished run dir → FAILED + diagnostic naming gc.
 
-    Pointer repair (T5): pointer-without-item completes an interrupted move when the
-    item is found in another lane; corrupt pointers are quarantined; only a well-formed
-    orphan with no validated ``run.json`` is deleted. Item-without-pointer is left as
-    stuck evidence (not guessed).
+    ``now`` / ``current_boot_id`` / ``kill`` are injectable seams for tests (do not
+    monkeypatch ``os.kill`` or ``time.time`` globally).
 
     Per-item isolation: one item's hazard is recorded in ``diagnostics`` and the sweep
     continues (same posture as ``run_trigger``'s per-candidate loop). An uncaught
@@ -1389,6 +1912,26 @@ def sweep(watch_abs: Path, *, on_done: str, fs: Any = None) -> SweepReport:
     left: list[Path] = []
     repaired: list[Path] = []
     diagnostics: list[str] = []
+    reaped: list[Path] = []
+    flagged_live: list[Path] = []
+    promoted: list[str] = []
+
+    # --- W3 lease reap (opt-in; serial default triggers pass lease_ttl_s=None) ---
+    if lease_ttl_s is not None:
+        try:
+            r, f, diags = reap_expired_leases(
+                watch_abs,
+                on_done=on_done,
+                now=now,
+                current_boot_id=current_boot_id,
+                kill=kill,
+                fs=fs,
+            )
+            reaped.extend(r)
+            flagged_live.extend(f)
+            diagnostics.extend(diags)
+        except Exception as exc:  # noqa: BLE001 — never abort the rest of sweep
+            diagnostics.append(f"lease reap hazarded: {exc}")
 
     # --- pointer repair across all lanes (crash between pointer move and item) ---
     for lane in _LANES:
@@ -1499,9 +2042,20 @@ def sweep(watch_abs: Path, *, on_done: str, fs: Any = None) -> SweepReport:
                 if item.is_file():
                     left.append(item)
 
+    # --- T12 residual: promote stranded .deferred/ for free identities ---
+    try:
+        for line in mop_stranded_deferred(watch_abs, fs=fs):
+            promoted.append(line)
+            diagnostics.append(line)
+    except Exception as exc:  # noqa: BLE001 — never abort the sweep report
+        diagnostics.append(f"stranded-deferred mop hazarded: {exc}")
+
     return SweepReport(
         moved=tuple(moved),
         left=tuple(left),
         repaired=tuple(repaired),
         diagnostics=tuple(diagnostics),
+        reaped=tuple(reaped),
+        flagged_live=tuple(flagged_live),
+        promoted_deferred=tuple(promoted),
     )

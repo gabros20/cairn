@@ -18,9 +18,18 @@ from typing import Any, NoReturn
 
 import yaml
 
+from cairn.kernel.config import parse_duration
 from cairn.kernel.errors import ConfigError
 from cairn.kernel.proc import Runner
-from cairn.kernel.queue_ledger import count_by_class, ledger_counts, stuck_claims
+from cairn.kernel.queue_ledger import (
+    LEASE_TTL_DEFAULT,
+    LEASE_TTL_OFF,
+    count_by_class,
+    effective_lease_ttl,
+    ledger_counts,
+    lease_status,
+    stuck_claims,
+)
 from cairn.kernel.types import Finding
 
 TRIGGERS_YAML = "triggers.yaml"
@@ -42,6 +51,8 @@ _TRIGGER_KEYS = frozenset({
     # W3 identity (T1): default off = arbitrary names, no reservation/dedupe/defer
     "identity",
     "max_item_bytes",
+    # W3 liveness (T13): claim leases — default ON only for concurrency>1
+    "lease",
 })
 _ON_DONE_VALUES = frozenset({"done", "delete"})
 _ORDER_VALUES = frozenset({"name", "aged"})
@@ -92,6 +103,9 @@ class Trigger:
           # identity: off           # "off" (default) | "strict" — filename grammar +
           #                         # reservation/dedupe/defer (FACTORY-PLAN T1)
           # max_item_bytes: 1048576 # admission envelope byte cap (strict only; default 1 MiB)
+          # lease: off              # "off" | duration ("60m") — claim liveness (T13).
+          #                         # Default ON (60m) only when concurrency > 1;
+          #                         # serial default stays stuck-forever (D7).
 
     Soft vs hard caps under ``concurrency > 1``: ``waiting_max`` / ``blocked_max`` /
     ``capacity_max`` are soft — up to ``concurrency`` in-flight items may land in
@@ -102,6 +116,9 @@ class Trigger:
 
     ``identity: off`` (default) keeps arbitrary inbox names and no reservation —
     byte-identical to pre-T12. ``identity: strict`` enables the T1 envelope.
+
+    ``lease`` (T13): stored as seconds or the sentinels ``LEASE_TTL_DEFAULT`` /
+    ``LEASE_TTL_OFF``. Resolve with :func:`cairn.kernel.queue_ledger.effective_lease_ttl`.
     """
 
     name: str
@@ -119,6 +136,8 @@ class Trigger:
     inbox_max: int | None = None
     identity: str = "off"  # "off" | "strict"
     max_item_bytes: int | None = None  # None → DEFAULT_MAX_ITEM_BYTES when strict
+    # LEASE_TTL_DEFAULT (-1) = policy; LEASE_TTL_OFF (0) = off; >0 = explicit ttl.
+    lease_ttl_s: int = LEASE_TTL_DEFAULT
 
 
 def _fail(message: str, file: Path) -> NoReturn:
@@ -255,6 +274,8 @@ def _parse_trigger(name: str, entry: Any, workspace_dir: Path, file: Path) -> Tr
             name, "max_item_bytes", entry["max_item_bytes"], file
         )
 
+    lease_ttl_s = _parse_lease(name, entry, file)
+
     return Trigger(
         name=name,
         pipeline=pipeline,
@@ -271,6 +292,55 @@ def _parse_trigger(name: str, entry: Any, workspace_dir: Path, file: Path) -> Tr
         inbox_max=inbox_max,
         identity=identity,
         max_item_bytes=max_item_bytes,
+        lease_ttl_s=lease_ttl_s,
+    )
+
+
+def _parse_lease(name: str, entry: dict[str, Any], file: Path) -> int:
+    """Parse ``lease:`` → ttl seconds or LEASE_TTL_DEFAULT / LEASE_TTL_OFF.
+
+    Accepts ``off`` (and YAML bool ``false``/``False``), a duration string
+    (``60m``, ``1h`` — via :func:`parse_duration`), or a positive int (seconds).
+    Absent key → :data:`LEASE_TTL_DEFAULT` (policy: on only for concurrency>1).
+    """
+    if "lease" not in entry:
+        return LEASE_TTL_DEFAULT
+    raw = entry["lease"]
+    # YAML 1.1: bare `off` → False; bare `on` → True (reject True).
+    if raw is False or raw == "off":
+        return LEASE_TTL_OFF
+    if raw is True or raw == "on":
+        _fail(
+            f"trigger {name!r}: 'lease' must be 'off' or a duration like '60m', "
+            f"got {raw!r} (use an explicit duration to enable leases on a serial trigger)",
+            file,
+        )
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        if raw < 1:
+            _fail(
+                f"trigger {name!r}: 'lease' duration must be a positive number of "
+                f"seconds, got {raw!r}",
+                file,
+            )
+        return raw
+    if isinstance(raw, str):
+        try:
+            seconds = parse_duration(raw)
+        except ValueError as exc:
+            _fail(
+                f"trigger {name!r}: 'lease' must be 'off' or a duration like '60m', "
+                f"got {raw!r} ({exc})",
+                file,
+            )
+        if seconds < 1:
+            _fail(
+                f"trigger {name!r}: 'lease' duration must be positive, got {raw!r}",
+                file,
+            )
+        return seconds
+    _fail(
+        f"trigger {name!r}: 'lease' must be 'off' or a duration like '60m', got {raw!r}",
+        file,
     )
 
 
@@ -666,6 +736,12 @@ class TriggerStatus:
     capacity_max: int | None = None
     wip_max: int | None = None
     inbox_max: int | None = None
+    # W3/T13 lease surface (additive; 0/empty when leases off or no claims).
+    lease_ttl_s: int | None = None  # effective ttl, or None when leases off
+    lease_ages_s: tuple[float, ...] = ()
+    expired_live: int = 0
+    missing_lease: int = 0
+    reaped: int = 0  # filled by reconcile summaries; list leaves 0
 
 
 def sync_triggers(
@@ -924,6 +1000,9 @@ def list_installed_triggers(
         concurrency = 1
         order = "name"
         waiting_max = blocked_max = capacity_max = wip_max = inbox_max = None
+        lease_ttl: int | None = None
+        lease_ages: tuple[float, ...] = ()
+        expired_live = missing_lease = 0
         if trigger is not None:
             watch_abs = watch_dir(trigger, workspace_dir)
             stuck = tuple(stuck_claims(watch_abs))
@@ -944,6 +1023,12 @@ def list_installed_triggers(
             capacity_max = trigger.capacity_max
             wip_max = trigger.wip_max
             inbox_max = trigger.inbox_max
+            lease_ttl = effective_lease_ttl(trigger.lease_ttl_s, trigger.concurrency)
+            if lease_ttl is not None:
+                ls = lease_status(watch_abs)
+                lease_ages = tuple(ls["lease_ages_s"])
+                expired_live = int(ls["expired_live"])
+                missing_lease = int(ls["missing_lease"])
         statuses.append(
             TriggerStatus(
                 name=name,
@@ -965,6 +1050,10 @@ def list_installed_triggers(
                 capacity_max=capacity_max,
                 wip_max=wip_max,
                 inbox_max=inbox_max,
+                lease_ttl_s=lease_ttl,
+                lease_ages_s=lease_ages,
+                expired_live=expired_live,
+                missing_lease=missing_lease,
             )
         )
     return statuses

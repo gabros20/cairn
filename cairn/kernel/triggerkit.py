@@ -17,16 +17,29 @@ the drain's module globals) — the setattr facade is gone (W1a / T5 review).
 
 from __future__ import annotations
 
-from cairn.kernel.queue_drain import run_trigger
+from cairn.kernel.queue_drain import (
+    ReconcileReport,
+    TriggerReconcileSummary,
+    reconcile_workspace,
+    run_trigger,
+)
 from cairn.kernel.queue_ledger import (
+    DEFAULT_LEASE_TTL_S,
+    LEASE_TTL_DEFAULT,
+    LEASE_TTL_OFF,
     SweepReport,
+    boot_id,
     claim,
     count_by_class,
+    effective_lease_ttl,
     ledger_counts,
+    mop_stranded_deferred,
+    pid_alive,
     retire,
     scan_candidates,
     stuck_claims,
     sweep,
+    write_lease,
 )
 from cairn.kernel.trigger_host import (
     Trigger,
@@ -44,14 +57,24 @@ from cairn.kernel.trigger_host import (
 
 # Public surface — explicit re-exports (no star imports).
 __all__ = [
+    "DEFAULT_LEASE_TTL_S",
+    "LEASE_TTL_DEFAULT",
+    "LEASE_TTL_OFF",
+    "ReconcileReport",
     "SweepReport",
     "Trigger",
+    "TriggerReconcileSummary",
     "TriggerStatus",
+    "boot_id",
     "claim",
     "count_by_class",
+    "effective_lease_ttl",
     "ledger_counts",
     "list_installed_triggers",
     "load_triggers",
+    "mop_stranded_deferred",
+    "pid_alive",
+    "reconcile_workspace",
     "remove_trigger",
     "render_trigger_launchd",
     "render_trigger_systemd",
@@ -64,4 +87,5 @@ __all__ = [
     "trigger_launchd_label",
     "trigger_systemd_unit_names",
     "watch_dir",
+    "write_lease",
 ]

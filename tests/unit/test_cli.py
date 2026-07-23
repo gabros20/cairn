@@ -81,6 +81,7 @@ def test_all_expected_subcommands_are_registered():
     assert SUBCOMMANDS == [
         "plan", "run", "resume", "gate", "validate", "trail", "ps", "inbox",
         "doctor", "test", "new", "compose", "batch", "learnings", "gc", "schedule", "trigger",
+        "factory",
     ]
 
 
@@ -1907,6 +1908,11 @@ def test_trigger_sync_list_remove_launchd_roundtrip(hello_ws, monkeypatch, tmp_p
             "capacity_max": None,
             "wip_max": None,
             "inbox_max": None,
+            # W3/T13 lease surface (serial default → leases off).
+            "lease_ttl_s": None,
+            "lease_ages_s": [],
+            "expired_live": 0,
+            "missing_lease": 0,
         }
     ]
 

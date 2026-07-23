@@ -83,6 +83,7 @@ from cairn.kernel.trigger_host import load_triggers, watch_dir
 from cairn.kernel.triggerkit import (
     TriggerStatus,
     list_installed_triggers,
+    reconcile_workspace,
     remove_trigger,
     run_trigger,
     sync_triggers,
@@ -109,6 +110,7 @@ SUBCOMMANDS: list[str] = [
     "gc",
     "schedule",
     "trigger",
+    "factory",
 ]
 
 # --------------------------------------------------------------------------- #
@@ -2123,6 +2125,11 @@ def _trigger_status_json(status: TriggerStatus) -> dict[str, Any]:
         "capacity_max": status.capacity_max,
         "wip_max": status.wip_max,
         "inbox_max": status.inbox_max,
+        # W3/T13 lease surface.
+        "lease_ttl_s": status.lease_ttl_s,
+        "lease_ages_s": list(status.lease_ages_s),
+        "expired_live": status.expired_live,
+        "missing_lease": status.missing_lease,
     }
 
 
@@ -2143,7 +2150,10 @@ def _print_trigger_list(statuses: list[TriggerStatus], backend: str) -> None:
             v is not None
             for v in (s.waiting_max, s.blocked_max, s.capacity_max, s.wip_max, s.inbox_max)
         )
-        if s.declared and (has_depth or has_caps or s.concurrency != 1 or s.order != "name"):
+        has_lease = s.lease_ttl_s is not None or s.lease_ages_s or s.expired_live
+        if s.declared and (
+            has_depth or has_caps or has_lease or s.concurrency != 1 or s.order != "name"
+        ):
             print(
                 f"      waiting={s.waiting} failed={s.failed} done={s.done} "
                 f"stuck={len(s.stuck)}"
@@ -2164,8 +2174,37 @@ def _print_trigger_list(statuses: list[TriggerStatus], backend: str) -> None:
             if s.inbox_max is not None:
                 caps.append(f"inbox_max={s.inbox_max}")
             print(f"      {' '.join(caps)}")
+            if s.lease_ttl_s is not None or s.lease_ages_s or s.expired_live:
+                ages = ",".join(f"{a:.0f}s" for a in s.lease_ages_s) or "-"
+                ttl = s.lease_ttl_s if s.lease_ttl_s is not None else "off"
+                print(
+                    f"      lease_ttl={ttl} ages=[{ages}] "
+                    f"expired_live={s.expired_live} missing_lease={s.missing_lease}"
+                )
         for claim_path in s.stuck:
             print(f"      ! stuck claim (never auto-retried): {claim_path}")
+
+
+def _cmd_factory(args: argparse.Namespace) -> int:
+    """``cairn factory reconcile`` — single-flight all-trigger health pass (T13)."""
+    ws = _workspace(args)
+    if args.action != "reconcile":
+        print(f"cairn: unknown factory action {args.action!r}", file=sys.stderr)
+        return int(ExitCode.CONFIG)
+    try:
+        report = reconcile_workspace(
+            ws,
+            now=_now(),
+            out=sys.stdout,
+            err=sys.stderr,
+        )
+    except ConfigError as exc:
+        return _print_config_error(exc)
+    if report.already_running:
+        return int(ExitCode.OK)
+    if report.hazarded:
+        return 1
+    return int(ExitCode.OK)
 
 
 # --------------------------------------------------------------------------- #
@@ -2342,6 +2381,15 @@ def _build_parser() -> argparse.ArgumentParser:
              "(`run: [trigger, run, <name>, --headless]`, TRIGGERS.md §3) is copy-paste invocable",
     )
     sp.set_defaults(func=_cmd_trigger)
+
+    # factory — host-woken / manual health pass (T13; no daemon — D1)
+    sp = sub.add_parser(
+        "factory",
+        help="factory health verbs (reconcile: sweep all triggers, reap leases, mop deferred)",
+    )
+    sp.add_argument("action", choices=["reconcile"], help="reconcile: single-flight all-trigger sweep")
+    sp.add_argument("--workspace", default=".", help="workspace root (default .)")
+    sp.set_defaults(func=_cmd_factory)
 
     return parser
 

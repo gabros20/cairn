@@ -25,14 +25,19 @@ pool width rather than the process count.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
+import os
 import re
 import sys
 import threading
+import time
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import TextIO
+from typing import Iterator, TextIO
 
 from cairn.kernel.config import load_config
 from cairn.kernel.errors import CairnError, ConfigError
@@ -42,8 +47,10 @@ from cairn.kernel.proc import Runner
 from cairn.kernel.queue_ledger import (
     DEFAULT_MAX_ITEM_BYTES,
     admit_strict,
+    boot_id,
     claim,
     count_by_class,
+    effective_lease_ttl,
     pointer_path,
     read_pointer,
     release_orphan_reservations,
@@ -51,6 +58,8 @@ from cairn.kernel.queue_ledger import (
     scan_candidates,
     sweep,
     unclaim,
+    update_lease_child_pid,
+    write_lease,
     write_pointer,
 )
 from cairn.kernel.runctl import Minted, Refusal, mint_new
@@ -194,6 +203,12 @@ def _run_one(
             write_pointer(ptr, run_dir=run_dir, child_pid=pid)
     else:
         write_pointer(ptr, run_dir=run_dir, child_pid=pid)
+    # Lease child_pid update (T13) — same moment as pointer; no-op if no lease.
+    watch_abs = claimed_path.parent.parent  # .../<watch>/.claim/<name>
+    try:
+        update_lease_child_pid(watch_abs, claimed_path.name, pid)
+    except Exception:  # noqa: BLE001 — best-effort; pointer already holds pid
+        pass
     result = handle.wait()
     if out is not None and result.stdout:
         out.write(result.stdout)
@@ -370,10 +385,18 @@ def _claim_one(
     watch_abs: Path,
     candidate: Path,
     diag: TextIO,
+    lease_ttl_s: int | None = None,
+    claimed_at: float | None = None,
+    current_boot_id: str | None = None,
 ) -> tuple[Path | None, bool]:
     """Attempt claim. Returns ``(claimed_or_None, claim_hazarded)``.
 
     ``claimed is None`` and not hazarded = lost race (benign skip).
+
+    When ``lease_ttl_s`` is set (lease-enabled trigger), write the claim lease
+    immediately after a successful claim (child_pid filled later on spawn).
+    Serial default-concurrency triggers pass ``lease_ttl_s=None`` — no lease
+    file, stuck-forever preserved (D7).
     """
     try:
         claimed = claim(watch_abs, candidate)
@@ -384,6 +407,24 @@ def _claim_one(
             file=diag,
         )
         return None, True
+    if claimed is not None and lease_ttl_s is not None:
+        try:
+            write_lease(
+                watch_abs,
+                claimed.name,
+                drain_pid=os.getpid(),
+                child_pid=None,
+                boot_id=current_boot_id if current_boot_id is not None else boot_id(),
+                claimed_at=claimed_at if claimed_at is not None else time.time(),
+                ttl_s=lease_ttl_s,
+            )
+        except Exception as exc:  # noqa: BLE001 — lease write failure is a hazard
+            print(
+                f"cairn: trigger {name!r}: candidate {candidate.name!r} lease write "
+                f"hazarded after claim — left in .claim/: {exc}",
+                file=diag,
+            )
+            return claimed, True
     return claimed, False
 
 
@@ -439,6 +480,9 @@ def _drain_serial(
     err: TextIO | None,
     diag: TextIO,
     check_caps: bool,
+    lease_ttl_s: int | None = None,
+    claimed_at: float | None = None,
+    current_boot_id: str | None = None,
 ) -> bool:
     """Serial admitter: claim one at a time, re-checking caps before each claim.
 
@@ -463,7 +507,13 @@ def _drain_serial(
         ):
             continue
         claimed, hazarded = _claim_one(
-            name=name, watch_abs=watch_abs, candidate=candidate, diag=diag
+            name=name,
+            watch_abs=watch_abs,
+            candidate=candidate,
+            diag=diag,
+            lease_ttl_s=lease_ttl_s,
+            claimed_at=claimed_at,
+            current_boot_id=current_boot_id,
         )
         if hazarded:
             any_failed = True
@@ -503,6 +553,9 @@ def _drain_pooled(
     err: TextIO | None,
     diag: TextIO,
     check_caps: bool,
+    lease_ttl_s: int | None = None,
+    claimed_at: float | None = None,
+    current_boot_id: str | None = None,
 ) -> bool:
     """Bounded pool: claim→submit lazily; at most ``concurrency`` children in flight.
 
@@ -559,7 +612,13 @@ def _drain_pooled(
         ):
             return True  # consumed candidate (rejected/skipped/deferred); keep admitting
         claimed, hazarded = _claim_one(
-            name=name, watch_abs=watch_abs, candidate=candidate, diag=diag
+            name=name,
+            watch_abs=watch_abs,
+            candidate=candidate,
+            diag=diag,
+            lease_ttl_s=lease_ttl_s,
+            claimed_at=claimed_at,
+            current_boot_id=current_boot_id,
         )
         if hazarded:
             mark_failed()
@@ -661,10 +720,19 @@ def run_trigger(
     watch_abs = watch_dir(trigger, workspace_dir)
     diag = err if err is not None else sys.stderr
     any_failed = False
+    now_ts = now.timestamp()
+    lease_ttl = effective_lease_ttl(trigger.lease_ttl_s, trigger.concurrency)
+    cur_boot = boot_id()
 
-    # T6: sweep FIRST — advance .waiting/ from trail evidence before new claims.
+    # T6/T13: sweep FIRST — lease reap + advance .waiting/ + mop stranded deferred.
     try:
-        report = sweep(watch_abs, on_done=trigger.on_done)
+        report = sweep(
+            watch_abs,
+            on_done=trigger.on_done,
+            now=now_ts,
+            lease_ttl_s=lease_ttl,
+            current_boot_id=cur_boot,
+        )
     except Exception as exc:  # noqa: BLE001 — sweep must never abort the drain
         any_failed = True
         print(
@@ -680,7 +748,7 @@ def run_trigger(
     # new admits. Grace-gated (RESERVATION_GRACE_S) so a concurrent drain cannot
     # free a live reserve→claim gap. Cheap no-op when no .ids/ present.
     try:
-        for line in release_orphan_reservations(watch_abs, now=now.timestamp()):
+        for line in release_orphan_reservations(watch_abs, now=now_ts):
             print(f"cairn: trigger {name!r}: {line}", file=diag)
     except Exception as exc:  # noqa: BLE001 — never abort the drain
         print(
@@ -693,7 +761,7 @@ def run_trigger(
     check_caps = _has_admit_caps(trigger)
 
     # D7: concurrency:1 stays on the serial path (exact claim order + output).
-    # Pool only when concurrency > 1.
+    # Pool only when concurrency > 1. Leases off on serial default (no lease key).
     if trigger.concurrency > 1:
         if _drain_pooled(
             name=name,
@@ -708,6 +776,9 @@ def run_trigger(
             err=err,
             diag=diag,
             check_caps=check_caps,
+            lease_ttl_s=lease_ttl,
+            claimed_at=now_ts,
+            current_boot_id=cur_boot,
         ):
             any_failed = True
     else:
@@ -724,6 +795,180 @@ def run_trigger(
             err=err,
             diag=diag,
             check_caps=check_caps,
+            lease_ttl_s=lease_ttl,
+            claimed_at=now_ts,
+            current_boot_id=cur_boot,
         ):
             any_failed = True
     return 1 if any_failed else 0
+
+
+# --------------------------------------------------------------------------- #
+# factory reconcile — single-flight all-trigger health pass (T13 / D1)
+# --------------------------------------------------------------------------- #
+
+RECONCILE_LOCK_NAME = ".cairn-reconcile.lock"
+
+
+@dataclass(frozen=True)
+class TriggerReconcileSummary:
+    """One-line-per-trigger outcome of :func:`reconcile_workspace`."""
+
+    name: str
+    waiting: int
+    blocked: int
+    capacity: int
+    needs_human: int
+    reaped: int
+    flagged_live: int
+    promoted_deferred: int
+    diagnostics: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ReconcileReport:
+    """Workspace-level reconcile outcome."""
+
+    summaries: tuple[TriggerReconcileSummary, ...]
+    already_running: bool = False
+    hazarded: bool = False
+
+
+@contextmanager
+def _reconcile_lock(workspace_dir: Path) -> Iterator[bool]:
+    """Advisory non-blocking flock on a workspace-level lock file.
+
+    Yields ``True`` when this process holds the lock, ``False`` when another
+    reconcile is already running (contention → exit 0, "already running").
+    Mirrors :func:`cairn.kernel.runstate.run_lock` (flock, non-blocking).
+    """
+    workspace_dir = Path(workspace_dir)
+    lock_path = workspace_dir / RECONCILE_LOCK_NAME
+    lock_path.touch(exist_ok=True)
+    fh = lock_path.open("r+", encoding="utf-8")
+    try:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            yield False
+            return
+        fh.seek(0)
+        fh.truncate()
+        fh.write(str(os.getpid()))
+        fh.flush()
+        try:
+            yield True
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        if not fh.closed:
+            fh.close()
+
+
+def reconcile_workspace(
+    workspace_dir: Path,
+    *,
+    now: datetime,
+    out: TextIO | None = None,
+    err: TextIO | None = None,
+) -> ReconcileReport:
+    """Single-flight health pass over every declared trigger (T13 / D1).
+
+    No daemon: host-woken or manual. For each trigger:
+    - release aged orphan reservations
+    - sweep (lease reap + waiting advance + stranded-deferred mop)
+    - report one-line summary (waiting/blocked/capacity/reaped)
+
+    Contention on the workspace reconcile lock → ``already_running=True``
+    (caller exits 0). Real hazards set ``hazarded=True`` (nonzero exit).
+    """
+    workspace_dir = Path(workspace_dir)
+    diag = err if err is not None else sys.stderr
+    out_s = out if out is not None else sys.stdout
+    now_ts = now.timestamp()
+    cur_boot = boot_id()
+
+    with _reconcile_lock(workspace_dir) as held:
+        if not held:
+            print("cairn: reconcile already running", file=out_s)
+            return ReconcileReport(summaries=(), already_running=True)
+
+        triggers = load_triggers(workspace_dir)
+        summaries: list[TriggerReconcileSummary] = []
+        hazarded = False
+
+        for name in sorted(triggers):
+            trigger = triggers[name]
+            watch_abs = watch_dir(trigger, workspace_dir)
+            lease_ttl = effective_lease_ttl(trigger.lease_ttl_s, trigger.concurrency)
+            reaped_n = 0
+            flagged_n = 0
+            promoted_n = 0
+            diags: list[str] = []
+
+            try:
+                for line in release_orphan_reservations(watch_abs, now=now_ts):
+                    diags.append(line)
+            except Exception as exc:  # noqa: BLE001
+                hazarded = True
+                diags.append(f"orphan-reservation sweep hazarded: {exc}")
+
+            try:
+                report = sweep(
+                    watch_abs,
+                    on_done=trigger.on_done,
+                    now=now_ts,
+                    lease_ttl_s=lease_ttl,
+                    current_boot_id=cur_boot,
+                )
+                reaped_n = len(report.reaped)
+                flagged_n = len(report.flagged_live)
+                promoted_n = len(report.promoted_deferred)
+                diags.extend(report.diagnostics)
+            except Exception as exc:  # noqa: BLE001
+                hazarded = True
+                diags.append(f"sweep hazarded: {exc}")
+
+            try:
+                depths = count_by_class(watch_abs, glob=trigger.glob)
+            except Exception as exc:  # noqa: BLE001
+                hazarded = True
+                diags.append(f"depth count hazarded: {exc}")
+                depths = {
+                    "waiting": 0,
+                    "blocked": 0,
+                    "capacity": 0,
+                    "needs_human": 0,
+                }
+
+            summary = TriggerReconcileSummary(
+                name=name,
+                waiting=int(depths.get("waiting", 0)),
+                blocked=int(depths.get("blocked", 0)),
+                capacity=int(depths.get("capacity", 0)),
+                needs_human=int(depths.get("needs_human", 0)),
+                reaped=reaped_n,
+                flagged_live=flagged_n,
+                promoted_deferred=promoted_n,
+                diagnostics=tuple(diags),
+            )
+            summaries.append(summary)
+            print(
+                f"cairn: reconcile {name}: waiting={summary.waiting} "
+                f"blocked={summary.blocked} capacity={summary.capacity} "
+                f"needs-human={summary.needs_human} reaped={summary.reaped} "
+                f"flagged-live={summary.flagged_live} "
+                f"promoted-deferred={summary.promoted_deferred}",
+                file=out_s,
+            )
+            for line in diags:
+                print(f"cairn: reconcile {name}: {line}", file=diag)
+
+        if not summaries:
+            print("cairn: reconcile: no triggers declared", file=out_s)
+
+        return ReconcileReport(
+            summaries=tuple(summaries),
+            already_running=False,
+            hazarded=hazarded,
+        )
