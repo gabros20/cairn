@@ -1554,6 +1554,34 @@ def test_agent_nonzero_exit_with_auth_signature_halts_blocked_and_skips_retries(
     assert halt["data"]["exit_code"] == int(ExitCode.BLOCKED)
 
 
+def test_auth_failure_on_retry_attempt_n_still_routes_blocked(ws: Path, tmp_path: Path) -> None:
+    """T7 M4: auth-tail classification is attempt-invariant — attempt N>1 still → BLOCKED(9).
+
+    Attempt 1 is a content failure (empty artifact, no auth signature) so the retry
+    loop advances; attempt 2 (N=2) then exits non-zero with an auth signature and
+    must halt at BLOCKED, not slip to EXECUTOR/GATE_FAILED.
+    """
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"], retry=(2, True))], arts, resolved_models=models_for("s"))
+
+    def on_invoke(inv, n):
+        inv.log_path.parent.mkdir(parents=True, exist_ok=True)
+        if n == 1:
+            inv.log_path.write_text("generic content failure, nothing auth-related\n", encoding="utf-8")
+            (inv.cwd / "a.txt").write_text("", encoding="utf-8")  # invalid → content retry
+            return Result(step={"status": "done", "summary": "ok", "artifacts": []}, exit_code=1, duration_s=1.0)
+        inv.log_path.write_text("Error: not logged in. Please run `claude /login`.\n", encoding="utf-8")
+        (inv.cwd / "a.txt").write_text("would-be-valid", encoding="utf-8")
+        return Result(step={"status": "done", "summary": "ok", "artifacts": []}, exit_code=1, duration_s=1.0)
+
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    ex = FakeExecutor(on_invoke)
+    assert _walk(ws, plan, run_dir, {"fake": ex}) == ExitCode.BLOCKED
+    assert len(ex.invocations) == 2  # attempt 1 content + attempt 2 auth halt
+    halt = next(e for e in read_trail(run_dir) if e["event"] == "run-halt")
+    assert halt["data"]["exit_code"] == int(ExitCode.BLOCKED)
+
+
 def test_agent_nonzero_exit_without_auth_signature_still_retries(ws: Path, tmp_path: Path) -> None:
     """The content-invalid retry path (walk.py ~469) stays intact: a non-zero exit with no
     auth/executor signature in the output is a content failure, not an executor failure."""

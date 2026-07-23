@@ -21,6 +21,7 @@ from cairn.cli import SUBCOMMANDS, main
 from cairn.kernel import newkit
 from cairn.kernel.errors import ExecutorSpawnError
 from cairn.kernel.types import ExitCode
+from fstestkit import _CannedHandle
 
 REPO = Path(__file__).resolve().parents[2]
 FAKEBIN = REPO / "tests" / "unit" / "fixtures" / "fakebin"
@@ -1618,27 +1619,6 @@ def test_gc_apply_deletes_selected_run(hello_ws, monkeypatch, capsys):
 # --------------------------------------------------------------------------- #
 # schedule — a FAKE runner + tmp target dirs; NEVER the real crontab/launchctl/systemctl.
 # --------------------------------------------------------------------------- #
-
-
-class _CannedHandle:
-    """Immediate ProcessHandle for test fakes — pid fixed, wait returns a canned RunResult."""
-
-    def __init__(self, result, pid: int = 1):
-        self._result = result
-        self._pid = pid
-
-    @property
-    def pid(self) -> int:
-        return self._pid
-
-    def wait(self, timeout=None):
-        return self._result
-
-    def poll(self):
-        return self._result.returncode
-
-    def terminate(self) -> None:
-        return None
 
 
 class _FakeRunner:

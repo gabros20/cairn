@@ -1491,3 +1491,54 @@ def test_gate_with_default_on_schedule_no_teaching_lint(tmp_path):
     assert isinstance(g, GateNode) and g.default == "no"
     assert g.options == (("yes", "Y"), ("no", "N"))
     assert not any("no default" in w.message for w in p.warnings)
+
+
+def test_defaultless_gate_malformed_schedules_soft_parses(tmp_path):
+    """T7 M4: malformed schedules.yaml must not crash plan(); soft-parse yields no lint."""
+    steps = '  - { gate: approve, options: { "yes": \'Y\', "no": \'N\' }, ask: \'ok?\' }\n'
+    ws = _write_ws(
+        tmp_path,
+        _HEADER + steps,
+        extra={"schedules.yaml": "this: is: [not: valid: yaml: [[[\n"},
+    )
+    p = plan(ws, "p", {}, now=NOW)  # must not raise
+    g = _node(p, "approve")
+    assert isinstance(g, GateNode) and g.default == ""
+    assert not any("schedules.yaml" in w.message for w in p.warnings)
+
+
+def test_defaultless_gate_nested_in_loop_teaching_lint(tmp_path):
+    """T7 M4: teaching lint walks gates nested in a loop body (not only top-level).
+
+    Parallel children must be steps by grammar, so the recursive walk under loop
+    is the reachable nested case; _iter_gates also recurses parallels for completeness.
+    """
+    # Loop body needs a {cycle}-varying artifact (plan-time progress check).
+    yaml_text = (
+        "pipeline: p\n"
+        "version: 1\n"
+        'run_id: "p-{date}"\n'
+        "artifacts:\n"
+        '  a: { path: "a-{cycle}.json", schema: schemas/s.json }\n'
+        "steps:\n"
+        "  - loop: lp\n"
+        "    body:\n"
+        "      - { step: one, run: 'echo', produces: [a] }\n"
+        '      - { gate: nested, options: { "yes": \'Y\', "no": \'N\' }, ask: \'ok?\' }\n'
+    )
+    ws = _write_ws(
+        tmp_path,
+        yaml_text,
+        extra={
+            "schedules.yaml": (
+                "nightly:\n"
+                "  cron: '0 2 * * *'\n"
+                "  run: [run, p, --headless]\n"
+            ),
+        },
+    )
+    p = plan(ws, "p", {}, now=NOW)
+    msgs = [w.message for w in p.warnings if w.level == "warning"]
+    hit = [m for m in msgs if "nested" in m and "schedules.yaml" in m]
+    assert hit, f"expected nested-gate teaching lint; got: {msgs}"
+    assert "park" in hit[0].lower()

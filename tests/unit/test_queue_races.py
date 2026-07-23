@@ -28,7 +28,7 @@ from cairn.kernel.queue_ledger import (
     write_pointer,
 )
 from cairn.kernel.types import OutcomeClass, RunOutcome, classify_exit
-from fstestkit import RecordingFs
+from fstestkit import RecordingFs, _CannedHandle
 
 
 def _watch(tmp_path: Path) -> Path:
@@ -261,25 +261,6 @@ def test_repair_wellformed_orphan_pointer_deleted(tmp_path):
 # --------------------------------------------------------------------------- #
 # I1 — same-name re-drop → RunExists diagnostic, item back in inbox
 # --------------------------------------------------------------------------- #
-
-
-class _CannedHandle:
-    def __init__(self, result: RunResult, pid: int = 1):
-        self._result = result
-        self._pid = pid
-
-    @property
-    def pid(self) -> int:
-        return self._pid
-
-    def wait(self, timeout=None) -> RunResult:
-        return self._result
-
-    def poll(self) -> int | None:
-        return self._result.returncode
-
-    def terminate(self) -> None:
-        return None
 
 
 class FakeRunner(RunnerBase):

@@ -23,33 +23,13 @@ from cairn.kernel.schedkit import (
     run_schedule,
     uninstall,
 )
+from fstestkit import _CannedHandle
 
 WS = Path("/ws/acme")
 
 
 def _sched(cron="0 3 * * 1", name="weekly", run=("run", "brease-rebrand", "--headless")):
     return Schedule(name=name, cron=cron, run=tuple(run))
-
-
-class _CannedHandle:
-    """Immediate ProcessHandle for test fakes — pid fixed, wait returns a canned RunResult."""
-
-    def __init__(self, result: RunResult, pid: int = 1):
-        self._result = result
-        self._pid = pid
-
-    @property
-    def pid(self) -> int:
-        return self._pid
-
-    def wait(self, timeout=None) -> RunResult:
-        return self._result
-
-    def poll(self) -> int | None:
-        return self._result.returncode
-
-    def terminate(self) -> None:
-        return None
 
 
 class FakeRunner(RunnerBase):

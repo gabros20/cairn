@@ -12,6 +12,7 @@ from pathlib import Path
 from cairn.kernel.proc import RunResult, RunnerBase
 from cairn.kernel.triggerkit import sync_triggers, trigger_launchd_label, trigger_systemd_unit_names
 from cairn.kernel.wsid import workspace_id
+from fstestkit import _CannedHandle
 
 TRIGGERS_ONE = """\
 handle-reply:
@@ -32,27 +33,6 @@ _SCHEDULE_OWNED_SERVICE = (
     "[Unit]\nDescription=cairn schedule: trigger-X\n\n[Service]\nType=oneshot\n"
     "WorkingDirectory=/ws/acme\nExecStart=cairn schedule run trigger-X\n"
 ).encode("utf-8")
-
-
-class _CannedHandle:
-    """Immediate ProcessHandle for test fakes — pid fixed, wait returns a canned RunResult."""
-
-    def __init__(self, result: RunResult, pid: int = 1):
-        self._result = result
-        self._pid = pid
-
-    @property
-    def pid(self) -> int:
-        return self._pid
-
-    def wait(self, timeout=None) -> RunResult:
-        return self._result
-
-    def poll(self) -> int | None:
-        return self._result.returncode
-
-    def terminate(self) -> None:
-        return None
 
 
 class FakeRunner(RunnerBase):

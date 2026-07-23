@@ -927,9 +927,14 @@ class ItemId:
 def parse_item_name(name: str) -> ItemId | None:
     """Parse a strict work-item filename; return None if nonconforming.
 
-    Rejects uppercase, wrong shape, over-long names (NAME_MAX budget for the
-    filename and every derived ledger name), and anything that is not exactly
+    Rejects uppercase, wrong shape, over-long names (NAME_MAX budget on the
+    filename), and anything that is not exactly
     ``p<prio>-<source>-<id>-r<rev>.json``. Module-level pure function — no I/O.
+
+    Derived ledger names (``identity``, ``tombstone_name``) are always strict
+    substrings of ``name`` (shorter by the fixed ``p<prio>-`` / ``.json``
+    overhead), so the filename NAME_MAX check dominates them — a separate
+    derived-name check is unreachable by construction.
     """
     if not name or len(name) > NAME_MAX:
         return None
@@ -939,16 +944,12 @@ def parse_item_name(name: str) -> ItemId | None:
     m = _ITEM_NAME_RE.fullmatch(name)
     if m is None:
         return None
-    item = ItemId(
+    return ItemId(
         prio=int(m.group("prio")),
         source=m.group("source"),
         id=m.group("id"),
         rev=m.group("rev"),
     )
-    # Derived ledger names must also fit NAME_MAX (ENAMETOOLONG mid-QTP hazard).
-    if len(item.identity) > NAME_MAX or len(item.tombstone_name) > NAME_MAX:
-        return None
-    return item
 
 
 # --------------------------------------------------------------------------- #

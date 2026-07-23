@@ -54,6 +54,7 @@ from cairn.kernel.plan import (
     ParallelNode,
     Plan,
     StepNode,
+    _iter_gates,
     plan as build_plan,
 )
 from cairn.kernel.proc import SubprocessRunner as _SubprocessRunner
@@ -790,17 +791,6 @@ def _cmd_gate(args: argparse.Namespace) -> int:
     answer_gate(run_dir, name, choice)
     print(f"cairn: gate {name!r} answered {choice!r} (by external) → {run_dir}")
     return int(ExitCode.OK)
-
-
-def _iter_gates(nodes):
-    """Yield every :class:`GateNode` in a plan, recursing into parallels and loops."""
-    for node in nodes:
-        if isinstance(node, GateNode):
-            yield node
-        elif isinstance(node, ParallelNode):
-            yield from _iter_gates(node.steps)
-        elif isinstance(node, LoopNode):
-            yield from _iter_gates(node.body)
 
 
 # --------------------------------------------------------------------------- #

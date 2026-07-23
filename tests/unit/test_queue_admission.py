@@ -31,27 +31,9 @@ from cairn.kernel.queue_ledger import (
 )
 from cairn.kernel.trigger_host import Trigger, load_triggers, list_installed_triggers
 from cairn.kernel.triggerkit import scan_candidates
+from fstestkit import _CannedHandle
 
 NOW = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
-
-
-class _CannedHandle:
-    def __init__(self, result: RunResult, pid: int = 1):
-        self._result = result
-        self._pid = pid
-
-    @property
-    def pid(self) -> int:
-        return self._pid
-
-    def wait(self, timeout=None) -> RunResult:
-        return self._result
-
-    def poll(self) -> int | None:
-        return self._result.returncode
-
-    def terminate(self) -> None:
-        return None
 
 
 class FakeRunner(RunnerBase):

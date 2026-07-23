@@ -24,6 +24,7 @@ from cairn.kernel.triggerkit import (
     trigger_launchd_label,
     trigger_systemd_unit_names,
 )
+from fstestkit import _CannedHandle
 
 NOW = datetime(2026, 7, 14, 12, 0, tzinfo=timezone.utc)
 
@@ -62,27 +63,6 @@ _SCHEDULE_OWNED_SERVICE = (
 # would ever catch.
 _NON_UTF8_SERVICE_BYTES = b"ExecStart=\xff\xfe binary junk\n"
 _NON_UTF8_PATH_UNIT_BYTES = b"Unit=\xff\xfe binary junk\n"
-
-
-class _CannedHandle:
-    """Immediate ProcessHandle for test fakes — pid fixed, wait returns a canned RunResult."""
-
-    def __init__(self, result: RunResult, pid: int = 1):
-        self._result = result
-        self._pid = pid
-
-    @property
-    def pid(self) -> int:
-        return self._pid
-
-    def wait(self, timeout=None) -> RunResult:
-        return self._result
-
-    def poll(self) -> int | None:
-        return self._result.returncode
-
-    def terminate(self) -> None:
-        return None
 
 
 class FakeRunner(RunnerBase):

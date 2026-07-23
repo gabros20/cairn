@@ -184,6 +184,26 @@ def test_stale_pin_after_crash_still_protects(tmp_path):
     assert [c.run_id for c in plan2.candidates] == ["stale"]
 
 
+def test_corrupt_pin_file_fail_closed_protects(tmp_path):
+    """T8 M1: unparseable .queue-pin.json still protects — fail closed, never collect."""
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    run_dir = _minted_run(runs, "corrupt-pin", done=True)
+    pin_path = run_dir / QUEUE_PIN_NAME
+    pin_path.write_text("{not valid json [[[", encoding="utf-8")
+    assert pin_path.is_file()
+    assert read_queue_pin(run_dir) is None  # unparseable
+
+    plan = plan_gc(runs, keep_days=0, now=NOW)
+    assert plan.candidates == []
+    assert any("queue-pinned" in r for _, r in plan.skipped)
+
+    result = apply_gc(plan)
+    assert result.deleted == []
+    assert run_dir.is_dir()
+    assert (run_dir / "run.json").is_file()
+
+
 def test_waiting_park_survives_gc_then_sweep_retires(tmp_path):
     """Regression: gc --keep-days 0 must not vanish a .waiting-pointed run.
 

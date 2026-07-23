@@ -7,10 +7,35 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from cairn.kernel.proc import RunResult
 
 
 class SimulatedCrash(Exception):
     """Raised by the fake after a configured op prefix to model power loss."""
+
+
+class _CannedHandle:
+    """Immediate ProcessHandle for test fakes — pid fixed, wait returns a canned RunResult."""
+
+    def __init__(self, result: RunResult, pid: int = 1):
+        self._result = result
+        self._pid = pid
+
+    @property
+    def pid(self) -> int:
+        return self._pid
+
+    def wait(self, timeout=None) -> RunResult:
+        return self._result
+
+    def poll(self) -> int | None:
+        return self._result.returncode
+
+    def terminate(self) -> None:
+        return None
 
 
 class MemFile(io.StringIO):
