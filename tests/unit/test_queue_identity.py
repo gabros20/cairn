@@ -40,6 +40,7 @@ from cairn.kernel.queue_ledger import (
     reservation_path,
     reserve_identity,
     retire,
+    rev_confidently_newer,
     rev_order,
     scan_candidates,
     write_pointer,
@@ -1438,3 +1439,60 @@ def test_done_retire_still_uses_receipt_after_i2(tmp_path):
     )
     assert not (watch / "p1-github-42-r20.json").exists()
     assert (watch / ".done" / "tombstones" / "github-42-r20").is_file()
+
+
+# --------------------------------------------------------------------------- #
+# W4-T2 — harmonized non-numeric rev handling (shared rev_confidently_newer)
+# --------------------------------------------------------------------------- #
+
+
+def test_rev_confidently_newer_false_on_incomparable():
+    """Shared helper: non-numeric pairs are never confidently newer."""
+    assert rev_confidently_newer("20", "10") is True
+    assert rev_confidently_newer("10", "20") is False
+    assert rev_confidently_newer("10", "10") is False
+    assert rev_confidently_newer("a1", "b2") is False
+    assert rev_confidently_newer("10", "a1") is False
+    assert rev_confidently_newer("a1", "10") is False
+
+
+def test_retry_allowed_when_deferred_rev_non_numeric_incomparable(tmp_path):
+    """W4-T2: incomparable deferred does NOT refuse retry (fail toward not losing work)."""
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    run_dir = _validated_run(runs, "retry-def-nonnum")
+    name = _park_failed(watch, 1, "github", "42", "10", run_dir=run_dir)
+
+    deferred = watch / ".deferred"
+    deferred.mkdir(exist_ok=True)
+    # Non-numeric parked rev — cannot order against "10".
+    (deferred / "github-42").write_text(
+        _item_body(1, "github", "42", "abc"), encoding="utf-8"
+    )
+
+    result = prepare_failed_retry(watch, name, identity_mode="strict")
+    assert isinstance(result, RetryPrepared), getattr(result, "message", result)
+    assert result.identity == "github-42"
+    assert result.claim_path.is_file()
+
+
+def test_retry_allowed_when_tombstone_rev_non_numeric_incomparable(tmp_path):
+    """W4-T2: non-numeric DONE tombstone does NOT supersede a numeric failed rev."""
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    run_old = _validated_run(runs, "super-nonnum-old")
+    name10 = _park_failed(watch, 1, "github", "42", "10", run_dir=run_old)
+
+    # Plant a non-numeric "succeeded" tombstone with no matching .failed/ entry.
+    tomb = watch / ".done" / "tombstones"
+    tomb.mkdir(parents=True, exist_ok=True)
+    (tomb / "github-42-rabc").write_text("", encoding="utf-8")
+
+    result = prepare_failed_retry(watch, name10, identity_mode="strict")
+    assert isinstance(result, RetryPrepared), getattr(result, "message", result)
+    assert (watch / ".claim" / name10).is_file()
+

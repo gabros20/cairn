@@ -1150,6 +1150,21 @@ def rev_is_newer(a: str, b: str) -> bool | None:
     return order > 0
 
 
+def rev_confidently_newer(a: str, b: str) -> bool:
+    """True only when ``a`` is confidently strictly newer than ``b``.
+
+    Shared fail-safe for ownership / supersession decisions (W4-T2): a
+    non-numeric or otherwise incomparable pair is **not** confidently newer.
+    Both the DONE-supersession check and the deferred-ownership check call
+    this so they cannot diverge — non-numeric revs never silently drop or
+    block real work (allow retry / promote / admit).
+
+    Pure digits under the ``r`` marker (from :func:`cairn.kernel.work_item.work_item_rev`)
+    always order; non-numeric is off-nominal after W4.
+    """
+    return rev_is_newer(a, b) is True
+
+
 def park_deferred(
     watch_abs: Path,
     candidate: Path,
@@ -1657,12 +1672,14 @@ def _newer_done_supersession_reason(watch_abs: Path, item: ItemId) -> str | None
 
     Scans all tombstones (not only the highest) so DONE-at-r20 + FAILED-at-r30
     still refuses an older r10 retry.
+
+    Non-numeric / incomparable pairs are **not** confidently newer
+    (:func:`rev_confidently_newer`) — fail toward not losing work (allow retry).
     """
     failed_revs = _failed_revs_for_identity(watch_abs, item.identity)
     for t_rev in _tombstone_revs(watch_abs, item.identity):
-        order = rev_order(t_rev, item.rev)
-        if order is None or order <= 0:
-            continue  # not confidently newer
+        if not rev_confidently_newer(t_rev, item.rev):
+            continue  # equal, older, or incomparable — do not supersede
         if t_rev in failed_revs:
             continue  # newer rev also FAILED — does not supersede
         return (
@@ -1677,15 +1694,18 @@ def _identity_owned_reason(watch_abs: Path, item: ItemId) -> str | None:
 
     Ownership surfaces (FACTORY-PLAN T3 failed-retry rule / W4 SG3 + r1 C1):
     - a live item in ``.claim/`` or ``.waiting/`` for the same identity
-    - a ``.deferred/`` entry whose rev is confidently newer (or incomparable —
-      fail-safe refuse so two revs never run)
+    - a ``.deferred/`` entry whose rev is confidently newer (via
+      :func:`rev_confidently_newer` — incomparable does **not** refuse)
     - a tombstoned newer rev that already SUCCEEDED (no matching ``.failed/``
       entry — see :func:`_newer_done_supersession_reason`)
     - a held reservation (checked by the caller via :func:`reserve_identity`)
 
-    Equal/older deferred alone does not refuse (already-delivered park will be
-    mopped/dropped; retry of the failed rev is still the right re-entry).
-    A newer rev that itself FAILED does not supersede.
+    Equal/older/incomparable deferred alone does not refuse (already-delivered
+    park will be mopped/dropped; retry of the failed rev is still the right
+    re-entry). A newer rev that itself FAILED does not supersede.
+
+    Supersession and deferred ownership share :func:`rev_confidently_newer` so
+    non-numeric handling cannot diverge (W4-T2 — fail toward not losing work).
     """
     live = _live_item_for_identity(watch_abs, item.identity)
     if live is not None:
@@ -1698,9 +1718,9 @@ def _identity_owned_reason(watch_abs: Path, item: ItemId) -> str | None:
     if parked.is_file():
         deferred_item = _read_item_fields(parked)
         if deferred_item is not None:
-            newer = rev_is_newer(deferred_item.rev, item.rev)
-            # True (newer) or None (incomparable): refuse. False (≤): ok to retry.
-            if newer is not False:
+            # Confidently newer only — incomparable allows retry (same rule as
+            # supersession; never block real work on an unorderable rev).
+            if rev_confidently_newer(deferred_item.rev, item.rev):
                 return (
                     f"identity {item.identity} is owned by a newer/live rev "
                     f"(deferred r{deferred_item.rev}) — retry declined; "
@@ -1724,8 +1744,9 @@ def prepare_failed_retry(
     Identity-safe rules when ``identity_mode == "strict"``:
     - Reacquire the identity reservation via :func:`reserve_identity`.
     - If the identity is already owned (live reservation, live lane item, or a
-      newer/incomparable deferred) → :class:`RetryRefused` with a clear
+      confidently-newer deferred) → :class:`RetryRefused` with a clear
       diagnostic; **no** filesystem mutation. Never run two revs of one identity.
+      Incomparable/non-numeric revs do not count as ownership (W4-T2).
     - If free: move the item from ``.failed/`` to ``.claim/`` (pointer-first)
       and return :class:`RetryPrepared` so the caller can
       :func:`~cairn.kernel.runctl.resume_existing` the recorded run (T4 —

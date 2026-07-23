@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cairn:work-item",
+  "title": "work-item",
+  "description": "Object a source puller emits into a trigger inbox (W4 contract). Filename is p<prio>-<source>-<id>-r<rev>.json; body agrees on source/id/rev/prio.",
+  "type": "object",
+  "required": [
+    "id",
+    "source",
+    "title",
+    "url",
+    "priority",
+    "created",
+    "updated_at",
+    "rev",
+    "payload"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "id": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Provider object id (lowercased in the filename identity)."
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Source name (e.g. github); first segment of identity."
+    },
+    "title": {
+      "type": "string",
+      "description": "Human-readable summary for cards and judgment."
+    },
+    "url": {
+      "type": "string",
+      "description": "Canonical upstream URL (empty string when the source has none)."
+    },
+    "priority": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9,
+      "description": "Single-digit priority 1–9 (filename prio digit)."
+    },
+    "created": {
+      "type": "string",
+      "description": "Provider created-at ISO-8601 timestamp."
+    },
+    "updated_at": {
+      "type": "string",
+      "description": "Provider updated-at ISO-8601; feeds work_item_rev()."
+    },
+    "rev": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Sortable rev digits (under the filename r marker), from work_item_rev()."
+    },
+    "payload": {
+      "type": "object",
+      "description": "Source-specific body; opaque to the kernel."
+    },
+    "lane": {
+      "type": "string",
+      "description": "Optional autonomy lane name when the puller pins one."
+    }
+  }
+}

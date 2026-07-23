@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cairn:source-status",
+  "title": "source-status",
+  "description": "T6b refresh output: always current|changed|closed — never a bare skippable (W4).",
+  "type": "object",
+  "required": ["status", "checked_rev"],
+  "additionalProperties": true,
+  "properties": {
+    "status": {
+      "type": "string",
+      "enum": ["current", "changed", "closed"],
+      "description": "current = still the checked rev; changed = upstream moved (card demands accept); closed = cancelled path."
+    },
+    "checked_rev": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Rev this refresh checked against (digits under the r marker)."
+    },
+    "upstream_rev": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Upstream rev when status is changed (the newer one)."
+    }
+  }
+}

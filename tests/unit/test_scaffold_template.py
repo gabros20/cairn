@@ -25,7 +25,13 @@ EXPECTED_FILES = [
     "skills/cairn-operator/SKILL.md",
     "schemas/step-return.json",
     "schemas/greeting.json",
+    # W4 work-item contract (source puller furniture; scaffolds land in W4-T3).
+    "schemas/work-item.json",
+    "schemas/poll-report.json",
+    "schemas/source-status.json",
     "validators/nonempty.py",
+    "validators/poll-report-complete.py",
+    "validators/source-status.py",
     "prompts/DOCTRINE.md",
     "allowlist.yaml",
     ".gitignore",
@@ -63,7 +69,13 @@ def test_yaml_files_parse():
 
 
 def test_json_files_parse():
-    for rel in ("schemas/step-return.json", "schemas/greeting.json"):
+    for rel in (
+        "schemas/step-return.json",
+        "schemas/greeting.json",
+        "schemas/work-item.json",
+        "schemas/poll-report.json",
+        "schemas/source-status.json",
+    ):
         json.loads((TEMPLATE / rel).read_text(encoding="utf-8"))
 
 

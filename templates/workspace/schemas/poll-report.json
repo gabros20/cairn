@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "cairn:poll-report",
+  "title": "poll-report",
+  "description": "Produces of a source-puller poll step (W4). complete:false must fail validation so a cursor: step does not advance the watermark.",
+  "type": "object",
+  "required": ["complete", "cursor", "emitted", "source"],
+  "additionalProperties": true,
+  "properties": {
+    "complete": {
+      "type": "boolean",
+      "description": "True only when the poll finished its window (no rate-limit/pagination shortfall). False → cursor must not advance."
+    },
+    "cursor": {
+      "type": "object",
+      "required": ["updated_at", "id"],
+      "additionalProperties": true,
+      "properties": {
+        "updated_at": {
+          "type": "string",
+          "description": "High-water updated_at of the poll window (ISO-8601)."
+        },
+        "id": {
+          "type": "string",
+          "description": "Tiebreak id at that updated_at (provider object id)."
+        }
+      }
+    },
+    "emitted": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Count of work-item files written this poll."
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Source name matching the work-items emitted."
+    }
+  }
+}

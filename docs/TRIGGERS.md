@@ -186,6 +186,53 @@ can push instead of only answering polls.
 *Not currently built:* `cairn plan` does not warn when a `cursor:` step is unreachable
 from any schedule or trigger — a possible future addition, not present behavior today.
 
+### Source puller contract (W4)
+
+A **source puller** is a `run:` step (usually under a schedule) that polls a provider
+and drops work-item files into a trigger inbox. The kernel does not call providers;
+pullers are workspace scripts that honour this contract. Scaffolds that *generate*
+pullers (`cairn new source`, default `triggers.yaml` rows) land in W4-T3 — this section
+is the contract those scaffolds implement.
+
+**Work-item file.** One JSON object per inbox drop. Schema:
+`schemas/work-item.json` (`id`, `source`, `title`, `url`, `priority` 1–9, `created`,
+`updated_at`, `rev`, `payload`, optional `lane`). Filename is identity-strict:
+
+```text
+p<prio>-<source>-<id>-r<rev>.json
+```
+
+Rev comes from `cairn.kernel.work_item.work_item_rev(updated_at, version=None)` →
+`r<epoch>` (UTC integer seconds from provider `updated_at`). Optional provider
+version tiebreak is zero-padded to width 6 and appended so the digits under the
+`r` marker stay pure-digit and sort under `rev_is_newer`. Body fields
+`(source, id, rev, priority)` must agree with the filename (admission envelope).
+
+**Cursor watermark.** Poll steps use `cursor:` (§4). The durable cursor value is
+the pair `{updated_at, id}` — high-water provider timestamp plus the object id at
+that stamp (stable total order when many objects share one second). Re-poll with an
+**overlap window** (re-fetch slightly before the watermark and rely on identity +
+tombstone dedupe) so a clock skew or partial page cannot skip items.
+
+**Completeness → no advance.** The poll's `produces` include a `poll-report`
+(`schemas/poll-report.json`: `complete`, `cursor`, `emitted`, `source`). Wire
+`validators/poll-report-complete.py`: it **fails** when `complete: false`. Because
+the kernel commits `cursor.next` only after produces validate (§4), an incomplete
+poll (rate-limit, pagination shortfall, spool `inbox_max` backpressure) leaves the
+watermark untouched — nothing is lost upstream; the next firing re-fetches from the
+same point.
+
+**Source-status (T6b refresh).** A refresh step always produces
+`source-status` (`schemas/source-status.json`, validator `validators/source-status.py`):
+
+| `status` | Meaning |
+|---|---|
+| `current` | Upstream still matches `checked_rev` |
+| `changed` | Upstream moved (`upstream_rev`); card demands accept-new-revision on the **same** run |
+| `closed` | Upstream closed → cancellation path → cancelled tombstone |
+
+Never emit a bare skippable boolean — walker `needs` would strand the item.
+
 ## 5. Webhook bridge — a documented edge pattern, not a kernel feature
 
 Most providers only push, never poll — but a webhook receiver is a resident network
