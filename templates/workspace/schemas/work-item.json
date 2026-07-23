@@ -9,7 +9,7 @@
     "source",
     "title",
     "url",
-    "priority",
+    "prio",
     "created",
     "updated_at",
     "rev",
@@ -35,11 +35,11 @@
       "type": "string",
       "description": "Canonical upstream URL (empty string when the source has none)."
     },
-    "priority": {
+    "prio": {
       "type": "integer",
       "minimum": 1,
       "maximum": 9,
-      "description": "Single-digit priority 1–9 (filename prio digit)."
+      "description": "Single-digit priority 1–9; body field name is prio (canonical — matches filename p digit and kernel _body_agrees)."
     },
     "created": {
       "type": "string",

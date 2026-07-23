@@ -104,22 +104,57 @@ def test_template_schema_is_valid_json_schema(name: str):
     assert "properties" in schema
 
 
-def test_sample_work_item_validates_against_schema():
-    schema = _load_schema("work-item")
+def _sample_work_item() -> dict:
+    """Schema-conformant work-item body (canonical field names, incl. ``prio``)."""
     token = work_item_rev("2024-01-15T12:00:00Z")
-    doc = {
+    return {
         "id": "42",
         "source": "github",
         "title": "Fix the drain",
         "url": "https://example.com/issues/42",
-        "priority": 3,
+        "prio": 3,
         "created": "2024-01-10T00:00:00Z",
         "updated_at": "2024-01-15T12:00:00Z",
         "rev": token[1:],
         "payload": {"labels": ["bug"]},
         "lane": "lit",
     }
+
+
+def test_sample_work_item_validates_against_schema():
+    schema = _load_schema("work-item")
+    jsonschema.Draft202012Validator(schema).validate(_sample_work_item())
+
+
+def test_schema_conformant_work_item_is_admitted_strict(tmp_path: Path):
+    """Integration: schema-valid body + grammar filename → admit_strict ACCEPTS.
+
+    Catches schema↔kernel drift on body-agreement fields (source, id, rev, prio).
+    A field renamed only on one side (e.g. priority vs prio) fails this test.
+    """
+    from cairn.kernel.queue_ledger import admit_strict
+
+    doc = _sample_work_item()
+    schema = _load_schema("work-item")
     jsonschema.Draft202012Validator(schema).validate(doc)
+
+    # Filename prio digit must match body["prio"]; rev digits match body["rev"].
+    name = f"p{doc['prio']}-{doc['source']}-{doc['id']}-r{doc['rev']}.json"
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    path = watch / name
+    path.write_text(json.dumps(doc), encoding="utf-8")
+
+    result = admit_strict(watch, path)
+    assert result.disposition == "admit", (
+        f"schema-conformant work-item rejected: {result.diagnostic!r} "
+        f"(schema and kernel body-agreement must agree on field names)"
+    )
+    assert result.item is not None
+    assert result.item.source == doc["source"]
+    assert result.item.id == doc["id"]
+    assert result.item.rev == doc["rev"]
+    assert result.item.prio == doc["prio"]
 
 
 def test_sample_poll_report_and_source_status_validate():

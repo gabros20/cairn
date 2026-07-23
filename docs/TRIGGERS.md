@@ -195,7 +195,7 @@ pullers (`cairn new source`, default `triggers.yaml` rows) land in W4-T3 — thi
 is the contract those scaffolds implement.
 
 **Work-item file.** One JSON object per inbox drop. Schema:
-`schemas/work-item.json` (`id`, `source`, `title`, `url`, `priority` 1–9, `created`,
+`schemas/work-item.json` (`id`, `source`, `title`, `url`, `prio` 1–9, `created`,
 `updated_at`, `rev`, `payload`, optional `lane`). Filename is identity-strict:
 
 ```text
@@ -206,7 +206,8 @@ Rev comes from `cairn.kernel.work_item.work_item_rev(updated_at, version=None)` 
 `r<epoch>` (UTC integer seconds from provider `updated_at`). Optional provider
 version tiebreak is zero-padded to width 6 and appended so the digits under the
 `r` marker stay pure-digit and sort under `rev_is_newer`. Body fields
-`(source, id, rev, priority)` must agree with the filename (admission envelope).
+`(source, id, rev, prio)` must agree with the filename (admission envelope;
+kernel `_body_agrees` — field name is `prio`, not `priority`).
 
 **Cursor watermark.** Poll steps use `cursor:` (§4). The durable cursor value is
 the pair `{updated_at, id}` — high-water provider timestamp plus the object id at
