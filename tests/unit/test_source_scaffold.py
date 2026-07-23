@@ -132,6 +132,8 @@ def test_cli_new_source_prints_snippets(ws: Path, monkeypatch, capsys):
     assert "identity: strict" in out
     assert "lease: 60m" in out
     assert "schedules.yaml" in out
+    assert "attended posture" in out
+    assert "W8" in out
 
 
 def test_cli_unknown_provider_config_exit(ws: Path, monkeypatch, capsys):
@@ -457,6 +459,80 @@ def test_hostile_upstream_id_sanitized_not_traversal_or_wedge(
     assert report["emitted"] >= 2
     assert report.get("skipped", 0) >= 1  # /// unsalvageable
     assert cursor_next.is_file()  # pull not wedged — cursor advances past good items
+
+
+def test_id_collision_increments_skipped_with_reason(
+    github_ws: Path, tmp_path: Path
+):
+    """Two raw upstream ids that sanitize to the same token must not be silent."""
+    pull = _load_module(
+        github_ws / "scripts/pull_github-issues.py", "cairn_test_pull_coll"
+    )
+    workspace = tmp_path / "ws"
+    (workspace / "work" / "inbox").mkdir(parents=True)
+
+    # Foo-1 and foo--1 both sanitize to foo-1 (same dest when rev/prio match).
+    assert safe_item_id("Foo-1") == safe_item_id("foo--1") == "foo-1"
+    ts = "2024-06-01T00:00:00Z"
+
+    def collide_fetch(*, since, cursor, environ=None, runner=None):
+        return [
+            {
+                "id": "Foo-1",
+                "title": "first",
+                "url": "u1",
+                "created": ts,
+                "updated_at": ts,
+                "prio": 5,
+                "payload": {},
+            },
+            {
+                "id": "foo--1",
+                "title": "second-collides",
+                "url": "u2",
+                "created": ts,
+                "updated_at": ts,
+                "prio": 5,
+                "payload": {},
+            },
+            {
+                "id": "other-9",
+                "title": "unrelated",
+                "url": "u3",
+                "created": ts,
+                "updated_at": ts,
+                "prio": 3,
+                "payload": {},
+            },
+        ]
+
+    report_path = tmp_path / "report.json"
+    cursor_next = tmp_path / "cursor.next"
+    rc = pull.run_pull(
+        workspace=workspace,
+        cursor_value="",
+        cursor_next=cursor_next,
+        poll_report_path=report_path,
+        fetch=collide_fetch,
+        rev_fn=work_item_rev,
+        environ={"GH_TOKEN": "t"},
+    )
+    assert rc == 0
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["complete"] is True
+    assert report["emitted"] == 2  # Foo-1 + other-9
+    assert report.get("skipped", 0) == 1
+    reasons = report.get("skip_reasons") or []
+    assert len(reasons) == 1
+    assert "id-collision" in reasons[0]
+    assert "foo--1" in reasons[0]
+    assert "Foo-1" in reasons[0]
+    # Safety unchanged: first writer wins; no overwrite of first body.
+    inbox = workspace / "work" / "inbox"
+    collided = list(inbox.glob("*foo-1*.json"))
+    assert len(collided) == 1
+    body = json.loads(collided[0].read_text(encoding="utf-8"))
+    assert body["title"] == "first"
 
 
 def test_overlap_since_rewinds_watermark(github_ws: Path):

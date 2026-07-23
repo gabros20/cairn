@@ -186,6 +186,8 @@ def new_source(provider: str, workspace_dir: Path) -> SourceScaffoldResult:
         "triggers.yaml / schedules.yaml are NOT edited — paste the snippets below",
         f"ship-gates: identity:strict (SG1), lease: {spec.lease} (SG4), "
         "fail-closed notify markers (SG5)",
+        "attended posture: do not run source pullers fully unattended until W8 "
+        "(ledger audit surfaces via doctor/reconcile; no auto-quarantine yet — SG6)",
     )
     return SourceScaffoldResult(
         provider=provider,
@@ -385,6 +387,13 @@ after poll-report validates complete:true.
 Backpressure: if work/inbox depth >= inbox_max, skip the poll, emit a paused
 poll-report (complete:true, paused:true, emitted:0), leave cursor.next
 untouched, exit 0.
+
+Attended posture (SG6 defer): this puller runs under identity:strict +
+fail-closed markers + audit SURFACING via `cairn doctor` / `cairn factory
+reconcile`. The ledger invariant audit surfaces violating identities but does
+NOT yet auto-quarantine them (that enforcement lands with W8 lights-out /
+dark-lane work). Do NOT run source pullers FULLY UNATTENDED (headless cron
+with no operator watching reconcile/doctor) until W8.
 
 Stdlib + cairn.kernel.work_item; pure helpers below are unit-tested with a
 seamed fetch_items (no live network in tests).
@@ -625,6 +634,8 @@ def run_pull(
     emitted = 0
     skipped = 0
     skip_reasons: list[str] = []
+    # dest basename → first raw upstream id that claimed it this run (id-collision detect)
+    claimed_dest: dict[str, str] = {}
     high_ua = cursor["updated_at"] if cursor else ""
     high_id = cursor["id"] if cursor else ""
     inbox_resolved = inbox.resolve()
@@ -655,6 +666,23 @@ def run_pull(
             if not dest.exists():
                 dest.write_text(json.dumps(body, indent=2) + "\n", encoding="utf-8")
                 emitted += 1
+                claimed_dest[name] = item_id
+            else:
+                # Dest already present. Same raw id (overlap re-fetch) is an
+                # intentional no-op; a DIFFERENT raw id that sanitized to the
+                # same token is a rare collision — count + reason so it is not
+                # a silent missed-emit (safety unchanged: still do not overwrite).
+                prior_raw = claimed_dest.get(name)
+                if prior_raw is None:
+                    claimed_dest[name] = item_id
+                elif prior_raw != item_id:
+                    skipped += 1
+                    reason = (
+                        f"{item_id!r}: id-collision dest={name} "
+                        f"already claimed by {prior_raw!r}"
+                    )
+                    skip_reasons.append(reason)
+                    print(f"pull: skip item {reason}", file=sys.stderr)
             # High-water uses the sanitized id (body["id"]), never the raw upstream string.
             safe_id = body["id"]
             if (not high_ua) or updated_at > high_ua or (

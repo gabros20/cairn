@@ -194,6 +194,14 @@ pullers are workspace scripts that honour this contract. Scaffolds that *generat
 pullers (`cairn new source`, default `triggers.yaml` rows — see walkthrough below)
 implement this contract.
 
+**Attended posture (SG6 defer).** Source pullers run in an **attended** posture
+today: `identity: strict` (SG1), fail-closed notify markers (SG5), and ledger
+invariant audit *surfacing* via `cairn doctor` / `cairn factory reconcile`. That
+audit reports violating identities but does **not** yet auto-quarantine them —
+admission-refusing enforcement lands with W8's lights-out / dark-lane work. Until
+then, do **not** run source pullers fully unattended (headless cron with no
+operator watching reconcile/doctor).
+
 **Work-item file.** One JSON object per inbox drop. Schema:
 `schemas/work-item.json` (`id`, `source`, `title`, `url`, `prio` 0–9, `created`,
 `updated_at`, `rev`, `payload`, optional `lane`). Filename is identity-strict:
@@ -252,6 +260,7 @@ cairn: source 'github-issues' scaffolded (5 files)
   + scripts/refresh_github-issues.py
   + scripts/notify_github-issues.py
   note: … ship-gates: identity:strict (SG1), lease: 60m (SG4), fail-closed …
+  note: attended posture: do not run source pullers fully unattended until W8 …
 ```
 
 **What gets created**
