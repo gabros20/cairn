@@ -273,6 +273,19 @@ def test_multiple_triggers(tmp_path):
     assert set(triggers) == {"handle-reply", "handle-webhook"}
 
 
+def _pipeline_with_lane(ws: Path, pipeline: str = "handle-reply", lane: str = "dark") -> None:
+    """Overwrite the stub pipeline so it declares ``lane`` (trigger load checks key set only)."""
+    (ws / "pipelines" / f"{pipeline}.yaml").write_text(
+        f"pipeline: {pipeline}\n"
+        "version: 1\n"
+        "lanes:\n"
+        "  lit: {}\n"
+        f"  {lane}: {{}}\n"
+        "steps: []\n",
+        encoding="utf-8",
+    )
+
+
 def test_load_trigger_lane_field(tmp_path):
     ws = _workspace(
         tmp_path,
@@ -283,6 +296,7 @@ def test_load_trigger_lane_field(tmp_path):
           lane: dark
         """,
     )
+    _pipeline_with_lane(ws, "handle-reply", "dark")
     t = load_triggers(ws)["handle-reply"]
     assert t.lane == "dark"
 
@@ -310,4 +324,36 @@ def test_load_trigger_lane_empty_is_error(tmp_path):
         """,
     )
     with pytest.raises(ConfigError, match=r"'lane' must be a non-empty string"):
+        load_triggers(ws)
+
+
+@pytest.mark.parametrize("bad", ["evil:x", 'quo"te', "has space"])
+def test_load_trigger_lane_name_must_be_slug(tmp_path, bad):
+    """I1: trigger lane: rejects the same special chars as pipeline lane names."""
+    ws = _workspace(
+        tmp_path,
+        f"""
+        handle-reply:
+          pipeline: handle-reply
+          watch: inbox/replies/
+          lane: {bad!r}
+        """,
+    )
+    with pytest.raises(ConfigError, match=r"'lane'"):
+        load_triggers(ws)
+
+
+def test_load_trigger_lane_must_exist_in_pipeline(tmp_path):
+    """M1: typo'd lane fails at load/sync, not when the child drains."""
+    ws = _workspace(
+        tmp_path,
+        """
+        handle-reply:
+          pipeline: handle-reply
+          watch: inbox/replies/
+          lane: dark
+        """,
+    )
+    # Stub pipeline has no lanes: at all.
+    with pytest.raises(ConfigError, match=r"not declared in pipeline"):
         load_triggers(ws)

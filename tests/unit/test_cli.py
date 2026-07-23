@@ -2341,3 +2341,17 @@ def test_run_no_lane_no_lanes_block_unchanged(hello_ws, monkeypatch):
     rd = _run_dir(hello_ws, "hello-world")
     decision = json.loads((rd / "gates" / "tone.json").read_text())
     assert decision["by"] == "default"
+
+
+def test_run_unknown_lane_leaves_no_run_dir(hello_ws, monkeypatch, capsys):
+    """I2: lane ConfigError fires before mint — a typo'd --lane strands nothing on disk."""
+    monkeypatch.chdir(hello_ws)
+    _write_lane_pipeline(hello_ws)
+    runs = hello_ws / "runs"
+    before = set(runs.iterdir()) if runs.is_dir() else set()
+    rc = main(["run", "laned", "--headless", "--lane", "typo"])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "unknown lane" in err and "typo" in err
+    after = set(runs.iterdir()) if runs.is_dir() else set()
+    assert after == before  # nothing minted

@@ -506,6 +506,12 @@ def _cmd_run(args: argparse.Namespace) -> int:
             headless=args.headless,
         )
         config = load_config(ws)
+        # W5: resolve --lane BEFORE mint so an unknown lane / --gate conflict refuses
+        # with nothing on disk (matches every other plan-time ConfigError). Needs only
+        # the Plan — never the run dir. No-lane path is byte-identical (D7).
+        p, gate_presets, gate_preset_by = resolve_lane(
+            p, getattr(args, "lane", None), _kv(args.gate)
+        )
     except ConfigError as exc:
         return _print_config_error(exc)
 
@@ -545,18 +551,11 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     interactive = (not args.headless) and sys.stdin.isatty()
     try:
-        # W5: --lane resolves into the existing gate-preset path + optional max_headless
-        # override. Conflict with --gate on the same gate (different value) is a ConfigError.
-        p, gate_presets, gate_preset_by = resolve_lane(
-            p, getattr(args, "lane", None), _kv(args.gate)
-        )
         return _drive(
             p, run_dir, ws, config,
             interactive=interactive, gate_presets=gate_presets, now=now, stub_mode=stub_mode,
             gate_preset_by=gate_preset_by,
         )
-    except ConfigError as exc:
-        return _print_config_error(exc)
     except CairnError as exc:
         print(f"cairn: {exc}", file=sys.stderr)
         return int(ExitCode.EXECUTOR)

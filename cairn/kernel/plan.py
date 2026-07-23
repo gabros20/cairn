@@ -1585,21 +1585,41 @@ def _iter_gates(nodes: list[Node] | tuple[Node, ...]):
             yield from _iter_gates(node.body)
 
 
+# Lane names feed `by: "lane:<name>"` (signed ledger) and `--lane` argv — restrict to a
+# slug so colons/quotes/spaces cannot corrupt provenance or shadow CLI flags (W5-T1 r1 I1).
+_LANE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _has_loops(nodes: list[Node] | tuple[Node, ...]) -> bool:
+    """Whether any LoopNode exists in the tree (for the max_headless-on-loopless warning)."""
+    for node in nodes:
+        if isinstance(node, LoopNode):
+            return True
+        if isinstance(node, ParallelNode) and _has_loops(node.steps):
+            return True
+    return False
+
+
 def _parse_lanes(
     raw: Any,
     *,
     gates_by_name: dict[str, GateNode],
     artifacts: dict[str, ArtifactDecl],
+    has_loops: bool,
+    warnings: list[Finding],
     file: str,
 ) -> dict[str, LaneProfile]:
     """Parse + validate the top-level ``lanes:`` block (FACTORY-PLAN §8 / W5-T1).
 
-    Rules (all plan-time ConfigErrors):
+    Rules (all plan-time ConfigErrors unless noted):
+    - lane names match ``^[A-Za-z0-9_-]+$`` (feeds ``by: "lane:<name>"`` + ``--lane``)
     - each profile is a mapping with optional ``gates`` / ``loops``
     - gate names must exist as gate nodes; option keys must be on that gate
     - empty ``gates`` is legal only for the reserved park lane (``lit``)
+    - a non-lit lane may not preset a gate with empty ``reads`` (no-evidence dark decision)
     - every artifact a preset gate ``reads`` must carry a ``validator:`` (oracle lint —
       schema-only is not enough for a dark decision)
+    - ``loops.max_headless`` on a loopless pipeline → warning (Finding), not error
     """
     if raw is None:
         return {}
@@ -1611,6 +1631,12 @@ def _parse_lanes(
     profiles: dict[str, LaneProfile] = {}
     for lane_name, profile in raw.items():
         name = str(lane_name)
+        if not _LANE_NAME_RE.fullmatch(name):
+            _err(
+                f"lane name {name!r} must match {_LANE_NAME_RE.pattern!r} "
+                f"(it is recorded as by:\"lane:<name>\" and passed as --lane)",
+                file,
+            )
         if not isinstance(profile, dict):
             _err(f"lane {name!r}: profile must be a mapping", file)
         for key in profile:
@@ -1648,7 +1674,16 @@ def _parse_lanes(
                     f"lane {name!r}: gate {gname!r}: choice {choice!r} is not one of {options}",
                     file,
                 )
-            # Oracle lint: every reads-artifact needs a validator (not schema-only).
+            # Oracle lint C1: empty reads is STRICTLY WORSE than schema-only — reject
+            # before the per-artifact loop so a dark decision cannot vacuous-pass.
+            if not gate.reads:
+                _err(
+                    f"lane '{name}' presets gate '{gname}' but it reads no evidence — "
+                    f"a dark decision needs a machine-checkable oracle; give the gate a "
+                    f"validator-backed reads artifact or leave it to a human (lit).",
+                    file,
+                )
+            # Oracle lint: EVERY reads-artifact needs a validator (not schema-only).
             for art_name in gate.reads:
                 decl = artifacts.get(art_name)
                 if decl is None or decl.validator is None:
@@ -1680,6 +1715,14 @@ def _parse_lanes(
                         file,
                     )
                 max_headless = mh
+                if not has_loops:
+                    warnings.append(
+                        Finding(
+                            "warning",
+                            f"lane {name!r}: loops.max_headless={mh} but this pipeline "
+                            f"has no loop — the cap matches nothing",
+                        )
+                    )
 
         profiles[name] = LaneProfile(gates=gates, max_headless=max_headless)
     return profiles
@@ -2003,17 +2046,14 @@ def plan(
 
     # Autonomy lanes (W5): parse after nodes exist so gate-name / option / oracle lint can
     # reference the full gate tree + artifact decls. Absent/empty lanes → {} (today's shape).
+    # Gates walk the expanded tree (incl. nested in loops/parallels).
     gates_by_name = {g.name: g for g in _iter_gates(active)}
-    # Also include gates that plan-time expansion dropped (raw tree) so a lane can still
-    # name them; validate option keys against any still-active gate of that name, else skip
-    # option checks only when the gate was dropped entirely. _gather already collected names;
-    # re-walk active first, then re-parse dropped gates is overkill — lanes may only target
-    # gates present in the expanded tree (including nested). Conditional gates that stayed
-    # active with when_runtime are included.
     lanes = _parse_lanes(
         doc.get("lanes"),
         gates_by_name=gates_by_name,
         artifacts=artifact_decls,
+        has_loops=_has_loops(active),
+        warnings=warnings,
         file=str(pfile),
     )
 

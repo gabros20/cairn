@@ -77,6 +77,8 @@ _IDENTITY_VALUES = frozenset({"off", "strict"})
 # below since workspace_dir/cairn_bin never pass through this validation (they're CLI
 # args, not triggers.yaml fields).
 _TRIGGER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]*$")
+# Same slug as pipeline ``lanes:`` names (plan._LANE_NAME_RE) — feeds by:"lane:<name>".
+_LANE_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 
 # Characters that would break a rendered unit file's line-oriented syntax (a systemd
 # unit is line-oriented INI; a literal newline mid-value ends the current Key=Value line
@@ -158,6 +160,24 @@ class Trigger:
 def _fail(message: str, file: Path) -> NoReturn:
     raise ConfigError(message, findings=[Finding("error", message)], file=str(file))
 
+
+def _pipeline_lane_names(workspace_dir: Path, pipeline: str) -> set[str]:
+    """Lane names declared in ``pipelines/<pipeline>.yaml`` (soft-empty on unreadable YAML).
+
+    Used at trigger load to refuse a ``lane:`` that the target pipeline does not define —
+    a clear ConfigError at sync/load beats a late drain-child failure (W5-T1 r1 M1).
+    """
+    pfile = Path(workspace_dir) / "pipelines" / f"{pipeline}.yaml"
+    try:
+        doc = yaml.safe_load(pfile.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return set()
+    if not isinstance(doc, dict):
+        return set()
+    lanes = doc.get("lanes") or {}
+    if not isinstance(lanes, dict):
+        return set()
+    return {str(k) for k in lanes}
 
 
 # --------------------------------------------------------------------------- #
@@ -300,6 +320,22 @@ def _parse_trigger(name: str, entry: Any, workspace_dir: Path, file: Path) -> Tr
                 file,
             )
         lane = raw_lane.strip()
+        # Same slug as pipeline lanes: (feeds by:"lane:<name>" + --lane argv).
+        if not _LANE_NAME_RE.fullmatch(lane):
+            _fail(
+                f"trigger {name!r}: 'lane' {lane!r} must match {_LANE_NAME_RE.pattern!r} "
+                f"(it is recorded as by:\"lane:<name>\" and passed as --lane)",
+                file,
+            )
+        # Fail closed at load/sync: a typo'd lane must not wait for a drain child to die.
+        declared = _pipeline_lane_names(workspace_dir, pipeline)
+        if lane not in declared:
+            known = ", ".join(sorted(declared)) or "(none)"
+            _fail(
+                f"trigger {name!r}: lane {lane!r} is not declared in pipeline "
+                f"{pipeline!r} (declared lanes: {known})",
+                file,
+            )
 
     return Trigger(
         name=name,

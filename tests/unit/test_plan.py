@@ -1779,3 +1779,133 @@ def test_no_lanes_block_is_empty_and_identical_behavior(tmp_path):
     steps = "  - { step: one, run: 'echo', produces: [a] }\n"
     p = _plan_p(tmp_path, steps)
     assert p.lanes == {}
+
+
+def test_lanes_empty_reads_gate_is_config_error(tmp_path):
+    """C1: a dark lane presetting a no-evidence gate must not vacuous-pass the oracle lint."""
+    yaml_text = (
+        "pipeline: p\n"
+        "version: 1\n"
+        'run_id: "p-{date}"\n'
+        "lanes:\n"
+        "  dark:\n"
+        '    gates: { approve: "yes" }\n'
+        "steps:\n"
+        '  - { gate: approve, options: { "yes": Y, "no": N }, ask: "ok?" }\n'
+    )
+    with pytest.raises(ConfigError, match=r"reads no evidence"):
+        plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+
+
+def test_lanes_multi_reads_nonfirst_without_validator_is_error(tmp_path):
+    """Oracle lint checks EVERY reads artifact, not just the first."""
+    yaml_text = (
+        "pipeline: p\n"
+        "version: 1\n"
+        'run_id: "p-{date}"\n'
+        "artifacts:\n"
+        "  a: { path: a.json, validator: validators/v.py }\n"
+        "  b: { path: b.json, schema: schemas/s.json }\n"  # schema-only — second reads
+        "lanes:\n"
+        "  dark:\n"
+        '    gates: { approve: "yes" }\n'
+        "steps:\n"
+        "  - { step: one, run: 'echo', produces: [a, b] }\n"
+        "  - gate: approve\n"
+        "    reads: [a, b]\n"
+        "    ask: ok?\n"
+        '    options: { "yes": Y, "no": N }\n'
+    )
+    with pytest.raises(ConfigError, match=r"evidence 'b' has no validator"):
+        plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+
+
+def test_lanes_nested_gate_in_loop_body_is_linted(tmp_path):
+    """Oracle lint reaches gates nested in a loop body via _iter_gates."""
+    yaml_text = (
+        "pipeline: p\n"
+        "version: 1\n"
+        'run_id: "p-{date}"\n'
+        "artifacts:\n"
+        '  a: { path: "a-{cycle}.json", schema: schemas/s.json }\n'  # schema-only
+        "lanes:\n"
+        "  dark:\n"
+        '    gates: { nested: "yes" }\n'
+        "steps:\n"
+        "  - loop: lp\n"
+        "    body:\n"
+        "      - { step: one, run: 'echo', produces: [a] }\n"
+        "      - gate: nested\n"
+        "        reads: [a]\n"
+        "        ask: ok?\n"
+        '        options: { "yes": Y, "no": N }\n'
+    )
+    with pytest.raises(ConfigError, match=r"lane 'dark' presets gate 'nested'.*no validator"):
+        plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+
+
+def test_lanes_nested_gate_with_validator_ok(tmp_path):
+    yaml_text = (
+        "pipeline: p\n"
+        "version: 1\n"
+        'run_id: "p-{date}"\n'
+        "artifacts:\n"
+        '  a: { path: "a-{cycle}.json", validator: validators/v.py }\n'
+        "lanes:\n"
+        "  dark:\n"
+        '    gates: { nested: "yes" }\n'
+        "steps:\n"
+        "  - loop: lp\n"
+        "    body:\n"
+        "      - { step: one, run: 'echo', produces: [a] }\n"
+        "      - gate: nested\n"
+        "        reads: [a]\n"
+        "        ask: ok?\n"
+        '        options: { "yes": Y, "no": N }\n'
+    )
+    p = plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+    assert p.lanes["dark"].gates == {"nested": "yes"}
+
+
+@pytest.mark.parametrize("bad", ["evil:x", 'quo"te', "has space", "a/b", ""])
+def test_lanes_name_must_be_slug(tmp_path, bad):
+    """I1: lane names feed by:\"lane:<name>\" — reject colon/quote/space/empty."""
+    # Empty key is awkward in YAML mapping; skip pure empty via invalid profile shape.
+    if bad == "":
+        yaml_text = (
+            "pipeline: p\nversion: 1\n"
+            'run_id: "p-{date}"\n'
+            "lanes:\n"
+            "  ? ''\n"
+            "  : {}\n"
+            "steps:\n"
+            "  - { step: one, run: 'echo' }\n"
+        )
+    else:
+        yaml_text = (
+            "pipeline: p\nversion: 1\n"
+            'run_id: "p-{date}"\n'
+            "lanes:\n"
+            f"  {bad!r}: {{}}\n"
+            "steps:\n"
+            "  - { step: one, run: 'echo' }\n"
+        )
+    with pytest.raises(ConfigError, match=r"lane name"):
+        plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+
+
+def test_lanes_max_headless_on_loopless_pipeline_warns(tmp_path):
+    """M2: loops.max_headless with no loop is a warning, not a silent no-op."""
+    yaml_text = _lane_pipeline(
+        art_a="validator: validators/v.py",
+        lanes=(
+            "lanes:\n"
+            "  dark:\n"
+            '    gates: { approve: "yes" }\n'
+            "    loops: { max_headless: 5 }\n"
+        ),
+        with_loop=False,
+    )
+    p = plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+    msgs = [w.message for w in p.warnings if w.level == "warning"]
+    assert any("max_headless" in m and "no loop" in m for m in msgs), msgs
