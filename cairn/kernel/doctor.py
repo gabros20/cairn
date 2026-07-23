@@ -143,7 +143,7 @@ def run_doctor(
         out(f"{_BAD} guard runner    cannot import — guarded commands will fail closed")
 
     # -- factory FS safety + ledger invariant audit (D2 / T8) ---------------- #
-    errors += _doctor_factory(workspace_dir, out)
+    errors += _doctor_factory(workspace_dir, out, now=now)
 
     if probe_hooks:
         errors += _doctor_probe_hooks(scope, workspace_dir, out)
@@ -151,7 +151,12 @@ def run_doctor(
     return int(ExitCode.CONFIG) if errors else int(ExitCode.OK)
 
 
-def _doctor_factory(workspace_dir: Path, out: Callable[[str], None]) -> int:
+def _doctor_factory(
+    workspace_dir: Path,
+    out: Callable[[str], None],
+    *,
+    now: datetime,
+) -> int:
     """D2 cloud-sync/hardlink refusals + T8 ledger invariant audit per declared trigger."""
     try:
         from cairn.kernel.trigger_host import load_triggers, watch_dir
@@ -165,6 +170,7 @@ def _doctor_factory(workspace_dir: Path, out: Callable[[str], None]) -> int:
     if not triggers:
         return 0
     errs = 0
+    now_ts = now.timestamp()
     for name in sorted(triggers):
         try:
             watch_abs = watch_dir(triggers[name], workspace_dir)
@@ -181,7 +187,7 @@ def _doctor_factory(workspace_dir: Path, out: Callable[[str], None]) -> int:
             else:
                 out(f"  ! factory {name}  {f.message}")
         try:
-            issues = audit_ledger(watch_abs)
+            issues = audit_ledger(watch_abs, now=now_ts)
         except Exception as exc:  # noqa: BLE001
             out(f"{_BAD} factory {name}  ledger audit failed: {exc}")
             errs += 1

@@ -969,7 +969,9 @@ def reconcile_workspace(
             # (sweep/orphan release may have fixed transient claim↔pointer gaps).
             # Surface + flag; do NOT auto-delete (over-preserve).
             try:
-                for issue in audit_ledger(watch_abs):
+                for issue in audit_ledger(
+                    watch_abs, now=now_ts, current_boot_id=cur_boot
+                ):
                     diags.append(f"audit: {issue}")
                     hazarded = True
             except Exception as exc:  # noqa: BLE001

@@ -20,6 +20,7 @@ from cairn.kernel.fssafety import (
 from cairn.kernel.gckit import QUEUE_PIN_NAME, write_queue_pin
 from cairn.kernel.proc import RunResult, RunnerBase
 from cairn.kernel.queue_ledger import (
+    AUDIT_GRACE_S,
     LEDGER_VERSION,
     audit_ledger,
     check_ledger_version,
@@ -308,22 +309,34 @@ def test_audit_pointer_without_item(tmp_path):
 
 
 def test_audit_item_without_pointer(tmp_path):
+    import os
+
     watch = tmp_path / "inbox"
     claim = watch / ".claim"
     claim.mkdir(parents=True)
-    (claim / "lone.json").write_text("{}", encoding="utf-8")
-    issues = audit_ledger(watch)
+    item = claim / "lone.json"
+    item.write_text("{}", encoding="utf-8")
+    # Aged past AUDIT_GRACE_S so this is a genuine orphan, not an in-flight claim.
+    old = 1_000_000.0
+    os.utime(item, (old, old))
+    issues = audit_ledger(watch, now=old + AUDIT_GRACE_S + 1)
     assert any("item without pointer" in i for i in issues)
 
 
 def test_audit_claim_without_reservation_for_strict_name(tmp_path):
+    import os
+
     watch = tmp_path / "inbox"
     claim = watch / ".claim"
     claim.mkdir(parents=True)
     name = "p1-jira-abc-r10.json"
-    (claim / name).write_text("{}", encoding="utf-8")
+    path = claim / name
+    path.write_text("{}", encoding="utf-8")
     write_pointer(claim / ".runs" / name, run_dir="/runs/x")
-    issues = audit_ledger(watch)
+    # Aged past grace so missing reservation is a real invariant break, not mid-admit.
+    old = 1_000_000.0
+    os.utime(path, (old, old))
+    issues = audit_ledger(watch, now=old + AUDIT_GRACE_S + 1)
     assert any("claim without reservation" in i for i in issues)
 
 
@@ -546,13 +559,36 @@ def test_audit_in_flight_claim_with_live_lease_is_not_a_violation(tmp_path):
     assert not any("item without pointer" in i for i in issues)
 
 
+def test_audit_fresh_serial_claim_without_pointer_is_not_a_violation(tmp_path):
+    """I1 r2: fresh lease-less serial claim (mtime=now) is in-flight, not an orphan."""
+    watch = tmp_path / "inbox"
+    claim = watch / ".claim"
+    claim.mkdir(parents=True)
+    name = "fresh-serial.json"
+    (claim / name).write_text("{}", encoding="utf-8")
+    # No lease (concurrency:1 default) + mtime ≈ now → grace window suppresses.
+    now = 2_000_000.0
+    import os
+
+    os.utime(claim / name, (now, now))
+    issues = audit_ledger(watch, now=now, current_boot_id="boot-test")
+    assert not any("item without pointer" in i for i in issues)
+
+
 def test_audit_orphaned_claim_without_pointer_is_reported(tmp_path):
-    """I1: claim without pointer + dead/absent owner → real violation."""
+    """I1 r2: aged claim without pointer/lease → genuine orphan is reported."""
+    import os
+
     watch = tmp_path / "inbox"
     claim = watch / ".claim"
     claim.mkdir(parents=True)
     name = "orphan.json"
-    (claim / name).write_text("{}", encoding="utf-8")
-    # No lease at all → dead/absent owner.
-    issues = audit_ledger(watch, current_boot_id="boot-test")
+    path = claim / name
+    path.write_text("{}", encoding="utf-8")
+    # No lease + mtime older than AUDIT_GRACE_S → real orphan.
+    old = 1_000_000.0
+    os.utime(path, (old, old))
+    issues = audit_ledger(
+        watch, now=old + AUDIT_GRACE_S + 10, current_boot_id="boot-test"
+    )
     assert any("item without pointer" in i for i in issues)

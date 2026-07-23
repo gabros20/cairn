@@ -64,6 +64,12 @@ DEFAULT_MAX_ITEM_BYTES = 1_048_576  # 1 MiB
 # a reservation with no live item AND mtime older than this window.
 RESERVATION_GRACE_S = 60.0
 
+# Audit grace for lease-less serial claims (T14 r2 I1 residual): protect the
+# claim→write_pointer window on concurrency:1 triggers (no lease written — T13
+# opt-in). A fresh .claim/ item without a pointer is in-flight, not an orphan.
+# Same magnitude as RESERVATION_GRACE_S; over-holding is safe.
+AUDIT_GRACE_S = RESERVATION_GRACE_S
+
 # Claim leases (FACTORY-PLAN W3 / T13): default ttl when leases auto-enable
 # (concurrency > 1). Serial default-concurrency triggers stay stuck-forever (D7)
 # unless ``lease:`` is set explicitly.
@@ -172,9 +178,29 @@ def _claim_has_live_owner(
     return not child_is_dead(lease, current_boot_id=boot, kill=kill)
 
 
+def _claim_within_audit_grace(
+    claim_path: Path,
+    *,
+    now: float,
+    grace_s: float = AUDIT_GRACE_S,
+) -> bool:
+    """True when ``claim_path`` mtime is younger than ``grace_s`` (in-flight window).
+
+    Lease-independent: covers serial concurrency:1 drains that write no lease
+    (T14 r2 I1 residual). Over-holding is safe — genuine orphans age out of the
+    window and are reported on the next audit/reconcile beat.
+    """
+    try:
+        mtime = claim_path.stat().st_mtime
+    except OSError:
+        return False
+    return (now - mtime) < grace_s
+
+
 def audit_ledger(
     watch_abs: Path,
     *,
+    now: float | None = None,
     current_boot_id: str | None = None,
     kill: Callable[[int, int], None] | None = None,
 ) -> list[str]:
@@ -187,10 +213,14 @@ def audit_ledger(
     3. no identity occupies two live states (``.claim`` and ``.waiting``)
     4. terminal-ledger runs (``.done`` / ``.failed`` pointers) are not queue-pinned
 
-    **Lease liveness (T14 I1):** a ``.claim/`` item without a pointer (or without a
-    reservation) whose lease shows a LIVE owner (drain_pid / child_pid alive, same
-    boot — :func:`child_is_dead`) is an in-flight drain window, NOT a violation.
-    Only a claim with no pointer AND a dead/absent owner is reported.
+    **In-flight claim window (T14 I1 / r2):** a ``.claim/`` item without a pointer
+    is NOT a violation when EITHER:
+    (a) a live lease owner exists (concurrency>1 / explicit lease — T13), OR
+    (b) the claim file's mtime is within :data:`AUDIT_GRACE_S` (lease-less serial
+        claim→write_pointer window — the common concurrency:1 default).
+    Only a claim with no pointer AND no live lease owner AND mtime older than
+    the grace is a genuine orphan. ``now`` is an injected unix timestamp (defaults
+    to ``time.time()``); doctor/reconcile pass their clock.
 
     Over-preserve: returns issues only — never mutates. Callers (doctor, reconcile)
     surface + may quarantine affected identities; they do NOT auto-delete.
@@ -203,6 +233,7 @@ def audit_ledger(
         return issues
 
     boot = current_boot_id if current_boot_id is not None else boot_id()
+    now_ts = float(now) if now is not None else time.time()
 
     # (1) pointer <-> item for each lane
     for lane in _LANES:
@@ -226,11 +257,14 @@ def audit_ledger(
         # pointer is the normal .done shape. Live lanes + .failed keep both.
         if lane != ".done":
             for name in sorted(items - pointers):
-                # In-flight claim (live lease owner, no pointer yet) is not a violation.
-                if lane == ".claim" and _claim_has_live_owner(
-                    watch_abs, name, current_boot_id=boot, kill=kill
-                ):
-                    continue
+                if lane == ".claim":
+                    # (a) live lease owner, or (b) fresh mtime grace → in-flight.
+                    if _claim_has_live_owner(
+                        watch_abs, name, current_boot_id=boot, kill=kill
+                    ):
+                        continue
+                    if _claim_within_audit_grace(lane_dir / name, now=now_ts):
+                        continue
                 issues.append(f"item without pointer: {lane}/{name}")
 
     # (2) every grammar-conforming .claim item has a reservation
@@ -244,8 +278,10 @@ def audit_ledger(
                 continue  # identity:off / nonconforming — no reservation expected
             if reservation_path(watch_abs, item.identity).is_file():
                 continue
-            # Live in-flight claim may still be mid-admit; only flag when owner is dead.
+            # Live lease or fresh claim → mid-admit; only flag aged orphans.
             if _claim_has_live_owner(watch_abs, p.name, current_boot_id=boot, kill=kill):
+                continue
+            if _claim_within_audit_grace(p, now=now_ts):
                 continue
             issues.append(
                 f"claim without reservation: {p.name} (identity {item.identity})"
