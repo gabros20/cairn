@@ -1742,6 +1742,18 @@ def _cmd_new(args: argparse.Namespace) -> int:
             print(f"cairn: workspace {name!r} created at {dest}")
             print(f"  cd {dest} && cairn run hello")
             return int(ExitCode.OK)
+        if target == "source":
+            result = newkit.new_source(name, _workspace(args))
+            print(f"cairn: source {name!r} scaffolded ({len(result.files)} files)")
+            for rel in result.files:
+                print(f"  + {rel}")
+            for note in result.notes:
+                print(f"  note: {note}")
+            print()
+            print(result.triggers_snippet.rstrip())
+            print()
+            print(result.schedules_snippet.rstrip())
+            return int(ExitCode.OK)
         if target in ("pipeline", "agent", "skill", "validator"):
             path = newkit.new_stub(target, name, _workspace(args))
             print(f"cairn: {target} {name!r} created at {path}")
@@ -2517,9 +2529,21 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=_cmd_test)
 
     # new
-    sp = sub.add_parser("new", help="scaffold a workspace or a single-file stub")
-    sp.add_argument("target", choices=["workspace", "pipeline", "agent", "skill", "validator"])
-    sp.add_argument("name")
+    sp = sub.add_parser(
+        "new",
+        help="scaffold a workspace, single-file stub, or source adapter",
+    )
+    sp.add_argument(
+        "target",
+        choices=["workspace", "pipeline", "agent", "skill", "validator", "source"],
+    )
+    sp.add_argument(
+        "name",
+        help=(
+            "workspace/stub name, or for `source` one of: "
+            + ", ".join(newkit.KNOWN_PROVIDERS)
+        ),
+    )
     sp.add_argument("--dir", help="parent dir for `new workspace`")
     sp.set_defaults(func=_cmd_new)
 

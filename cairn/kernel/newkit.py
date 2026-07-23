@@ -3,8 +3,9 @@
 ``new workspace`` instantiates the packaged ``templates/workspace/`` tree (the one hard
 requirement: ``cairn run hello`` works immediately, offline, zero auth) with
 ``{{WORKSPACE_NAME}}`` substituted. ``new pipeline|agent|skill|validator`` drop a minimal,
-plan-valid single-file stub into the right workspace directory. Stdlib + pyyaml (the
-matrix-append check on the packaged self-improve retrofit).
+plan-valid single-file stub into the right workspace directory. ``new source`` scaffolds
+a W4 source puller/fix adapter (see :mod:`cairn.kernel.sourcekit`). Stdlib + pyyaml
+(the matrix-append check on the packaged self-improve retrofit).
 """
 
 from __future__ import annotations
@@ -13,6 +14,22 @@ import shutil
 from pathlib import Path
 
 import yaml
+
+from cairn.kernel.sourcekit import (
+    KNOWN_PROVIDERS,
+    SourceScaffoldResult,
+    new_source,
+)
+
+__all__ = [
+    "templates_dir",
+    "new_workspace",
+    "new_stub",
+    "new_source",
+    "KNOWN_PROVIDERS",
+    "SourceScaffoldResult",
+]
+
 
 _WORKSPACE_MARKER = "{{WORKSPACE_NAME}}"
 

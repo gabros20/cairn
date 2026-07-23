@@ -191,8 +191,8 @@ from any schedule or trigger — a possible future addition, not present behavio
 A **source puller** is a `run:` step (usually under a schedule) that polls a provider
 and drops work-item files into a trigger inbox. The kernel does not call providers;
 pullers are workspace scripts that honour this contract. Scaffolds that *generate*
-pullers (`cairn new source`, default `triggers.yaml` rows) land in W4-T3 — this section
-is the contract those scaffolds implement.
+pullers (`cairn new source`, default `triggers.yaml` rows — see walkthrough below)
+implement this contract.
 
 **Work-item file.** One JSON object per inbox drop. Schema:
 `schemas/work-item.json` (`id`, `source`, `title`, `url`, `prio` 0–9, `created`,
@@ -236,6 +236,79 @@ same point.
 | `closed` | Upstream closed → cancellation path → cancelled tombstone |
 
 Never emit a bare skippable boolean — walker `needs` would strand the item.
+
+### `cairn new source` — scaffold walkthrough (github-issues)
+
+Generate a worked GitHub Issues adapter (or a same-shape seam for linear / jira /
+notion) into an **existing** workspace:
+
+```console
+$ cd my-workspace
+$ cairn new source github-issues
+cairn: source 'github-issues' scaffolded (5 files)
+  + pipelines/pull-github-issues.yaml
+  + pipelines/fix-github-issues.yaml
+  + scripts/pull_github-issues.py
+  + scripts/refresh_github-issues.py
+  + scripts/notify_github-issues.py
+  note: … ship-gates: identity:strict (SG1), lease: 60m (SG4), fail-closed …
+```
+
+**What gets created**
+
+| File | Role |
+|---|---|
+| `pipelines/pull-github-issues.yaml` | `cursor:` poll step → `poll-report` (schema + `poll-report-complete` validator) |
+| `pipelines/fix-github-issues.yaml` | intake → T6b refresh (`source-status`) → work placeholder → deliver; `closed` skips delivery |
+| `scripts/pull_github-issues.py` | env token, inbox_max backpressure, `work_item_rev` filenames, overlap window |
+| `scripts/refresh_github-issues.py` | T6b `current\|changed\|closed` lookup |
+| `scripts/notify_github-issues.py` | SG5 find-before-create markers; uncertainty → exit **9 (BLOCKED)**, never create |
+
+Also ensures `work/inbox/` and `state/` exist. **Does not edit** `triggers.yaml` or
+`schedules.yaml` (same posture as self-improve vs `cairn.toml`) — the command prints
+the exact snippets to paste:
+
+```yaml
+# triggers.yaml — ship-gate defaults baked in
+fix-github-issues:
+  pipeline: fix-github-issues
+  watch: work/inbox/
+  glob: "p*-github-*-r*.json"
+  identity: strict          # SG1
+  lease: 60m                # SG4 explicit serial-drain lease
+  concurrency: 1
+  order: aged
+  inbox_max: 50
+
+# schedules.yaml — timer fires the puller
+pull-github-issues:
+  cron: "*/5 * * * *"
+  run: [run, pull-github-issues, --headless, --idempotent]
+```
+
+**Env vars (tokens only via env — never scaffolded values)**
+
+| Provider | Token env |
+|---|---|
+| `github-issues` (worked) | `GH_TOKEN` or `GITHUB_TOKEN` (+ `gh` on PATH) |
+| `linear` / `jira` / `notion` (scaffold seams) | `LINEAR_TOKEN` / `JIRA_TOKEN` / `NOTION_TOKEN` |
+
+**How the loop runs**
+
+1. Host timer → `cairn schedule run pull-github-issues` → pull script polls GitHub,
+   drops `p<prio>-github-<id>-r<rev>.json` into `work/inbox/`, writes a poll-report.
+   Cursor advances only when that report validates `complete: true`. Over-cap inbox
+   depth skips the poll (`paused` report, cursor untouched, exit 0).
+2. Host WatchPaths / path unit → `cairn trigger run fix-github-issues` → drain claims
+   one work-item under `identity: strict` + the explicit lease, runs fix:
+   refresh → work → notify (or cancel when upstream is closed).
+3. Notify looks up a deterministic marker (`cairn-delivery-github-<id>-r<rev>`) before
+   creating any comment/PR; API uncertainty exits BLOCKED(9).
+
+**Others are scaffold seams.** `linear`, `jira`, and `notion` get the same pipeline
+shape and pure helpers; the provider API call sites are marked
+`# TODO: your <provider> API call here` with endpoint + env docs in the script header.
+Fill the seam, keep the fail-closed marker contract.
 
 ## 5. Webhook bridge — a documented edge pattern, not a kernel feature
 
