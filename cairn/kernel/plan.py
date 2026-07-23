@@ -96,6 +96,7 @@ class StepNode:
     env: tuple[str, ...]
     network: bool
     cursor: str | None = None  # workspace-relative watermark path — run: steps only (§4)
+    locks: tuple[str, ...] = ()  # named resource leases (W8) — opaque or repo:<path>
 
 
 @dataclass(frozen=True)
@@ -205,7 +206,8 @@ class Plan:
     step id → ``(executor, model, effort)`` for every agent step *in range*. ``tool_requirements``
     is the range-scoped subset of ``[tools]`` (see :class:`ToolRequirement`) — the hard-stop set
     ``cairn run`` verifies before it mints or walks anything. ``lanes`` is the optional autonomy
-    profile table (absent/empty = today's behavior)."""
+    profile table (absent/empty = today's behavior). ``pipeline_locks`` is the optional
+    top-level ``locks:`` list (W8) — applied to every step in addition to per-step locks."""
 
     pipeline: str
     version: int
@@ -221,6 +223,7 @@ class Plan:
     skipped: tuple[PlanSkip, ...] = ()
     tool_requirements: tuple[ToolRequirement, ...] = ()
     lanes: dict[str, LaneProfile] = field(default_factory=dict)
+    pipeline_locks: tuple[str, ...] = ()
 
 
 # --------------------------------------------------------------------------- #
@@ -636,7 +639,7 @@ def _scan_check(text: str, *, strict: bool, allow_cycle: bool, allow_refs: bool,
 
 _STEP_KEYS = {
     "id", "step", "agent", "run", "manual", "args", "needs", "needs_optional", "produces",
-    "when", "unless", "timeout", "retry", "executor", "skippable", "cursor",
+    "when", "unless", "timeout", "retry", "executor", "skippable", "cursor", "locks",
 }
 _GATE_KEYS = {"gate", "when", "unless", "reads", "ask", "options", "default"}
 _PARALLEL_KEYS = {"parallel", "on_fail", "when", "unless", "steps"}
@@ -735,6 +738,30 @@ def _parse_retry(raw: dict, ctx: _Ctx) -> tuple[int, bool]:
     return attempts, bool(r.get("feedback", False))
 
 
+def _parse_locks(raw: dict | list | None, label: str, ctx: _Ctx | None = None, *, file: str | None = None) -> tuple[str, ...]:
+    """``locks: [<name>, ...]`` — opaque names or ``repo:<path>`` (W8).
+
+    Validated as a list of non-empty strings at plan time. Canonical ``repo:``
+    resolution (git-common-dir) happens at walk / enforcement time where a Runner
+    is available.
+    """
+    if raw is None:
+        return ()
+    # Called with the raw value (list) or a mapping that may contain ``locks``.
+    locks = raw.get("locks") if isinstance(raw, dict) else raw
+    if locks is None:
+        return ()
+    f = file if file is not None else (ctx.file if ctx is not None else None)
+    if not isinstance(locks, list):
+        _err(f"{label}: locks must be a list of non-empty strings", f)
+    out: list[str] = []
+    for i, item in enumerate(locks):
+        if not isinstance(item, str) or not item:
+            _err(f"{label}: locks[{i}] must be a non-empty string", f)
+        out.append(item)
+    return tuple(out)
+
+
 def _parse_step(raw: dict, ctx: _Ctx, in_loop: bool, when_runtime: Expr | None) -> StepNode:
     if "step" in raw and "id" in raw:
         _err(
@@ -793,6 +820,7 @@ def _parse_step(raw: dict, ctx: _Ctx, in_loop: bool, when_runtime: Expr | None) 
         env=agent.env if agent else (),
         network=agent.network if agent else False,
         cursor=_parse_cursor(raw, ctx, sid, kind),
+        locks=_parse_locks(raw, f"step {sid!r}", ctx),
     )
 
 
@@ -1947,7 +1975,8 @@ def _tool_requirements(
 # --------------------------------------------------------------------------- #
 
 _KNOWN_TOP_LEVEL = {
-    "pipeline", "version", "params", "dims", "run_id", "artifacts", "guards", "steps", "lanes",
+    "pipeline", "version", "params", "dims", "run_id", "artifacts", "guards", "steps",
+    "lanes", "locks",
 }
 
 
@@ -2057,6 +2086,12 @@ def plan(
         file=str(pfile),
     )
 
+    # W8 named resource leases: pipeline-level locks apply to every step (union with
+    # per-step locks: at walk time). Absent → () (D7).
+    pipeline_locks = _parse_locks(
+        doc.get("locks"), "pipeline", file=str(pfile)
+    )
+
     # claude-F10: honest enforcement — warn (never error) when a guard's declared enforce
     # layers yield no effective pre-execution block for THIS plan's resolved executor(s), or
     # when agent steps run wholly unguarded. Only in range guards + resolved_models are used.
@@ -2095,6 +2130,7 @@ def plan(
         skipped=tuple(skips),
         tool_requirements=tool_requirements,
         lanes=lanes,
+        pipeline_locks=pipeline_locks,
     )
 
 

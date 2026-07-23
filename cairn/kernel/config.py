@@ -300,7 +300,7 @@ class FactoryConfig:
       ``~/.cairn/machine.toml`` (XDG) is present with a pool.
     - ``True`` → force-join the shared machine slots dir.
     - ``False`` → explicit opt-out; always use workspace-local ``state/agents/``.
-    Slot-pool opt-out NEVER opts out of W8 repo locks (boundary note; W8 not built).
+    Slot-pool opt-out NEVER opts out of W8 repo locks (see resource_locks).
     """
 
     max_agents: int | None = None

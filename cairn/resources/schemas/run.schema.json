@@ -47,6 +47,11 @@
     "git_dirty": { "type": ["boolean", "null"] },
     "created_at": { "type": "string" },
     "status": { "enum": ["running", "done", "halted"] },
+    "held_locks": {
+      "type": "array",
+      "description": "Canonical resource-lock names currently held by this run (W8). Empty/absent when none; cleared before any park.",
+      "items": { "type": "string" }
+    },
     "nodes": {
       "type": "object",
       "additionalProperties": {

@@ -515,6 +515,17 @@ def _cmd_run(args: argparse.Namespace) -> int:
         p, gate_presets, gate_preset_by = resolve_lane(
             p, getattr(args, "lane", None), _kv(args.gate)
         )
+        # W8: concurrent/dark git-touch without locks → ConfigError. Gate is here
+        # (not pure plan()) because only run-entry knows --lane; concurrency is
+        # enforced at drain preallocate (child cairn run sees concurrency=1).
+        from cairn.kernel.resource_locks import enforce_repo_locks
+
+        enforce_repo_locks(
+            p,
+            workspace_dir=ws,
+            concurrency=1,
+            lane=getattr(args, "lane", None),
+        )
     except ConfigError as exc:
         return _print_config_error(exc)
 
@@ -2444,6 +2455,22 @@ def _trigger_status_json(status: TriggerStatus) -> dict[str, Any]:
     }
 
 
+def _print_machine_locks() -> None:
+    """W8 hung-holder surface: machine-wide resource locks under trigger list."""
+    from cairn.kernel.resource_locks import DEFAULT_HUNG_HOLDER_S, list_locks
+
+    held = list_locks()
+    if not held:
+        return
+    print(f"  locks (machine; hung-holder ttl={DEFAULT_HUNG_HOLDER_S:g}s):")
+    for lk in held:
+        flag = " HUNG" if lk.hung else ""
+        live = "live" if lk.live else "stale"
+        print(
+            f"    {lk.name} pid={lk.pid} age={lk.age_s:.0f}s {live}{flag}"
+        )
+
+
 def _print_trigger_list(statuses: list[TriggerStatus], backend: str) -> None:
     print(f"cairn: triggers (declared vs installed on {backend}):")
     if not statuses:
@@ -2506,6 +2533,8 @@ def _print_trigger_list(statuses: list[TriggerStatus], backend: str) -> None:
                 )
         for claim_path in s.stuck:
             print(f"      ! stuck claim (never auto-retried): {claim_path}")
+    # W8: machine-wide resource locks + hung-holder flag (never force-broken).
+    _print_machine_locks()
 
 
 def _cmd_factory(args: argparse.Namespace) -> int:

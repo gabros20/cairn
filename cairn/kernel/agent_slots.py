@@ -34,9 +34,9 @@ the number of concurrent acquirers; the per-executor dimension is the one
 that protects vendor rate limits.
 
 Opt-in: absent ``[factory] max_agents`` AND no machine pool ⇒ slots OFF ⇒
-unbounded (D7). Slot-pool opt-out NEVER opts out of W8 repo locks (boundary
-note only; W8 not built). Cross-machine shared FS is unsupported (local
-``pid_alive`` on a remote holder's pid is unsafe).
+unbounded (D7). Slot-pool opt-out NEVER opts out of W8 repo locks (see
+:mod:`cairn.kernel.resource_locks`). Cross-machine shared FS is unsupported
+(local ``pid_alive`` on a remote holder's pid is unsafe).
 
 Tests inject ``fs=`` / ``kill=`` / ``now=`` / ``sleep=`` seams — never monkeypatch
 ``os.*`` (D10). Machine home is env-injectable via ``XDG_STATE_HOME`` / ``HOME``.

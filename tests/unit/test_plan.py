@@ -1317,6 +1317,54 @@ def test_cursor_dotdot_path_is_a_config_error(tmp_path):
 
 
 # --------------------------------------------------------------------------- #
+# locks: — named resource leases (W8 / FACTORY-PLAN §11).
+# --------------------------------------------------------------------------- #
+
+
+def test_locks_on_step_parses(tmp_path):
+    steps = "  - { id: one, run: 'echo', locks: [repo:brease, shared-db], produces: [a] }\n"
+    p = _plan_p(tmp_path, steps)
+    assert _node(p, "one").locks == ("repo:brease", "shared-db")
+
+
+def test_locks_absent_by_default(tmp_path):
+    steps = "  - { id: one, run: 'echo', produces: [a] }\n"
+    p = _plan_p(tmp_path, steps)
+    assert _node(p, "one").locks == ()
+    assert p.pipeline_locks == ()
+
+
+def test_pipeline_level_locks_parses(tmp_path):
+    # _plan_p writes only steps; author a full pipeline with top-level locks.
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "cairn.toml").write_text('[workspace]\nname = "t"\n', encoding="utf-8")
+    (ws / "pipelines").mkdir()
+    (ws / "pipelines" / "p.yaml").write_text(
+        "pipeline: p\nlocks: [repo:., shared]\nsteps:\n"
+        "  - { id: one, run: 'echo', produces: [] }\n",
+        encoding="utf-8",
+    )
+    p = plan(ws, "p", {}, now=NOW)
+    assert p.pipeline_locks == ("repo:.", "shared")
+    assert _node(p, "one").locks == ()
+
+
+def test_locks_must_be_list_of_strings(tmp_path):
+    steps = "  - { id: one, run: 'echo', locks: 'repo:x', produces: [a] }\n"
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    assert "locks" in str(exc.value)
+
+
+def test_locks_empty_string_rejected(tmp_path):
+    steps = "  - { id: one, run: 'echo', locks: [''], produces: [a] }\n"
+    with pytest.raises(ConfigError) as exc:
+        _plan_p(tmp_path, steps)
+    assert "locks" in str(exc.value)
+
+
+# --------------------------------------------------------------------------- #
 # step: — the canonical node shape key (id: stays a permanent silent alias).
 # --------------------------------------------------------------------------- #
 

@@ -66,6 +66,15 @@ from cairn.kernel.agent_slots import (
     resolve_slots_dir,
     wait_acquire_slot,
 )
+from cairn.kernel.resource_locks import (
+    DEFAULT_LOCK_WAIT_S,
+    effective_step_locks,
+    machine_locks_dir,
+    refresh_lock,
+    release_locks,
+    resolve_lock_names,
+    wait_acquire_locks,
+)
 from cairn.kernel.artifacts import (
     DEFAULT_VALIDATOR_TIMEOUT_S,
     done,
@@ -633,6 +642,49 @@ class _Walk:
         reasons: list[str] = []
         attempt = 1
 
+        # W8 named resource leases: acquire OUTSIDE/around the whole step (agent
+        # invoke AND run: command). Wait is CAPACITY-class — excluded from
+        # step.timeout_s. Multiple locks in canonical sort order. RELEASE-BEFORE-
+        # PARK: finally always drops them (a parked run must never hold a repo).
+        held_locks, locks_dir = self._acquire_step_locks(step, cycle=cycle)
+        try:
+            self._execute_step_body(
+                step,
+                cycle,
+                executor=executor,
+                make_prompt=make_prompt,
+                env=env,
+                model=model,
+                effort=effort,
+                model_str=model_str,
+                retry_attempts=retry_attempts,
+                feedback=feedback,
+                reasons=reasons,
+                attempt=attempt,
+                held_locks=held_locks,
+                locks_dir=locks_dir,
+            )
+        finally:
+            self._release_step_locks(held_locks, locks_dir)
+
+    def _execute_step_body(
+        self,
+        step: StepNode,
+        cycle: int | None,
+        *,
+        executor: Any,
+        make_prompt: Callable[..., str],
+        env: dict[str, str],
+        model: str,
+        effort: str | None,
+        model_str: str,
+        retry_attempts: int,
+        feedback: bool,
+        reasons: list[str],
+        attempt: int,
+        held_locks: tuple[str, ...],
+        locks_dir: Path | None,
+    ) -> None:
         while True:
             prompt_path = self._log_path(step.id, "prompt.md", attempt, cycle)
             prompt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -661,7 +713,7 @@ class _Walk:
             # Agent-slot pool (W6): hold a numbered O_EXCL slot to spawn an agent
             # step. Wait is BEFORE invoke so step.timeout_s is untouched. run:/
             # manual: never acquire. Absent [factory] max_agents AND no machine
-            # pool ⇒ OFF (D7).
+            # pool ⇒ OFF (D7). Locks (W8) are already held outside this body.
             slot_name: str | None = None
             slots_dir: Path | None = None
             if step.kind != "run":
@@ -676,6 +728,8 @@ class _Walk:
                     log_path,
                     slot_name=slot_name,
                     slots_dir=slots_dir,
+                    lock_names=held_locks,
+                    locks_dir=locks_dir,
                 ):
                     result = executor.invoke(inv)
             except ExecTimeout as exc:
@@ -1460,15 +1514,118 @@ class _Walk:
         with self._lock:
             update_run(self.run_dir, lambda doc: doc.__setitem__("status", status))
 
-    # -- agent slots (FACTORY-PLAN §9 / W6) --------------------------------- #
+    # -- resource locks (FACTORY-PLAN §11 / W8) ----------------------------- #
 
     def _slot_now(self) -> float:
-        """Wall clock for slot wait/acquire. Tests inject a fake via assignment."""
+        """Wall clock for slot/lock wait/acquire. Tests inject a fake via assignment."""
         return time.time()
 
     def _slot_sleep(self, seconds: float) -> None:
-        """Sleep during slot wait. Tests inject a fake via assignment."""
+        """Sleep during slot/lock wait. Tests inject a fake via assignment."""
         time.sleep(seconds)
+
+    def _lock_runner(self) -> Any:
+        """Runner for ``repo:`` git-common-dir resolution. Tests inject a fake."""
+        from cairn.kernel.proc import SubprocessRunner
+
+        return SubprocessRunner()
+
+    def _locks_dir(self) -> Path:
+        """Machine locks dir (sibling of W6 machine slots). Tests may override."""
+        return machine_locks_dir()
+
+    def _lock_wait_s(self) -> float:
+        """How long a step waits for a free lock before CAPACITY. Default 15m."""
+        return DEFAULT_LOCK_WAIT_S
+
+    def _record_held_locks(self, lock_names: tuple[str, ...]) -> None:
+        """Persist currently-held locks on run.json (crash-reap + release-before-park)."""
+        names = list(lock_names)
+
+        def mutate(doc: dict) -> None:
+            if names:
+                doc["held_locks"] = names
+            else:
+                doc.pop("held_locks", None)
+
+        with self._lock:
+            update_run(self.run_dir, mutate)
+
+    def _acquire_step_locks(
+        self, step: StepNode, *, cycle: int | None
+    ) -> tuple[tuple[str, ...], Path | None]:
+        """Acquire every named lock for ``step`` (pipeline ∪ step), sorted, or CAPACITY.
+
+        Returns ``((), None)`` when the step declares no locks (D7 — zero cost).
+        Wait is outside ``step.timeout_s``. Wait expiry → ``_Halt(CAPACITY)`` with
+        any partial acquires already released by :func:`wait_acquire_locks`.
+        """
+        authored = effective_step_locks(
+            step, pipeline_locks=tuple(getattr(self.plan, "pipeline_locks", ()) or ())
+        )
+        if not authored:
+            return (), None
+
+        try:
+            names = resolve_lock_names(
+                authored,
+                workspace_dir=self.workspace_dir,
+                runner=self._lock_runner(),
+            )
+        except ConfigError as exc:
+            raise _Halt(ExitCode.CONFIG, step.id, str(exc)) from exc
+
+        if not names:
+            return (), None
+
+        locks_dir = self._locks_dir()
+        wait_s = float(self._lock_wait_s())
+        waited: set[str] = set()
+
+        def on_wait_start(lock_name: str) -> None:
+            if lock_name in waited:
+                return
+            waited.add(lock_name)
+            self._emit(
+                "lock-wait",
+                node=step.id,
+                cycle=cycle,
+                data={
+                    "lock": lock_name,
+                    "wait_s": wait_s,
+                    "locks_dir": str(locks_dir),
+                },
+            )
+
+        held = wait_acquire_locks(
+            locks_dir,
+            names,
+            pid=os.getpid(),
+            wait_s=wait_s,
+            now=self._slot_now,
+            sleep=self._slot_sleep,
+            poll_s=DEFAULT_POLL_S,
+            on_wait_start=on_wait_start,
+        )
+        if not held:
+            raise _Halt(
+                ExitCode.CAPACITY,
+                step.id,
+                f"no resource lock within {wait_s:g}s — capacity",
+            )
+        self._record_held_locks(held)
+        return held, locks_dir
+
+    def _release_step_locks(
+        self, held_locks: tuple[str, ...], locks_dir: Path | None
+    ) -> None:
+        """Release every held lock and clear run.json ``held_locks`` (RELEASE-BEFORE-PARK)."""
+        if not held_locks or locks_dir is None:
+            return
+        release_locks(locks_dir, held_locks)
+        self._record_held_locks(())
+
+    # -- agent slots (FACTORY-PLAN §9 / W6) --------------------------------- #
 
     def _slot_beat_interval_s(self) -> float:
         """Cadence for slot-only refresh when trail heartbeats are OFF (default 30s).
@@ -1577,6 +1734,8 @@ class _Walk:
         *,
         slot_name: str | None = None,
         slots_dir: Path | None = None,
+        lock_names: tuple[str, ...] = (),
+        locks_dir: Path | None = None,
     ) -> Iterator[None]:
         """Emit a periodic ``heartbeat`` while a blocking step runs.
 
@@ -1591,29 +1750,37 @@ class _Walk:
         When ``slot_name`` is set (W6 agent-slot held), each beat also refreshes the
         slot's heartbeat timestamp so a live holder is never reaped as stale.
         ``slots_dir`` is the same path acquire used (local or machine pool).
+
+        When ``lock_names`` is set (W8 resource locks held), each beat also refreshes
+        every lock's heartbeat so a live step is never age-reaped as stale.
         """
         interval = self.config.defaults.heartbeat_s
-        # Slot refresh needs a beat loop even when trail heartbeats are off — a tiny
-        # interval keeps the slot live without emitting trail events when heartbeat_s
-        # is unset. When both are off (no slot), zero-cost yield.
-        if (not interval or interval <= 0) and not slot_name:
+        # Slot/lock refresh needs a beat loop even when trail heartbeats are off — a
+        # tiny interval keeps holders live without emitting trail events when
+        # heartbeat_s is unset. When all are off (no slot, no locks), zero-cost yield.
+        need_refresh = bool(slot_name) or bool(lock_names)
+        if (not interval or interval <= 0) and not need_refresh:
             yield
             return
 
         stop = threading.Event()
         started = time.monotonic()
-        # Trail heartbeats only when configured; slot refresh uses the same cadence
-        # (or _slot_beat_interval_s when trail heartbeats are off but a slot is held).
+        # Trail heartbeats only when configured; slot/lock refresh uses the same cadence
+        # (or _slot_beat_interval_s when trail heartbeats are off but a holder is held).
         beat_interval = (
             interval if interval and interval > 0 else self._slot_beat_interval_s()
         )
         emit_trail = bool(interval and interval > 0)
         refresh_dir = slots_dir if slot_name else None
+        lock_refresh_dir = locks_dir if lock_names else None
 
         def beat() -> None:
             while not stop.wait(beat_interval):
                 if slot_name is not None and refresh_dir is not None:
                     refresh_slot(refresh_dir, slot_name, now=self._slot_now)
+                if lock_refresh_dir is not None:
+                    for ln in lock_names:
+                        refresh_lock(lock_refresh_dir, ln, now=self._slot_now)
                 if not emit_trail:
                     continue
                 log_bytes, last_line = _tail_log(log_path)

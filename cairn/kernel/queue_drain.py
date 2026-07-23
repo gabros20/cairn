@@ -221,6 +221,16 @@ def preallocate_run(
         now=now,
         headless=True,
     )
+    # W8: concurrent/dark git-touch without locks → ConfigError at the gate where
+    # concurrency + lane ARE known (plan() alone cannot see trigger concurrency).
+    from cairn.kernel.resource_locks import enforce_repo_locks
+
+    enforce_repo_locks(
+        p,
+        workspace_dir=workspace_dir,
+        concurrency=int(trigger.concurrency),
+        lane=trigger.lane,
+    )
     minted = mint_new(
         workspace_dir,
         p,
