@@ -39,9 +39,13 @@ _TRIGGER_KEYS = frozenset({
     "capacity_max",
     "wip_max",
     "inbox_max",
+    # W3 identity (T1): default off = arbitrary names, no reservation/dedupe/defer
+    "identity",
+    "max_item_bytes",
 })
 _ON_DONE_VALUES = frozenset({"done", "delete"})
 _ORDER_VALUES = frozenset({"name", "aged"})
+_IDENTITY_VALUES = frozenset({"off", "strict"})
 
 # A trigger name becomes a launchd job label segment and a systemd unit filename stem
 # (trigger_launchd_label / trigger_systemd_unit_names) — both are structural identifiers,
@@ -85,6 +89,9 @@ class Trigger:
           # capacity_max: 10        # stop on capacity-park depth
           # wip_max: 20             # stop when inflight (claimed + all waiting) reaches this
           # inbox_max: 50           # spool cap for pullers (W4); list-only here, not an admit gate
+          # identity: off           # "off" (default) | "strict" — filename grammar +
+          #                         # reservation/dedupe/defer (FACTORY-PLAN T1)
+          # max_item_bytes: 1048576 # admission envelope byte cap (strict only; default 1 MiB)
 
     Soft vs hard caps under ``concurrency > 1``: ``waiting_max`` / ``blocked_max`` /
     ``capacity_max`` are soft — up to ``concurrency`` in-flight items may land in
@@ -92,6 +99,9 @@ class Trigger:
     class is unknown until a child retires). ``wip_max`` is hard (claim updates
     ``.claim/`` synchronously on the admitter). Bounded overshoot, not unbounded
     (FACTORY-PLAN §2 T2 tradeoff, pool-width bound).
+
+    ``identity: off`` (default) keeps arbitrary inbox names and no reservation —
+    byte-identical to pre-T12. ``identity: strict`` enables the T1 envelope.
     """
 
     name: str
@@ -107,6 +117,8 @@ class Trigger:
     capacity_max: int | None = None
     wip_max: int | None = None
     inbox_max: int | None = None
+    identity: str = "off"  # "off" | "strict"
+    max_item_bytes: int | None = None  # None → DEFAULT_MAX_ITEM_BYTES when strict
 
 
 def _fail(message: str, file: Path) -> NoReturn:
@@ -216,6 +228,33 @@ def _parse_trigger(name: str, entry: Any, workspace_dir: Path, file: Path) -> Tr
     wip_max = _parse_optional_positive_int(name, "wip_max", entry, file)
     inbox_max = _parse_optional_positive_int(name, "inbox_max", entry, file)
 
+    # YAML 1.1 treats bare `off`/`on` as booleans — coerce so `identity: off`
+    # (the documented default spelling) is not a ConfigError.
+    raw_identity = entry.get("identity", "off")
+    if raw_identity is False:
+        identity = "off"
+    elif raw_identity is True:
+        _fail(
+            f"trigger {name!r}: 'identity' must be one of "
+            f"{sorted(_IDENTITY_VALUES)}, got {raw_identity!r} "
+            f"(YAML boolean — use the string 'off' or 'strict')",
+            file,
+        )
+    else:
+        identity = raw_identity
+    if identity not in _IDENTITY_VALUES:
+        _fail(
+            f"trigger {name!r}: 'identity' must be one of "
+            f"{sorted(_IDENTITY_VALUES)}, got {identity!r}",
+            file,
+        )
+
+    max_item_bytes: int | None = None
+    if "max_item_bytes" in entry:
+        max_item_bytes = _parse_positive_int(
+            name, "max_item_bytes", entry["max_item_bytes"], file
+        )
+
     return Trigger(
         name=name,
         pipeline=pipeline,
@@ -230,6 +269,8 @@ def _parse_trigger(name: str, entry: Any, workspace_dir: Path, file: Path) -> Tr
         capacity_max=capacity_max,
         wip_max=wip_max,
         inbox_max=inbox_max,
+        identity=identity,
+        max_item_bytes=max_item_bytes,
     )
 
 

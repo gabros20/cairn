@@ -40,10 +40,13 @@ from cairn.kernel.gckit import write_queue_pin
 from cairn.kernel.plan import plan as build_plan
 from cairn.kernel.proc import Runner
 from cairn.kernel.queue_ledger import (
+    DEFAULT_MAX_ITEM_BYTES,
+    admit_strict,
     claim,
     count_by_class,
     pointer_path,
     read_pointer,
+    release_orphan_reservations,
     retire,
     scan_candidates,
     sweep,
@@ -384,6 +387,44 @@ def _claim_one(
     return claimed, False
 
 
+def _admit_before_claim(
+    *,
+    name: str,
+    trigger: Trigger,
+    watch_abs: Path,
+    candidate: Path,
+    diag: TextIO,
+) -> bool:
+    """Strict-identity gate before claim. Returns True if the candidate may be claimed.
+
+    ``identity: off`` (default) is a no-op — D7 byte-compatible with pre-T12.
+    For ``identity: strict``: envelope + reservation + tombstone dedupe + defer
+    (FACTORY-PLAN T1). Non-admit dispositions emit a diagnostic and skip claim.
+    """
+    if trigger.identity != "strict":
+        return True
+    max_bytes = (
+        trigger.max_item_bytes
+        if trigger.max_item_bytes is not None
+        else DEFAULT_MAX_ITEM_BYTES
+    )
+    try:
+        result = admit_strict(watch_abs, candidate, max_item_bytes=max_bytes)
+    except Exception as exc:  # noqa: BLE001 — per-candidate isolation
+        print(
+            f"cairn: trigger {name!r}: candidate {candidate.name!r} identity "
+            f"admission hazarded: {exc}",
+            file=diag,
+        )
+        return False
+    if result.diagnostic:
+        print(
+            f"cairn: trigger {name!r}: {result.diagnostic}",
+            file=diag,
+        )
+    return result.disposition == "admit"
+
+
 def _drain_serial(
     *,
     name: str,
@@ -412,6 +453,15 @@ def _drain_serial(
             if reason is not None:
                 print(f"cairn: trigger {name!r}: {reason}", file=diag)
                 break
+        # T1 identity:strict — envelope/reserve/dedupe/defer BEFORE claim.
+        if not _admit_before_claim(
+            name=name,
+            trigger=trigger,
+            watch_abs=watch_abs,
+            candidate=candidate,
+            diag=diag,
+        ):
+            continue
         claimed, hazarded = _claim_one(
             name=name, watch_abs=watch_abs, candidate=candidate, diag=diag
         )
@@ -499,6 +549,15 @@ def _drain_pooled(
         except StopIteration:
             stop_admit = True
             return False
+        # T1 identity:strict — envelope/reserve/dedupe/defer BEFORE claim.
+        if not _admit_before_claim(
+            name=name,
+            trigger=trigger,
+            watch_abs=watch_abs,
+            candidate=candidate,
+            diag=diag,
+        ):
+            return True  # consumed candidate (rejected/skipped/deferred); keep admitting
         claimed, hazarded = _claim_one(
             name=name, watch_abs=watch_abs, candidate=candidate, diag=diag
         )
@@ -616,6 +675,17 @@ def run_trigger(
     if report is not None:
         for line in report.diagnostics:
             print(f"cairn: trigger {name!r}: sweep: {line}", file=diag)
+
+    # T1: release orphan reservations (reserve-without-claim crash window) before
+    # new admits. Only meaningful for identity:strict; cheap no-op otherwise.
+    try:
+        for line in release_orphan_reservations(watch_abs):
+            print(f"cairn: trigger {name!r}: {line}", file=diag)
+    except Exception as exc:  # noqa: BLE001 — never abort the drain
+        print(
+            f"cairn: trigger {name!r}: orphan-reservation sweep hazarded: {exc}",
+            file=diag,
+        )
 
     candidates = scan_candidates(watch_abs, trigger.glob)
     candidates = order_candidates(candidates, trigger.order, now=now)

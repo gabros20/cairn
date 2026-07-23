@@ -15,11 +15,18 @@ import errno
 import fnmatch
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
-from cairn.kernel.durafs import atomic_write_text, durable_link, durable_move, durable_unlink
+from cairn.kernel.durafs import (
+    atomic_write_text,
+    durable_link,
+    durable_move,
+    durable_unlink,
+    exclusive_create,
+)
 from cairn.kernel.errors import CairnError, ConfigError
 from cairn.kernel.gckit import clear_queue_pin
 from cairn.kernel.runstate import load_run
@@ -31,6 +38,529 @@ from cairn.kernel.types import OutcomeClass, RunOutcome, classify_exit
 _LANES = (".claim", ".waiting", ".failed", ".done")
 _POINTER_SUBDIR = ".runs"
 _TOMBSTONE_SUBDIR = "tombstones"
+_IDS_SUBDIR = ".ids"
+_DEFERRED_SUBDIR = ".deferred"
+_REJECTED_SUBDIR = ".rejected"
+
+# POSIX NAME_MAX floor; identity + every ledger-derived name must fit (FACTORY-PLAN T1).
+NAME_MAX = 255
+
+# Default admission byte cap for identity:strict triggers (overridable per trigger).
+DEFAULT_MAX_ITEM_BYTES = 1_048_576  # 1 MiB
+
+# --------------------------------------------------------------------------- #
+# Filename grammar (identity:strict) — FACTORY-PLAN §2 T1
+# --------------------------------------------------------------------------- #
+#
+#   p<prio>-<source>-<id>-r<rev>.json
+#
+#   prio   — single digit 0–9
+#   source — [a-z][a-z0-9]*          (lowercase; first hyphen-separated segment)
+#   id     — [a-z0-9]([a-z0-9._-]*[a-z0-9])?   (lowercase; may contain hyphens)
+#   rev    — [a-z0-9][a-z0-9._-]*    (sortable string; W4 uses epoch digits)
+#
+# Identity = ``<source>-<id>`` (lowercased by construction — case-safe; uppercase
+# is nonconforming). Traversal names (``..``, ``/``) cannot appear: names come
+# from readdir and the grammar rejects anything outside the charset above.
+#
+# Derived ledger names (all must fit NAME_MAX):
+#   reservation  ``.claim/.ids/<identity>``
+#   deferred     ``.deferred/<identity>``
+#   tombstone    ``.done/tombstones/<identity>-r<rev>``
+#   pointer/item full filename (with prio + .json)
+#
+# Rev ordering here is **lexical string compare**. True monotonic rev ordering
+# is W4's ``r<epoch>`` puller contract; until then lexically-greater wins.
+
+_ITEM_NAME_RE = re.compile(
+    r"^p(?P<prio>[0-9])-"
+    r"(?P<source>[a-z][a-z0-9]*)-"
+    r"(?P<id>[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?)-"
+    r"r(?P<rev>[a-z0-9][a-z0-9._-]*)"
+    r"\.json$"
+)
+
+
+@dataclass(frozen=True)
+class ItemId:
+    """Parsed work-item identity from a conforming filename (T1)."""
+
+    prio: int
+    source: str
+    id: str
+    rev: str
+
+    @property
+    def identity(self) -> str:
+        """Canonical identity key: ``<source>-<id>``."""
+        return f"{self.source}-{self.id}"
+
+    @property
+    def filename(self) -> str:
+        """Canonical inbox filename for this item."""
+        return f"p{self.prio}-{self.source}-{self.id}-r{self.rev}.json"
+
+    @property
+    def tombstone_name(self) -> str:
+        """Tombstone marker basename: ``<identity>-r<rev>`` (no ``.json``)."""
+        return f"{self.identity}-r{self.rev}"
+
+
+def parse_item_name(name: str) -> ItemId | None:
+    """Parse a strict work-item filename; return None if nonconforming.
+
+    Rejects uppercase, wrong shape, over-long names (NAME_MAX budget for the
+    filename and every derived ledger name), and anything that is not exactly
+    ``p<prio>-<source>-<id>-r<rev>.json``. Module-level pure function — no I/O.
+    """
+    if not name or len(name) > NAME_MAX:
+        return None
+    # Case-safe: any uppercase letter is nonconforming (identity is lowercased).
+    if any(c.isupper() for c in name):
+        return None
+    m = _ITEM_NAME_RE.fullmatch(name)
+    if m is None:
+        return None
+    item = ItemId(
+        prio=int(m.group("prio")),
+        source=m.group("source"),
+        id=m.group("id"),
+        rev=m.group("rev"),
+    )
+    # Derived ledger names must also fit NAME_MAX (ENAMETOOLONG mid-QTP hazard).
+    if len(item.identity) > NAME_MAX or len(item.tombstone_name) > NAME_MAX:
+        return None
+    return item
+
+
+# --------------------------------------------------------------------------- #
+# Identity reservation / deferred / rejection (T1 — opt-in identity:strict)
+# --------------------------------------------------------------------------- #
+
+
+def reservation_path(watch_abs: Path, identity: str) -> Path:
+    """``.claim/.ids/<identity>`` — durable O_EXCL identity reservation."""
+    return Path(watch_abs) / ".claim" / _IDS_SUBDIR / identity
+
+
+def deferred_path(watch_abs: Path, identity: str) -> Path:
+    """``.deferred/<identity>`` — one parked newer-rev file per identity."""
+    return Path(watch_abs) / _DEFERRED_SUBDIR / identity
+
+
+def rejected_dir(watch_abs: Path) -> Path:
+    """``.rejected/`` quarantine for nonconforming inbox drops (bounded; never claimed)."""
+    return Path(watch_abs) / _REJECTED_SUBDIR
+
+
+def _tombstone_dir(watch_abs: Path) -> Path:
+    return Path(watch_abs) / ".done" / _TOMBSTONE_SUBDIR
+
+
+def highest_tombstoned_rev(watch_abs: Path, identity: str) -> str | None:
+    """Highest lexical rev among ``.done/tombstones/<identity>-r*`` markers, or None."""
+    tomb_dir = _tombstone_dir(watch_abs)
+    if not tomb_dir.is_dir():
+        return None
+    prefix = f"{identity}-r"
+    best: str | None = None
+    for p in tomb_dir.iterdir():
+        if not p.is_file() or not p.name.startswith(prefix):
+            continue
+        rev = p.name[len(prefix) :]
+        if not rev:
+            continue
+        if best is None or rev > best:
+            best = rev
+    return best
+
+
+def _live_identities(watch_abs: Path) -> set[str]:
+    """Identities with a live item in ``.claim/`` (top-level) or ``.waiting/``."""
+    live: set[str] = set()
+    for lane in (".claim", ".waiting"):
+        d = Path(watch_abs) / lane
+        if not d.is_dir():
+            continue
+        for p in d.iterdir():
+            if not p.is_file():
+                continue
+            item = parse_item_name(p.name)
+            if item is not None:
+                live.add(item.identity)
+    return live
+
+
+def reserve_identity(watch_abs: Path, identity: str, *, fs: Any = None) -> bool:
+    """O_EXCL create ``.claim/.ids/<identity>``. True if reserved, False if taken."""
+    path = reservation_path(watch_abs, identity)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return exclusive_create(path, "", fs=fs)
+
+
+def release_reservation(watch_abs: Path, identity: str, *, fs: Any = None) -> None:
+    """Drop the durable reservation for ``identity`` if present (terminal retire)."""
+    path = reservation_path(watch_abs, identity)
+    try:
+        durable_unlink(path, fs=fs)
+    except FileNotFoundError:
+        pass
+
+
+def release_orphan_reservations(watch_abs: Path, *, fs: Any = None) -> list[str]:
+    """Release ``.claim/.ids/*`` with no live claim/waiting item (T1 orphan recovery).
+
+    Called at drain start (after sweep). Over-holding is safe; this only drops a
+    reservation whose identity has no file in ``.claim/`` or ``.waiting/`` — the
+    crash window between reserve and claim. Aggressive multi-observer grace and
+    reconcile-time audits are T13. Returns diagnostic strings.
+    """
+    watch_abs = Path(watch_abs)
+    ids_dir = watch_abs / ".claim" / _IDS_SUBDIR
+    if not ids_dir.is_dir():
+        return []
+    live = _live_identities(watch_abs)
+    diags: list[str] = []
+    for entry in sorted(ids_dir.iterdir()):
+        if not entry.is_file():
+            continue
+        if entry.name in live:
+            continue
+        try:
+            durable_unlink(entry, fs=fs)
+        except FileNotFoundError:
+            continue
+        diags.append(f"released orphan reservation {entry.name}")
+    return diags
+
+
+def _read_item_fields(path: Path) -> ItemId | None:
+    """Best-effort ItemId from a parked deferred body's source/id/rev/prio."""
+    try:
+        raw = path.read_bytes()
+        body = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    if not isinstance(body, dict):
+        return None
+    try:
+        prio = int(body["prio"])
+        source = str(body["source"])
+        id_ = str(body["id"])
+        rev = str(body["rev"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    # Rebuild via the grammar so promotion only re-admits conforming items.
+    return parse_item_name(f"p{prio}-{source}-{id_}-r{rev}.json")
+
+
+def _rev_cmp_gt(a: str, b: str) -> bool:
+    """Lexical rev compare (W4 epoch digits will order; document limitation)."""
+    return a > b
+
+
+def park_deferred(
+    watch_abs: Path,
+    candidate: Path,
+    item: ItemId,
+    *,
+    fs: Any = None,
+) -> str:
+    """Move ``candidate`` into ``.deferred/<identity>``; latest lexical rev wins.
+
+    Returns a diagnostic. Drops the candidate (no park) when an equal-or-greater
+    rev is already parked.
+    """
+    watch_abs = Path(watch_abs)
+    candidate = Path(candidate)
+    dest = deferred_path(watch_abs, item.identity)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.is_file():
+        existing = _read_item_fields(dest)
+        if existing is not None and not _rev_cmp_gt(item.rev, existing.rev):
+            # Already have equal or newer — drop the inbox duplicate.
+            try:
+                durable_unlink(candidate, fs=fs)
+            except FileNotFoundError:
+                pass
+            return (
+                f"deferred drop {candidate.name}: parked rev {existing.rev!r} "
+                f">= arriving {item.rev!r}"
+            )
+        # Replace with newer rev.
+        try:
+            durable_unlink(dest, fs=fs)
+        except FileNotFoundError:
+            pass
+    try:
+        durable_move(candidate, dest, fs=fs)
+    except FileExistsError:
+        # Racer recreated dest — drop candidate if still present.
+        try:
+            durable_unlink(candidate, fs=fs)
+        except FileNotFoundError:
+            pass
+        return f"deferred race on {item.identity}: candidate dropped"
+    return f"deferred {candidate.name} → .deferred/{item.identity} (rev {item.rev})"
+
+
+def promote_deferred(
+    watch_abs: Path,
+    item: ItemId,
+    *,
+    fs: Any = None,
+) -> str | None:
+    """After terminal retire of ``item``: promote or drop ``.deferred/<identity>``.
+
+    If deferred rev > just-retired rev → install into inbox under the canonical
+    filename for the next drain. Else drop (already delivered / stale). Returns
+    a diagnostic or None when no deferred file existed.
+    """
+    watch_abs = Path(watch_abs)
+    parked = deferred_path(watch_abs, item.identity)
+    if not parked.is_file():
+        return None
+    deferred_item = _read_item_fields(parked)
+    if deferred_item is None or not _rev_cmp_gt(deferred_item.rev, item.rev):
+        try:
+            durable_unlink(parked, fs=fs)
+        except FileNotFoundError:
+            pass
+        # Also tombstone a ≤ retired deferred (plan: already delivered).
+        if deferred_item is not None:
+            _tombstone(watch_abs, deferred_item.tombstone_name, fs=fs)
+        return (
+            f"dropped deferred {item.identity} "
+            f"(rev {(deferred_item.rev if deferred_item else '?')!r} "
+            f"<= retired {item.rev!r})"
+        )
+    inbox_name = deferred_item.filename
+    dest = watch_abs / inbox_name
+    if dest.exists():
+        # Inbox already has this name — leave deferred? Prefer drop park if same.
+        try:
+            durable_unlink(parked, fs=fs)
+        except FileNotFoundError:
+            pass
+        return f"deferred {item.identity} not promoted: inbox already has {inbox_name}"
+    try:
+        durable_move(parked, dest, fs=fs)
+    except (FileNotFoundError, FileExistsError) as exc:
+        return f"deferred promote of {item.identity} failed: {exc}"
+    return f"promoted deferred {item.identity} rev {deferred_item.rev} → inbox {inbox_name}"
+
+
+def _reject_candidate(
+    watch_abs: Path,
+    candidate: Path,
+    *,
+    reason: str,
+    fs: Any = None,
+) -> str:
+    """Durable-move nonconforming candidate into ``.rejected/``; return diagnostic."""
+    watch_abs = Path(watch_abs)
+    candidate = Path(candidate)
+    rej = rejected_dir(watch_abs)
+    rej.mkdir(parents=True, exist_ok=True)
+    dest = rej / candidate.name
+    # Collision: suffix so we never destroy prior rejection evidence.
+    if dest.exists():
+        stem, ext = Path(candidate.name).stem, Path(candidate.name).suffix
+        n = 2
+        while (rej / f"{stem}-v{n}{ext}").exists():
+            n += 1
+        dest = rej / f"{stem}-v{n}{ext}"
+    try:
+        durable_move(candidate, dest, fs=fs)
+    except FileNotFoundError:
+        return f"rejected {candidate.name} vanished before quarantine ({reason})"
+    except FileExistsError:
+        try:
+            durable_unlink(candidate, fs=fs)
+        except FileNotFoundError:
+            pass
+        return f"rejected {candidate.name} already quarantined ({reason})"
+    return f"rejected {candidate.name} → .rejected/ ({reason})"
+
+
+def _body_agrees(body: dict[str, Any], item: ItemId) -> bool:
+    """Filename↔body agreement on (source, id, rev, prio)."""
+    try:
+        if str(body.get("source", "")) != item.source:
+            return False
+        if str(body.get("id", "")) != item.id:
+            return False
+        if str(body.get("rev", "")) != item.rev:
+            return False
+        if int(body["prio"]) != item.prio:
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    return True
+
+
+AdmitDisposition = Literal["admit", "skip", "reject", "defer"]
+
+
+@dataclass(frozen=True)
+class AdmitResult:
+    """Outcome of :func:`admit_strict` for one inbox candidate."""
+
+    disposition: AdmitDisposition
+    item: ItemId | None = None
+    diagnostic: str | None = None
+
+
+def admit_strict(
+    watch_abs: Path,
+    candidate: Path,
+    *,
+    max_item_bytes: int = DEFAULT_MAX_ITEM_BYTES,
+    fs: Any = None,
+) -> AdmitResult:
+    """Admission envelope + reservation + tombstone dedupe + defer (T1 strict).
+
+    Call BEFORE claim. Never reserves or claims nonconforming input.
+
+    Dispositions:
+    - ``admit``  — identity reserved; caller should claim
+    - ``skip``   — duplicate of a tombstoned rev (inbox file removed)
+    - ``reject`` — nonconforming; moved to ``.rejected/``
+    - ``defer``  — identity live; parked under ``.deferred/``
+    """
+    watch_abs = Path(watch_abs)
+    candidate = Path(candidate)
+    name = candidate.name
+
+    # --- admission envelope (before any reservation) ---
+    if candidate.is_symlink():
+        return AdmitResult(
+            "reject",
+            diagnostic=_reject_candidate(
+                watch_abs, candidate, reason="symlink (not a regular file)", fs=fs
+            ),
+        )
+    if not candidate.is_file():
+        return AdmitResult(
+            "reject",
+            diagnostic=_reject_candidate(
+                watch_abs, candidate, reason="not a regular file", fs=fs
+            ),
+        )
+    try:
+        size = candidate.stat().st_size
+    except OSError as exc:
+        return AdmitResult(
+            "reject",
+            diagnostic=_reject_candidate(
+                watch_abs, candidate, reason=f"stat failed: {exc}", fs=fs
+            ),
+        )
+    if size > max_item_bytes:
+        return AdmitResult(
+            "reject",
+            diagnostic=_reject_candidate(
+                watch_abs,
+                candidate,
+                reason=f"byte cap exceeded ({size} > {max_item_bytes})",
+                fs=fs,
+            ),
+        )
+    try:
+        raw = candidate.read_bytes()
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return AdmitResult(
+            "reject",
+            diagnostic=_reject_candidate(
+                watch_abs, candidate, reason="not UTF-8", fs=fs
+            ),
+        )
+    except OSError as exc:
+        return AdmitResult(
+            "reject",
+            diagnostic=_reject_candidate(
+                watch_abs, candidate, reason=f"read failed: {exc}", fs=fs
+            ),
+        )
+    try:
+        body = json.loads(text)
+    except json.JSONDecodeError:
+        return AdmitResult(
+            "reject",
+            diagnostic=_reject_candidate(
+                watch_abs, candidate, reason="not JSON", fs=fs
+            ),
+        )
+    if not isinstance(body, dict):
+        return AdmitResult(
+            "reject",
+            diagnostic=_reject_candidate(
+                watch_abs, candidate, reason="JSON root is not an object", fs=fs
+            ),
+        )
+    item = parse_item_name(name)
+    if item is None:
+        return AdmitResult(
+            "reject",
+            diagnostic=_reject_candidate(
+                watch_abs, candidate, reason="filename grammar nonconforming", fs=fs
+            ),
+        )
+    if not _body_agrees(body, item):
+        return AdmitResult(
+            "reject",
+            item=item,
+            diagnostic=_reject_candidate(
+                watch_abs,
+                candidate,
+                reason="filename↔body disagreement (source/id/rev/prio)",
+                fs=fs,
+            ),
+        )
+
+    # --- tombstone dedupe: rev ≤ any tombstoned rev → already delivered ---
+    tomb_rev = highest_tombstoned_rev(watch_abs, item.identity)
+    if tomb_rev is not None and item.rev <= tomb_rev:
+        try:
+            durable_unlink(candidate, fs=fs)
+        except FileNotFoundError:
+            pass
+        return AdmitResult(
+            "skip",
+            item=item,
+            diagnostic=(
+                f"dedupe skip {name}: rev {item.rev!r} <= tombstoned {tomb_rev!r}"
+            ),
+        )
+
+    # --- durable reservation (closes cross-drain TOCTOU) ---
+    if not reserve_identity(watch_abs, item.identity, fs=fs):
+        # Identity live — park as deferred (latest rev wins).
+        diag = park_deferred(watch_abs, candidate, item, fs=fs)
+        return AdmitResult("defer", item=item, diagnostic=diag)
+
+    return AdmitResult("admit", item=item)
+
+
+def release_identity_on_terminal(
+    watch_abs: Path,
+    item_name: str,
+    *,
+    fs: Any = None,
+) -> list[str]:
+    """On terminal retire: release reservation + promote/drop deferred (T1).
+
+    No-op when ``item_name`` does not parse as a strict identity filename (so
+    identity:off retires of arbitrary names stay byte-identical). Returns
+    diagnostics from promote/drop.
+    """
+    item = parse_item_name(item_name)
+    if item is None:
+        return []
+    release_reservation(watch_abs, item.identity, fs=fs)
+    diag = promote_deferred(watch_abs, item, fs=fs)
+    return [diag] if diag else []
 
 
 # --------------------------------------------------------------------------- #
@@ -257,10 +787,16 @@ def read_pointer(path: Path) -> dict[str, Any]:
 
 
 def _tombstone(watch_abs: Path, name: str, *, fs: Any = None) -> Path:
-    """Create an empty tombstone marker under ``.done/tombstones/<name>`` (T1/T3)."""
+    """Create an empty tombstone marker under ``.done/tombstones/<name>`` (T1/T3).
+
+    For grammar-conforming item names the marker is ``<identity>-r<rev>`` so re-entry
+    can compare revs; arbitrary (identity:off) names keep the full filename.
+    """
+    item = parse_item_name(name)
+    marker = item.tombstone_name if item is not None else name
     tomb_dir = Path(watch_abs) / ".done" / _TOMBSTONE_SUBDIR
     tomb_dir.mkdir(parents=True, exist_ok=True)
-    dest = tomb_dir / name
+    dest = tomb_dir / marker
     # Empty marker; collision is fine (re-entry after prior retire of same name).
     if not dest.exists():
         atomic_write_text(dest, "", fs=fs)
@@ -391,6 +927,8 @@ def retire(
         # T3 pin-release: terminal ledger placement FIRST, then clear pin.
         if run_dir_s:
             clear_queue_pin(Path(run_dir_s), fs=fs)
+        # T1: release identity reservation + promote deferred (terminal only).
+        release_identity_on_terminal(watch_abs, name, fs=fs)
         return placed
 
     # DONE — terminal: item to .done/ (or delete), drop live pointer, always tombstone.
@@ -418,6 +956,7 @@ def retire(
         _tombstone(watch_abs, name, fs=fs)
         if run_dir_s:
             clear_queue_pin(Path(run_dir_s), fs=fs)
+        release_identity_on_terminal(watch_abs, name, fs=fs)
         return None
     placed = _place(claim_path, watch_abs / ".done", name, fs=fs)
     if src_ptr.is_file():
@@ -429,6 +968,7 @@ def retire(
     # T3 pin-release: terminal ledger placement FIRST, then clear pin.
     if run_dir_s:
         clear_queue_pin(Path(run_dir_s), fs=fs)
+    release_identity_on_terminal(watch_abs, name, fs=fs)
     return placed
 
 

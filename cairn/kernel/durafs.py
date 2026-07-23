@@ -46,6 +46,8 @@ class _FsOps(Protocol):
 
     def close(self, fd: int) -> None: ...
 
+    def exclusive_create(self, path: Path, text: str = "") -> bool: ...
+
 
 class _OsFs:
     """Default backend: delegates to ``os`` / ``Path`` at call time (monkeypatch-visible)."""
@@ -77,6 +79,22 @@ class _OsFs:
 
     def close(self, fd: int) -> None:
         os.close(fd)
+
+    def exclusive_create(self, path: Path, text: str = "") -> bool:
+        """O_CREAT|O_EXCL create; True if created, False if the name is taken."""
+        path = Path(path)
+        flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+        try:
+            fd = os.open(path, flags, 0o600)
+        except FileExistsError:
+            return False
+        try:
+            if text:
+                os.write(fd, text.encode("utf-8"))
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        return True
 
 
 _OS_FS = _OsFs()
@@ -157,3 +175,20 @@ def durable_move(src: Path, dest: Path, *, fs: _FsOps | None = None) -> None:
     src, dest = Path(src), Path(dest)
     durable_link(src, dest, fs=ops)
     durable_unlink(src, fs=ops)
+
+
+def exclusive_create(path: Path, text: str = "", *, fs: _FsOps | None = None) -> bool:
+    """Create ``path`` with O_CREAT|O_EXCL (or the fs seam's equivalent).
+
+    Returns True when this caller created the file, False when the name was already
+    taken — the atomic mutual-exclusion primitive for identity reservations
+    (``.claim/.ids/<identity>``, FACTORY-PLAN T1). Content is file-fsynced then the
+    parent directory is fsynced so the reservation survives a crash that follows
+    a successful return. Caller ensures the parent directory exists.
+    """
+    ops = _resolve(fs)
+    path = Path(path)
+    if not ops.exclusive_create(path, text):
+        return False
+    fsync_dir(path.parent, fs=ops)
+    return True

@@ -190,3 +190,14 @@ class RecordingFs:
         self._dir_fds.pop(fd, None)
         self._fds.pop(fd, None)
         self._file_fds.pop(fd, None)
+
+    def exclusive_create(self, path: Path, text: str = "") -> bool:
+        """O_CREAT|O_EXCL stand-in: False if path already visible; else pending create."""
+        path = Path(path)
+        self._record("exclusive_create", path)
+        if path in self.files:
+            return False
+        self._note_dir_create(path, text)
+        # Content is "file-fsynced" as part of exclusive create (matches _OsFs).
+        self._file_content_synced.add(path)
+        return True
