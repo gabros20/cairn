@@ -85,6 +85,13 @@ class Trigger:
           # capacity_max: 10        # stop on capacity-park depth
           # wip_max: 20             # stop when inflight (claimed + all waiting) reaches this
           # inbox_max: 50           # spool cap for pullers (W4); list-only here, not an admit gate
+
+    Soft vs hard caps under ``concurrency > 1``: ``waiting_max`` / ``blocked_max`` /
+    ``capacity_max`` are soft — up to ``concurrency`` in-flight items may land in
+    one class past its cap before the next admission check observes them (outcome
+    class is unknown until a child retires). ``wip_max`` is hard (claim updates
+    ``.claim/`` synchronously on the admitter). Bounded overshoot, not unbounded
+    (FACTORY-PLAN §2 T2 tradeoff, pool-width bound).
     """
 
     name: str

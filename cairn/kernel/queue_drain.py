@@ -14,6 +14,13 @@ stops further claims (exit 0 — healthy back pressure, not failure). ``concurre
 runs a bounded ThreadPool when >1; ``concurrency: 1`` + no caps keeps the serial
 path byte-identical to pre-W3. ``order: aged`` priority-ages by mtime (see
 :data:`AGE_STEP_SECONDS`).
+
+Backpressure caps are soft under concurrency>1: up to ``concurrency`` in-flight
+items may land in one class past its cap before the next admission check
+observes them (outcome class is unknown until a child retires off the admitter
+thread); ``wip_max`` is hard (claim is synchronous on the admitter). This is the
+same bounded-overshoot tradeoff FACTORY-PLAN §2 T2 accepts, here bounded by the
+pool width rather than the process count.
 """
 
 from __future__ import annotations
@@ -450,7 +457,18 @@ def _drain_pooled(
     """Bounded pool: claim→submit lazily; at most ``concurrency`` children in flight.
 
     Caps are re-checked on the admitter thread before each new claim (as slots free).
-    Per-candidate hazard isolation and lost-race discipline are preserved.
+    Per-candidate hazard isolation and lost-race discipline are preserved: a
+    worker that raises is marked failed and siblings still complete; a
+    KeyboardInterrupt during the drain blocks on ``ThreadPoolExecutor``
+    shutdown until in-flight ``handle.wait()`` calls return (acceptable —
+    no orphaned children; longer perceived hang than the serial path's
+    single in-flight child).
+
+    Soft-cap overshoot (waiting_max / blocked_max / capacity_max): up to
+    ``concurrency`` in-flight items may retire into one class past its cap
+    before the next ``try_admit`` observes them; ``wip_max`` is hard because
+    claim updates ``.claim/`` on the admitter thread. Bound is the pool width
+    (FACTORY-PLAN §2 T2 tradeoff).
     """
     any_failed = False
     lock = threading.Lock()
@@ -557,11 +575,20 @@ def run_trigger(
     (FACTORY-PLAN T6).
 
     Per-candidate isolation preserved: a hazard on one event never aborts the drain;
-    post-claim exceptions leave stuck claims in ``.claim/``.
+    post-claim exceptions leave stuck claims in ``.claim/``. On the pooled path a
+    worker exception is isolated the same way (siblings still retire).
 
     W3: optional caps gate admission (lazy, re-checked before each claim);
     ``concurrency > 1`` runs a bounded pool; ``concurrency: 1`` + no caps keeps the
     serial path (D7 byte-compatible with pre-W3).
+
+    Backpressure caps are soft under concurrency>1: up to ``concurrency``
+    in-flight items may land in one class past its cap before the next admission
+    check observes them; ``wip_max`` is hard. This is the same bounded-overshoot
+    tradeoff FACTORY-PLAN §2 T2 accepts, here bounded by the pool width rather
+    than the process count. A subsequent drain re-checks live depths and refuses
+    further claims once the class is at or over cap. KeyboardInterrupt during a
+    pooled drain blocks on pool shutdown until in-flight children return.
     """
     workspace_dir = Path(workspace_dir)
     triggers = load_triggers(workspace_dir)

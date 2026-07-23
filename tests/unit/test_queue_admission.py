@@ -599,6 +599,143 @@ def test_concurrency_pool_no_double_claim(tmp_path, monkeypatch):
     assert len(claimed_params) == len(set(claimed_params)) == 8
 
 
+def test_pooled_waiting_max_overshoot_bounded_by_concurrency(tmp_path, monkeypatch):
+    """I1: under concurrency=K, waiting_max=W soft-overshoots by at most K, then re-engages.
+
+    Seed empty waiting + many candidates; all children park needs-human. One wave
+    may admit up to K before any retire is visible, so depth ≤ W+K. A subsequent
+    drain then refuses further claims (cap re-engages on live depths).
+    """
+    K, W = 3, 1
+    ws = _workspace(
+        tmp_path,
+        f"""
+        handle-reply:
+          pipeline: handle-reply
+          watch: inbox/replies
+          concurrency: {K}
+          waiting_max: {W}
+        """,
+    )
+    _stub_mint(monkeypatch, ws)
+    watch_abs = ws / "inbox" / "replies"
+    watch_abs.mkdir(parents=True)
+    # Enough candidates that unbounded admit would go well past W+K.
+    for i in range(12):
+        (watch_abs / f"item-{i:02d}.json").write_text(str(i), encoding="utf-8")
+
+    # Slow park so the pool fills to K before any needs_human pointer appears.
+    class SlowParkRunner(RunnerBase):
+        def __init__(self):
+            self.calls: list[dict] = []
+            self._lock = threading.Lock()
+            self._n = 0
+
+        def spawn(self, argv, *, input=None, cwd=None):
+            with self._lock:
+                self.calls.append({"argv": list(argv)})
+                self._n += 1
+                pid = 1000 + self._n
+
+            class H:
+                def __init__(self, p):
+                    self._pid = p
+
+                @property
+                def pid(self):
+                    return self._pid
+
+                def wait(self, timeout=None):
+                    time.sleep(0.04)
+                    return RunResult(returncode=6, stdout="parked\n", stderr="")
+
+                def poll(self):
+                    return None
+
+                def terminate(self):
+                    return None
+
+            return H(pid)
+
+    runner = SlowParkRunner()
+    err1 = io.StringIO()
+    code1 = run_trigger(
+        "handle-reply", ws, runner=runner, cairn_bin="cairn", now=NOW, err=err1
+    )
+    assert code1 == 0
+    depths = count_by_class(watch_abs, glob="*")
+    # Soft overshoot: at most W+K needs-human after one pooled drain.
+    assert depths["needs_human"] <= W + K
+    assert depths["needs_human"] >= 1  # at least something parked
+    # Did not drain the whole inbox unbounded.
+    assert depths["needs_human"] < 12
+    leftover = list(scan_candidates(watch_abs, "*"))
+    assert leftover, "expected unclaimed candidates for the re-engage check"
+
+    # Subsequent drain: cap re-engages — claims nothing, prints diagnostic.
+    err2 = io.StringIO()
+    runner2 = FakeRunner({("cairn", "run"): RunResult(0, "", "")})
+    code2 = run_trigger(
+        "handle-reply", ws, runner=runner2, cairn_bin="cairn", now=NOW, err=err2
+    )
+    assert code2 == 0
+    assert runner2.calls == []
+    assert "review lane full" in err2.getvalue()
+    assert list(scan_candidates(watch_abs, "*")) == leftover
+
+
+def test_pooled_worker_exception_isolates_siblings(tmp_path, monkeypatch):
+    """Pool path: one _process_claimed raise fails the drain but siblings still retire."""
+    import cairn.kernel.queue_drain as qd
+
+    ws = _workspace(
+        tmp_path,
+        """
+        handle-reply:
+          pipeline: handle-reply
+          watch: inbox/replies
+          concurrency: 3
+        """,
+    )
+    _stub_mint(monkeypatch, ws)
+    watch_abs = ws / "inbox" / "replies"
+    watch_abs.mkdir(parents=True)
+    for name in ("a-bad.json", "b-ok.json", "c-ok.json", "d-ok.json"):
+        (watch_abs / name).write_text(name, encoding="utf-8")
+
+    real_process = qd._process_claimed
+
+    def flaky_process(**kwargs):
+        if "bad" in kwargs["candidate"].name:
+            raise RuntimeError("simulated pooled worker boom")
+        # Slow slightly so bad and ok can be in flight together.
+        time.sleep(0.02)
+        return real_process(**kwargs)
+
+    monkeypatch.setattr(qd, "_process_claimed", flaky_process)
+    err = io.StringIO()
+    code = run_trigger(
+        "handle-reply",
+        ws,
+        runner=FakeRunner({("cairn", "run"): RunResult(0, "", "")}),
+        cairn_bin="cairn",
+        now=NOW,
+        err=err,
+    )
+    assert code != 0  # any_failed from the worker exception
+    assert "pooled worker hazarded" in err.getvalue()
+    assert "simulated pooled worker boom" in err.getvalue()
+    # Siblings completed and retired (isolation, not stranded).
+    done_names = sorted(p.name for p in (watch_abs / ".done").glob("*.json"))
+    assert "b-ok.json" in done_names
+    assert "c-ok.json" in done_names
+    assert "d-ok.json" in done_names
+    assert "a-bad.json" not in done_names
+    # Bad item was claimed then left stuck (exception after claim, before retire).
+    stuck = sorted(p.name for p in (watch_abs / ".claim").glob("*.json"))
+    assert "a-bad.json" in stuck
+
+
 # --------------------------------------------------------------------------- #
 # trigger list depths
 # --------------------------------------------------------------------------- #

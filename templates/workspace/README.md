@@ -36,10 +36,10 @@ typed a command, add a `triggers.yaml` at the workspace root and sync it into th
 #   # optional W3 back-pressure (absent = serial unbounded drain, today's default):
 #   # concurrency: 1               # max children at once (>1 = bounded pool)
 #   # order: name                  # "name" | "aged" (priority aging by mtime)
-#   # waiting_max: 5               # stop admitting when needs-human depth is full
-#   # blocked_max: 5               # default = waiting_max when set
-#   # capacity_max: 10             # stop on capacity-park depth
-#   # wip_max: 20                  # claimed + all waiting
+#   # waiting_max: 5               # soft under concurrency>1: overshoot ≤ concurrency
+#   # blocked_max: 5               # soft; default = waiting_max when set
+#   # capacity_max: 10             # soft; stop on capacity-park depth
+#   # wip_max: 20                  # hard (claim is synchronous); claimed + all waiting
 #   # inbox_max: 50                # spool cap for pullers (W4); list-only until then
 # cairn trigger sync --backend launchd   # or systemd; cron cannot host a file watch
 ```

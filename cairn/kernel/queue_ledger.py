@@ -481,11 +481,20 @@ def ledger_counts(watch_abs: Path) -> dict[str, int]:
 def count_by_class(watch_abs: Path, *, glob: str = "*") -> dict[str, int]:
     """Live depth counts from ledger pointer outcome classes (D8) + spool.
 
-    Cheap: one readdir per lane + pointer JSON reads — never opens trails.
-    Waiting-class splits (needs_human / blocked / capacity) come from
-    ``.waiting/.runs/`` pointer ``exit_code`` via :func:`classify_exit`.
-    Items in ``.waiting/`` whose pointer is missing or unclassifiable still
-    count toward ``waiting`` / ``inflight`` / ``wip`` but not a specific class.
+    Per call: one readdir per lane + a JSON read of every pointer under
+    ``.waiting/.runs/`` — never opens trails. Waiting-class splits
+    (needs_human / blocked / capacity) come from pointer ``exit_code`` via
+    :func:`classify_exit`. Items in ``.waiting/`` whose pointer is missing or
+    unclassifiable still count toward ``waiting`` / ``inflight`` / ``wip`` but
+    not a specific class.
+
+    **Admission-loop cost:** when caps are set, the drain calls this once per
+    candidate (before each claim). Aggregate cost is therefore
+    O(candidates × waiting_depth) pointer reads per drain — e.g. 1000 inbox
+    items against a 500-deep waiting lane is ~500k reads. Acceptable for the
+    single-machine target scale; an incremental count (delta from what this
+    drain itself admitted) is a future optimization if a watch dir ever holds
+    thousands of waiting items.
 
     Returns keys:
     - ``needs_human``, ``blocked``, ``capacity`` — waiting-class depths
