@@ -58,7 +58,17 @@ from cairn.kernel.plan import (
     plan as build_plan,
 )
 from cairn.kernel.proc import SubprocessRunner as _SubprocessRunner
-from cairn.kernel.queue_ledger import pointer_path, read_pointer, sweep
+from cairn.kernel.gckit import write_queue_pin
+from cairn.kernel.queue_ledger import (
+    RetryError,
+    RetryPrepared,
+    RetryRefused,
+    pointer_path,
+    prepare_failed_retry,
+    read_pointer,
+    retire,
+    sweep,
+)
 from cairn.kernel.runctl import (
     AlreadyDone,
     Minted,
@@ -79,7 +89,7 @@ from cairn.kernel.schedkit import (
     run_schedule,
     uninstall as uninstall_schedules,
 )
-from cairn.kernel.trail import RunStatus, derive_status, follow, read_trail
+from cairn.kernel.trail import RunStatus, derive_status, follow, format_at, read_trail
 from cairn.kernel.fssafety import check_watch_fs_safety
 from cairn.kernel.trigger_host import load_triggers, watch_dir
 from cairn.kernel.triggerkit import (
@@ -1444,7 +1454,10 @@ def _inbox_answer_and_resume(ws: Path, card: _InboxCard, choice: str, *, now: da
 
 
 def _list_failed(ws: Path) -> list[dict[str, Any]]:
-    """Read-only listing of ``.failed/`` items that carry a run pointer (retry is W3)."""
+    """Read-only listing of ``.failed/`` items that carry a run pointer.
+
+    Action surface: ``cairn trigger retry <trigger> <item>`` (W4 SG3).
+    """
     rows: list[dict[str, Any]] = []
     try:
         triggers = load_triggers(ws)
@@ -1473,7 +1486,7 @@ def _list_failed(ws: Path) -> list[dict[str, Any]]:
                     "item": item.name,
                     "watch": trigger.watch,
                     "run_dir": run_ptr,
-                    "note": "cairn trigger retry (future) will resume these",
+                    "note": "cairn trigger retry <trigger> <item> resumes these",
                 }
             )
     return rows
@@ -1501,8 +1514,8 @@ def _cmd_inbox(args: argparse.Namespace) -> int:
         for r in rows:
             print(f"{r['trigger']:20} {r['item']:28} {r['run_dir'] or '-'}")
         print(
-            "note: listing only — `cairn trigger retry` (W3) will resume these; "
-            "inbox does not retry failed items."
+            "note: listing only — use `cairn trigger retry <trigger> <item>` to "
+            "resume a failed item; inbox does not retry."
         )
         return int(ExitCode.OK)
 
@@ -2063,6 +2076,134 @@ def _refuse_unsafe_watch_dirs(
     return int(ExitCode.CONFIG)
 
 
+def _cmd_trigger_retry(args: argparse.Namespace) -> int:
+    """``cairn trigger retry <trigger> <item>`` — identity-safe FAILED re-entry (W4 SG3).
+
+    Reacquires the identity reservation (strict), moves the item from ``.failed/``
+    back to ``.claim/``, and resumes the recorded run (T4 — never a fresh mint).
+    A newer/live rev owning the identity → refuse with a clear diagnostic.
+    """
+    ws = _workspace(args)
+    now = _now()
+    if not args.name:
+        print("cairn: `cairn trigger retry` needs a trigger name", file=sys.stderr)
+        return int(ExitCode.CONFIG)
+    item_name = getattr(args, "item", None)
+    if not item_name:
+        print(
+            "cairn: `cairn trigger retry` needs an item name "
+            "(from `cairn inbox --failed`)",
+            file=sys.stderr,
+        )
+        return int(ExitCode.CONFIG)
+    unsafe = bool(getattr(args, "unsafe_synced_fs", False))
+    refused = _refuse_unsafe_watch_dirs(
+        ws, unsafe_synced_fs=unsafe, trigger_names=[args.name]
+    )
+    if refused is not None:
+        return refused
+    try:
+        triggers = load_triggers(ws)
+    except ConfigError as exc:
+        return _print_config_error(exc)
+    trigger = triggers.get(args.name)
+    if trigger is None:
+        print(f"cairn: no trigger named {args.name!r} in triggers.yaml", file=sys.stderr)
+        return int(ExitCode.CONFIG)
+    try:
+        watch_abs = watch_dir(trigger, ws)
+    except ConfigError as exc:
+        return _print_config_error(exc)
+
+    prepared = prepare_failed_retry(
+        watch_abs,
+        item_name,
+        identity_mode=trigger.identity,
+    )
+    if isinstance(prepared, RetryError):
+        print(f"cairn: trigger retry: {prepared.message}", file=sys.stderr)
+        return int(ExitCode.CONFIG)
+    if isinstance(prepared, RetryRefused):
+        # Nonzero-but-clean: not a crash, not a successful redrive — supersession.
+        print(f"cairn: trigger retry: {prepared.message}", file=sys.stderr)
+        return int(ExitCode.CONFIG)
+    assert isinstance(prepared, RetryPrepared)
+
+    # Re-pin so gc cannot reap the run while we resume (terminal retire cleared it).
+    write_queue_pin(
+        prepared.run_dir,
+        trigger=trigger.name,
+        item=prepared.item_name,
+        pinned_at=format_at(now),
+    )
+
+    try:
+        run_doc = load_run(prepared.run_dir)
+    except (OSError, ValueError, ConfigError) as exc:
+        print(
+            f"cairn: trigger retry: cannot read {prepared.run_dir}/run.json: {exc}",
+            file=sys.stderr,
+        )
+        return int(ExitCode.CONFIG)
+    pipeline = run_doc["pipeline"]
+    pfile = ws / "pipelines" / f"{pipeline}.yaml"
+    if not pfile.is_file():
+        print(
+            f"cairn: trigger retry: pipeline file {pfile} no longer exists",
+            file=sys.stderr,
+        )
+        return int(ExitCode.CONFIG)
+    phash = _pipeline_hash(ws, pipeline)
+    outcome = resume_existing(
+        prepared.run_dir, ws=ws, phash=phash, pipeline=pipeline, force=False
+    )
+    if isinstance(outcome, Refusal):
+        # Leave the item in .claim/ as a stuck claim with diagnostic — operator
+        # can force-resume or discard; do not silently re-fail without a walk.
+        print(
+            f"cairn: trigger retry: resume refused for {prepared.item_name!r} "
+            f"(left in .claim/):",
+            file=sys.stderr,
+        )
+        return _print_refusal(outcome)
+    _print_advisories(outcome.advisories)
+    print(
+        f"cairn: trigger retry: resuming {prepared.item_name!r} → {prepared.run_dir}"
+        + (f" (identity {prepared.identity})" if prepared.identity else ""),
+    )
+    code = _drive_resume(
+        ws,
+        prepared.run_dir,
+        outcome.run_doc,
+        force=False,
+        from_node=None,
+        interactive=False,
+        now=now,
+        phash=phash,
+    )
+    # Re-retire by walk exit (D8) — same routing as a drain child.
+    run_outcome = classify_exit(code)
+    try:
+        retire(
+            watch_abs,
+            prepared.claim_path,
+            outcome=run_outcome,
+            on_done=trigger.on_done,
+            exit_code=code,
+            run_dir=prepared.run_dir,
+        )
+    except Exception as exc:  # noqa: BLE001 — surface, leave claim for audit
+        print(
+            f"cairn: trigger retry: re-retire hazarded for {prepared.item_name!r} "
+            f"(left in .claim/): {exc}",
+            file=sys.stderr,
+        )
+        return int(ExitCode.EXECUTOR)
+    if code == int(ExitCode.OK):
+        print(f"cairn: trigger retry: done → {prepared.run_dir}")
+    return code
+
+
 def _cmd_trigger(args: argparse.Namespace) -> int:
     ws = _workspace(args)
     backend = args.backend
@@ -2073,6 +2214,9 @@ def _cmd_trigger(args: argparse.Namespace) -> int:
     unsafe = bool(getattr(args, "unsafe_synced_fs", False))
 
     try:
+        if args.action == "retry":
+            return _cmd_trigger_retry(args)
+
         if args.action == "run":
             if not args.name:
                 print("cairn: `cairn trigger run` needs a trigger name", file=sys.stderr)
@@ -2353,7 +2497,8 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument(
         "--failed",
         action="store_true",
-        help="list .failed/ items with run pointers (read-only; retry is W3)",
+        help="list .failed/ items with run pointers (read-only; retry via "
+             "`cairn trigger retry`)",
     )
     sp.set_defaults(func=_cmd_inbox)
 
@@ -2420,10 +2565,22 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--systemd-dir", help="override the systemd user-unit dir")
     sp.set_defaults(func=_cmd_schedule)
 
-    # trigger — sync triggers.yaml into the host watcher
-    sp = sub.add_parser("trigger", help="sync triggers.yaml → host watcher (sync/list/remove/run)")
-    sp.add_argument("action", choices=["sync", "list", "remove", "run"])
-    sp.add_argument("name", nargs="?", help="trigger name (required for remove/run)")
+    # trigger — sync triggers.yaml into the host watcher + identity-safe retry
+    sp = sub.add_parser(
+        "trigger",
+        help="sync triggers.yaml → host watcher (sync/list/remove/run/retry)",
+    )
+    sp.add_argument("action", choices=["sync", "list", "remove", "run", "retry"])
+    sp.add_argument(
+        "name",
+        nargs="?",
+        help="trigger name (required for remove/run/retry)",
+    )
+    sp.add_argument(
+        "item",
+        nargs="?",
+        help="work-item name (required for retry; from `cairn inbox --failed`)",
+    )
     sp.add_argument("--backend", choices=["cron", "launchd", "systemd"], default="cron", help="host backend (default cron)")
     sp.add_argument("--launchd-dir", help="override the launchd LaunchAgents dir")
     sp.add_argument("--systemd-dir", help="override the systemd user-unit dir")

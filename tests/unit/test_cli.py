@@ -1988,6 +1988,170 @@ def test_trigger_run_failing_pipeline_moves_event_to_failed_and_exits_nonzero(he
     assert not list((inbox / ".done").glob("*.json"))
 
 
+def test_trigger_retry_requires_name_and_item(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    assert main(["trigger", "retry"]) == int(ExitCode.CONFIG)
+    assert "needs a trigger name" in capsys.readouterr().err
+    capsys.readouterr()
+    assert main(["trigger", "retry", "handle-reply"]) == int(ExitCode.CONFIG)
+    assert "needs an item name" in capsys.readouterr().err
+
+
+def test_trigger_retry_nonexistent_item_is_config_error(hello_ws, monkeypatch, capsys):
+    _write_triggers(hello_ws, "handle-reply:\n  pipeline: on-event\n  watch: inbox/replies\n")
+    _write_on_event_pipeline(hello_ws)
+    (hello_ws / "inbox" / "replies").mkdir(parents=True)
+    monkeypatch.chdir(hello_ws)
+    rc = main(["trigger", "retry", "handle-reply", "missing.json"])
+    assert rc == int(ExitCode.CONFIG)
+    assert "no failed item" in capsys.readouterr().err
+
+
+def _write_once_fail_pipeline(ws: Path, *, pipeline: str = "on-event") -> None:
+    """Pipeline that fails until ``fail.once`` exists in the run dir, then succeeds.
+
+    Shell steps run with cwd=run_dir, so the marker is per-run and armable between
+    the first FAILED drain and a subsequent ``trigger retry``.
+    """
+    (ws / "pipelines" / f"{pipeline}.yaml").write_text(
+        f"pipeline: {pipeline}\n"
+        "version: 1\n"
+        "params:\n"
+        "  event: { type: string, required: true }\n"
+        "artifacts:\n"
+        "  echoed:\n"
+        "    path: echoed.txt\n"
+        "    validator: validators/nonempty.py\n"
+        "steps:\n"
+        "  - id: maybe\n"
+        "    run: >-\n"
+        "      python3 -c \"import pathlib,sys,shutil; p=pathlib.Path('fail.once');\n"
+        "      (sys.exit(1) if not p.exists() else (p.unlink(),\n"
+        "      shutil.copyfile(sys.argv[1], sys.argv[2])))\"\n"
+        "      \"{params.event}\" \"{artifact:echoed}\"\n"
+        "    produces: [echoed]\n",
+        encoding="utf-8",
+    )
+
+
+def test_trigger_retry_non_strict_failed_item_redrives_to_done(hello_ws, monkeypatch, capsys):
+    """identity:off FAILED item — retry resumes the recorded run (no reservation)."""
+    _write_triggers(hello_ws, "handle-reply:\n  pipeline: on-event\n  watch: inbox/replies\n")
+    _write_once_fail_pipeline(hello_ws)
+    inbox = hello_ws / "inbox" / "replies"
+    inbox.mkdir(parents=True)
+    event = inbox / "bad.json"
+    body = '{"bad": true}'
+    event.write_text(body, encoding="utf-8")
+    monkeypatch.chdir(hello_ws)
+    monkeypatch.setenv("PATH", _path_without_cairn())
+
+    assert main(["trigger", "run", "handle-reply"]) != 0
+    assert (inbox / ".failed" / "bad.json").is_file()
+    run_dir = hello_ws / "runs" / "handle-reply-bad"
+    assert run_dir.is_dir()
+
+    # Arm success for the same pipeline (no drift — file unchanged).
+    (run_dir / "fail.once").write_text("armed", encoding="utf-8")
+
+    capsys.readouterr()
+    rc = main(["trigger", "retry", "handle-reply", "bad.json"])
+    out = capsys.readouterr()
+    assert rc == int(ExitCode.OK), out
+    assert (inbox / ".done" / "bad.json").is_file()
+    assert not (inbox / ".failed" / "bad.json").exists()
+    assert (run_dir / "echoed.txt").read_text(encoding="utf-8") == body
+
+
+def test_trigger_retry_strict_succeeds_when_identity_free(hello_ws, monkeypatch, capsys):
+    """W4 SG3 e2e: strict FAILED free-identity item retries via resume → done."""
+    _write_triggers(
+        hello_ws,
+        "handle-reply:\n  pipeline: on-event\n  watch: inbox/replies\n  identity: strict\n",
+    )
+    _write_once_fail_pipeline(hello_ws)
+    inbox = hello_ws / "inbox" / "replies"
+    inbox.mkdir(parents=True)
+    body = json.dumps({"source": "github", "id": "99", "rev": "1", "prio": 1})
+    name = "p1-github-99-r1.json"
+    (inbox / name).write_text(body, encoding="utf-8")
+    monkeypatch.chdir(hello_ws)
+    monkeypatch.setenv("PATH", _path_without_cairn())
+
+    # 1) First drain: step fails (no fail.once marker) → .failed/
+    rc1 = main(["trigger", "run", "handle-reply"])
+    assert rc1 != 0
+    assert (inbox / ".failed" / name).is_file()
+    assert (inbox / ".done" / "tombstones" / "github-99-r1").is_file()
+    assert not (inbox / ".claim" / ".ids" / "github-99").exists()
+    run_dir = hello_ws / "runs" / f"handle-reply-{name.removesuffix('.json')}"
+
+    # 2) Arm the once-file in the run dir so resume's step succeeds.
+    (run_dir / "fail.once").write_text("armed", encoding="utf-8")
+
+    # 3) Retry: reacquire identity, resume recorded run, re-retire DONE.
+    capsys.readouterr()
+    rc2 = main(["trigger", "retry", "handle-reply", name])
+    out = capsys.readouterr()
+    assert rc2 == int(ExitCode.OK), out
+    assert (inbox / ".done" / name).is_file()
+    assert not (inbox / ".failed" / name).exists()
+    assert not (inbox / ".claim" / ".ids" / "github-99").exists()
+    assert (run_dir / "echoed.txt").read_text(encoding="utf-8") == body
+
+
+def test_trigger_retry_strict_refuses_when_newer_rev_owns_identity(
+    hello_ws, monkeypatch, capsys
+):
+    """FAILED strict item whose identity a newer live rev owns → refuse, no second run."""
+    _write_triggers(
+        hello_ws,
+        "handle-reply:\n  pipeline: on-event-fail\n  watch: inbox/replies\n"
+        "  identity: strict\n",
+    )
+    _write_on_event_fail_pipeline(hello_ws)
+    inbox = hello_ws / "inbox" / "replies"
+    inbox.mkdir(parents=True)
+    body10 = json.dumps({"source": "github", "id": "7", "rev": "10", "prio": 1})
+    name10 = "p1-github-7-r10.json"
+    (inbox / name10).write_text(body10, encoding="utf-8")
+    monkeypatch.chdir(hello_ws)
+    monkeypatch.setenv("PATH", _path_without_cairn())
+
+    assert main(["trigger", "run", "handle-reply"]) != 0
+    assert (inbox / ".failed" / name10).is_file()
+
+    # Newer rev admits and claims (reservation free after failed terminal).
+    body20 = json.dumps({"source": "github", "id": "7", "rev": "20", "prio": 1})
+    name20 = "p1-github-7-r20.json"
+    (inbox / name20).write_text(body20, encoding="utf-8")
+    # Drain will try to run r20 and fail again — that's fine; it owns the identity.
+    assert main(["trigger", "run", "handle-reply"]) != 0
+    # After r20 also fails, identity is free again. Re-claim a live hold:
+    # put r20 back into .claim/ via re-drop + admit+claim path... simpler: write
+    # a live claim file + reservation directly.
+    from cairn.kernel.queue_ledger import claim, reserve_identity
+
+    # r20 ended in .failed/ too; re-stage a live claim for r30 to own the identity.
+    body30 = json.dumps({"source": "github", "id": "7", "rev": "30", "prio": 1})
+    name30 = "p1-github-7-r30.json"
+    (inbox / name30).write_text(body30, encoding="utf-8")
+    assert reserve_identity(inbox, "github-7")
+    claimed = claim(inbox, inbox / name30)
+    assert claimed is not None
+
+    capsys.readouterr()
+    rc = main(["trigger", "retry", "handle-reply", name10])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "owned by a newer/live rev" in err
+    assert (inbox / ".failed" / name10).is_file()
+    # No second run for r10.
+    run10 = hello_ws / "runs" / f"handle-reply-{name10.removesuffix('.json')}"
+    # Original failed run dir exists once; retry did not re-mint.
+    assert run10.is_dir()
+
+
 def _write_on_event_manual_pipeline(ws: Path) -> None:
     # Manual step halts headless with exit 6 (NEEDS_HUMAN) — park surface for W1a e2e.
     # Hand-answer = write the produces artifact; then resume finishes to run-done.

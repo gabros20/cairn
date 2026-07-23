@@ -1198,18 +1198,100 @@ def park_deferred(
     return f"deferred {candidate.name} → .deferred/{item.identity} (rev {item.rev})"
 
 
+# Convention paths for the W4 delivery-receipt produced artifact (relative to run dir).
+# Pipelines declare ``artifacts: delivery-receipt: { path: delivery-receipt.json, ... }``;
+# we also accept a few common aliases so a hand-written receipt still counts.
+_RECEIPT_REL_PATHS: tuple[str, ...] = (
+    "delivery-receipt.json",
+    "delivery_receipt.json",
+    "artifacts/delivery-receipt.json",
+)
+_RECEIPT_REV_KEYS: tuple[str, ...] = ("rev", "checked_rev", "delivered_rev", "receipt_rev")
+
+
+def _rev_from_json_mapping(doc: Any) -> str | None:
+    """Extract a rev string from a receipt-shaped mapping; None if absent/invalid."""
+    if not isinstance(doc, dict):
+        return None
+    for key in _RECEIPT_REV_KEYS:
+        val = doc.get(key)
+        if isinstance(val, (str, int)) and str(val):
+            return str(val)
+    return None
+
+
+def read_receipt_rev(run_dir: Path | str | None) -> str | None:
+    """Return the delivered/checked rev recorded by a run, or None if none exists.
+
+    Receipt source order (first hit wins) — FACTORY-PLAN T1 deferred promotion / W4 SG2:
+
+    1. A ``delivery-receipt`` produced artifact under the run dir (ordinary
+       ``produces:`` — D4). File names: ``delivery-receipt.json`` and aliases
+       in :data:`_RECEIPT_REL_PATHS`. JSON body must carry a rev field
+       (``rev`` / ``checked_rev`` / ``delivered_rev`` / ``receipt_rev``).
+    2. Optional run.json meta keys of the same names (extra properties are
+       schema-allowed; written by future delivery steps or tests).
+    3. None — callers fall back to the retiring item's rev so behavior is
+       byte-identical to pre-receipt promotion (D7).
+
+    Never raises: missing/corrupt evidence → None (fail open to the item-rev
+    fallback, never invent a rev).
+    """
+    if run_dir is None or run_dir == "":
+        return None
+    run_dir = Path(run_dir)
+    if not run_dir.is_dir():
+        return None
+    for rel in _RECEIPT_REL_PATHS:
+        path = run_dir / rel
+        if not path.is_file():
+            continue
+        try:
+            doc = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
+            continue
+        rev = _rev_from_json_mapping(doc)
+        if rev is not None:
+            return rev
+    # run.json optional meta (best-effort; do not require schema validation here —
+    # a partially-written run mid-crash must not block retire).
+    run_json = run_dir / "run.json"
+    if run_json.is_file():
+        try:
+            doc = json.loads(run_json.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError, RecursionError, ValueError):
+            doc = None
+        if isinstance(doc, dict):
+            rev = _rev_from_json_mapping(doc)
+            if rev is not None:
+                return rev
+    return None
+
+
 def promote_deferred(
     watch_abs: Path,
     item: ItemId,
     *,
+    receipt_rev: str | None = None,
     fs: Any = None,
 ) -> str | None:
     """Promote or drop ``.deferred/<identity>`` while reservation is still held.
 
     Call BEFORE :func:`release_reservation` (plan T1: transfer then release).
-    If deferred rev is confidently > retired rev → install into inbox. If
-    confidently ≤ retired → drop + tombstone. If incomparable → promote
-    (fail-safe admit-on-doubt). Returns a diagnostic or None when no deferred.
+
+    Comparison baseline (W4 SG2 / FACTORY-PLAN T1):
+    - When ``receipt_rev`` is provided, compare the deferred rev against that
+      (the rev the retiring run actually delivered/checked).
+    - When ``receipt_rev`` is None, fall back to ``item.rev`` — byte-identical
+      to pre-receipt behavior (D7).
+
+    Rules against the baseline ``compared_rev``:
+    - deferred confidently > compared → install into inbox
+    - deferred confidently ≤ compared → drop + tombstone (already delivered;
+      closes the park → refresh-delivered → re-promote duplicate chain)
+    - incomparable → promote (fail-safe admit-on-doubt)
+
+    Returns a diagnostic or None when no deferred.
     """
     watch_abs = Path(watch_abs)
     parked = deferred_path(watch_abs, item.identity)
@@ -1222,17 +1304,19 @@ def promote_deferred(
         except FileNotFoundError:
             pass
         return f"dropped deferred {item.identity} (unreadable body)"
-    newer = rev_is_newer(deferred_item.rev, item.rev)
+    compared_rev = receipt_rev if receipt_rev is not None else item.rev
+    newer = rev_is_newer(deferred_item.rev, compared_rev)
     if newer is False:
-        # Confidently ≤ retired — already delivered.
+        # Confidently ≤ receipt/retired — already delivered.
         try:
             durable_unlink(parked, fs=fs)
         except FileNotFoundError:
             pass
         _tombstone(watch_abs, deferred_item.tombstone_name, fs=fs)
+        baseline = "receipt" if receipt_rev is not None else "retired"
         return (
             f"dropped deferred {item.identity} "
-            f"(rev {deferred_item.rev!r} <= retired {item.rev!r})"
+            f"(rev {deferred_item.rev!r} <= {baseline} {compared_rev!r})"
         )
     # newer is True OR None (incomparable) → promote to inbox (fail-safe).
     inbox_name = deferred_item.filename
@@ -1470,6 +1554,7 @@ def release_identity_on_terminal(
     watch_abs: Path,
     item_name: str,
     *,
+    receipt_rev: str | None = None,
     fs: Any = None,
 ) -> list[str]:
     """On terminal retire: promote/drop deferred FIRST, then release reservation (T1).
@@ -1478,14 +1563,222 @@ def release_identity_on_terminal(
     identity ("transfer ownership, then release") so a concurrent drain cannot
     re-admit between free and promote. No-op when ``item_name`` does not parse
     as a strict identity filename. Returns diagnostics from promote/drop.
+
+    ``receipt_rev`` (W4 SG2): when set, :func:`promote_deferred` compares the
+    parked rev against the run's delivered/checked rev rather than the retiring
+    item's filename rev. None → item-rev fallback (byte-identical to pre-SG2).
     """
     item = parse_item_name(item_name)
     if item is None:
         return []
     # Promote (or drop) under the still-held reservation, THEN release.
-    diag = promote_deferred(watch_abs, item, fs=fs)
+    diag = promote_deferred(watch_abs, item, receipt_rev=receipt_rev, fs=fs)
     release_reservation(watch_abs, item.identity, fs=fs)
     return [diag] if diag else []
+
+
+# --------------------------------------------------------------------------- #
+# Failed-item retry (W4 SG3 — identity-safe re-entry of a tombstoned FAILED rev)
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class RetryPrepared:
+    """A ``.failed/`` item is back in ``.claim/`` and ready for resume (not mint)."""
+
+    claim_path: Path
+    run_dir: Path
+    item_name: str
+    identity: str | None  # set when strict grammar applies; None for identity:off
+
+
+@dataclass(frozen=True)
+class RetryRefused:
+    """Retry declined because a newer/live rev owns the identity (no state change)."""
+
+    message: str
+    identity: str
+
+
+@dataclass(frozen=True)
+class RetryError:
+    """Caller error: missing item, missing pointer, non-failed target, etc."""
+
+    message: str
+
+
+def _live_item_for_identity(watch_abs: Path, identity: str) -> Path | None:
+    """Return a live ``.claim/`` or ``.waiting/`` file for ``identity``, if any."""
+    watch_abs = Path(watch_abs)
+    for lane in _LIVE_LANES:
+        d = watch_abs / lane
+        if not d.is_dir():
+            continue
+        for p in d.iterdir():
+            if not p.is_file():
+                continue
+            other = parse_item_name(p.name)
+            if other is not None and other.identity == identity:
+                return p
+    return None
+
+
+def _identity_owned_reason(watch_abs: Path, item: ItemId) -> str | None:
+    """If a newer/live rev owns ``item.identity``, return a refusal diagnostic.
+
+    Ownership surfaces (FACTORY-PLAN T3 failed-retry rule / W4 SG3):
+    - a live item in ``.claim/`` or ``.waiting/`` for the same identity
+    - a ``.deferred/`` entry whose rev is confidently newer (or incomparable —
+      fail-safe refuse so two revs never run)
+    - a held reservation (checked by the caller via :func:`reserve_identity`)
+
+    Equal/older deferred alone does not refuse (already-delivered park will be
+    mopped/dropped; retry of the failed rev is still the right re-entry).
+    """
+    live = _live_item_for_identity(watch_abs, item.identity)
+    if live is not None:
+        return (
+            f"identity {item.identity} is owned by a newer/live rev "
+            f"({live.name} in {live.parent.name}) — retry declined; "
+            f"the newer work supersedes this failure"
+        )
+    parked = deferred_path(watch_abs, item.identity)
+    if parked.is_file():
+        deferred_item = _read_item_fields(parked)
+        if deferred_item is not None:
+            newer = rev_is_newer(deferred_item.rev, item.rev)
+            # True (newer) or None (incomparable): refuse. False (≤): ok to retry.
+            if newer is not False:
+                return (
+                    f"identity {item.identity} is owned by a newer/live rev "
+                    f"(deferred r{deferred_item.rev}) — retry declined; "
+                    f"the newer work supersedes this failure"
+                )
+    return None
+
+
+def prepare_failed_retry(
+    watch_abs: Path,
+    item_name: str,
+    *,
+    identity_mode: str = "off",
+    fs: Any = None,
+) -> RetryPrepared | RetryRefused | RetryError:
+    """Move a ``.failed/`` item back to ``.claim/`` for resume (W4 SG3).
+
+    Identity-safe rules when ``identity_mode == "strict"``:
+    - Reacquire the identity reservation via :func:`reserve_identity`.
+    - If the identity is already owned (live reservation, live lane item, or a
+      newer/incomparable deferred) → :class:`RetryRefused` with a clear
+      diagnostic; **no** filesystem mutation. Never run two revs of one identity.
+    - If free: move the item from ``.failed/`` to ``.claim/`` (pointer-first)
+      and return :class:`RetryPrepared` so the caller can
+      :func:`~cairn.kernel.runctl.resume_existing` the recorded run (T4 —
+      never a fresh mint).
+
+    The FAILED tombstone for this identity+rev is left in place. Retry is the
+    sanctioned re-entry of the SAME rev; a puller re-drop of the same rev still
+    hits tombstone dedupe via :func:`admit_strict` (retry-vs-redrop distinction).
+
+    ``identity_mode == "off"``: no reservation dance — just re-home the item and
+    return the recorded run dir for resume.
+
+    Does **not** resume the run or re-retire — the CLI owns the walk + retire.
+    """
+    watch_abs = Path(watch_abs)
+    item_name = str(item_name)
+    failed_lane = watch_abs / ".failed"
+    failed_path = failed_lane / item_name
+    if not failed_path.is_file():
+        # Distinguish "not failed" (lives elsewhere) from "does not exist".
+        for lane in (".claim", ".waiting", ".done"):
+            alt = watch_abs / lane / item_name
+            if alt.is_file():
+                return RetryError(
+                    message=(
+                        f"item {item_name!r} is in {lane}/, not .failed/ — "
+                        f"`cairn trigger retry` only re-enters failed items"
+                    )
+                )
+        return RetryError(
+            message=f"no failed item named {item_name!r} under {watch_abs}"
+        )
+
+    src_ptr = pointer_path(failed_lane, item_name)
+    if not src_ptr.is_file():
+        return RetryError(
+            message=(
+                f"failed item {item_name!r} has no run pointer "
+                f"(.failed/.runs/{item_name}) — cannot resume"
+            )
+        )
+    try:
+        rec = read_pointer(src_ptr)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return RetryError(
+            message=f"failed item {item_name!r}: unreadable pointer ({exc})"
+        )
+    run_dir_s = rec.get("run_dir")
+    if not run_dir_s:
+        return RetryError(
+            message=f"failed item {item_name!r}: pointer missing run_dir"
+        )
+    run_dir = Path(str(run_dir_s))
+    # T4: only resume a validated run; a husk is not retryable this way.
+    try:
+        load_run(run_dir)
+    except (OSError, ValueError, ConfigError, json.JSONDecodeError) as exc:
+        return RetryError(
+            message=(
+                f"failed item {item_name!r}: run dir {run_dir} has no "
+                f"validated run.json ({exc}) — not resumeable"
+            )
+        )
+
+    parsed = parse_item_name(item_name)
+    identity: str | None = None
+    if identity_mode == "strict":
+        if parsed is None:
+            return RetryError(
+                message=(
+                    f"item {item_name!r} does not match the strict identity "
+                    f"filename grammar — cannot reacquire reservation"
+                )
+            )
+        identity = parsed.identity
+        owned = _identity_owned_reason(watch_abs, parsed)
+        if owned is not None:
+            return RetryRefused(message=owned, identity=identity)
+        if not reserve_identity(watch_abs, identity, fs=fs):
+            return RetryRefused(
+                message=(
+                    f"identity {identity} is owned by a newer/live rev "
+                    f"(reservation held) — retry declined; the newer work "
+                    f"supersedes this failure"
+                ),
+                identity=identity,
+            )
+
+    # Pointer-first re-home into .claim/ (same T5 discipline as retire).
+    dest_lane = watch_abs / ".claim"
+    dest_lane.mkdir(parents=True, exist_ok=True)
+    dest_ptr = pointer_path(dest_lane, item_name)
+    _relocate_pointer(
+        src_ptr,
+        dest_ptr,
+        run_dir=str(run_dir),
+        outcome=None,  # live again — outcome unknown until re-retire
+        exit_code=None,
+        child_pid=rec.get("child_pid") if isinstance(rec.get("child_pid"), int) else None,
+        fs=fs,
+    )
+    placed = _place(failed_path, dest_lane, item_name, fs=fs)
+    return RetryPrepared(
+        claim_path=placed,
+        run_dir=run_dir,
+        item_name=item_name,
+        identity=identity,
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1801,6 +2094,7 @@ def retire(
     exit_code: int | None = None,
     child_pid: int | None = None,
     run_dir: Path | str | None = None,
+    receipt_rev: str | None = None,
     fs: Any = None,
 ) -> Path | None:
     """Retire a claimed (or waiting) item by :class:`RunOutcome` (FACTORY-PLAN T3).
@@ -1814,6 +2108,10 @@ def retire(
     Pointer order (T5): write/move the pointer FIRST, then the item. Pointer content
     records outcome class (D8 depth-count contract), exit_code, child_pid, run_dir.
     Returns the final item path, or ``None`` when the item was deleted (``on_done=delete``).
+
+    ``receipt_rev`` (W4 SG2): explicit delivered/checked rev for deferred
+    promotion. When omitted, :func:`read_receipt_rev` is consulted for the run;
+    when that too is None, promotion falls back to the item's filename rev.
     """
     watch_abs = Path(watch_abs)
     claim_path = Path(claim_path)
@@ -1824,6 +2122,9 @@ def retire(
         src_ptr, run_dir=run_dir, exit_code=exit_code, child_pid=child_pid
     )
     outcome_s = outcome.outcome.value
+    # Resolve receipt once for terminal identity release (WAITING keeps reservation).
+    if receipt_rev is None and run_dir_s:
+        receipt_rev = read_receipt_rev(run_dir_s)
 
     if outcome.outcome is OutcomeClass.WAITING:
         # Waiting parks retain the reciprocal gc pin (judgment still pending).
@@ -1862,7 +2163,9 @@ def retire(
         if run_dir_s:
             clear_queue_pin(Path(run_dir_s), fs=fs)
         # T1: release identity reservation + promote deferred (terminal only).
-        release_identity_on_terminal(watch_abs, name, fs=fs)
+        release_identity_on_terminal(
+            watch_abs, name, receipt_rev=receipt_rev, fs=fs
+        )
         return placed
 
     # DONE — terminal: item to .done/ (or delete), drop live pointer, always tombstone.
@@ -1891,7 +2194,9 @@ def retire(
         clear_lease(watch_abs, name, fs=fs)
         if run_dir_s:
             clear_queue_pin(Path(run_dir_s), fs=fs)
-        release_identity_on_terminal(watch_abs, name, fs=fs)
+        release_identity_on_terminal(
+            watch_abs, name, receipt_rev=receipt_rev, fs=fs
+        )
         return None
     placed = _place(claim_path, watch_abs / ".done", name, fs=fs)
     if src_ptr.is_file():
@@ -1904,7 +2209,9 @@ def retire(
     # T3 pin-release: terminal ledger placement FIRST, then clear pin.
     if run_dir_s:
         clear_queue_pin(Path(run_dir_s), fs=fs)
-    release_identity_on_terminal(watch_abs, name, fs=fs)
+    release_identity_on_terminal(
+        watch_abs, name, receipt_rev=receipt_rev, fs=fs
+    )
     return placed
 
 
