@@ -596,7 +596,12 @@ def write_circuit(
 
 
 def reset_circuit(watch_abs: Path, *, fs: Any = None) -> None:
-    """Operator / recovery close: consecutive_failures→0, drop opened_at (write closed state)."""
+    """Operator / recovery close: consecutive_failures→0, drop opened_at (write closed state).
+
+    Race vs a concurrent drain: last-writer-wins. A reset while a live drain is
+    still incrementing may be immediately re-incremented — correct when the lane
+    is still failing (fix the lane, then reset; or let a DONE auto-close).
+    """
     write_circuit(watch_abs, consecutive_failures=0, opened_at=None, fs=fs)
 
 
@@ -624,7 +629,11 @@ def note_circuit_outcome(
     - WAITING (6/8/9) → no change (parked, not a verdict)
     - FAILED + not dark → no change (only dark failures count toward the breaker)
 
-    Dark detection is the caller's job (trigger.lane at spawn: set and not ``lit``).
+    Dark detection is the caller's job (trigger.lane at spawn: set and not
+    :data:`~cairn.kernel.plan.PARK_LANE`). Callers that may run concurrent
+    workers MUST hold a lock around the full read-modify-write (in-process
+    serialization; cross-process drains stay last-writer-wins).
+
     Returns the post-update state dict.
     """
     state = read_circuit(watch_abs)

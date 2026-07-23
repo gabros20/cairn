@@ -42,7 +42,7 @@ from typing import Iterator, TextIO
 from cairn.kernel.config import load_config
 from cairn.kernel.errors import CairnError, ConfigError
 from cairn.kernel.gckit import write_queue_pin
-from cairn.kernel.plan import plan as build_plan
+from cairn.kernel.plan import PARK_LANE, plan as build_plan
 from cairn.kernel.proc import Runner
 from cairn.kernel.queue_ledger import (
     DEFAULT_MAX_ITEM_BYTES,
@@ -50,6 +50,7 @@ from cairn.kernel.queue_ledger import (
     audit_ledger,
     boot_id,
     check_ledger_version,
+    circuit_path,
     claim,
     count_by_class,
     effective_lease_ttl,
@@ -272,11 +273,12 @@ def _has_admit_caps(trigger: Trigger) -> bool:
 def _is_dark_lane(trigger: Trigger) -> bool:
     """Whether this trigger's lane is a dark (non-park) autonomy profile.
 
-    Dark = ``lane:`` is set and is not the reserved park profile ``lit``. Used by
-    the circuit breaker: only dark-lane FAILED runs increment consecutive_failures;
-    a DONE run (dark recovery or a lit pass if ever possible) resets.
+    Dark = ``lane:`` is set and is not the reserved park profile
+    (:data:`~cairn.kernel.plan.PARK_LANE`). Used by the circuit breaker: only
+    dark-lane FAILED runs increment consecutive_failures; a DONE run (dark
+    recovery or a lit pass if ever possible) resets.
     """
-    return trigger.lane is not None and trigger.lane != "lit"
+    return trigger.lane is not None and trigger.lane != PARK_LANE
 
 
 def _cap_stop_reason(trigger: Trigger, depths: dict[str, int]) -> str | None:
@@ -331,11 +333,18 @@ def _process_claimed(
     out: TextIO | None,
     err: TextIO | None,
     diag: TextIO,
+    circuit_lock: threading.Lock | None = None,
 ) -> bool:
     """Mint+spawn+retire one claimed item. Returns True if this candidate failed.
 
     Guard-refusals unclaim and return False (not a drain failure). Post-claim
     hazards leave a stuck claim and return True. WAITING parks return False.
+
+    ``circuit_lock`` serializes the dark-lane breaker read-modify-write when
+    pool workers retire concurrently (concurrency>1). Without it, concurrent
+    ``note_circuit_outcome`` calls undercount and violate ``atomic_write_text``'s
+    fixed-tmp serialization precondition. Cross-process drains remain the
+    bounded-overshoot case the plan already accepts.
     """
     try:
         try:
@@ -407,17 +416,37 @@ def _process_claimed(
             run_dir=run_dir,
         )
         # W5 circuit breaker: only when lane_circuit is authored on this trigger.
+        # Hold circuit_lock around the entire RMW so pool workers cannot lose counts
+        # or collide on the fixed .circuit.tmp (I1). Write failures stay non-fatal
+        # for the drain but MUST signal the operator (I2) — silent blindness would
+        # let a failing dark lane burn the queue with no breaker.
         if trigger.lane_circuit_failures is not None:
             try:
-                note_circuit_outcome(
-                    watch_abs,
-                    outcome,
-                    is_dark=_is_dark_lane(trigger),
-                    failures_threshold=trigger.lane_circuit_failures,
-                    now_iso=format_at(now),
+                lock = circuit_lock
+                if lock is not None:
+                    with lock:
+                        note_circuit_outcome(
+                            watch_abs,
+                            outcome,
+                            is_dark=_is_dark_lane(trigger),
+                            failures_threshold=trigger.lane_circuit_failures,
+                            now_iso=format_at(now),
+                        )
+                else:
+                    note_circuit_outcome(
+                        watch_abs,
+                        outcome,
+                        is_dark=_is_dark_lane(trigger),
+                        failures_threshold=trigger.lane_circuit_failures,
+                        now_iso=format_at(now),
+                    )
+            except Exception as exc:  # noqa: BLE001 — breaker bookkeeping never fails the drain
+                print(
+                    f"cairn: trigger {name!r}: lane circuit for {name!r}: could not "
+                    f"update breaker state: {exc} — breaker may not open; check "
+                    f"{circuit_path(watch_abs)}",
+                    file=diag,
                 )
-            except Exception:  # noqa: BLE001 — breaker bookkeeping never fails the drain
-                pass
     except Exception as exc:
         # Spawn / retire hazard after claim — stuck claim, not silent retry.
         print(
@@ -533,6 +562,7 @@ def _drain_serial(
     lease_ttl_s: int | None = None,
     claimed_at: float | None = None,
     current_boot_id: str | None = None,
+    circuit_lock: threading.Lock | None = None,
 ) -> bool:
     """Serial admitter: claim one at a time, re-checking caps before each claim.
 
@@ -588,6 +618,7 @@ def _drain_serial(
             out=out,
             err=err,
             diag=diag,
+            circuit_lock=circuit_lock,
         )
         if failed:
             any_failed = True
@@ -611,6 +642,7 @@ def _drain_pooled(
     lease_ttl_s: int | None = None,
     claimed_at: float | None = None,
     current_boot_id: str | None = None,
+    circuit_lock: threading.Lock | None = None,
 ) -> bool:
     """Bounded pool: claim→submit lazily; at most ``concurrency`` children in flight.
 
@@ -627,9 +659,20 @@ def _drain_pooled(
     before the next ``try_admit`` observes them; ``wip_max`` is hard because
     claim updates ``.claim/`` on the admitter thread. Bound is the pool width
     (FACTORY-PLAN §2 T2 tradeoff).
+
+    W5 dark-lane circuit breaker overshoot (same class): under concurrency>1,
+    up to ``concurrency-1`` already-in-flight dark failures may still retire past
+    the breaker threshold before the next ``try_admit`` observes the open
+    circuit and stops claiming. In-process RMW is serialized via ``circuit_lock``
+    so consecutive_failures counts exactly (no lost updates / fixed-tmp
+    collisions). Cross-process drain concurrency stays the plan's
+    bounded-overshoot case.
     """
     any_failed = False
     lock = threading.Lock()
+    # Prefer the dedicated circuit_lock from run_trigger; fall back to the pool
+    # lock so concurrent note_circuit_outcome calls never run unlocked.
+    c_lock = circuit_lock if circuit_lock is not None else lock
     stop_admit = False
     cand_iter = iter(candidates)
     pending: set[Future[bool]] = set()
@@ -700,6 +743,7 @@ def _drain_pooled(
             out=out,
             err=err,
             diag=diag,
+            circuit_lock=c_lock,
         )
         pending.add(fut)
         return True
@@ -748,10 +792,10 @@ def run_trigger(
 
     Exit code: ``0`` when every candidate was processed clean (including waiting-class
     parks — they do NOT set failure), OR the scan was empty, OR admission stopped on a
-    full cap (healthy back pressure); nonzero when ANY candidate failed (FAILED
-    outcome) or a claim/spawn/retire hazard raised. Guard-refusals from mint are not
-    outcomes: item returns to the inbox, diagnostic only, neither failed nor parked
-    (FACTORY-PLAN T6).
+    full cap / open dark-lane circuit (healthy back pressure); nonzero when ANY
+    candidate failed (FAILED outcome) or a claim/spawn/retire hazard raised.
+    Guard-refusals from mint are not outcomes: item returns to the inbox,
+    diagnostic only, neither failed nor parked (FACTORY-PLAN T6).
 
     Per-candidate isolation preserved: a hazard on one event never aborts the drain;
     post-claim exceptions leave stuck claims in ``.claim/``. On the pooled path a
@@ -768,6 +812,14 @@ def run_trigger(
     than the process count. A subsequent drain re-checks live depths and refuses
     further claims once the class is at or over cap. KeyboardInterrupt during a
     pooled drain blocks on pool shutdown until in-flight children return.
+
+    W5 dark-lane circuit breaker (``lane_circuit: {failures: N}``): consecutive
+    FAILED dark runs open the breaker and pause admission (exit 0). Under
+    concurrency>1 the breaker can overshoot its threshold by ≤ concurrency-1
+    already-in-flight dark failures before admission stops (same soft-cap
+    class as W3). In-process pool workers serialize the ``.circuit``
+    read-modify-write so counts are exact; cross-process concurrent drains on
+    the same watch remain last-writer-wins / bounded-overshoot.
     """
     workspace_dir = Path(workspace_dir)
     triggers = load_triggers(workspace_dir)
@@ -784,6 +836,8 @@ def run_trigger(
     now_ts = now.timestamp()
     lease_ttl = effective_lease_ttl(trigger.lease_ttl_s, trigger.concurrency)
     cur_boot = boot_id()
+    # Serialize breaker RMW across pool workers (and serial path for uniformity).
+    circuit_lock = threading.Lock()
 
     # T8: refuse a newer-than-us ledger; stamp/adopt older-or-absent on proceed.
     check_ledger_version(watch_abs)
@@ -844,6 +898,7 @@ def run_trigger(
             lease_ttl_s=lease_ttl,
             claimed_at=now_ts,
             current_boot_id=cur_boot,
+            circuit_lock=circuit_lock,
         ):
             any_failed = True
     else:
@@ -863,6 +918,7 @@ def run_trigger(
             lease_ttl_s=lease_ttl,
             claimed_at=now_ts,
             current_boot_id=cur_boot,
+            circuit_lock=circuit_lock,
         ):
             any_failed = True
     return 1 if any_failed else 0

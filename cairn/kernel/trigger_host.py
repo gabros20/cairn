@@ -20,6 +20,7 @@ import yaml
 
 from cairn.kernel.config import parse_duration
 from cairn.kernel.errors import ConfigError
+from cairn.kernel.plan import PARK_LANE
 from cairn.kernel.proc import Runner
 from cairn.kernel.queue_ledger import (
     LEASE_TTL_DEFAULT,
@@ -383,8 +384,8 @@ def _parse_lane_circuit(
 
     Non-dark rule (ConfigError): a circuit breaker is only meaningful on a dark
     autonomy lane — requires ``lane:`` set to something other than the reserved
-    park profile ``lit``. A bare ``lane_circuit`` without a dark ``lane:`` is a
-    load-time error (not a silent no-op).
+    park profile (:data:`~cairn.kernel.plan.PARK_LANE`). A bare ``lane_circuit``
+    without a dark ``lane:`` is a load-time error (not a silent no-op).
     """
     if "lane_circuit" not in entry:
         return None
@@ -409,17 +410,17 @@ def _parse_lane_circuit(
             file,
         )
     failures = _parse_positive_int(name, "lane_circuit.failures", raw["failures"], file)
-    # Dark-only: no lane, or lit (park) → ConfigError.
+    # Dark-only: no lane, or park profile → ConfigError.
     if lane is None:
         _fail(
             f"trigger {name!r}: 'lane_circuit' requires a dark 'lane:' "
             f"(a circuit breaker without an autonomy lane cannot count dark failures)",
             file,
         )
-    if lane == "lit":
+    if lane == PARK_LANE:
         _fail(
             f"trigger {name!r}: 'lane_circuit' is only meaningful on a dark lane "
-            f"(got lane: lit — the park profile never fails-closed dark)",
+            f"(got lane: {PARK_LANE} — the park profile never fails-closed dark)",
             file,
         )
     return failures

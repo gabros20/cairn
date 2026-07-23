@@ -2104,6 +2104,10 @@ def _cmd_trigger_reset(args: argparse.Namespace) -> int:
 
     Clears ``<watch>/.circuit`` consecutive_failures→0 so admission resumes after
     an operator fixes the dark lane. A subsequent DONE dark run also auto-closes.
+
+    Race vs a concurrent drain: last-writer-wins. Reset while a live failing
+    streak is still retiring may be immediately re-incremented — expected when
+    the lane is still broken (fix first, then reset).
     """
     if not args.name:
         print("cairn: `cairn trigger reset` needs a trigger name", file=sys.stderr)

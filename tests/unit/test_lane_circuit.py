@@ -11,6 +11,8 @@ from __future__ import annotations
 import io
 import json
 import textwrap
+import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -605,3 +607,118 @@ def test_cli_trigger_list_json_includes_circuit(tmp_path, capsys):
     assert row["circuit_failures"] == 2
     assert row["circuit_consecutive"] == 1
     assert row["circuit_open"] is False
+
+
+# --------------------------------------------------------------------------- #
+# Fix wave r1: concurrent RMW lock (I1) + write-blind diagnostic (I2)
+# --------------------------------------------------------------------------- #
+
+
+def test_pooled_dark_failures_count_exactly_no_lost_update(tmp_path, monkeypatch):
+    """I1: concurrency>1 — N concurrent dark FAILED runs → consecutive_failures == N.
+
+    Without the circuit_lock around note_circuit_outcome, pool workers race the
+    read-modify-write and undercount (breaker opens late). This is the regression
+    test for that lost-update / fixed-tmp collision class.
+    """
+    n = 4
+    ws = _workspace(
+        tmp_path,
+        f"""
+        handle-reply:
+          pipeline: handle-reply
+          watch: inbox/replies
+          lane: dark
+          concurrency: {n}
+          lane_circuit:
+            failures: {n}
+        """,
+    )
+    _stub_mint(monkeypatch, ws)
+    watch_abs = ws / "inbox" / "replies"
+    watch_abs.mkdir(parents=True)
+    for i in range(n):
+        (watch_abs / f"item-{i}.json").write_text(str(i), encoding="utf-8")
+
+    live = 0
+    peak = 0
+    lock = threading.Lock()
+
+    class SlowFailRunner(RunnerBase):
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def spawn(self, argv, *, input=None, cwd=None):
+            with lock:
+                self.calls.append({"argv": list(argv)})
+                nonlocal live, peak
+                live += 1
+                peak = max(peak, live)
+
+            class SlowHandle:
+                def __init__(self):
+                    self._pid = 200 + len(self_outer.calls)
+
+                @property
+                def pid(self):
+                    return self._pid
+
+                def wait(self, timeout=None):
+                    # Overlap retires so concurrent note_circuit_outcome is forced.
+                    time.sleep(0.05)
+                    with lock:
+                        nonlocal live
+                        live -= 1
+                    return RunResult(returncode=3, stdout="", stderr="")  # FAILED
+
+                def poll(self):
+                    return None
+
+                def terminate(self):
+                    return None
+
+            self_outer = self
+            return SlowHandle()
+
+    runner = SlowFailRunner()
+    code = run_trigger("handle-reply", ws, runner=runner, cairn_bin="cairn", now=NOW)
+    assert code == 1  # FAILED outcomes
+    assert peak >= 2  # actually concurrent
+    assert len(runner.calls) == n
+    # Exact count — no lost updates under the pool.
+    assert read_circuit(watch_abs)["consecutive_failures"] == n
+    assert is_circuit_open(watch_abs, n)
+
+
+def test_circuit_write_failure_emits_diagnostic_does_not_crash(tmp_path, monkeypatch):
+    """I2: state-write failure stays non-fatal for the drain but MUST signal the operator.
+
+    Silent blindness would let a failing dark lane burn the queue with no breaker.
+    """
+    ws = _dark_circuit_ws(tmp_path, failures=1)
+    _stub_mint(monkeypatch, ws)
+    watch_abs = ws / "inbox" / "replies"
+    watch_abs.mkdir(parents=True)
+    (watch_abs / "boom.json").write_text("x", encoding="utf-8")
+
+    import cairn.kernel.queue_ledger as ql
+
+    def boom_write(*_a, **_k):
+        raise OSError("disk full (injected)")
+
+    monkeypatch.setattr(ql, "write_circuit", boom_write)
+
+    err = io.StringIO()
+    runner = FakeRunner({("cairn", "run"): RunResult(3, "", "")})
+    code = run_trigger(
+        "handle-reply", ws, runner=runner, cairn_bin="cairn", now=NOW, err=err
+    )
+    # Drain continues (FAILED still sets exit 1 from the run outcome itself).
+    assert code == 1
+    assert len(runner.calls) == 1
+    diag = err.getvalue()
+    assert "could not update breaker state" in diag
+    assert "breaker may not open" in diag
+    assert str(circuit_path(watch_abs)) in diag or ".circuit" in diag
+    # Injected write failure → state never advanced (file absent or still closed).
+    assert not is_circuit_open(watch_abs, 1)
