@@ -14,6 +14,7 @@ import pytest
 
 from cairn.kernel.errors import CairnError, ConfigError
 from cairn.kernel.proc import RunResult, RunnerBase
+from cairn.kernel.wsid import workspace_id
 from cairn.kernel.triggerkit import (
     list_installed_triggers,
     remove_trigger,
@@ -116,7 +117,7 @@ def test_sync_launchd_writes_plist_and_loads_via_runner(tmp_path):
     launchd_dir = tmp_path / "launchd"
     runner = FakeRunner()
     touched = sync_triggers(ws, backend="launchd", runner=runner, cairn_bin="cairn", launchd_dir=launchd_dir)
-    plist = launchd_dir / f"{trigger_launchd_label('handle-reply')}.plist"
+    plist = launchd_dir / f"{trigger_launchd_label('handle-reply', workspace_id(ws))}.plist"
     assert plist.is_file()
     doc = plistlib.loads(plist.read_bytes())
     assert doc["ProgramArguments"][:3] == ["cairn", "trigger", "run"]
@@ -133,7 +134,7 @@ def test_sync_systemd_writes_units_and_enables_path_unit(tmp_path):
     systemd_dir = tmp_path / "systemd"
     runner = FakeRunner()
     touched = sync_triggers(ws, backend="systemd", runner=runner, cairn_bin="cairn", systemd_dir=systemd_dir)
-    path_name, service_name = trigger_systemd_unit_names("handle-reply")
+    path_name, service_name = trigger_systemd_unit_names("handle-reply", workspace_id(ws))
     assert (systemd_dir / path_name).is_file()
     assert (systemd_dir / service_name).is_file()
     assert set(touched) == {path_name, service_name}
@@ -163,18 +164,20 @@ def test_sync_unknown_backend_is_config_error(tmp_path):
 
 def test_sync_refuses_to_overwrite_a_schedule_owned_unit_file(tmp_path):
     # A schedule named "trigger-X" and a trigger named "X" both render
-    # cairn-trigger-X.service (T2's namespace cannot rule this out) — sync must refuse
-    # loud rather than overwrite the schedule's live unit file.
+    # cairn-<ws8>-trigger-X.service (ws-scoped namespace still collides on that stem) —
+    # sync must refuse loud rather than overwrite the schedule's live unit file.
     ws = _workspace(tmp_path, TRIGGERS_ONE_X, pipelines=("x-pipe",))
     systemd_dir = tmp_path / "systemd"
     systemd_dir.mkdir()
-    service_path = systemd_dir / "cairn-trigger-X.service"
+    _, service_name = trigger_systemd_unit_names("X", workspace_id(ws))
+    service_path = systemd_dir / service_name
     service_path.write_bytes(_SCHEDULE_OWNED_SERVICE)
     runner = FakeRunner()
     with pytest.raises(ConfigError, match="schedule"):
         sync_triggers(ws, backend="systemd", runner=runner, cairn_bin="cairn", systemd_dir=systemd_dir)
     assert service_path.read_bytes() == _SCHEDULE_OWNED_SERVICE
-    assert not (systemd_dir / "cairn-trigger-X.path").exists()  # nothing else got written either
+    path_name, _ = trigger_systemd_unit_names("X", workspace_id(ws))
+    assert not (systemd_dir / path_name).exists()  # nothing else got written either
     assert runner.calls == []  # refused before any runner call
 
 
@@ -182,7 +185,7 @@ def test_sync_refuses_to_overwrite_an_unmanaged_launchd_plist(tmp_path):
     ws = _workspace(tmp_path, TRIGGERS_ONE)
     launchd_dir = tmp_path / "launchd"
     launchd_dir.mkdir()
-    label = trigger_launchd_label("handle-reply")
+    label = trigger_launchd_label("handle-reply", workspace_id(ws))
     foreign = launchd_dir / f"{label}.plist"
     foreign.write_text("not a plist at all", encoding="utf-8")
     with pytest.raises(ConfigError, match="unmanaged"):
@@ -204,7 +207,7 @@ def test_sync_systemd_survives_a_stray_non_utf8_foreign_service_file(tmp_path):
     foreign.write_bytes(_NON_UTF8_SERVICE_BYTES)
     runner = FakeRunner()
     touched = sync_triggers(ws, backend="systemd", runner=runner, cairn_bin="cairn", systemd_dir=systemd_dir)
-    path_name, service_name = trigger_systemd_unit_names("handle-reply")
+    path_name, service_name = trigger_systemd_unit_names("handle-reply", workspace_id(ws))
     assert set(touched) == {path_name, service_name}  # the declared trigger still synced fine
     assert foreign.read_bytes() == _NON_UTF8_SERVICE_BYTES  # foreign file never touched
 
@@ -222,7 +225,7 @@ def test_sync_systemd_survives_a_stray_non_utf8_foreign_path_unit_file(tmp_path)
 
 def test_sync_systemd_ownership_prepass_leaves_dir_byte_for_byte_untouched_on_refusal(tmp_path):
     # Two declared triggers, "a" then "X" — "X" collides with a pre-seeded
-    # schedule-owned cairn-trigger-X.service. The pre-pass validates ownership for
+    # schedule-owned cairn-<ws8>-trigger-X.service. The pre-pass validates ownership for
     # EVERY declared trigger before writing ANY of them: "a"'s unit files must never
     # land on disk from this call, and zero runner calls may fire (Finding 3) — without
     # the fix, "a" (processed first) would already be written and reloaded by the time
@@ -230,11 +233,12 @@ def test_sync_systemd_ownership_prepass_leaves_dir_byte_for_byte_untouched_on_re
     ws = _workspace(tmp_path, TRIGGERS_A_THEN_X, pipelines=("handle-reply", "x-pipe"))
     systemd_dir = tmp_path / "systemd"
     systemd_dir.mkdir()
-    (systemd_dir / "cairn-trigger-X.service").write_bytes(_SCHEDULE_OWNED_SERVICE)
+    _, x_service = trigger_systemd_unit_names("X", workspace_id(ws))
+    (systemd_dir / x_service).write_bytes(_SCHEDULE_OWNED_SERVICE)
     runner = FakeRunner()
     with pytest.raises(ConfigError, match="schedule"):
         sync_triggers(ws, backend="systemd", runner=runner, cairn_bin="cairn", systemd_dir=systemd_dir)
-    a_path_name, a_service_name = trigger_systemd_unit_names("a")
+    a_path_name, a_service_name = trigger_systemd_unit_names("a", workspace_id(ws))
     assert not (systemd_dir / a_path_name).exists()
     assert not (systemd_dir / a_service_name).exists()
     assert runner.calls == []
@@ -246,12 +250,12 @@ def test_sync_launchd_ownership_prepass_leaves_dir_byte_for_byte_untouched_on_re
     ws = _workspace(tmp_path, TRIGGERS_A_THEN_X, pipelines=("handle-reply", "x-pipe"))
     launchd_dir = tmp_path / "launchd"
     launchd_dir.mkdir()
-    foreign = launchd_dir / f"{trigger_launchd_label('X')}.plist"
+    foreign = launchd_dir / f"{trigger_launchd_label('X', workspace_id(ws))}.plist"
     foreign.write_text("not a plist at all", encoding="utf-8")
     runner = FakeRunner()
     with pytest.raises(ConfigError, match="unmanaged"):
         sync_triggers(ws, backend="launchd", runner=runner, cairn_bin="cairn", launchd_dir=launchd_dir)
-    a_plist = launchd_dir / f"{trigger_launchd_label('a')}.plist"
+    a_plist = launchd_dir / f"{trigger_launchd_label('a', workspace_id(ws))}.plist"
     assert not a_plist.exists()
     assert runner.calls == []
 
@@ -276,7 +280,7 @@ def test_remove_trigger_systemd_treats_non_utf8_target_file_as_unmanaged_not_a_c
     ws = _workspace(tmp_path, TRIGGERS_ONE)
     systemd_dir = tmp_path / "systemd"
     systemd_dir.mkdir()
-    _, service_name = trigger_systemd_unit_names("handle-reply")
+    _, service_name = trigger_systemd_unit_names("handle-reply", workspace_id(ws))
     foreign = systemd_dir / service_name
     foreign.write_bytes(_NON_UTF8_SERVICE_BYTES)
     with pytest.raises(ConfigError, match="unmanaged"):
@@ -306,7 +310,7 @@ def test_remove_trigger_launchd_removes_plist_and_unloads(tmp_path):
     launchd_dir = tmp_path / "launchd"
     runner = FakeRunner()
     sync_triggers(ws, backend="launchd", runner=runner, cairn_bin="cairn", launchd_dir=launchd_dir)
-    plist = launchd_dir / f"{trigger_launchd_label('handle-reply')}.plist"
+    plist = launchd_dir / f"{trigger_launchd_label('handle-reply', workspace_id(ws))}.plist"
     assert plist.is_file()
     removed = remove_trigger("handle-reply", ws, backend="launchd", runner=runner, launchd_dir=launchd_dir)
     assert removed is True
@@ -327,7 +331,7 @@ def test_remove_trigger_systemd_removes_both_units_and_reloads(tmp_path):
     systemd_dir = tmp_path / "systemd"
     runner = FakeRunner()
     sync_triggers(ws, backend="systemd", runner=runner, cairn_bin="cairn", systemd_dir=systemd_dir)
-    path_name, service_name = trigger_systemd_unit_names("handle-reply")
+    path_name, service_name = trigger_systemd_unit_names("handle-reply", workspace_id(ws))
     assert (systemd_dir / path_name).is_file()
     assert (systemd_dir / service_name).is_file()
     removed = remove_trigger("handle-reply", ws, backend="systemd", runner=runner, systemd_dir=systemd_dir)
@@ -341,7 +345,8 @@ def test_remove_trigger_refuses_to_delete_a_schedule_owned_file(tmp_path):
     ws = _workspace(tmp_path, TRIGGERS_ONE_X, pipelines=("x-pipe",))
     systemd_dir = tmp_path / "systemd"
     systemd_dir.mkdir()
-    service_path = systemd_dir / "cairn-trigger-X.service"
+    _, service_name = trigger_systemd_unit_names("X", workspace_id(ws))
+    service_path = systemd_dir / service_name
     service_path.write_bytes(_SCHEDULE_OWNED_SERVICE)
     with pytest.raises(ConfigError, match="schedule"):
         remove_trigger("X", ws, backend="systemd", runner=FakeRunner(), systemd_dir=systemd_dir)
@@ -359,7 +364,7 @@ def test_remove_trigger_systemd_leaves_the_path_unit_alone_when_the_service_is_s
     systemd_dir = tmp_path / "systemd"
     runner = FakeRunner()
     sync_triggers(ws, backend="systemd", runner=runner, cairn_bin="cairn", systemd_dir=systemd_dir)
-    path_name, service_name = trigger_systemd_unit_names("X")
+    path_name, service_name = trigger_systemd_unit_names("X", workspace_id(ws))
     assert (systemd_dir / path_name).is_file()
     (systemd_dir / service_name).write_bytes(_SCHEDULE_OWNED_SERVICE)
 

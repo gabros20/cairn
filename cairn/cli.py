@@ -79,6 +79,7 @@ from cairn.kernel.schedkit import (
     uninstall as uninstall_schedules,
 )
 from cairn.kernel.trail import RunStatus, derive_status, follow, read_trail
+from cairn.kernel.fssafety import check_watch_fs_safety
 from cairn.kernel.trigger_host import load_triggers, watch_dir
 from cairn.kernel.triggerkit import (
     TriggerStatus,
@@ -88,8 +89,9 @@ from cairn.kernel.triggerkit import (
     run_trigger,
     sync_triggers,
 )
-from cairn.kernel.types import ExitCode, classify_exit
+from cairn.kernel.types import ExitCode, Finding, classify_exit
 from cairn.kernel.walk import invalidate_from, walk
+from cairn.kernel.wsid import label_prefix_for, workspace_id
 
 # The full verb surface (docs/API.md §9). Order is the help-listing order.
 SUBCOMMANDS: list[str] = [
@@ -1931,6 +1933,9 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     backend = args.backend
     runner = _SubprocessRunner()
     launchd_dir, systemd_dir = _schedule_dirs(args)
+    # W3 multi-factory: scope host units under io.cairn.<ws8>.
+    prefix = label_prefix_for(ws)
+    wid = workspace_id(ws)
 
     try:
         if args.action == "run":
@@ -1961,6 +1966,8 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 cairn_bin=_resolve_cairn_bin(),
                 launchd_dir=launchd_dir,
                 systemd_dir=systemd_dir,
+                label_prefix=prefix,
+                ws_id=wid,
             )
             print(f"cairn: installed {len(schedules)} schedule(s) into the {backend} backend")
             return int(ExitCode.OK)
@@ -1972,6 +1979,8 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 runner=runner,
                 launchd_dir=launchd_dir,
                 systemd_dir=systemd_dir,
+                label_prefix=prefix,
+                ws_id=wid,
             )
             print(f"cairn: removed cairn-managed schedules from the {backend} backend")
             return int(ExitCode.OK)
@@ -1979,7 +1988,12 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
         if args.action == "list":
             schedules = load_schedules(ws)
             installed = list_installed(
-                backend, runner=runner, launchd_dir=launchd_dir, systemd_dir=systemd_dir
+                backend,
+                runner=runner,
+                launchd_dir=launchd_dir,
+                systemd_dir=systemd_dir,
+                label_prefix=prefix,
+                ws_id=wid,
             )
             _print_schedule_diff(diff_schedules(schedules, installed), backend)
             return int(ExitCode.OK)
@@ -2019,6 +2033,46 @@ def _print_schedule_diff(diff, backend: str) -> None:
 # --------------------------------------------------------------------------- #
 
 
+def _refuse_unsafe_watch_dirs(
+    workspace_dir: Path,
+    *,
+    unsafe_synced_fs: bool,
+    trigger_names: list[str] | None = None,
+) -> int | None:
+    """D2 hard refusal when a watch/ledger dir is on cloud-sync or fails hardlink.
+
+    Returns an exit code to abort with, or None to proceed. ``--unsafe-synced-fs``
+    logs a warning and proceeds.
+    """
+    try:
+        triggers = load_triggers(workspace_dir)
+    except ConfigError:
+        return None
+    names = trigger_names if trigger_names is not None else sorted(triggers)
+    findings: list[Finding] = []
+    for name in names:
+        if name not in triggers:
+            continue
+        try:
+            watch_abs = watch_dir(triggers[name], workspace_dir)
+        except ConfigError:
+            continue
+        findings.extend(check_watch_fs_safety(watch_abs))
+    if not findings:
+        return None
+    errors = [f for f in findings if f.level == "error"]
+    if not errors:
+        return None
+    if unsafe_synced_fs:
+        for f in errors:
+            print(f"cairn: WARNING --unsafe-synced-fs: {f.message}", file=sys.stderr)
+        return None
+    for f in errors:
+        fix = f" → {f.fix}" if f.fix else ""
+        print(f"cairn: {f.message}{fix}", file=sys.stderr)
+    return int(ExitCode.CONFIG)
+
+
 def _cmd_trigger(args: argparse.Namespace) -> int:
     ws = _workspace(args)
     backend = args.backend
@@ -2026,12 +2080,16 @@ def _cmd_trigger(args: argparse.Namespace) -> int:
     # Same target-dir resolution schedule uses (`--launchd-dir`/`--systemd-dir`, same
     # per-user defaults) — triggerkit's sync/list/remove take the identical two knobs.
     launchd_dir, systemd_dir = _schedule_dirs(args)
+    unsafe = bool(getattr(args, "unsafe_synced_fs", False))
 
     try:
         if args.action == "run":
             if not args.name:
                 print("cairn: `cairn trigger run` needs a trigger name", file=sys.stderr)
                 return int(ExitCode.CONFIG)
+            refused = _refuse_unsafe_watch_dirs(ws, unsafe_synced_fs=unsafe, trigger_names=[args.name])
+            if refused is not None:
+                return refused
             # The exit code IS the contract (requirement 3): claim hazards and a failed
             # child both surface here, verbatim — never remapped into an ExitCode member.
             # Thread our real streams through (mirrors `schedule run` above): the
@@ -2048,6 +2106,9 @@ def _cmd_trigger(args: argparse.Namespace) -> int:
             )
 
         if args.action == "sync":
+            refused = _refuse_unsafe_watch_dirs(ws, unsafe_synced_fs=unsafe)
+            if refused is not None:
+                return refused
             names = sync_triggers(
                 ws,
                 backend=backend,
@@ -2191,6 +2252,10 @@ def _cmd_factory(args: argparse.Namespace) -> int:
     if args.action != "reconcile":
         print(f"cairn: unknown factory action {args.action!r}", file=sys.stderr)
         return int(ExitCode.CONFIG)
+    unsafe = bool(getattr(args, "unsafe_synced_fs", False))
+    refused = _refuse_unsafe_watch_dirs(ws, unsafe_synced_fs=unsafe)
+    if refused is not None:
+        return refused
     try:
         report = reconcile_workspace(
             ws,
@@ -2375,6 +2440,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--workspace", default=".", help="workspace root (default .)")
     sp.add_argument("--json", action="store_true", help="list: machine-readable output")
     sp.add_argument(
+        "--unsafe-synced-fs",
+        action="store_true",
+        help="override D2 hard refusal when watch/ledger sits on cloud-sync or fails "
+             "hard-link probe (logged; data-loss risk — FACTORY-PLAN D2)",
+    )
+    sp.add_argument(
         "--headless", action="store_true",
         help="accepted, ignored — a fired trigger's child run is already --headless by "
              "construction; present so the documented cron-fallback schedules.yaml entry "
@@ -2389,6 +2460,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp.add_argument("action", choices=["reconcile"], help="reconcile: single-flight all-trigger sweep")
     sp.add_argument("--workspace", default=".", help="workspace root (default .)")
+    sp.add_argument(
+        "--unsafe-synced-fs",
+        action="store_true",
+        help="override D2 hard refusal when a watch/ledger sits on cloud-sync or fails "
+             "hard-link probe (logged; data-loss risk — FACTORY-PLAN D2)",
+    )
     sp.set_defaults(func=_cmd_factory)
 
     return parser

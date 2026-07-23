@@ -11,6 +11,7 @@ from pathlib import Path
 
 from cairn.kernel.proc import RunResult, RunnerBase
 from cairn.kernel.triggerkit import sync_triggers, trigger_launchd_label, trigger_systemd_unit_names
+from cairn.kernel.wsid import workspace_id
 
 TRIGGERS_ONE = """\
 handle-reply:
@@ -86,7 +87,7 @@ def test_double_sync_launchd_is_a_true_noop_second_time(tmp_path):
     launchd_dir = tmp_path / "launchd"
     runner = FakeRunner()
     sync_triggers(ws, backend="launchd", runner=runner, cairn_bin="cairn", launchd_dir=launchd_dir)
-    plist = launchd_dir / f"{trigger_launchd_label('handle-reply')}.plist"
+    plist = launchd_dir / f"{trigger_launchd_label('handle-reply', workspace_id(ws))}.plist"
     before = plist.read_bytes()
 
     runner.calls.clear()
@@ -102,7 +103,7 @@ def test_double_sync_systemd_is_a_true_noop_second_time(tmp_path):
     systemd_dir = tmp_path / "systemd"
     runner = FakeRunner()
     sync_triggers(ws, backend="systemd", runner=runner, cairn_bin="cairn", systemd_dir=systemd_dir)
-    path_name, service_name = trigger_systemd_unit_names("handle-reply")
+    path_name, service_name = trigger_systemd_unit_names("handle-reply", workspace_id(ws))
     before_path = (systemd_dir / path_name).read_bytes()
     before_service = (systemd_dir / service_name).read_bytes()
 
@@ -123,8 +124,8 @@ def test_sync_after_removing_a_trigger_prunes_only_its_own_managed_file(tmp_path
     launchd_dir = tmp_path / "launchd"
     runner = FakeRunner()
     sync_triggers(ws, backend="launchd", runner=runner, cairn_bin="cairn", launchd_dir=launchd_dir)
-    kept_plist = launchd_dir / f"{trigger_launchd_label('handle-reply')}.plist"
-    removed_plist = launchd_dir / f"{trigger_launchd_label('other')}.plist"
+    kept_plist = launchd_dir / f"{trigger_launchd_label('handle-reply', workspace_id(ws))}.plist"
+    removed_plist = launchd_dir / f"{trigger_launchd_label('other', workspace_id(ws))}.plist"
     assert kept_plist.is_file() and removed_plist.is_file()
 
     # an unmanaged file sitting in the same directory must never be touched

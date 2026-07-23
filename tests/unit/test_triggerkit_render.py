@@ -21,6 +21,9 @@ from cairn.kernel.triggerkit import (
 )
 
 WS = Path("/ws/acme")
+# Fixed workspace UUID for offline render tests (no mint of .cairn/workspace-id).
+WID = "aabbccdd11223344556677889900aabb"
+WS8 = WID[:8]
 
 
 def _trigger(name="handle-reply", pipeline="handle-reply", watch="inbox/replies", **kw):
@@ -30,14 +33,17 @@ def _trigger(name="handle-reply", pipeline="handle-reply", watch="inbox/replies"
 # --- label / unit-name helpers ------------------------------------------------
 
 
-def test_trigger_launchd_label_is_namespaced_under_trigger():
-    assert trigger_launchd_label("handle-reply") == "io.cairn.trigger.handle-reply"
+def test_trigger_launchd_label_is_ws_scoped_under_trigger():
+    assert (
+        trigger_launchd_label("handle-reply", WID)
+        == f"io.cairn.{WS8}.trigger.handle-reply"
+    )
 
 
-def test_trigger_systemd_unit_names_are_namespaced_under_trigger():
-    assert trigger_systemd_unit_names("handle-reply") == (
-        "cairn-trigger-handle-reply.path",
-        "cairn-trigger-handle-reply.service",
+def test_trigger_systemd_unit_names_are_ws_scoped_under_trigger():
+    assert trigger_systemd_unit_names("handle-reply", WID) == (
+        f"cairn-{WS8}-trigger-handle-reply.path",
+        f"cairn-{WS8}-trigger-handle-reply.service",
     )
 
 
@@ -45,9 +51,10 @@ def test_trigger_and_schedule_namespaces_never_collide_on_a_shared_name():
     # a schedule and a trigger named identically must never produce the same unit/label
     from cairn.kernel.schedkit import launchd_label, systemd_unit_names
 
-    assert trigger_launchd_label("weekly") != launchd_label("weekly")
-    trig_path, trig_service = trigger_systemd_unit_names("weekly")
-    sched_service, sched_timer = systemd_unit_names("weekly")
+    prefix = f"io.cairn.{WS8}."
+    assert trigger_launchd_label("weekly", WID) != launchd_label("weekly", prefix)
+    trig_path, trig_service = trigger_systemd_unit_names("weekly", WID)
+    sched_service, sched_timer = systemd_unit_names("weekly", ws_id=WID)
     assert trig_path not in (sched_service, sched_timer)
     assert trig_service not in (sched_service, sched_timer)
 
@@ -56,9 +63,9 @@ def test_trigger_and_schedule_namespaces_never_collide_on_a_shared_name():
 
 
 def test_render_trigger_launchd_is_valid_plist_with_watchpaths_and_argv():
-    xml = render_trigger_launchd(_trigger(), WS, "cairn")
+    xml = render_trigger_launchd(_trigger(), WS, "cairn", ws_id=WID)
     doc = plistlib.loads(xml.encode("utf-8"))
-    assert doc["Label"] == "io.cairn.trigger.handle-reply"
+    assert doc["Label"] == f"io.cairn.{WS8}.trigger.handle-reply"
     assert doc["ProgramArguments"] == [
         "cairn",
         "trigger",
@@ -73,7 +80,7 @@ def test_render_trigger_launchd_is_valid_plist_with_watchpaths_and_argv():
 
 def test_render_trigger_launchd_watch_dir_is_absolute_and_resolved():
     trig = _trigger(name="ingest", watch="inbox/ingest")
-    xml = render_trigger_launchd(trig, WS, "cairn")
+    xml = render_trigger_launchd(trig, WS, "cairn", ws_id=WID)
     doc = plistlib.loads(xml.encode("utf-8"))
     watch = Path(doc["WatchPaths"][0])
     assert watch.is_absolute()
@@ -84,11 +91,11 @@ def test_render_trigger_launchd_watch_dir_is_absolute_and_resolved():
 
 
 def test_render_trigger_systemd_path_and_service():
-    path_unit, service_unit = render_trigger_systemd(_trigger(), WS, "cairn")
+    path_unit, service_unit = render_trigger_systemd(_trigger(), WS, "cairn", ws_id=WID)
 
     assert "[Path]" in path_unit
     assert f"DirectoryNotEmpty={WS / 'inbox/replies'}" in path_unit
-    assert "Unit=cairn-trigger-handle-reply.service" in path_unit
+    assert f"Unit=cairn-{WS8}-trigger-handle-reply.service" in path_unit
     assert "[Install]" in path_unit
     assert "WantedBy=default.target" in path_unit
 
@@ -105,7 +112,7 @@ def test_render_trigger_systemd_path_and_service():
 
 def test_render_trigger_systemd_argv_is_the_stable_entry_never_expanded_params():
     trig = _trigger(name="ingest", pipeline="handle-reply", watch="inbox/ingest", param="event")
-    _, service_unit = render_trigger_systemd(trig, WS, "cairn")
+    _, service_unit = render_trigger_systemd(trig, WS, "cairn", ws_id=WID)
     assert "ExecStart=cairn trigger run ingest --workspace /ws/acme" in service_unit
     # editing triggers.yaml (pipeline/param/glob/on_done) must change behavior without
     # re-sync — none of those fields ever leak into the rendered argv
@@ -116,7 +123,7 @@ def test_render_trigger_systemd_argv_is_the_stable_entry_never_expanded_params()
 def test_render_trigger_systemd_quotes_workspace_with_spaces_and_non_ascii():
     ws = Path("/ws/acmé co/root dir")
     trig = _trigger(name="ingest", watch="inbox/ingest")
-    path_unit, service_unit = render_trigger_systemd(trig, ws, "cairn")
+    path_unit, service_unit = render_trigger_systemd(trig, ws, "cairn", ws_id=WID)
 
     # DirectoryNotEmpty= is a single unsplit value — no quoting needed or added
     assert f"DirectoryNotEmpty={ws / 'inbox/ingest'}" in path_unit
@@ -133,7 +140,7 @@ def test_render_trigger_systemd_quotes_workspace_with_spaces_and_non_ascii():
 def test_render_trigger_launchd_handles_workspace_with_spaces_and_non_ascii():
     ws = Path("/ws/acmé co/root dir")
     trig = _trigger(name="ingest", watch="inbox/ingest")
-    xml = render_trigger_launchd(trig, ws, "cairn")
+    xml = render_trigger_launchd(trig, ws, "cairn", ws_id=WID)
     doc = plistlib.loads(xml.encode("utf-8"))
     # ProgramArguments is a plist array — each element is its own string, no shell
     # word-splitting risk, so the raw (unquoted) path is the correct rendering
@@ -157,14 +164,14 @@ def test_render_trigger_systemd_rejects_injection_payload_in_name_bypassing_load
     evil_name = "evil\n[Service]\nExecStart=/bin/touch /tmp/pwned\n#"
     trig = Trigger(name=evil_name, pipeline="p", watch="inbox")
     with pytest.raises(ConfigError, match="trigger name"):
-        render_trigger_systemd(trig, WS, "cairn")
+        render_trigger_systemd(trig, WS, "cairn", ws_id=WID)
 
 
 def test_render_trigger_systemd_rejects_injection_payload_in_watch_bypassing_load():
     evil_watch = "inbox\n[Service]\nExecStart=/bin/touch /tmp/pwned3\n#"
     trig = Trigger(name="ok", pipeline="p", watch=evil_watch)
     with pytest.raises(ConfigError, match="watch directory"):
-        render_trigger_systemd(trig, WS, "cairn")
+        render_trigger_systemd(trig, WS, "cairn", ws_id=WID)
 
 
 def test_render_trigger_systemd_rejects_injection_payload_in_workspace_dir():
@@ -173,13 +180,15 @@ def test_render_trigger_systemd_rejects_injection_payload_in_workspace_dir():
     trig = _trigger()
     evil_ws = Path("/ws/acme\n[Service]\nExecStart=/bin/touch /tmp/pwned\n#")
     with pytest.raises(ConfigError, match="workspace_dir"):
-        render_trigger_systemd(trig, evil_ws, "cairn")
+        render_trigger_systemd(trig, evil_ws, "cairn", ws_id=WID)
 
 
 def test_render_trigger_systemd_rejects_injection_payload_in_cairn_bin():
     trig = _trigger()
     with pytest.raises(ConfigError, match="cairn_bin"):
-        render_trigger_systemd(trig, WS, "cairn\n[Service]\nExecStart=/bin/touch /tmp/pwned\n#")
+        render_trigger_systemd(
+            trig, WS, "cairn\n[Service]\nExecStart=/bin/touch /tmp/pwned\n#", ws_id=WID
+        )
 
 
 def test_render_trigger_systemd_injection_attempts_never_produce_rendered_text():
@@ -189,7 +198,7 @@ def test_render_trigger_systemd_injection_attempts_never_produce_rendered_text()
     evil_name = "evil\n[Service]\nExecStart=/bin/touch /tmp/pwned\n#"
     trig = Trigger(name=evil_name, pipeline="p", watch="inbox")
     try:
-        render_trigger_systemd(trig, WS, "cairn")
+        render_trigger_systemd(trig, WS, "cairn", ws_id=WID)
         raised = False
     except ConfigError as exc:
         raised = True
@@ -204,11 +213,11 @@ def test_render_trigger_launchd_rejects_injection_payload_in_workspace_dir():
     trig = _trigger()
     evil_ws = Path("/ws/acme\n[Service]\nExecStart=/bin/touch /tmp/pwned\n#")
     with pytest.raises(ConfigError, match="workspace_dir"):
-        render_trigger_launchd(trig, evil_ws, "cairn")
+        render_trigger_launchd(trig, evil_ws, "cairn", ws_id=WID)
 
 
 def test_render_trigger_launchd_rejects_injection_payload_in_name_bypassing_load():
     evil_name = "evil\n[Service]\nExecStart=/bin/touch /tmp/pwned\n#"
     trig = Trigger(name=evil_name, pipeline="p", watch="inbox")
     with pytest.raises(ConfigError, match="trigger name"):
-        render_trigger_launchd(trig, WS, "cairn")
+        render_trigger_launchd(trig, WS, "cairn", ws_id=WID)

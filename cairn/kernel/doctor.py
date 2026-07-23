@@ -20,7 +20,9 @@ from typing import Callable
 
 from cairn.kernel.config import Config, load_config, requires_satisfied
 from cairn.kernel.errors import ConfigError
+from cairn.kernel.fssafety import check_watch_fs_safety
 from cairn.kernel.plan import plan as build_plan
+from cairn.kernel.queue_ledger import audit_ledger
 from cairn.kernel.toolcheck import run_tool_check
 
 _OK = "✔"
@@ -140,10 +142,57 @@ def run_doctor(
     else:
         out(f"{_BAD} guard runner    cannot import — guarded commands will fail closed")
 
+    # -- factory FS safety + ledger invariant audit (D2 / T8) ---------------- #
+    errors += _doctor_factory(workspace_dir, out)
+
     if probe_hooks:
         errors += _doctor_probe_hooks(scope, workspace_dir, out)
 
     return int(ExitCode.CONFIG) if errors else int(ExitCode.OK)
+
+
+def _doctor_factory(workspace_dir: Path, out: Callable[[str], None]) -> int:
+    """D2 cloud-sync/hardlink refusals + T8 ledger invariant audit per declared trigger."""
+    try:
+        from cairn.kernel.trigger_host import load_triggers, watch_dir
+    except Exception:  # noqa: BLE001
+        return 0
+    try:
+        triggers = load_triggers(workspace_dir)
+    except ConfigError as exc:
+        out(f"{_BAD} factory        triggers.yaml: {exc}")
+        return 1
+    if not triggers:
+        return 0
+    errs = 0
+    for name in sorted(triggers):
+        try:
+            watch_abs = watch_dir(triggers[name], workspace_dir)
+        except ConfigError as exc:
+            out(f"{_BAD} factory {name}  watch: {exc}")
+            errs += 1
+            continue
+        findings = check_watch_fs_safety(watch_abs)
+        for f in findings:
+            if f.level == "error":
+                fix = f" → {f.fix}" if f.fix else ""
+                out(f"{_BAD} factory {name}  {f.message}{fix}")
+                errs += 1
+            else:
+                out(f"  ! factory {name}  {f.message}")
+        try:
+            issues = audit_ledger(watch_abs)
+        except Exception as exc:  # noqa: BLE001
+            out(f"{_BAD} factory {name}  ledger audit failed: {exc}")
+            errs += 1
+            continue
+        if issues:
+            for issue in issues:
+                out(f"{_BAD} factory {name}  ledger: {issue}")
+                errs += 1
+        elif not findings:
+            out(f"{_OK} factory {name}  watch fs + ledger audit green")
+    return 1 if errs else 0
 
 
 def _doctor_requires(spec: str, out: Callable[[str], None]) -> int:

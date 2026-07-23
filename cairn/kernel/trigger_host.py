@@ -28,11 +28,19 @@ from cairn.kernel.queue_ledger import (
     effective_lease_ttl,
     ledger_counts,
     lease_status,
+    stamp_ledger_version,
     stuck_claims,
 )
 from cairn.kernel.types import Finding
+from cairn.kernel.wsid import label_prefix_for, workspace_id, ws8
 
 TRIGGERS_YAML = "triggers.yaml"
+
+# Reconcile beat: host timer firing `cairn factory reconcile --workspace <ws>` (D1/D6).
+# Name is a schedule-shaped stem under the ws-scoped label prefix; install/remove via
+# schedkit (timers are schedkit's boundary; this module REQUESTS the beat).
+RECONCILE_BEAT_NAME = "factory-reconcile"
+RECONCILE_BEAT_CRON = "*/10 * * * *"  # every 10 minutes
 
 _TRIGGER_KEYS = frozenset({
     "pipeline",
@@ -447,17 +455,32 @@ def _assert_render_safe(what: str, value: str) -> None:
         raise ConfigError(message, findings=[Finding("error", message)])
 
 
-def trigger_launchd_label(name: str) -> str:
+def trigger_launchd_label(name: str, ws_id: str) -> str:
     """The launchd job label for a trigger (also the plist basename stem).
 
-    The literal ``trigger.`` segment — vs schedkit's :func:`launchd_label`'s bare
-    ``io.cairn.<name>`` — means a trigger and a schedule sharing one name can never
-    collide as ~/Library/LaunchAgents plist labels.
+    Form: ``io.cairn.<ws8>.trigger.<name>`` — workspace-UUID-scoped so N factories on
+    one machine never collide (FACTORY-PLAN §6 W3 / D9). The literal ``trigger.``
+    segment — vs schedkit's :func:`launchd_label` ``io.cairn.<ws8>.<name>`` — means a
+    trigger and a schedule sharing one name still never collide as LaunchAgent labels.
+
+    Legacy (pre-W3) form was ``io.cairn.trigger.<name>``; :func:`sync_triggers` migrates
+    this workspace's own old units by attributing ownership via ``--workspace`` in argv.
     """
+    return f"io.cairn.{ws8(ws_id)}.trigger.{name}"
+
+
+def trigger_launchd_label_legacy(name: str) -> str:
+    """Pre-W3 launchd label (``io.cairn.trigger.<name>``) — migration discovery only."""
     return f"io.cairn.trigger.{name}"
 
 
-def render_trigger_launchd(trigger: Trigger, workspace_dir: Path, cairn_bin: str) -> str:
+def render_trigger_launchd(
+    trigger: Trigger,
+    workspace_dir: Path,
+    cairn_bin: str,
+    *,
+    ws_id: str | None = None,
+) -> str:
     """Render one trigger as a launchd LaunchAgent plist (XML string) with a ``WatchPaths``
     key, plistlib-generated (never hand-concatenated XML — malformed XML is a silently
     dead LaunchAgent, not a load-time error a human sees).
@@ -468,6 +491,9 @@ def render_trigger_launchd(trigger: Trigger, workspace_dir: Path, cairn_bin: str
     event can cascade into a burst of self-triggered re-fires; ``scan_candidates`` always
     excludes those dot-dirs, so each extra firing just scans an already-empty top level —
     a cheap no-op — which is what makes throttling to once per 10s safe rather than lossy.
+
+    ``ws_id`` overrides the workspace UUID (render-only tests / offline paths that cannot
+    mint ``.cairn/workspace-id``). Production callers leave it unset.
     """
     workspace_dir = Path(workspace_dir)
     watch_abs = watch_dir(trigger, workspace_dir)
@@ -478,8 +504,9 @@ def render_trigger_launchd(trigger: Trigger, workspace_dir: Path, cairn_bin: str
         ("cairn_bin", cairn_bin),
     ):
         _assert_render_safe(what, value)
+    wid = ws_id if ws_id is not None else workspace_id(workspace_dir)
     plist: dict[str, Any] = {
-        "Label": trigger_launchd_label(trigger.name),
+        "Label": trigger_launchd_label(trigger.name, wid),
         "ProgramArguments": _trigger_argv(trigger, workspace_dir, cairn_bin),
         "WatchPaths": [str(watch_abs)],
         "ThrottleInterval": 10,
@@ -487,19 +514,29 @@ def render_trigger_launchd(trigger: Trigger, workspace_dir: Path, cairn_bin: str
     return plistlib.dumps(plist, sort_keys=False).decode("utf-8")
 
 
-def trigger_systemd_unit_names(name: str) -> tuple[str, str]:
+def trigger_systemd_unit_names(name: str, ws_id: str) -> tuple[str, str]:
     """The (``.path``, ``.service``) unit filenames for a trigger.
 
-    The ``trigger-`` segment — vs schedkit's :func:`systemd_unit_names`'s bare
-    ``cairn-<name>.service``/``.timer`` — means a trigger and a schedule sharing one name
-    install as distinct unit files in the same systemd user directory rather than one
-    silently overwriting the other's ``.service``.
+    Form: ``cairn-<ws8>-trigger-<name>.{path,service}`` — workspace-scoped (W3 / D9).
+    The ``trigger-`` segment — vs schedkit's ``cairn-<ws8>-<name>.{service,timer}`` —
+    keeps a same-named schedule and trigger as distinct unit files. Legacy form was
+    ``cairn-trigger-<name>.*``; sync migrates this workspace's own old units.
     """
+    w = ws8(ws_id)
+    return (f"cairn-{w}-trigger-{name}.path", f"cairn-{w}-trigger-{name}.service")
+
+
+def trigger_systemd_unit_names_legacy(name: str) -> tuple[str, str]:
+    """Pre-W3 systemd unit names — migration discovery only."""
     return (f"cairn-trigger-{name}.path", f"cairn-trigger-{name}.service")
 
 
 def render_trigger_systemd(
-    trigger: Trigger, workspace_dir: Path, cairn_bin: str
+    trigger: Trigger,
+    workspace_dir: Path,
+    cairn_bin: str,
+    *,
+    ws_id: str | None = None,
 ) -> tuple[str, str]:
     """Render one trigger as a systemd (``.path``, ``.service``) unit pair (text strings).
 
@@ -516,6 +553,8 @@ def render_trigger_systemd(
     sits on the ``.path`` unit only — mirroring schedkit's asymmetry, where the
     activation unit (there, the ``.timer``) carries ``[Install]`` and the oneshot
     ``.service`` it triggers does not.
+
+    ``ws_id`` overrides the workspace UUID (render-only tests). Production leaves it unset.
     """
     workspace_dir = Path(workspace_dir)
     watch_abs = watch_dir(trigger, workspace_dir)
@@ -526,7 +565,8 @@ def render_trigger_systemd(
         ("cairn_bin", cairn_bin),
     ):
         _assert_render_safe(what, value)
-    _, service_name = trigger_systemd_unit_names(trigger.name)
+    wid = ws_id if ws_id is not None else workspace_id(workspace_dir)
+    _, service_name = trigger_systemd_unit_names(trigger.name, wid)
     argv = _trigger_argv(trigger, workspace_dir, cairn_bin)
     path_unit = (
         "[Unit]\n"
@@ -596,31 +636,55 @@ def _cron_unsupported() -> NoReturn:
     raise ConfigError(message, findings=[Finding("error", "cron backend not supported for triggers")])
 
 
-def _classify_plist(path: Path) -> tuple[str, str | None]:
-    """Classify an existing plist sitting at a trigger's managed stem, from its OWN
-    rendered content — never trust the filename alone (spec finding F1 / addendum 2).
-    Returns ``("trigger", name)`` when ``ProgramArguments`` has the exact
-    ``[cairn_bin, "trigger", "run", name, ...]`` shape :func:`_trigger_argv` renders
-    (this IS our prior render, for that trigger); ``("schedule", None)`` when it instead
-    has schedkit's ``[cairn_bin, "schedule", "run", ...]`` shape; ``("unmanaged", None)``
-    for anything else (foreign content, an unparseable/corrupted plist, or a shape that
-    matches neither convention).
+def _workspace_from_argv(argv: list[str]) -> Path | None:
+    """Extract ``--workspace <path>`` from a rendered host-unit argv, if present."""
+    for i, tok in enumerate(argv):
+        if tok == "--workspace" and i + 1 < len(argv):
+            return Path(argv[i + 1])
+        if tok.startswith("--workspace="):
+            return Path(tok.split("=", 1)[1])
+    return None
+
+
+def _same_workspace(a: Path | None, b: Path) -> bool:
+    """True when ``a`` names the same directory as ``b`` (resolved when possible)."""
+    if a is None:
+        return False
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return Path(a) == Path(b)
+
+
+def _classify_plist(path: Path) -> tuple[str, str | None, Path | None]:
+    """Classify an existing plist from its OWN content — never trust the filename alone
+    (spec finding F1 / addendum 2).
+
+    Returns ``(kind, name, workspace)``:
+    - ``("trigger", name, workspace_or_None)`` when argv is
+      ``[cairn_bin, "trigger", "run", name, ..., --workspace <path>]``
+    - ``("schedule", None, workspace_or_None)`` for schedkit's ``schedule run`` shape
+      (or factory-reconcile argv)
+    - ``("unmanaged", None, None)`` for foreign / unparseable content
     """
     try:
         doc = plistlib.loads(path.read_bytes())
     except Exception:
-        return "unmanaged", None
+        return "unmanaged", None, None
     argv = doc.get("ProgramArguments")
-    if not isinstance(argv, list) or len(argv) < 4 or not all(isinstance(a, str) for a in argv):
-        return "unmanaged", None
-    if argv[1:3] == ["trigger", "run"]:
-        return "trigger", argv[3]
+    if not isinstance(argv, list) or len(argv) < 3 or not all(isinstance(a, str) for a in argv):
+        return "unmanaged", None, None
+    ws = _workspace_from_argv(argv)
+    if len(argv) >= 4 and argv[1:3] == ["trigger", "run"]:
+        return "trigger", argv[3], ws
     if len(argv) >= 3 and argv[1:2] == ["schedule"]:
-        return "schedule", None
-    return "unmanaged", None
+        return "schedule", None, ws
+    if len(argv) >= 3 and argv[1:3] == ["factory", "reconcile"]:
+        return "schedule", None, ws
+    return "unmanaged", None, None
 
 
-def _classify_systemd_service(path: Path) -> tuple[str, str | None]:
+def _classify_systemd_service(path: Path) -> tuple[str, str | None, Path | None]:
     """The ``.service``-file counterpart of :func:`_classify_plist`: reads back the
     ``ExecStart=`` line (shlex-split the same way systemd itself word-splits it) rather
     than trusting the filename.
@@ -633,33 +697,36 @@ def _classify_systemd_service(path: Path) -> tuple[str, str | None]:
         # _classify_plist's bare `except Exception`) — `Path.read_text` raises
         # UnicodeDecodeError (a ValueError subclass, NOT an OSError subclass) on
         # non-UTF-8 bytes, and this classifier is called across every
-        # cairn-trigger-*.service in the target dir by _sync_systemd's prune sweep and
+        # cairn-*-trigger-*.service in the target dir by _sync_systemd's prune sweep and
         # _installed_trigger_names — one stray binary file anywhere in that shared
         # directory must never crash the sweep for every trigger (review-T3-quality-r1.md
         # Finding 1).
-        return "unmanaged", None
+        return "unmanaged", None, None
     exec_line = next((line for line in text.splitlines() if line.startswith("ExecStart=")), None)
     if exec_line is None:
-        return "unmanaged", None
+        return "unmanaged", None, None
     try:
         argv = shlex.split(exec_line[len("ExecStart=") :])
     except ValueError:
-        return "unmanaged", None
+        return "unmanaged", None, None
+    ws = _workspace_from_argv(argv)
     if len(argv) >= 4 and argv[1:3] == ["trigger", "run"]:
-        return "trigger", argv[3]
+        return "trigger", argv[3], ws
     if len(argv) >= 3 and argv[1:2] == ["schedule"]:
-        return "schedule", None
-    return "unmanaged", None
+        return "schedule", None, ws
+    if len(argv) >= 3 and argv[1:3] == ["factory", "reconcile"]:
+        return "schedule", None, ws
+    return "unmanaged", None, None
 
 
-def _classify_systemd_path_unit(path: Path) -> tuple[str, str | None]:
+def _classify_systemd_path_unit(path: Path) -> tuple[str, str | None, Path | None]:
     """The ``.path``-file counterpart of :func:`_classify_plist`. Only triggerkit ever
     renders a ``.path`` unit — schedkit's systemd backend has no analogue — so this can
     never collide with a *schedule's* file the way ``.service`` can; an operator hand-
     placing an unrelated file at the managed stem is still possible, so content is
     checked all the same rather than trusting presence alone. Reads the ``Unit=`` line
-    and recovers the trigger name from the ``cairn-trigger-<name>.service`` target it
-    names.
+    and recovers the trigger name from the ``cairn[-<ws8>]-trigger-<name>.service``
+    target it names.
     """
     try:
         text = path.read_text(encoding="utf-8")
@@ -667,31 +734,42 @@ def _classify_systemd_path_unit(path: Path) -> tuple[str, str | None]:
         # Same posture as _classify_systemd_service (see its comment) — non-UTF-8
         # content at this stem is foreign content, not a crash (review-T3-quality-r1.md
         # Finding 1).
-        return "unmanaged", None
+        return "unmanaged", None, None
     unit_line = next((line for line in text.splitlines() if line.startswith("Unit=")), None)
     if unit_line is None:
-        return "unmanaged", None
-    match = re.fullmatch(r"cairn-trigger-(.+)\.service", unit_line[len("Unit=") :].strip())
+        return "unmanaged", None, None
+    target = unit_line[len("Unit=") :].strip()
+    # New-style: cairn-<ws8>-trigger-<name>.service  | legacy: cairn-trigger-<name>.service
+    match = re.fullmatch(r"cairn-(?:[0-9a-f]{8}-)?trigger-(.+)\.service", target)
     if not match:
-        return "unmanaged", None
-    return "trigger", match.group(1)
+        return "unmanaged", None, None
+    return "trigger", match.group(1), None  # .path has no --workspace; ownership via .service
 
 
-def _require_ownership(path: Path, trigger_name: str, classify: Callable[[Path], tuple[str, str | None]]) -> None:
+def _require_ownership(
+    path: Path,
+    trigger_name: str,
+    classify: Callable[[Path], tuple[str, str | None, Path | None]],
+    *,
+    workspace_dir: Path | None = None,
+) -> None:
     """Refuse to write or prune ``path`` unless it is either absent or recognizably OUR
     prior render for THIS trigger (spec finding F1, addendum 2 — a hard requirement,
     not a heuristic nicety): a schedule named ``trigger-X`` and a trigger named ``X``
-    both render ``cairn-trigger-X.service``, and the T2 stem/label namespace alone
-    cannot make this impossible, so ownership is verified from the existing file's
-    content (via ``classify``) before it is ever touched, whether by a write in
-    `sync_triggers` or a delete in `remove_trigger`/`sync_triggers`'s prune pass.
+    can still share a unit stem under the ws-scoped namespace, so ownership is verified
+    from the existing file's content (via ``classify``) before it is ever touched.
+    When ``workspace_dir`` is set, a trigger unit for a *different* workspace is also
+    refused (multi-factory safety).
     """
     if not path.is_file():
         return
-    owner_kind, owner_name = classify(path)
+    owner_kind, owner_name, owner_ws = classify(path)
     if owner_kind == "trigger" and owner_name == trigger_name:
-        return
+        if workspace_dir is None or owner_ws is None or _same_workspace(owner_ws, workspace_dir):
+            return
     likely_owner = "a schedule" if owner_kind == "schedule" else "an unmanaged file"
+    if owner_kind == "trigger" and owner_name == trigger_name and owner_ws is not None:
+        likely_owner = f"another workspace's trigger ({owner_ws})"
     message = (
         f"refusing to write trigger {trigger_name!r}'s unit file {path}: it already "
         f"exists and is not recognizably managed by this trigger — it looks like "
@@ -761,18 +839,46 @@ def sync_triggers(
     sync of byte-identical rendered output issues ZERO host-watcher calls (unload/load,
     daemon-reload, enable) — a true no-op, not merely an unchanged file on disk.
 
+    Also: stamps ``ledger-version`` on every declared watch dir; installs (or removes)
+    the workspace-scoped reconcile beat host timer when any (resp. no) trigger exists;
+    migrates this workspace's own legacy unscoped units onto the ws-UUID label scheme
+    without touching another workspace's units.
+
     Returns the unit/plist filenames installed, updated, or pruned this call (a trigger
     that was already current is still included — it's part of what's installed after
     this call returns, even though nothing was written for it).
     """
     workspace_dir = Path(workspace_dir)
     triggers = load_triggers(workspace_dir)
+    # Stamp ledger-version on every declared watch dir (upgrade-safety marker).
+    for trigger in triggers.values():
+        stamp_ledger_version(watch_dir(trigger, workspace_dir))
     if backend == "cron":
         _cron_unsupported()
     if backend == "launchd":
-        return _sync_launchd(triggers, workspace_dir, runner, cairn_bin, launchd_dir)
+        touched = _sync_launchd(triggers, workspace_dir, runner, cairn_bin, launchd_dir)
+        _sync_reconcile_beat(
+            bool(triggers),
+            workspace_dir,
+            backend="launchd",
+            runner=runner,
+            cairn_bin=cairn_bin,
+            launchd_dir=launchd_dir,
+            systemd_dir=None,
+        )
+        return touched
     if backend == "systemd":
-        return _sync_systemd(triggers, workspace_dir, runner, cairn_bin, systemd_dir)
+        touched = _sync_systemd(triggers, workspace_dir, runner, cairn_bin, systemd_dir)
+        _sync_reconcile_beat(
+            bool(triggers),
+            workspace_dir,
+            backend="systemd",
+            runner=runner,
+            cairn_bin=cairn_bin,
+            launchd_dir=None,
+            systemd_dir=systemd_dir,
+        )
+        return touched
     _bad_backend(backend)
 
 
@@ -784,34 +890,76 @@ def _sync_launchd(
     launchd_dir: Path | None,
 ) -> list[str]:
     target = _require_dir(launchd_dir, "launchd", "launchd_dir")
+    wid = workspace_id(workspace_dir)
     # Pre-pass: validate ownership for EVERY declared trigger before writing ANY of
     # them, so an ownership refusal for trigger N never leaves an earlier trigger's
     # freshly-written plist on disk from this same call (review-T3-quality-r1.md
     # Finding 3 — same "check everything, then act" pattern remove_trigger's systemd
     # branch now uses for its own two-stem check).
     for trigger in triggers.values():
-        filename = f"{trigger_launchd_label(trigger.name)}.plist"
-        _require_ownership(target / filename, trigger.name, _classify_plist)
+        filename = f"{trigger_launchd_label(trigger.name, wid)}.plist"
+        _require_ownership(
+            target / filename, trigger.name, _classify_plist, workspace_dir=workspace_dir
+        )
     touched: list[str] = []
     for trigger in triggers.values():
-        filename = f"{trigger_launchd_label(trigger.name)}.plist"
+        filename = f"{trigger_launchd_label(trigger.name, wid)}.plist"
         path = target / filename
         rendered = render_trigger_launchd(trigger, workspace_dir, cairn_bin)
         if path.is_file() and path.read_text(encoding="utf-8") == rendered:
             touched.append(filename)  # already current — zero host-watcher calls
+        else:
+            path.write_text(rendered, encoding="utf-8")
+            runner.run(["launchctl", "unload", str(path)])  # idempotent reload
+            runner.run(["launchctl", "load", str(path)])
+            touched.append(filename)
+        # Migration: drop THIS workspace's legacy unscoped unit for the same name.
+        legacy = target / f"{trigger_launchd_label_legacy(trigger.name)}.plist"
+        if legacy.is_file() and legacy.resolve() != path.resolve():
+            kind, name, ows = _classify_plist(legacy)
+            if kind == "trigger" and name == trigger.name and _same_workspace(ows, workspace_dir):
+                runner.run(["launchctl", "unload", str(legacy)])
+                legacy.unlink()
+                touched.append(legacy.name)
+    # Prune: both new-style (this ws8) and legacy unscoped labels owned by THIS workspace
+    # whose trigger left triggers.yaml. NEVER touch another workspace's units.
+    for path in _iter_launchd_trigger_plists(target, wid):
+        owner_kind, owner_name, owner_ws = _classify_plist(path)
+        if owner_kind != "trigger" or owner_name is None:
             continue
-        path.write_text(rendered, encoding="utf-8")
-        runner.run(["launchctl", "unload", str(path)])  # idempotent reload, mirrors schedkit.install
-        runner.run(["launchctl", "load", str(path)])
-        touched.append(filename)
-    for path in sorted(target.glob("io.cairn.trigger.*.plist")):
-        owner_kind, owner_name = _classify_plist(path)
-        if owner_kind != "trigger" or owner_name in triggers:
-            continue  # not ours, or its trigger is still declared — never touch
+        if not _same_workspace(owner_ws, workspace_dir):
+            continue  # other factory's unit — leave it
+        if owner_name in triggers and path.name == f"{trigger_launchd_label(owner_name, wid)}.plist":
+            continue  # still declared, current-style — keep
+        # Declared but we're looking at a legacy path already handled above, or
+        # undeclared: prune.
+        if owner_name in triggers:
+            # legacy residual for a still-declared trigger — migrate pass should have
+            # cleaned it; if still present (race), drop it.
+            if path.name == f"{trigger_launchd_label_legacy(owner_name)}.plist":
+                runner.run(["launchctl", "unload", str(path)])
+                path.unlink()
+                touched.append(path.name)
+            continue
         runner.run(["launchctl", "unload", str(path)])
         path.unlink()
         touched.append(path.name)
     return touched
+
+
+def _iter_launchd_trigger_plists(target: Path, wid: str):
+    """Yield candidate launchd plists: new-style for this ws + legacy unscoped form."""
+    seen: set[Path] = set()
+    for pattern in (
+        f"io.cairn.{ws8(wid)}.trigger.*.plist",
+        "io.cairn.trigger.*.plist",
+    ):
+        for path in sorted(target.glob(pattern)):
+            rp = path.resolve() if path.exists() else path
+            if rp in seen:
+                continue
+            seen.add(rp)
+            yield path
 
 
 def _sync_systemd(
@@ -822,6 +970,7 @@ def _sync_systemd(
     systemd_dir: Path | None,
 ) -> list[str]:
     target = _require_dir(systemd_dir, "systemd", "systemd_dir")
+    wid = workspace_id(workspace_dir)
     # Pre-pass: validate ownership of BOTH stems for EVERY declared trigger before
     # writing ANY of them. Writes happen per-trigger inside the loop below but
     # daemon-reload/enable are deferred until after the whole loop finishes — an
@@ -832,15 +981,19 @@ def _sync_systemd(
     # scheduler (review-T3-quality-r1.md Finding 3). Validating everything up front
     # keeps a refusal a true no-op: the target dir stays byte-for-byte untouched.
     for trigger in triggers.values():
-        path_name, service_name = trigger_systemd_unit_names(trigger.name)
-        _require_ownership(target / path_name, trigger.name, _classify_systemd_path_unit)
-        _require_ownership(target / service_name, trigger.name, _classify_systemd_service)
+        path_name, service_name = trigger_systemd_unit_names(trigger.name, wid)
+        _require_ownership(
+            target / path_name, trigger.name, _classify_systemd_path_unit, workspace_dir=workspace_dir
+        )
+        _require_ownership(
+            target / service_name, trigger.name, _classify_systemd_service, workspace_dir=workspace_dir
+        )
 
     touched: list[str] = []
     to_enable: list[str] = []
     needs_reload = False
     for trigger in triggers.values():
-        path_name, service_name = trigger_systemd_unit_names(trigger.name)
+        path_name, service_name = trigger_systemd_unit_names(trigger.name, wid)
         path_unit_path = target / path_name
         service_unit_path = target / service_name
         path_text, service_text = render_trigger_systemd(trigger, workspace_dir, cairn_bin)
@@ -851,35 +1004,175 @@ def _sync_systemd(
             and service_unit_path.read_text(encoding="utf-8") == service_text
         )
         touched.extend([path_name, service_name])
-        if unchanged:
-            continue  # already current — zero host-watcher calls for this trigger
-        path_unit_path.write_text(path_text, encoding="utf-8")
-        service_unit_path.write_text(service_text, encoding="utf-8")
-        needs_reload = True
-        to_enable.append(path_name)
-    # Prune managed files whose trigger left triggers.yaml. `.path` and `.service` are
-    # swept independently (not derived from each other) so an orphaned half-pair — e.g.
-    # a `.service` deleted by hand while its `.path` survives — is still caught.
-    for path in sorted(target.glob("cairn-trigger-*.path")):
-        owner_kind, owner_name = _classify_systemd_path_unit(path)
-        if owner_kind != "trigger" or owner_name in triggers:
+        if not unchanged:
+            path_unit_path.write_text(path_text, encoding="utf-8")
+            service_unit_path.write_text(service_text, encoding="utf-8")
+            needs_reload = True
+            to_enable.append(path_name)
+        # Migration: drop THIS workspace's legacy unscoped units for the same name.
+        leg_path, leg_service = trigger_systemd_unit_names_legacy(trigger.name)
+        for leg_name, classify in (
+            (leg_path, _classify_systemd_path_unit),
+            (leg_service, _classify_systemd_service),
+        ):
+            leg = target / leg_name
+            if not leg.is_file() or leg.name in (path_name, service_name):
+                continue
+            kind, name, ows = classify(leg)
+            # .path units have no workspace in content — attribute via matching .service
+            if leg.suffix == ".path":
+                svc = target / leg_service
+                if svc.is_file():
+                    _, _, ows = _classify_systemd_service(svc)
+            if kind == "trigger" and name == trigger.name and (
+                ows is None or _same_workspace(ows, workspace_dir)
+            ):
+                # Only drop legacy when the service side confirms this workspace (or
+                # when only a .path exists with no service to contradict).
+                if leg.suffix == ".service" and not _same_workspace(ows, workspace_dir):
+                    continue
+                if leg.suffix == ".path":
+                    runner.run(["systemctl", "--user", "disable", "--now", leg.name])
+                leg.unlink()
+                touched.append(leg.name)
+                needs_reload = True
+    # Prune managed files whose trigger left triggers.yaml (new-style + legacy),
+    # but ONLY units owned by THIS workspace.
+    for path in _iter_systemd_trigger_units(target, wid, "*.path"):
+        owner_kind, owner_name, _ows = _classify_systemd_path_unit(path)
+        if owner_kind != "trigger" or owner_name is None:
             continue
-        runner.run(["systemctl", "--user", "disable", "--now", path.name])
-        path.unlink()
-        touched.append(path.name)
-        needs_reload = True
-    for path in sorted(target.glob("cairn-trigger-*.service")):
-        owner_kind, owner_name = _classify_systemd_service(path)
-        if owner_kind != "trigger" or owner_name in triggers:
+        # Attribute ownership via the paired .service when present.
+        svc_guess = path.with_suffix(".service")
+        if not svc_guess.is_file():
+            # try legacy/new name pairing
+            if path.name.startswith("cairn-trigger-"):
+                svc_guess = target / path.name.replace(".path", ".service")
+            else:
+                svc_guess = path.with_suffix(".service")
+        owner_ws = None
+        if svc_guess.is_file():
+            sk, sn, owner_ws = _classify_systemd_service(svc_guess)
+            if sk == "trigger":
+                owner_name = sn or owner_name
+        if owner_ws is not None and not _same_workspace(owner_ws, workspace_dir):
             continue
-        path.unlink()
-        touched.append(path.name)
-        needs_reload = True
+        # If we have no workspace signal and the unit is legacy (shared namespace), only
+        # prune when the path is new-style for this ws8 (unique to us) OR when the
+        # paired service confirms ownership. Legacy without service: leave alone if
+        # ambiguous — over-preserve.
+        is_new_style = f"-{ws8(wid)}-trigger-" in path.name
+        if owner_ws is None and not is_new_style:
+            continue
+        if owner_name in triggers and is_new_style:
+            continue
+        if owner_name in triggers and not is_new_style:
+            # legacy residual for declared trigger
+            runner.run(["systemctl", "--user", "disable", "--now", path.name])
+            path.unlink()
+            touched.append(path.name)
+            needs_reload = True
+            continue
+        if owner_name not in triggers:
+            runner.run(["systemctl", "--user", "disable", "--now", path.name])
+            path.unlink()
+            touched.append(path.name)
+            needs_reload = True
+    for path in _iter_systemd_trigger_units(target, wid, "*.service"):
+        owner_kind, owner_name, owner_ws = _classify_systemd_service(path)
+        if owner_kind != "trigger" or owner_name is None:
+            continue
+        if owner_ws is not None and not _same_workspace(owner_ws, workspace_dir):
+            continue
+        is_new_style = f"-{ws8(wid)}-trigger-" in path.name
+        if owner_ws is None and not is_new_style:
+            continue
+        if owner_name in triggers and is_new_style:
+            continue
+        if owner_name in triggers or owner_name not in triggers:
+            if owner_name in triggers and is_new_style:
+                continue
+            path.unlink()
+            touched.append(path.name)
+            needs_reload = True
     if needs_reload:
         runner.run(["systemctl", "--user", "daemon-reload"])
     for path_name in to_enable:
         runner.run(["systemctl", "--user", "enable", "--now", path_name])
     return touched
+
+
+def _iter_systemd_trigger_units(target: Path, wid: str, suffix_glob: str):
+    """Yield new-style + legacy trigger unit paths matching ``suffix_glob`` (e.g. ``*.path``)."""
+    seen: set[Path] = set()
+    patterns = (
+        f"cairn-{ws8(wid)}-trigger-{suffix_glob}",
+        f"cairn-trigger-{suffix_glob}",
+    )
+    for pattern in patterns:
+        for path in sorted(target.glob(pattern)):
+            rp = path.resolve() if path.exists() else path
+            if rp in seen:
+                continue
+            seen.add(rp)
+            yield path
+
+
+def _sync_reconcile_beat(
+    want: bool,
+    workspace_dir: Path,
+    *,
+    backend: str,
+    runner: Runner,
+    cairn_bin: str,
+    launchd_dir: Path | None,
+    systemd_dir: Path | None,
+) -> None:
+    """Install or remove the ws-scoped reconcile host timer via schedkit.
+
+    When any trigger exists (``want=True``), install a calendar timer firing
+    ``cairn factory reconcile --workspace <ws>`` every 10m with RunAtLoad/boot.
+    When the last trigger is removed, drop the beat. Idempotent.
+    """
+    from cairn.kernel.schedkit import (
+        Schedule,
+        install as sched_install,
+        uninstall_named,
+    )
+
+    workspace_dir = Path(workspace_dir)
+    prefix = label_prefix_for(workspace_dir)
+    wid = workspace_id(workspace_dir)
+    argv = [cairn_bin, "factory", "reconcile", "--workspace", str(workspace_dir)]
+    if want:
+        schedule = Schedule(
+            name=RECONCILE_BEAT_NAME,
+            cron=RECONCILE_BEAT_CRON,
+            run=("factory", "reconcile"),
+        )
+        sched_install(
+            {RECONCILE_BEAT_NAME: schedule},
+            backend,
+            workspace_dir=workspace_dir,
+            runner=runner,
+            cairn_bin=cairn_bin,
+            launchd_dir=launchd_dir,
+            systemd_dir=systemd_dir,
+            label_prefix=prefix,
+            program_arguments=argv,
+            run_at_load=True,
+            ws_id=wid,
+        )
+    else:
+        uninstall_named(
+            [RECONCILE_BEAT_NAME],
+            backend,
+            runner=runner,
+            launchd_dir=launchd_dir,
+            systemd_dir=systemd_dir,
+            label_prefix=prefix,
+            ws_id=wid,
+        )
 
 
 def remove_trigger(
@@ -899,71 +1192,193 @@ def remove_trigger(
     (:func:`_require_ownership`): a file sitting at this trigger's managed stem that
     isn't recognizably OUR prior render for ``name`` is left untouched and raises loud,
     rather than silently deleting a schedule's or an operator's file that happens to
-    share the stem.
+    share the stem. Also drops a legacy unscoped unit for this workspace if present.
+    When the last trigger unit is gone, removes the reconcile beat.
     """
     workspace_dir = Path(workspace_dir)
+    wid = workspace_id(workspace_dir)
     if backend == "cron":
         _cron_unsupported()
     if backend == "launchd":
         target = _require_dir(launchd_dir, backend, "launchd_dir")
-        path = target / f"{trigger_launchd_label(name)}.plist"
-        if not path.is_file():
-            return False
-        _require_ownership(path, name, _classify_plist)
-        runner.run(["launchctl", "unload", str(path)])
-        path.unlink()
-        return True
-    if backend == "systemd":
-        target = _require_dir(systemd_dir, backend, "systemd_dir")
-        path_name, service_name = trigger_systemd_unit_names(name)
-        path_unit_path = target / path_name
-        service_unit_path = target / service_name
-        # Validate ownership of BOTH stems before acting on EITHER (mirrors
-        # _sync_systemd's write path) — checking .service only after already disabling
-        # and unlinking .path means an ownership refusal on .service (e.g. a
-        # same-named schedule's live unit file) leaves a real .path unit destructively
-        # removed behind what looks to the caller like a clean, no-op refusal
-        # (review-T3-quality-r1.md Finding 2).
-        if path_unit_path.is_file():
-            _require_ownership(path_unit_path, name, _classify_systemd_path_unit)
-        if service_unit_path.is_file():
-            _require_ownership(service_unit_path, name, _classify_systemd_service)
         removed = False
-        if path_unit_path.is_file():
-            runner.run(["systemctl", "--user", "disable", "--now", path_name])
-            path_unit_path.unlink()
-            removed = True
-        if service_unit_path.is_file():
-            service_unit_path.unlink()
+        for label in (
+            trigger_launchd_label(name, wid),
+            trigger_launchd_label_legacy(name),
+        ):
+            path = target / f"{label}.plist"
+            if not path.is_file():
+                continue
+            kind, oname, ows = _classify_plist(path)
+            if kind != "trigger" or oname != name:
+                _require_ownership(path, name, _classify_plist, workspace_dir=workspace_dir)
+                continue
+            if ows is not None and not _same_workspace(ows, workspace_dir):
+                continue  # other workspace's unit at legacy stem — leave it
+            _require_ownership(path, name, _classify_plist, workspace_dir=workspace_dir)
+            runner.run(["launchctl", "unload", str(path)])
+            path.unlink()
             removed = True
         if removed:
+            _maybe_drop_reconcile_beat(
+                workspace_dir,
+                backend="launchd",
+                runner=runner,
+                cairn_bin="cairn",
+                launchd_dir=launchd_dir,
+                systemd_dir=None,
+            )
+        return removed
+    if backend == "systemd":
+        target = _require_dir(systemd_dir, backend, "systemd_dir")
+        pairs = [
+            trigger_systemd_unit_names(name, wid),
+            trigger_systemd_unit_names_legacy(name),
+        ]
+        # Validate ownership of every existing stem before acting on any.
+        for path_name, service_name in pairs:
+            path_unit_path = target / path_name
+            service_unit_path = target / service_name
+            if path_unit_path.is_file():
+                _require_ownership(
+                    path_unit_path, name, _classify_systemd_path_unit, workspace_dir=workspace_dir
+                )
+            if service_unit_path.is_file():
+                kind, oname, ows = _classify_systemd_service(service_unit_path)
+                if kind == "trigger" and oname == name and ows is not None and not _same_workspace(
+                    ows, workspace_dir
+                ):
+                    continue  # other ws
+                _require_ownership(
+                    service_unit_path, name, _classify_systemd_service, workspace_dir=workspace_dir
+                )
+        removed = False
+        for path_name, service_name in pairs:
+            path_unit_path = target / path_name
+            service_unit_path = target / service_name
+            if service_unit_path.is_file():
+                kind, oname, ows = _classify_systemd_service(service_unit_path)
+                if kind == "trigger" and oname == name and ows is not None and not _same_workspace(
+                    ows, workspace_dir
+                ):
+                    continue
+            if path_unit_path.is_file():
+                runner.run(["systemctl", "--user", "disable", "--now", path_name])
+                path_unit_path.unlink()
+                removed = True
+            if service_unit_path.is_file():
+                kind, oname, ows = _classify_systemd_service(service_unit_path)
+                if kind == "trigger" and oname == name and (
+                    ows is None or _same_workspace(ows, workspace_dir)
+                ):
+                    service_unit_path.unlink()
+                    removed = True
+        if removed:
             runner.run(["systemctl", "--user", "daemon-reload"])
+            _maybe_drop_reconcile_beat(
+                workspace_dir,
+                backend="systemd",
+                runner=runner,
+                cairn_bin="cairn",
+                launchd_dir=None,
+                systemd_dir=systemd_dir,
+            )
         return removed
     _bad_backend(backend)
 
 
+def _maybe_drop_reconcile_beat(
+    workspace_dir: Path,
+    *,
+    backend: str,
+    runner: Runner,
+    cairn_bin: str,
+    launchd_dir: Path | None,
+    systemd_dir: Path | None,
+) -> None:
+    """Remove the reconcile beat when no declared triggers remain (post-remove)."""
+    if load_triggers(workspace_dir):
+        return
+    # Also check host for any remaining installed units for this ws.
+    try:
+        installed = _installed_trigger_names(
+            backend,
+            workspace_dir=workspace_dir,
+            launchd_dir=launchd_dir,
+            systemd_dir=systemd_dir,
+        )
+    except ConfigError:
+        installed = set()
+    if installed:
+        return
+    _sync_reconcile_beat(
+        False,
+        workspace_dir,
+        backend=backend,
+        runner=runner,
+        cairn_bin=cairn_bin,
+        launchd_dir=launchd_dir,
+        systemd_dir=systemd_dir,
+    )
+
+
 def _installed_trigger_names(
-    backend: str, *, launchd_dir: Path | None, systemd_dir: Path | None
+    backend: str,
+    *,
+    workspace_dir: Path | None = None,
+    launchd_dir: Path | None = None,
+    systemd_dir: Path | None = None,
 ) -> set[str]:
     """The set of trigger names with a recognizably trigger-owned unit/plist file on the
-    host, read back straight from the target dir — no `runner` needed for launchd/
-    systemd (mirrors schedkit's `list_installed`, which likewise only actually invokes
-    its runner for the cron branch).
+    host for THIS workspace (when ``workspace_dir`` is set), read back straight from the
+    target dir — no `runner` needed for launchd/systemd.
     """
     if backend == "launchd":
         target = _require_dir(launchd_dir, backend, "launchd_dir")
+        wid = workspace_id(workspace_dir) if workspace_dir is not None else None
         names: set[str] = set()
-        for path in target.glob("io.cairn.trigger.*.plist"):
-            owner_kind, owner_name = _classify_plist(path)
-            if owner_kind == "trigger" and owner_name is not None:
+        patterns = ["io.cairn.trigger.*.plist"]
+        if wid is not None:
+            patterns.insert(0, f"io.cairn.{ws8(wid)}.trigger.*.plist")
+        else:
+            patterns.insert(0, "io.cairn.*.trigger.*.plist")
+        seen: set[Path] = set()
+        for pattern in patterns:
+            for path in target.glob(pattern):
+                rp = path.resolve() if path.exists() else path
+                if rp in seen:
+                    continue
+                seen.add(rp)
+                owner_kind, owner_name, owner_ws = _classify_plist(path)
+                if owner_kind != "trigger" or owner_name is None:
+                    continue
+                if workspace_dir is not None and owner_ws is not None:
+                    if not _same_workspace(owner_ws, workspace_dir):
+                        continue
                 names.add(owner_name)
         return names
     if backend == "systemd":
         target = _require_dir(systemd_dir, backend, "systemd_dir")
+        wid = workspace_id(workspace_dir) if workspace_dir is not None else None
         names = set()
-        for path in target.glob("cairn-trigger-*.service"):
-            owner_kind, owner_name = _classify_systemd_service(path)
-            if owner_kind == "trigger" and owner_name is not None:
+        patterns = ["cairn-trigger-*.service"]
+        if wid is not None:
+            patterns.insert(0, f"cairn-{ws8(wid)}-trigger-*.service")
+        else:
+            patterns.insert(0, "cairn-*-trigger-*.service")
+        seen = set()
+        for pattern in patterns:
+            for path in target.glob(pattern):
+                rp = path.resolve() if path.exists() else path
+                if rp in seen:
+                    continue
+                seen.add(rp)
+                owner_kind, owner_name, owner_ws = _classify_systemd_service(path)
+                if owner_kind != "trigger" or owner_name is None:
+                    continue
+                if workspace_dir is not None and owner_ws is not None:
+                    if not _same_workspace(owner_ws, workspace_dir):
+                        continue
                 names.add(owner_name)
         return names
     if backend == "cron":
@@ -990,7 +1405,12 @@ def list_installed_triggers(
     """
     workspace_dir = Path(workspace_dir)
     triggers = load_triggers(workspace_dir)
-    installed_names = _installed_trigger_names(backend, launchd_dir=launchd_dir, systemd_dir=systemd_dir)
+    installed_names = _installed_trigger_names(
+        backend,
+        workspace_dir=workspace_dir,
+        launchd_dir=launchd_dir,
+        systemd_dir=systemd_dir,
+    )
     statuses: list[TriggerStatus] = []
     for name in sorted(set(triggers) | installed_names):
         trigger = triggers.get(name)

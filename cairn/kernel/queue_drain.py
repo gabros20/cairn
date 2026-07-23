@@ -47,7 +47,9 @@ from cairn.kernel.proc import Runner
 from cairn.kernel.queue_ledger import (
     DEFAULT_MAX_ITEM_BYTES,
     admit_strict,
+    audit_ledger,
     boot_id,
+    check_ledger_version,
     claim,
     count_by_class,
     effective_lease_ttl,
@@ -56,6 +58,7 @@ from cairn.kernel.queue_ledger import (
     release_orphan_reservations,
     retire,
     scan_candidates,
+    stamp_ledger_version,
     sweep,
     unclaim,
     update_lease_child_pid,
@@ -724,6 +727,10 @@ def run_trigger(
     lease_ttl = effective_lease_ttl(trigger.lease_ttl_s, trigger.concurrency)
     cur_boot = boot_id()
 
+    # T8: refuse a newer-than-us ledger; stamp/adopt older-or-absent on proceed.
+    check_ledger_version(watch_abs)
+    stamp_ledger_version(watch_abs)
+
     # T6/T13: sweep FIRST — lease reap + advance .waiting/ + mop stranded deferred.
     try:
         report = sweep(
@@ -913,6 +920,28 @@ def reconcile_workspace(
             promoted_n = 0
             diags: list[str] = []
 
+            # T8: refuse newer ledger (loud); stamp older/absent.
+            try:
+                check_ledger_version(watch_abs)
+                stamp_ledger_version(watch_abs)
+            except ConfigError as exc:
+                hazarded = True
+                diags.append(f"ledger-version refused: {exc}")
+                summary = TriggerReconcileSummary(
+                    name=name,
+                    waiting=0,
+                    blocked=0,
+                    capacity=0,
+                    needs_human=0,
+                    reaped=0,
+                    flagged_live=0,
+                    promoted_deferred=0,
+                    diagnostics=tuple(diags),
+                )
+                summaries.append(summary)
+                print(f"cairn: reconcile {name}: LEDGER-VERSION REFUSED: {exc}", file=diag)
+                continue
+
             try:
                 for line in release_orphan_reservations(watch_abs, now=now_ts):
                     diags.append(line)
@@ -935,6 +964,17 @@ def reconcile_workspace(
             except Exception as exc:  # noqa: BLE001
                 hazarded = True
                 diags.append(f"sweep hazarded: {exc}")
+
+            # T8 audit AFTER repair passes so residual violations are what surface
+            # (sweep/orphan release may have fixed transient claim↔pointer gaps).
+            # Surface + flag; do NOT auto-delete (over-preserve).
+            try:
+                for issue in audit_ledger(watch_abs):
+                    diags.append(f"audit: {issue}")
+                    hazarded = True
+            except Exception as exc:  # noqa: BLE001
+                hazarded = True
+                diags.append(f"audit hazarded: {exc}")
 
             try:
                 depths = count_by_class(watch_abs, glob=trigger.glob)

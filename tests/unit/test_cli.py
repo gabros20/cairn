@@ -1875,7 +1875,7 @@ def test_trigger_sync_list_remove_launchd_roundtrip(hello_ws, monkeypatch, tmp_p
     ld = tmp_path / "LaunchAgents"
 
     assert main(["trigger", "sync", "--backend", "launchd", "--launchd-dir", str(ld)]) == int(ExitCode.OK)
-    assert list(ld.glob("io.cairn.trigger.*.plist"))  # written to the INJECTED dir, not ~/Library
+    assert list(ld.glob("io.cairn.*.trigger.*.plist"))  # written to the INJECTED dir, not ~/Library
 
     capsys.readouterr()
     assert main(["trigger", "list", "--backend", "launchd", "--launchd-dir", str(ld)]) == int(ExitCode.OK)
@@ -1919,7 +1919,7 @@ def test_trigger_sync_list_remove_launchd_roundtrip(hello_ws, monkeypatch, tmp_p
     assert main(
         ["trigger", "remove", "handle-reply", "--backend", "launchd", "--launchd-dir", str(ld)]
     ) == int(ExitCode.OK)
-    assert not list(ld.glob("io.cairn.trigger.*.plist"))
+    assert not list(ld.glob("io.cairn.*.trigger.*.plist"))
 
 
 def test_trigger_remove_reports_nothing_installed(hello_ws, monkeypatch, tmp_path, capsys):

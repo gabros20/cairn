@@ -3,3 +3,6 @@ runs/
 
 # Local secrets and machine-specific env.
 .env
+
+# Uncommitted local factory state (workspace UUID for host-unit labels, etc.).
+.cairn/

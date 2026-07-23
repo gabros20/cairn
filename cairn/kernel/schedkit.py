@@ -501,21 +501,32 @@ def render_launchd(
     workspace_dir: Path,
     cairn_bin: str = "cairn",
     label_prefix: str = "io.cairn.",
+    program_arguments: list[str] | None = None,
+    run_at_load: bool = False,
 ) -> str:
     """Render one schedule as a launchd LaunchAgent plist (XML string).
 
     A single-interval schedule renders StartCalendarInterval as one dict; a schedule that
     expands to several fire-times renders it as an array (launchd's native repeat mechanism).
+
+    ``program_arguments`` overrides the default ``[cairn_bin, schedule, run, name]`` argv
+    (used by the factory reconcile beat to fire ``factory reconcile --workspace`` directly).
+    ``run_at_load`` sets RunAtLoad (boot/load fire) — default False for ordinary schedules.
     """
     spec = parse_cron(schedule.cron)
     _reject_dom_and_dow(spec, schedule.name, "launchd")
     intervals = _calendar_intervals(spec)
+    argv = (
+        list(program_arguments)
+        if program_arguments is not None
+        else [cairn_bin, "schedule", "run", schedule.name]
+    )
     plist: dict[str, Any] = {
         "Label": launchd_label(schedule.name, label_prefix),
-        "ProgramArguments": [cairn_bin, "schedule", "run", schedule.name],
+        "ProgramArguments": argv,
         "WorkingDirectory": str(workspace_dir),
         "StartCalendarInterval": intervals[0] if len(intervals) == 1 else intervals,
-        "RunAtLoad": False,
+        "RunAtLoad": bool(run_at_load),
     }
     return plistlib.dumps(plist, sort_keys=False).decode("utf-8")
 
@@ -537,22 +548,41 @@ def _on_calendar(spec: CronSpec) -> str:
     return f"{dow} {date} {time}"
 
 
-def systemd_unit_names(name: str) -> tuple[str, str]:
-    """The (service, timer) unit filenames for a schedule."""
+def systemd_unit_names(name: str, ws_id: str | None = None) -> tuple[str, str]:
+    """The (service, timer) unit filenames for a schedule.
+
+    When ``ws_id`` is set (multi-factory / W3), names are ``cairn-<ws8>-<name>.*`` so
+    N workspaces on one machine never collide. When absent, the legacy unscoped
+    ``cairn-<name>.*`` form is kept (pure schedkit unit tests / single-ws default).
+    """
+    if ws_id:
+        w = ws_id.replace("-", "").lower()[:8]
+        return (f"cairn-{w}-{name}.service", f"cairn-{w}-{name}.timer")
     return (f"cairn-{name}.service", f"cairn-{name}.timer")
 
 
 def render_systemd(
-    schedule: Schedule, *, workspace_dir: Path, cairn_bin: str = "cairn"
+    schedule: Schedule,
+    *,
+    workspace_dir: Path,
+    cairn_bin: str = "cairn",
+    program_arguments: list[str] | None = None,
+    ws_id: str | None = None,
 ) -> tuple[str, str]:
     """Render one schedule as a systemd (service, timer) unit pair (text strings).
 
     The timer is ``Persistent=true`` so a missed firing (machine asleep) runs at next boot —
     the same catch-up-via-resume posture ``--idempotent`` gives (SCHEDULING.md §3).
+
+    ``program_arguments`` overrides the default ``cairn schedule run <name>`` ExecStart
+    (factory reconcile beat uses a direct ``factory reconcile --workspace`` argv).
     """
     spec = parse_cron(schedule.cron)
     _reject_dom_and_dow(spec, schedule.name, "systemd")
-    command = f"{cairn_bin} schedule run {schedule.name}"
+    if program_arguments is not None:
+        command = shlex.join(list(program_arguments))
+    else:
+        command = f"{cairn_bin} schedule run {schedule.name}"
     service = (
         "[Unit]\n"
         f"Description=cairn schedule: {schedule.name}\n\n"
@@ -631,8 +661,15 @@ def install(
     launchd_dir: Path | None = None,
     systemd_dir: Path | None = None,
     label_prefix: str = "io.cairn.",
+    program_arguments: list[str] | None = None,
+    run_at_load: bool = False,
+    ws_id: str | None = None,
 ) -> None:
-    """Sync ``schedules`` into the host scheduler via the injected ``runner``. Idempotent."""
+    """Sync ``schedules`` into the host scheduler via the injected ``runner``. Idempotent.
+
+    ``program_arguments`` / ``run_at_load`` apply to every schedule in this call (used by
+    the single-entry factory reconcile beat). ``ws_id`` scopes systemd unit names.
+    """
     workspace_dir = Path(workspace_dir)
     if backend == "cron":
         merged = merge_cron(
@@ -643,26 +680,94 @@ def install(
         target = _require_dir(launchd_dir, backend, "launchd_dir")
         for schedule in schedules.values():
             path = target / f"{launchd_label(schedule.name, label_prefix)}.plist"
-            path.write_text(
-                render_launchd(schedule, workspace_dir=workspace_dir, cairn_bin=cairn_bin,
-                               label_prefix=label_prefix),
-                encoding="utf-8",
+            rendered = render_launchd(
+                schedule,
+                workspace_dir=workspace_dir,
+                cairn_bin=cairn_bin,
+                label_prefix=label_prefix,
+                program_arguments=program_arguments,
+                run_at_load=run_at_load,
             )
+            # True no-op when already current (same posture as trigger_host sync).
+            if path.is_file() and path.read_text(encoding="utf-8") == rendered:
+                continue
+            path.write_text(rendered, encoding="utf-8")
             runner.run(["launchctl", "unload", str(path)])  # idempotent reload
             runner.run(["launchctl", "load", str(path)])
     elif backend == "systemd":
         target = _require_dir(systemd_dir, backend, "systemd_dir")
+        needs_reload = False
+        to_enable: list[str] = []
         for schedule in schedules.values():
-            service_name, timer_name = systemd_unit_names(schedule.name)
-            service, timer = render_systemd(schedule, workspace_dir=workspace_dir, cairn_bin=cairn_bin)
-            (target / service_name).write_text(service, encoding="utf-8")
-            (target / timer_name).write_text(timer, encoding="utf-8")
-        runner.run(["systemctl", "--user", "daemon-reload"])
-        for schedule in schedules.values():
-            _, timer_name = systemd_unit_names(schedule.name)
-            runner.run(["systemctl", "--user", "enable", "--now", timer_name])
+            service_name, timer_name = systemd_unit_names(schedule.name, ws_id=ws_id)
+            service, timer = render_systemd(
+                schedule,
+                workspace_dir=workspace_dir,
+                cairn_bin=cairn_bin,
+                program_arguments=program_arguments,
+                ws_id=ws_id,
+            )
+            sp, tp = target / service_name, target / timer_name
+            unchanged = (
+                sp.is_file()
+                and sp.read_text(encoding="utf-8") == service
+                and tp.is_file()
+                and tp.read_text(encoding="utf-8") == timer
+            )
+            if unchanged:
+                continue
+            sp.write_text(service, encoding="utf-8")
+            tp.write_text(timer, encoding="utf-8")
+            needs_reload = True
+            to_enable.append(timer_name)
+        if needs_reload:
+            runner.run(["systemctl", "--user", "daemon-reload"])
+            for timer_name in to_enable:
+                runner.run(["systemctl", "--user", "enable", "--now", timer_name])
     else:
         _bad_backend(backend)
+
+
+def uninstall_named(
+    names: list[str],
+    backend: str,
+    *,
+    runner: Runner,
+    launchd_dir: Path | None = None,
+    systemd_dir: Path | None = None,
+    label_prefix: str = "io.cairn.",
+    ws_id: str | None = None,
+) -> None:
+    """Remove specific named schedule units only (not the whole managed set). Idempotent."""
+    if backend == "cron":
+        # Cron is a single managed block — selective name removal is not supported here.
+        return
+    if backend == "launchd":
+        target = _require_dir(launchd_dir, backend, "launchd_dir")
+        for name in names:
+            path = target / f"{launchd_label(name, label_prefix)}.plist"
+            if path.is_file():
+                runner.run(["launchctl", "unload", str(path)])
+                path.unlink()
+        return
+    if backend == "systemd":
+        target = _require_dir(systemd_dir, backend, "systemd_dir")
+        removed = False
+        for name in names:
+            service_name, timer_name = systemd_unit_names(name, ws_id=ws_id)
+            timer_path = target / timer_name
+            service_path = target / service_name
+            if timer_path.is_file():
+                runner.run(["systemctl", "--user", "disable", "--now", timer_name])
+                timer_path.unlink()
+                removed = True
+            if service_path.is_file():
+                service_path.unlink()
+                removed = True
+        if removed:
+            runner.run(["systemctl", "--user", "daemon-reload"])
+        return
+    _bad_backend(backend)
 
 
 def uninstall(
@@ -673,8 +778,13 @@ def uninstall(
     launchd_dir: Path | None = None,
     systemd_dir: Path | None = None,
     label_prefix: str = "io.cairn.",
+    ws_id: str | None = None,
 ) -> None:
-    """Remove every cairn-managed entry from the host scheduler. Idempotent; foreign entries stay."""
+    """Remove every cairn-managed entry from the host scheduler. Idempotent; foreign entries stay.
+
+    When ``ws_id`` is set, systemd removal is scoped to ``cairn-<ws8>-*`` only so
+    another factory's units on the same machine are never touched.
+    """
     if backend == "cron":
         stripped = strip_cron(_read_crontab(runner))
         runner.run(["crontab", "-"], input=stripped)
@@ -685,10 +795,15 @@ def uninstall(
             path.unlink()
     elif backend == "systemd":
         target = _require_dir(systemd_dir, backend, "systemd_dir")
-        for timer in sorted(target.glob("cairn-*.timer")):
+        if ws_id:
+            w = ws_id.replace("-", "").lower()[:8]
+            timer_glob, service_glob = f"cairn-{w}-*.timer", f"cairn-{w}-*.service"
+        else:
+            timer_glob, service_glob = "cairn-*.timer", "cairn-*.service"
+        for timer in sorted(target.glob(timer_glob)):
             runner.run(["systemctl", "--user", "disable", "--now", timer.name])
             timer.unlink()
-        for service in sorted(target.glob("cairn-*.service")):
+        for service in sorted(target.glob(service_glob)):
             service.unlink()
         runner.run(["systemctl", "--user", "daemon-reload"])
     else:
@@ -702,6 +817,7 @@ def list_installed(
     launchd_dir: Path | None = None,
     systemd_dir: Path | None = None,
     label_prefix: str = "io.cairn.",
+    ws_id: str | None = None,
 ) -> dict[str, InstalledEntry]:
     """Read back what cairn has installed on the host (the injected reader), keyed by name."""
     entries: dict[str, InstalledEntry] = {}
@@ -724,8 +840,15 @@ def list_installed(
             entries[name] = InstalledEntry(name=name, schedule=None)
     elif backend == "systemd":
         target = _require_dir(systemd_dir, backend, "systemd_dir")
-        for path in sorted(target.glob("cairn-*.timer")):
-            name = path.stem[len("cairn-"):]
+        if ws_id:
+            w = ws_id.replace("-", "").lower()[:8]
+            prefix = f"cairn-{w}-"
+            glob_pat = f"cairn-{w}-*.timer"
+        else:
+            prefix = "cairn-"
+            glob_pat = "cairn-*.timer"
+        for path in sorted(target.glob(glob_pat)):
+            name = path.stem[len(prefix):]
             on_calendar = None
             for line in path.read_text(encoding="utf-8").splitlines():
                 if line.startswith("OnCalendar="):

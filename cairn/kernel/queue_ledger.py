@@ -34,17 +34,24 @@ from cairn.kernel.errors import CairnError, ConfigError
 from cairn.kernel.gckit import clear_queue_pin
 from cairn.kernel.runstate import load_run
 from cairn.kernel.trail import last_trail_terminal
-from cairn.kernel.types import OutcomeClass, RunOutcome, classify_exit
+from cairn.kernel.types import Finding, OutcomeClass, RunOutcome, classify_exit
 
 
 # Ledger lanes under a watch dir (dot-prefixed; excluded from scan by construction).
 _LANES = (".claim", ".waiting", ".failed", ".done")
+_LIVE_LANES = (".claim", ".waiting")  # identity may occupy only one of these
+_TERMINAL_LANES = (".failed", ".done")
 _POINTER_SUBDIR = ".runs"
 _TOMBSTONE_SUBDIR = "tombstones"
 _IDS_SUBDIR = ".ids"
 _DEFERRED_SUBDIR = ".deferred"
 _REJECTED_SUBDIR = ".rejected"
 _LEASES_SUBDIR = ".leases"
+
+# Upgrade-safety marker (FACTORY-PLAN T8). A drain/reconcile REFUSES a watch dir
+# whose ledger-version is NEWER than this binary understands.
+LEDGER_VERSION = 1
+LEDGER_VERSION_NAME = "ledger-version"
 
 # POSIX NAME_MAX floor; identity + every ledger-derived name must fit (FACTORY-PLAN T1).
 NAME_MAX = 255
@@ -71,6 +78,176 @@ LEASE_TTL_OFF = 0
 # (different-boot reap still works only when a real id is available).
 _BOOT_ID_CACHE: str | None = None
 BOOT_ID_UNKNOWN = "unknown"
+
+
+# --------------------------------------------------------------------------- #
+# Ledger version marker (FACTORY-PLAN T8) — upgrade safety
+# --------------------------------------------------------------------------- #
+
+
+def ledger_version_path(watch_abs: Path) -> Path:
+    """``<watch>/ledger-version`` — small int, current = :data:`LEDGER_VERSION`."""
+    return Path(watch_abs) / LEDGER_VERSION_NAME
+
+
+def read_ledger_version(watch_abs: Path) -> int:
+    """Return the on-disk ledger-version, or ``0`` when absent (legacy)."""
+    path = ledger_version_path(watch_abs)
+    if not path.is_file():
+        return 0
+    try:
+        text = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return 0
+    if not text:
+        return 0
+    try:
+        return int(text.split()[0])
+    except ValueError:
+        # Unparseable marker — treat as current so we don't refuse a hand-edited file
+        # forever; stamp will rewrite a clean value on next write.
+        return 0
+
+
+def check_ledger_version(watch_abs: Path) -> None:
+    """Refuse (loud ConfigError, no mutation) when marker is newer than we understand.
+
+    Older-or-equal and absent (legacy = 0) proceed. An older binary must never
+    drain a newer ledger (mixed-version upgrade corruption hole, T8).
+    """
+    on_disk = read_ledger_version(watch_abs)
+    if on_disk > LEDGER_VERSION:
+        message = (
+            f"ledger-version {on_disk} in {watch_abs} is newer than this cairn "
+            f"understands (LEDGER_VERSION={LEDGER_VERSION}). Upgrade cairn, or do not "
+            "point an older binary at a newer ledger (FACTORY-PLAN T8)."
+        )
+        raise ConfigError(message, findings=[Finding("error", message)], file=str(ledger_version_path(watch_abs)))
+
+
+def stamp_ledger_version(watch_abs: Path, *, fs: Any = None) -> None:
+    """Write/bump ``ledger-version`` to :data:`LEDGER_VERSION` when older or absent.
+
+    No-op when already equal. Does NOT write when on-disk is newer (caller must
+    have refused via :func:`check_ledger_version` first). Creates the watch dir
+    if needed.
+    """
+    watch_abs = Path(watch_abs)
+    on_disk = read_ledger_version(watch_abs)
+    if on_disk > LEDGER_VERSION:
+        return
+    if on_disk == LEDGER_VERSION and ledger_version_path(watch_abs).is_file():
+        return
+    watch_abs.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(ledger_version_path(watch_abs), f"{LEDGER_VERSION}\n", fs=fs)
+
+
+# --------------------------------------------------------------------------- #
+# Invariant audit (FACTORY-PLAN T8 / T13 I2)
+# --------------------------------------------------------------------------- #
+
+
+def audit_ledger(watch_abs: Path) -> list[str]:
+    """Return human-readable invariant violations for ``watch_abs`` (empty = clean).
+
+    Checks (FACTORY-PLAN T8):
+    1. every ``.runs`` pointer has a sibling item file and vice versa (per lane)
+    2. every grammar-conforming ``.claim`` item has a reservation under ``.claim/.ids/``
+       (strict-identity shape — identity:off arbitrary names are skipped)
+    3. no identity occupies two live states (``.claim`` and ``.waiting``)
+    4. terminal-ledger runs (``.done`` / ``.failed`` pointers) are not queue-pinned
+
+    Over-preserve: returns issues only — never mutates. Callers (doctor, reconcile)
+    surface + may quarantine affected identities; they do NOT auto-delete.
+    """
+    from cairn.kernel.gckit import QUEUE_PIN_NAME
+
+    watch_abs = Path(watch_abs)
+    issues: list[str] = []
+    if not watch_abs.is_dir():
+        return issues
+
+    # (1) pointer <-> item for each lane
+    for lane in _LANES:
+        lane_dir = watch_abs / lane
+        if not lane_dir.is_dir():
+            continue
+        items = {
+            p.name
+            for p in lane_dir.iterdir()
+            if p.is_file() and not p.name.startswith(".")
+        }
+        runs = pointer_dir(lane_dir)
+        pointers: set[str] = set()
+        if runs.is_dir():
+            for p in runs.iterdir():
+                if p.is_file() and not p.name.startswith("."):
+                    pointers.add(p.name)
+        for name in sorted(pointers - items):
+            issues.append(f"pointer without item: {lane}/{name}")
+        # DONE drops the live pointer after terminal placement (retire); item-without-
+        # pointer is the normal .done shape. Live lanes + .failed keep both.
+        if lane != ".done":
+            for name in sorted(items - pointers):
+                issues.append(f"item without pointer: {lane}/{name}")
+
+    # (2) every grammar-conforming .claim item has a reservation
+    claim_dir = watch_abs / ".claim"
+    if claim_dir.is_dir():
+        for p in sorted(claim_dir.iterdir()):
+            if not p.is_file() or p.name.startswith("."):
+                continue
+            item = parse_item_name(p.name)
+            if item is None:
+                continue  # identity:off / nonconforming — no reservation expected
+            if not reservation_path(watch_abs, item.identity).is_file():
+                issues.append(
+                    f"claim without reservation: {p.name} (identity {item.identity})"
+                )
+
+    # (3) no identity in two live states
+    by_identity: dict[str, list[str]] = {}
+    for lane in _LIVE_LANES:
+        lane_dir = watch_abs / lane
+        if not lane_dir.is_dir():
+            continue
+        for p in lane_dir.iterdir():
+            if not p.is_file() or p.name.startswith("."):
+                continue
+            item = parse_item_name(p.name)
+            if item is None:
+                continue
+            by_identity.setdefault(item.identity, []).append(f"{lane}/{p.name}")
+    for identity, locs in sorted(by_identity.items()):
+        lanes_hit = {loc.split("/", 1)[0] for loc in locs}
+        if len(lanes_hit) > 1:
+            issues.append(
+                f"identity in two live states: {identity} at {', '.join(sorted(locs))}"
+            )
+
+    # (4) terminal-ledger runs are not pinned
+    for lane in _TERMINAL_LANES:
+        lane_dir = watch_abs / lane
+        runs = pointer_dir(lane_dir)
+        if not runs.is_dir():
+            continue
+        for ptr in runs.iterdir():
+            if not ptr.is_file() or ptr.name.startswith("."):
+                continue
+            try:
+                rec = read_pointer(ptr)
+            except (OSError, ValueError, json.JSONDecodeError):
+                continue
+            run_dir_s = rec.get("run_dir")
+            if not run_dir_s:
+                continue
+            pin = Path(run_dir_s) / QUEUE_PIN_NAME
+            if pin.is_file():
+                issues.append(
+                    f"terminal-ledger run still pinned: {lane}/{ptr.name} -> {run_dir_s}"
+                )
+
+    return issues
 
 
 # --------------------------------------------------------------------------- #
@@ -1238,7 +1415,9 @@ def scan_candidates(watch_abs: Path, glob: str) -> list[Path]:
 
     Never recurses; excludes directories and any name starting with ``.`` (which keeps
     the ``.claim``/``.done``/``.failed``/``.waiting`` ledger dirs below out of the scan by
-    construction). A watch dir that doesn't exist yet (no event has landed) scans empty.
+    construction). Also excludes the upgrade-safety ``ledger-version`` marker (T8) —
+    it lives at the watch root but is never a work item. A watch dir that doesn't exist
+    yet (no event has landed) scans empty.
     """
     watch_abs = Path(watch_abs)
     if not watch_abs.is_dir():
@@ -1246,7 +1425,10 @@ def scan_candidates(watch_abs: Path, glob: str) -> list[Path]:
     return sorted(
         p
         for p in watch_abs.iterdir()
-        if p.is_file() and not p.name.startswith(".") and fnmatch.fnmatch(p.name, glob)
+        if p.is_file()
+        and not p.name.startswith(".")
+        and p.name != LEDGER_VERSION_NAME
+        and fnmatch.fnmatch(p.name, glob)
     )
 
 
