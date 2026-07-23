@@ -5,6 +5,12 @@ how many coding-agent CLIs may spawn at once. Acquire one slot to invoke an
 agent step; at the cap the walker WAITS (bounded); wait expiry parks
 ``CAPACITY(8)``. Stale slots (holder pid dead) are reaped on acquire.
 
+**Reap is pid-dead-only** (see :func:`acquire_slot` / :func:`_reap_if_stale`): a
+leaked slot whose numeric pid was reused by an unrelated live process is never
+reaped and the pool runs *under* cap — the safe direction (throttles more, never
+double-runs). W6-T2 machine-pool aging is the intended backstop (reap a slot
+older than a max lifetime regardless of pid).
+
 Opt-in: absent ``[factory] max_agents`` ⇒ slots OFF ⇒ unbounded (D7). The machine
 pool (``~/.cairn/machine.toml``, per-executor sub-pools) is W6-T2.
 
@@ -82,6 +88,11 @@ def _holder_live(
     """True when the slot file names a still-live holder pid.
 
     Missing, corrupt, or unreadable content → False (reapable).
+
+    **Pid-reuse caveat:** liveness is numeric-pid only. If a crashed holder's pid
+    is later reused by an unrelated process, this returns True and the slot looks
+    held — fail-toward under-cap (safe; never false-reaps a live agent). Heartbeat
+    aging for that strand is W6-T2.
     """
     rec = _read_slot(path)
     if rec is None:
@@ -99,7 +110,13 @@ def _reap_if_stale(
     kill: Callable[[int, int], None] | None,
     fs: Any,
 ) -> bool:
-    """Remove a dead/corrupt slot. True if the path is free afterwards."""
+    """Remove a dead/corrupt slot. True if the path is free afterwards.
+
+    Reap criterion is **pid-dead only** (plus corrupt/missing content) — the
+    ``heartbeat`` field is never consulted. A leaked slot whose pid was reused
+    by a live process is therefore *not* reaped here; the pool runs under cap
+    (safe). W6-T2 machine-pool aging is the backstop for that strand.
+    """
     if not path.is_file():
         return True
     if _holder_live(path, kill=kill):
@@ -127,6 +144,14 @@ def acquire_slot(
     Returns the acquired slot name, or None when all N are held by LIVE holders.
     A slot whose holder pid is dead (or whose content is corrupt) is reaped and
     reacquired. Caller must ensure ``n >= 1``.
+
+    **Pid-reuse / under-cap caveat:** reap is pid-dead-only. A leaked slot file
+    whose recorded pid was reused by an unrelated live process (same-boot reuse
+    or another machine sharing the FS) still looks live, so it is never reaped
+    and the pool permanently runs under the configured cap — the *safe*
+    direction (throttles more, never double-runs a live agent past N). There is
+    no heartbeat-staleness reap in W6-T1; W6-T2 machine-pool aging is the
+    intended backstop (reap a slot older than a max lifetime regardless of pid).
     """
     if n < 1:
         return None
@@ -238,7 +263,14 @@ def wait_acquire_slot(
     unless the caller passes ``time.time`` / ``time.sleep``. Returns the slot
     name, or None when the wait expires with no free slot. Emits ``on_wait_start``
     at most once, the first time a poll is needed.
+
+    ``poll_s`` must be positive — ``poll_s <= 0`` would busy-spin a full-pool wait
+    (hot CPU) and raises :class:`ValueError`.
     """
+    base_poll = float(poll_s)
+    if base_poll <= 0:
+        raise ValueError(f"poll_s must be positive, got {poll_s!r}")
+
     slot = acquire_slot(slots_dir, n, pid=pid, now=now, fs=fs, kill=kill)
     if slot is not None:
         return slot
@@ -248,12 +280,11 @@ def wait_acquire_slot(
         on_wait_start()
 
     # Cap poll so a short wait_s does not oversleep past the deadline.
-    base_poll = max(0.0, float(poll_s))
     while now() < deadline:
         remaining = deadline - now()
         if remaining <= 0:
             break
-        sleep(min(base_poll, remaining) if base_poll > 0 else 0.0)
+        sleep(min(base_poll, remaining))
         slot = acquire_slot(slots_dir, n, pid=pid, now=now, fs=fs, kill=kill)
         if slot is not None:
             return slot

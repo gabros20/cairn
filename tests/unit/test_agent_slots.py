@@ -196,3 +196,23 @@ def test_wait_succeeds_when_slot_freed_mid_wait(tmp_path: Path) -> None:
         kill=_alive_kill,
     )
     assert name == "slot-0"
+
+
+def test_wait_rejects_non_positive_poll_s(tmp_path: Path) -> None:
+    clock = _Clock()
+    for bad in (0, 0.0, -1, -0.25):
+        try:
+            wait_acquire_slot(
+                tmp_path,
+                1,
+                pid=1,
+                wait_s=1.0,
+                now=clock.now,
+                sleep=clock.sleep,
+                poll_s=bad,
+                kill=_alive_kill,
+            )
+        except ValueError as exc:
+            assert "poll_s" in str(exc)
+        else:
+            raise AssertionError(f"expected ValueError for poll_s={bad!r}")

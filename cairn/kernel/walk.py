@@ -1456,6 +1456,14 @@ class _Walk:
         """Sleep during slot wait. Tests inject a fake via assignment."""
         time.sleep(seconds)
 
+    def _slot_beat_interval_s(self) -> float:
+        """Cadence for slot-only refresh when trail heartbeats are OFF (default 30s).
+
+        Tests assign a tiny value on the class/instance so a held slot's
+        ``refresh_slot`` beat is observable without a real 30s wait.
+        """
+        return 30.0
+
     def _acquire_agent_slot(
         self, step: StepNode, *, attempt: int, cycle: int | None
     ) -> str | None:
@@ -1543,8 +1551,10 @@ class _Walk:
         stop = threading.Event()
         started = time.monotonic()
         # Trail heartbeats only when configured; slot refresh uses the same cadence
-        # (or 30s when trail heartbeats are off but a slot is held).
-        beat_interval = interval if interval and interval > 0 else 30.0
+        # (or _slot_beat_interval_s when trail heartbeats are off but a slot is held).
+        beat_interval = (
+            interval if interval and interval > 0 else self._slot_beat_interval_s()
+        )
         emit_trail = bool(interval and interval > 0)
         slots_dir = slots_dir_for(self.workspace_dir) if slot_name else None
 

@@ -2112,3 +2112,78 @@ def test_max_agents_one_serializes_parallel_agent_steps(ws: Path, tmp_path: Path
     assert code == ExitCode.OK
     assert peak == 1  # never two concurrent invokes under max_agents=1
     assert not list(slots.glob("slot-*"))  # both released
+
+
+def test_slot_heartbeat_refreshed_during_invoke_when_trail_heartbeat_off(
+    ws: Path, tmp_path: Path
+) -> None:
+    """I1: beat loop runs for slot refresh even when [defaults] heartbeat is OFF.
+
+    Prove the held slot's ``heartbeat`` field advances while invoke is in flight
+    (wiring for a future W6-T2 aging reap). Tiny ``_slot_beat_interval_s`` so we
+    never wait the production 30s; real wall ``_slot_now`` so the field moves.
+    """
+    _enable_slots(ws, max_agents=1, slot_wait="15m")
+    assert load_config(ws).defaults.heartbeat_s is None  # trail heartbeats OFF
+
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    slots = ws / "state" / "agents"
+    saw_refresh = threading.Event()
+
+    def on_invoke(inv, _n):
+        path = slots / "slot-0"
+        assert path.is_file(), "slot must be held during invoke"
+        before = json.loads(path.read_text(encoding="utf-8"))["heartbeat"]
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            rec = json.loads(path.read_text(encoding="utf-8"))
+            if rec["heartbeat"] > before:
+                saw_refresh.set()
+                break
+            time.sleep(0.005)
+        assert saw_refresh.is_set(), "slot heartbeat never advanced during invoke"
+        (inv.cwd / "a.txt").write_text("ok")
+        return done_result()
+
+    # Inject a tiny slot-only beat cadence (production default is 30s).
+    original = _Walk._slot_beat_interval_s
+    _Walk._slot_beat_interval_s = lambda self: 0.01  # type: ignore[method-assign]
+    try:
+        code = _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)})
+    finally:
+        _Walk._slot_beat_interval_s = original  # type: ignore[method-assign]
+
+    assert code == ExitCode.OK
+    assert saw_refresh.is_set()
+    # No trail heartbeat events — only the slot-refresh half of the beat loop ran.
+    assert not [e for e in read_trail(run_dir) if e["event"] == "heartbeat"]
+    assert not (slots / "slot-0").is_file()  # released after invoke
+
+
+def test_no_slot_means_no_beat_loop_when_trail_heartbeat_off(
+    ws: Path, tmp_path: Path
+) -> None:
+    """I1 (companion): max_agents OFF + heartbeat OFF ⇒ zero-cost, no slots, no refresh."""
+    assert load_config(ws).factory.max_agents is None
+    assert load_config(ws).defaults.heartbeat_s is None
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    # Even if someone shrinks the slot beat interval, with no slot held the
+    # beat thread must not start (zero-cost yield path).
+    original = _Walk._slot_beat_interval_s
+    _Walk._slot_beat_interval_s = lambda self: 0.01  # type: ignore[method-assign]
+    try:
+        def on_invoke(inv, _n):
+            (inv.cwd / "a.txt").write_text("ok")
+            return done_result()
+
+        assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
+    finally:
+        _Walk._slot_beat_interval_s = original  # type: ignore[method-assign]
+
+    assert not (ws / "state" / "agents").exists()
+    assert not [e for e in read_trail(run_dir) if e["event"] == "heartbeat"]
