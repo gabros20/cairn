@@ -145,10 +145,57 @@ def run_doctor(
     # -- factory FS safety + ledger invariant audit (D2 / T8) ---------------- #
     errors += _doctor_factory(workspace_dir, out, now=now)
 
+    # -- machine agent pool join (W6-T2 r1 M2): discoverable opt-out -------- #
+    _doctor_machine_pool(config, out)
+
     if probe_hooks:
         errors += _doctor_probe_hooks(scope, workspace_dir, out)
 
     return int(ExitCode.CONFIG) if errors else int(ExitCode.OK)
+
+
+def _doctor_machine_pool(config: Config, out: Callable[[str], None]) -> None:
+    """Surface whether this workspace is joined to the machine agent pool (W6-T2).
+
+    Join-by-presence is silent by design for the walker; doctor makes the
+    join + opt-out discoverable so a dropped ``~/.cairn/machine.toml`` is not a
+    surprise throttle on every workspace.
+    """
+    try:
+        from cairn.kernel.agent_slots import (
+            load_machine_config,
+            machine_pool_active,
+            machine_slots_dir,
+            machine_toml_path,
+        )
+    except Exception:  # noqa: BLE001 — doctor never crashes on optional surface
+        return
+    try:
+        machine = load_machine_config()
+    except Exception:  # noqa: BLE001 — malformed machine.toml is not a doctor error here
+        out(
+            f"  ! machine pool  machine.toml present but unreadable "
+            f"({machine_toml_path()}) — fix or remove it"
+        )
+        return
+    factory_mp = config.factory.machine_pool
+    if factory_mp is False:
+        out(
+            f"{_OK} machine pool  opted out ([factory] machine_pool = false) — "
+            f"workspace-local slots only"
+        )
+        return
+    if not machine_pool_active(factory_machine_pool=factory_mp, machine=machine):
+        return  # no pool in effect — stay quiet (D7 / no noise)
+    path = machine.path if machine is not None else machine_toml_path()
+    n = machine.max_agents if machine is not None else config.factory.max_agents
+    out(
+        f"{_OK} machine pool  JOINED via {path} "
+        f"(max_agents={n}, slots={machine_slots_dir()})"
+    )
+    out(
+        "  → opt out: set [factory] machine_pool = false in this workspace's cairn.toml"
+    )
 
 
 def _doctor_factory(

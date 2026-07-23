@@ -4,17 +4,19 @@ A pool of ``slot-0``..``slot-(N-1)`` bounds how many coding-agent CLIs may spawn
 at once. Acquire one slot to invoke an agent step; at the cap the walker WAITS
 (bounded); wait expiry parks ``CAPACITY(8)``. Stale slots (holder pid dead) are
 reaped on acquire. W6-T2 adds a machine-wide pool, per-executor sub-pools, and
-an aging backstop that reaps a slot past a max lifetime regardless of pid
-(closing the pid-reuse under-cap strand).
+an aging backstop gated on **heartbeat staleness** (never reaps a live agent).
 
 **Reap criteria** (see :func:`acquire_slot` / :func:`_reap_if_stale`):
 
 1. **Pid-dead** — holder pid is not alive (W6-T1).
-2. **Aging** (W6-T2) — ``acquired_at`` older than ``slot_max_age_s``, *regardless*
-   of pid. Closes the pid-reuse strand: a leaked slot whose numeric pid was
-   reused by an unrelated live process is eventually reaped. Aging can also
-   reap a genuinely long-running agent, so the default (2h) exceeds a plausible
-   max agent runtime and is configurable via ``machine.toml`` ``slot_max_age``.
+2. **Aged + heartbeat-stale** (W6-T2) — BOTH ``acquired_at`` older than
+   ``slot_max_age_s`` AND ``heartbeat`` older than
+   :data:`DEFAULT_HEARTBEAT_STALE_S`. A live long agent keeps a fresh heartbeat
+   via :func:`refresh_slot` during invoke → never reaped. A leaked slot
+   (crashed run, or a dead pid reused by an unrelated process that never
+   refreshes THIS slot) freezes its heartbeat → aged+stale → reaped. This
+   closes the W6-T1 pid-reuse under-cap strand **without** reaping a live
+   holder past the per-executor cap.
 
 **Join-by-presence / slots-dir resolution** (see :func:`resolve_slots_dir`):
 
@@ -25,9 +27,16 @@ an aging backstop that reaps a slot past a max lifetime regardless of pid
    ``~/.cairn/agents`` — same XDG ladder as gatekeys).
 3. Else → workspace-local ``state/agents/`` (W6-T1).
 
+**Two-level cap (machine pool):** per-executor sub-pool is exact via O_EXCL;
+the global total is best-effort / TOCTOU-racy under concurrent acquirers
+(no cross-process admission lock — doctrine). Global overshoot is bounded by
+the number of concurrent acquirers; the per-executor dimension is the one
+that protects vendor rate limits.
+
 Opt-in: absent ``[factory] max_agents`` AND no machine pool ⇒ slots OFF ⇒
 unbounded (D7). Slot-pool opt-out NEVER opts out of W8 repo locks (boundary
-note only; W8 not built).
+note only; W8 not built). Cross-machine shared FS is unsupported (local
+``pid_alive`` on a remote holder's pid is unsafe).
 
 Tests inject ``fs=`` / ``kill=`` / ``now=`` / ``sleep=`` seams — never monkeypatch
 ``os.*`` (D10). Machine home is env-injectable via ``XDG_STATE_HOME`` / ``HOME``.
@@ -58,10 +67,16 @@ DEFAULT_POLL_S = 0.25
 # Workspace-relative default pool dir (machine-wide pool is W6-T2).
 DEFAULT_SLOTS_REL = Path("state") / "agents"
 
-# Aging default: 2 hours. Must exceed a plausible max agent runtime (coding agents
-# routinely run 30–90m); shorter would false-reap live work. Configurable via
-# machine.toml ``slot_max_age`` (duration string) or ``slot_max_age_s`` (int).
+# Aging age threshold default: 2 hours (``acquired_at``). Alone it does NOT
+# reap — see heartbeat staleness. Configurable via machine.toml ``slot_max_age``
+# or ``slot_max_age_s``.
 DEFAULT_SLOT_MAX_AGE_S = 7200.0
+
+# Heartbeat-staleness threshold for age-reap. Walker refresh cadence is 30s when
+# trail heartbeats are off (``_slot_beat_interval_s``) or the configured
+# ``[defaults] heartbeat`` — a few × that interval so a live agent is never
+# age-reaped while still refreshing. A leaked slot stops refreshing → stale.
+DEFAULT_HEARTBEAT_STALE_S = 120.0  # 4 × 30s slot-only beat
 
 # Per-executor sub-pool table name in machine.toml (TOML cannot have max_agents
 # as both an int and a table; brief's ``[max_agents] claude = 2`` is expressed here).
@@ -431,8 +446,49 @@ def _slot_aged(
     try:
         acquired = float(rec.get("acquired_at", 0.0))
     except (TypeError, ValueError):
-        return True  # corrupt timestamp → treat as aged/reapable
+        return True  # corrupt timestamp → treat as aged
     return (now_ts - acquired) > float(slot_max_age_s)
+
+
+def _slot_heartbeat_stale(
+    rec: dict[str, Any],
+    *,
+    now_ts: float,
+    heartbeat_stale_s: float | None,
+) -> bool:
+    """True when ``heartbeat`` is older than the staleness threshold."""
+    if heartbeat_stale_s is None:
+        return False
+    try:
+        hb = float(rec.get("heartbeat", rec.get("acquired_at", 0.0)))
+    except (TypeError, ValueError):
+        return True  # corrupt → treat as stale
+    return (now_ts - hb) > float(heartbeat_stale_s)
+
+
+def _slot_age_reapable(
+    rec: dict[str, Any],
+    *,
+    now_ts: float,
+    slot_max_age_s: float | None,
+    heartbeat_stale_s: float | None,
+) -> bool:
+    """True when the slot is BOTH aged and heartbeat-stale (W6-T2 r1).
+
+    Never true for a live long agent: :func:`refresh_slot` keeps ``heartbeat``
+    fresh, so age alone is not enough to reap. A leaked / pid-reused slot stops
+    refreshing → heartbeat freezes → eventually aged+stale → reaped.
+    """
+    if slot_max_age_s is None:
+        return False
+    stale_s = (
+        float(heartbeat_stale_s)
+        if heartbeat_stale_s is not None
+        else DEFAULT_HEARTBEAT_STALE_S
+    )
+    return _slot_aged(
+        rec, now_ts=now_ts, slot_max_age_s=slot_max_age_s
+    ) and _slot_heartbeat_stale(rec, now_ts=now_ts, heartbeat_stale_s=stale_s)
 
 
 def _holder_live(
@@ -441,21 +497,31 @@ def _holder_live(
     kill: Callable[[int, int], None] | None,
     now_ts: float | None = None,
     slot_max_age_s: float | None = None,
+    heartbeat_stale_s: float | None = None,
 ) -> bool:
-    """True when the slot file names a still-live, non-aged holder.
+    """True when the slot file names a still-held (live or fresh-heartbeat) agent.
 
     Missing, corrupt, or unreadable content → False (reapable).
-    Aged past ``slot_max_age_s`` → False regardless of pid (W6-T2 backstop).
+
+    **Age-reap (W6-T2 r1):** only when BOTH ``acquired_at`` is past
+    ``slot_max_age_s`` AND ``heartbeat`` is past the staleness threshold. A live
+    long agent with a fresh heartbeat is **never** reaped. A leaked slot (or a
+    pid-reused process that never refreshes this slot) has a stale heartbeat →
+    reaped — closing the W6-T1 pid-reuse under-cap strand without over-cap.
 
     **Pid-reuse caveat (when aging is off):** liveness is numeric-pid only. If a
     crashed holder's pid is later reused by an unrelated process, this returns
-    True and the slot looks held — fail-toward under-cap (safe). Aging is the
-    backstop for that strand when ``slot_max_age_s`` is set.
+    True and the slot looks held — fail-toward under-cap (safe).
     """
     rec = _read_slot(path)
     if rec is None:
         return False
-    if now_ts is not None and _slot_aged(rec, now_ts=now_ts, slot_max_age_s=slot_max_age_s):
+    if now_ts is not None and _slot_age_reapable(
+        rec,
+        now_ts=now_ts,
+        slot_max_age_s=slot_max_age_s,
+        heartbeat_stale_s=heartbeat_stale_s,
+    ):
         return False
     try:
         pid = int(rec["pid"])
@@ -471,16 +537,22 @@ def _reap_if_stale(
     fs: Any,
     now_ts: float | None = None,
     slot_max_age_s: float | None = None,
+    heartbeat_stale_s: float | None = None,
 ) -> bool:
-    """Remove a dead/corrupt/aged slot. True if the path is free afterwards.
+    """Remove a dead/corrupt/age-reapable slot. True if the path is free afterwards.
 
-    Reap criteria: pid-dead, corrupt/missing content, OR (when configured)
-    ``acquired_at`` older than ``slot_max_age_s`` regardless of pid. The
-    ``heartbeat`` field is never consulted for reap decisions.
+    Reap criteria: pid-dead, corrupt/missing content, OR (when aging is on)
+    aged **and** heartbeat-stale. A live heartbeating agent is never reaped.
     """
     if not path.is_file():
         return True
-    if _holder_live(path, kill=kill, now_ts=now_ts, slot_max_age_s=slot_max_age_s):
+    if _holder_live(
+        path,
+        kill=kill,
+        now_ts=now_ts,
+        slot_max_age_s=slot_max_age_s,
+        heartbeat_stale_s=heartbeat_stale_s,
+    ):
         return False
     try:
         durable_unlink(path, fs=fs)
@@ -497,9 +569,10 @@ def _count_live_slots(
     kill: Callable[[int, int], None] | None,
     now_ts: float,
     slot_max_age_s: float | None,
+    heartbeat_stale_s: float | None = None,
     executor: str | None = None,
 ) -> int:
-    """Count live (non-aged) slot files under ``slots_dir`` (optionally one executor)."""
+    """Count live (non-reapable) slot files under ``slots_dir`` (optionally one executor)."""
     slots_dir = Path(slots_dir)
     if not slots_dir.is_dir():
         return 0
@@ -511,7 +584,11 @@ def _count_live_slots(
         for path in root.iterdir():
             if path.is_file() and path.name.startswith("slot-"):
                 if _holder_live(
-                    path, kill=kill, now_ts=now_ts, slot_max_age_s=slot_max_age_s
+                    path,
+                    kill=kill,
+                    now_ts=now_ts,
+                    slot_max_age_s=slot_max_age_s,
+                    heartbeat_stale_s=heartbeat_stale_s,
                 ):
                     live += 1
         return live
@@ -519,14 +596,22 @@ def _count_live_slots(
     for path in slots_dir.iterdir():
         if path.is_file() and path.name.startswith("slot-"):
             if _holder_live(
-                path, kill=kill, now_ts=now_ts, slot_max_age_s=slot_max_age_s
+                path,
+                kill=kill,
+                now_ts=now_ts,
+                slot_max_age_s=slot_max_age_s,
+                heartbeat_stale_s=heartbeat_stale_s,
             ):
                 live += 1
         elif path.is_dir():
             for child in path.iterdir():
                 if child.is_file() and child.name.startswith("slot-"):
                     if _holder_live(
-                        child, kill=kill, now_ts=now_ts, slot_max_age_s=slot_max_age_s
+                        child,
+                        kill=kill,
+                        now_ts=now_ts,
+                        slot_max_age_s=slot_max_age_s,
+                        heartbeat_stale_s=heartbeat_stale_s,
                     ):
                         live += 1
     return live
@@ -543,24 +628,27 @@ def acquire_slot(
     executor: str | None = None,
     global_n: int | None = None,
     slot_max_age_s: float | None = None,
+    heartbeat_stale_s: float | None = None,
 ) -> str | None:
     """Try to claim one of ``slot-0``..``slot-(n-1)`` via O_EXCL.
 
     Returns the acquired slot name, or None when all N are held by LIVE holders
     (or the two-level global cap is saturated). A slot whose holder pid is dead,
-    whose content is corrupt, or whose ``acquired_at`` is past ``slot_max_age_s``
-    is reaped and reacquired. Caller must ensure ``n >= 1``.
+    whose content is corrupt, or that is aged **and** heartbeat-stale is reaped
+    and reacquired. Caller must ensure ``n >= 1``.
 
     **Executor sub-pools (W6-T2):** when ``executor`` is set, slots live under
-    ``<slots_dir>/<executor>/slot-i`` and ``n`` is the per-executor cap. When
-    ``global_n`` is also set, the total live slots across all executors must
-    stay ≤ ``global_n`` (two-level cap: per-executor AND total).
+    ``<slots_dir>/<executor>/slot-i`` and ``n`` is the per-executor cap (exact
+    via O_EXCL). When ``global_n`` is also set, the total live slots across all
+    executors should stay ≤ ``global_n`` — **best-effort / TOCTOU-racy** under
+    concurrent acquirers (scan-then-create; no cross-process admission lock).
+    Global overshoot is bounded by concurrent acquirers; the per-executor
+    sub-pool is the exact dimension that protects vendor rate limits.
 
-    **Pid-reuse / under-cap caveat (aging off):** reap is pid-dead-only when
-    ``slot_max_age_s`` is None. A leaked slot whose recorded pid was reused by
-    an unrelated live process still looks live, so the pool permanently runs
-    under the configured cap — the *safe* direction. Pass ``slot_max_age_s``
-    (machine pool default 2h) to close that strand.
+    **Age-reap (W6-T2 r1):** requires BOTH ``acquired_at > slot_max_age_s`` and
+    a stale ``heartbeat`` (default :data:`DEFAULT_HEARTBEAT_STALE_S`). A live
+    long agent keeps its heartbeat fresh via :func:`refresh_slot` → never
+    reaped. A leaked / pid-reused slot freezes the heartbeat → reaped.
     """
     if n < 1:
         return None
@@ -569,7 +657,7 @@ def acquire_slot(
     now_ts = _now_ts(now)
     body = _slot_record(pid, now_ts, executor=executor)
 
-    # Two-level global cap: refuse before probing when the machine total is full.
+    # Two-level global cap (best-effort under concurrency — see docstring).
     if global_n is not None and global_n >= 1:
         if (
             _count_live_slots(
@@ -577,6 +665,7 @@ def acquire_slot(
                 kill=kill,
                 now_ts=now_ts,
                 slot_max_age_s=slot_max_age_s,
+                heartbeat_stale_s=heartbeat_stale_s,
             )
             >= global_n
         ):
@@ -595,6 +684,7 @@ def acquire_slot(
                 fs=fs,
                 now_ts=now_ts,
                 slot_max_age_s=slot_max_age_s,
+                heartbeat_stale_s=heartbeat_stale_s,
             ):
                 continue  # live holder
             # reaped (or raced away) — fall through to exclusive_create
@@ -657,13 +747,15 @@ def free_slot_count(
     executor: str | None = None,
     global_n: int | None = None,
     slot_max_age_s: float | None = None,
+    heartbeat_stale_s: float | None = None,
 ) -> int:
-    """How many of ``slot-0``..``slot-(n-1)`` are free (absent, dead, or aged).
+    """How many of ``slot-0``..``slot-(n-1)`` are free (absent, dead, or age-reapable).
 
     Live-holder-aware. Exposed for W3 admission and the capacity-resume beat.
     When ``executor`` is set, counts that sub-pool only. When ``global_n`` is set
     (two-level cap), free count is also bounded by remaining global capacity:
-    ``min(per-executor free, global_n − live_total)``.
+    ``min(per-executor free, global_n − live_total)`` — global side is
+    best-effort under concurrency (same TOCTOU as :func:`acquire_slot`).
     """
     if n < 1:
         return 0
@@ -676,7 +768,11 @@ def free_slot_count(
             free += 1
             continue
         if not _holder_live(
-            path, kill=kill, now_ts=now_ts, slot_max_age_s=slot_max_age_s
+            path,
+            kill=kill,
+            now_ts=now_ts,
+            slot_max_age_s=slot_max_age_s,
+            heartbeat_stale_s=heartbeat_stale_s,
         ):
             free += 1
     if global_n is not None and global_n >= 1:
@@ -685,6 +781,7 @@ def free_slot_count(
             kill=kill,
             now_ts=now_ts,
             slot_max_age_s=slot_max_age_s,
+            heartbeat_stale_s=heartbeat_stale_s,
         )
         global_free = max(0, int(global_n) - live_total)
         free = min(free, global_free)
@@ -706,6 +803,7 @@ def wait_acquire_slot(
     executor: str | None = None,
     global_n: int | None = None,
     slot_max_age_s: float | None = None,
+    heartbeat_stale_s: float | None = None,
 ) -> str | None:
     """Acquire a slot, polling until success or ``wait_s`` elapses.
 
@@ -731,6 +829,7 @@ def wait_acquire_slot(
         executor=executor,
         global_n=global_n,
         slot_max_age_s=slot_max_age_s,
+        heartbeat_stale_s=heartbeat_stale_s,
     )
     if slot is not None:
         return slot
@@ -755,6 +854,7 @@ def wait_acquire_slot(
             executor=executor,
             global_n=global_n,
             slot_max_age_s=slot_max_age_s,
+            heartbeat_stale_s=heartbeat_stale_s,
         )
         if slot is not None:
             return slot

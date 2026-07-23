@@ -2794,10 +2794,12 @@ def sweep(
     terminal event — ``run-done`` → retire DONE; failure-class ``run-halt`` → FAILED;
     waiting-class halt → leave — **except CAPACITY(8)** when ``free_slots`` and
     ``resume_capacity`` are provided (W6-T2 capacity-loop closure): at most
-    ``free_slots`` capacity parks are re-driven per beat (resume budget); after
-    resume the trail is re-read and re-routed. Zero free slots → leave for the
-    next beat (must not strand forever once capacity frees). BLOCKED/needs_human
-    still leave.
+    ``free_slots`` capacity parks are re-driven (resume budget); after resume
+    the trail is re-read and re-routed. Resume runs the **full remaining
+    pipeline** (or its next park) synchronously when a slot is free — it does
+    not re-park fast. Callers that hold a multi-trigger flock (reconcile) must
+    pass a small budget (see :data:`~cairn.kernel.queue_drain.RECONCILE_CAPACITY_RESUME_BUDGET`).
+    Zero free slots → leave for the next beat. BLOCKED/needs_human still leave.
 
     **Drain-vs-reconcile concurrency (I1 / T13 r1):** reconcile's flock serializes
     reconcile-vs-reconcile only. A drain's ``sweep`` and a concurrent
@@ -2934,8 +2936,10 @@ def sweep(
                 if kind == "halt" and halt_code is not None:
                     outcome = classify_exit(halt_code)
                     if outcome.outcome is OutcomeClass.WAITING:
-                        # W6-T2: CAPACITY parks resume when a free agent slot exists
-                        # (budget = free_slots per beat). Other waiting kinds leave.
+                        # W6-T2: CAPACITY parks resume when a free agent slot
+                        # exists (budget = free_slots). Resume is synchronous
+                        # full-pipeline work when a slot is free. Other waiting
+                        # kinds leave.
                         if (
                             outcome.waiting_kind == "capacity"
                             and resume_budget > 0

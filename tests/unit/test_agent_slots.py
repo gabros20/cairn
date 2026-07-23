@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from cairn.kernel.agent_slots import (
+    DEFAULT_HEARTBEAT_STALE_S,
     DEFAULT_SLOT_MAX_AGE_S,
     acquire_slot,
     effective_executor_cap,
@@ -442,19 +443,19 @@ def test_effective_executor_cap_fallback() -> None:
     assert effective_executor_cap("claude", machine=None, global_n=8) == 8
 
 
-def test_aging_reaps_old_slot_regardless_of_pid(tmp_path: Path) -> None:
+def test_aging_reaps_aged_and_heartbeat_stale_leak(tmp_path: Path) -> None:
+    """I2: aged + heartbeat-stale (leak / reused pid that never refreshes) IS reaped."""
     clock = _Clock(t=1000.0)
-    # Seed a live-pid slot with an old acquired_at.
     name = acquire_slot(tmp_path, 1, pid=1, now=clock.now, kill=_alive_kill)
     assert name == "slot-0"
     path = slot_path(tmp_path, name)
     rec = json.loads(path.read_text(encoding="utf-8"))
     rec["acquired_at"] = 1000.0
-    rec["heartbeat"] = 1000.0
+    rec["heartbeat"] = 1000.0  # never refreshed
     path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
 
-    # Fresh live slot is NOT reaped when within age.
-    clock.t = 1000.0 + 60.0  # 1 minute later
+    # Still within age → not reaped.
+    clock.t = 1000.0 + 60.0
     assert (
         acquire_slot(
             tmp_path, 1, pid=2, now=clock.now, kill=_alive_kill, slot_max_age_s=7200.0
@@ -462,14 +463,45 @@ def test_aging_reaps_old_slot_regardless_of_pid(tmp_path: Path) -> None:
         is None
     )
 
-    # Past max age: reaped even though pid looks live.
+    # Past max age AND heartbeat stale (default 120s): reaped even if pid looks live.
     clock.t = 1000.0 + 7201.0
+    assert clock.t - rec["heartbeat"] > DEFAULT_HEARTBEAT_STALE_S
     got = acquire_slot(
         tmp_path, 1, pid=99, now=clock.now, kill=_alive_kill, slot_max_age_s=7200.0
     )
     assert got == "slot-0"
     rec2 = json.loads(path.read_text(encoding="utf-8"))
     assert rec2["pid"] == 99
+
+
+def test_aging_live_long_agent_fresh_heartbeat_not_reaped(tmp_path: Path) -> None:
+    """I2: aged but heartbeat-FRESH (live long agent still refreshing) is NOT reaped."""
+    clock = _Clock(t=1000.0)
+    name = acquire_slot(tmp_path, 1, pid=1, now=clock.now, kill=_alive_kill)
+    assert name == "slot-0"
+    path = slot_path(tmp_path, name)
+    # Simulate a multi-hour agent: acquired long ago, heartbeat kept fresh by refresh_slot.
+    rec = json.loads(path.read_text(encoding="utf-8"))
+    rec["acquired_at"] = 1000.0
+    rec["heartbeat"] = 1000.0
+    path.write_text(json.dumps(rec) + "\n", encoding="utf-8")
+
+    clock.t = 1000.0 + 7201.0  # past slot_max_age
+    refresh_slot(tmp_path, name, now=clock.now)  # live agent heartbeat
+    # Still held: age alone is not enough when heartbeat is fresh.
+    assert (
+        acquire_slot(
+            tmp_path, 1, pid=2, now=clock.now, kill=_alive_kill, slot_max_age_s=7200.0
+        )
+        is None
+    )
+    assert free_slot_count(
+        tmp_path, 1, now=clock.now, kill=_alive_kill, slot_max_age_s=7200.0
+    ) == 0
+    # Original holder still owns the slot.
+    rec2 = json.loads(path.read_text(encoding="utf-8"))
+    assert rec2["pid"] == 1
+    assert rec2["heartbeat"] == clock.t
 
 
 def test_aging_fresh_live_slot_not_reaped(tmp_path: Path) -> None:
@@ -513,3 +545,40 @@ def test_d7_no_machine_pool_keeps_flat_local_slots(tmp_path: Path) -> None:
     assert name == "slot-0"  # flat, not executor/slot-0
     assert (tmp_path / "slot-0").is_file()
     assert free_slot_count(tmp_path, 2, kill=_alive_kill) == 1
+
+
+def test_doctor_surfaces_machine_pool_join_and_opt_out(tmp_path: Path, monkeypatch) -> None:
+    """M2: doctor reports JOINED + how to opt out when machine pool is in effect."""
+    from cairn.kernel.config import load_config
+    from cairn.kernel.doctor import _doctor_machine_pool
+
+    xdg = tmp_path / "xdg"
+    (xdg / "cairn").mkdir(parents=True)
+    (xdg / "cairn" / "machine.toml").write_text("max_agents = 4\n", encoding="utf-8")
+    monkeypatch.setenv("XDG_STATE_HOME", str(xdg))
+
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "cairn.toml").write_text(
+        '[workspace]\nname = "w"\n[factory]\nmax_agents = 2\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(ws)
+    lines: list[str] = []
+    _doctor_machine_pool(cfg, lines.append)
+    joined = "\n".join(lines)
+    assert "JOINED" in joined
+    assert "machine.toml" in joined
+    assert "machine_pool = false" in joined
+    assert "max_agents=4" in joined
+
+    # Explicit opt-out surfaces clearly.
+    (ws / "cairn.toml").write_text(
+        '[workspace]\nname = "w"\n[factory]\nmax_agents = 2\nmachine_pool = false\n',
+        encoding="utf-8",
+    )
+    cfg2 = load_config(ws)
+    lines2: list[str] = []
+    _doctor_machine_pool(cfg2, lines2.append)
+    assert any("opted out" in ln for ln in lines2)
+    assert not any("JOINED" in ln for ln in lines2)

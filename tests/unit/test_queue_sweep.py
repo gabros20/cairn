@@ -195,6 +195,32 @@ def test_sweep_capacity_resume_budget_limits_herd(tmp_path):
     assert sum(1 for p in waiting if p.is_file()) == 1
 
 
+def test_sweep_capacity_resume_budget_one_matches_reconcile_cap(tmp_path):
+    """I1: free_slots=1 (reconcile budget) resumes exactly one of many parks."""
+    watch = _watch(tmp_path)
+    for i in range(3):
+        rd = tmp_path / "runs" / f"t-r{i}"
+        _park(watch, f"r{i}.json", rd, exit_code=8)
+        _write_trail(rd, [{"event": "run-halt", "data": {"exit_code": 8}}])
+
+    resumed: list[str] = []
+
+    def resume(rd: Path) -> None:
+        resumed.append(rd.name)
+        # Leave trail as capacity so parks stay waiting — only count resumes.
+
+    report = sweep(
+        watch,
+        on_done="done",
+        free_slots=1,  # RECONCILE_CAPACITY_RESUME_BUDGET
+        resume_capacity=resume,
+    )
+    assert len(resumed) == 1
+    assert len(report.capacity_resumed) == 1
+    waiting = [p for p in (watch / ".waiting").iterdir() if p.is_file()]
+    assert len(waiting) == 3
+
+
 def test_sweep_blocked_not_resumed_by_capacity_path(tmp_path):
     """BLOCKED parks are not capacity-resumed even when free_slots > 0."""
     watch = _watch(tmp_path)

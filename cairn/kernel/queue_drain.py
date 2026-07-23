@@ -90,13 +90,22 @@ from cairn.kernel.types import Finding, OutcomeClass, classify_exit
 AGE_STEP_SECONDS = 3600.0
 _PRIO_RE = re.compile(r"^p([0-9])-")
 
+# W6-T2 r1 (I1): the reconcile beat holds a workspace flock and resumes
+# capacity parks SYNCHRONOUSLY (``cairn resume`` runs the full remaining
+# pipeline — minutes — not a fast re-park). Cap the beat's capacity-resume
+# budget to this const so one beat cannot run free_slots long pipelines
+# back-to-back blocking every other trigger's health advance. The next beat
+# resumes the next park. The ordinary per-trigger drain keeps free_slots.
+RECONCILE_CAPACITY_RESUME_BUDGET = 1
+
 
 def _workspace_free_slots(workspace_dir: Path) -> int | None:
     """Free agent-slot count for the capacity-resume budget, or None when slots OFF.
 
     Reads ``[factory]`` + optional ``machine.toml`` (join-by-presence). Used by
-    drain/reconcile sweep so a CAPACITY(8) park is re-driven when a slot frees
-    (FACTORY-PLAN T6 resume budget ≤ free_slots per beat).
+    drain/reconcile sweep so a CAPACITY(8) park is re-driven when a slot frees.
+    Drain budget ≤ free_slots; reconcile is further capped to
+    :data:`RECONCILE_CAPACITY_RESUME_BUDGET` (I1).
     """
     try:
         cfg = load_config(workspace_dir)
@@ -141,7 +150,14 @@ def _spawn_capacity_resume(
     runner: Runner,
     cairn_bin: str,
 ) -> None:
-    """Re-drive a CAPACITY-parked run (``cairn resume``) so the walk can re-acquire a slot."""
+    """Re-drive a CAPACITY-parked run via ``cairn resume`` (synchronous).
+
+    ``handle.wait()`` blocks until the resumed walk finishes or re-parks.
+    When a free agent slot exists the walk re-acquires it and runs the **full
+    remaining pipeline** (minutes) — it does NOT re-park fast. Callers that
+    hold a multi-trigger flock (reconcile) MUST cap how many resumes they
+    issue per beat (:data:`RECONCILE_CAPACITY_RESUME_BUDGET`).
+    """
     argv = [cairn_bin, "resume", str(run_dir)]
     handle = runner.spawn(argv, cwd=workspace_dir)
     handle.wait()
@@ -1100,23 +1116,26 @@ def reconcile_workspace(
     now_ts = now.timestamp()
     cur_boot = boot_id()
     free_slots = _workspace_free_slots(workspace_dir)
-    resume_capacity = None
+    # Shared across all triggers this beat — I1: cap so the flock is not held
+    # for free_slots × full-pipeline runtime. Resume runs the pipeline to
+    # completion (or its next park); it does NOT re-park fast when a slot is free.
+    resume_budget_left = 0
     if (
         free_slots is not None
         and free_slots > 0
         and runner is not None
         and cairn_bin is not None
     ):
+        resume_budget_left = min(int(free_slots), RECONCILE_CAPACITY_RESUME_BUDGET)
 
-        def _resume_capacity(run_dir: Path) -> None:
-            _spawn_capacity_resume(
-                run_dir,
-                workspace_dir=workspace_dir,
-                runner=runner,
-                cairn_bin=cairn_bin,
-            )
-
-        resume_capacity = _resume_capacity
+    def _resume_capacity(run_dir: Path) -> None:
+        assert runner is not None and cairn_bin is not None
+        _spawn_capacity_resume(
+            run_dir,
+            workspace_dir=workspace_dir,
+            runner=runner,
+            cairn_bin=cairn_bin,
+        )
 
     with _reconcile_lock(workspace_dir) as held:
         if not held:
@@ -1166,18 +1185,25 @@ def reconcile_workspace(
                 diags.append(f"orphan-reservation sweep hazarded: {exc}")
 
             try:
-                # W6-T2: capacity parks resume on the beat when free slots exist
-                # (budget ≤ free_slots). Runner+cairn_bin optional for library
-                # callers; CLI passes both so the reconcile timer closes the loop.
+                # W6-T2 r1 (I1): capacity resume is synchronous full-pipeline work.
+                # Budget is shared across triggers and capped to
+                # RECONCILE_CAPACITY_RESUME_BUDGET so the beat cannot stall on
+                # free_slots long resumes. Remaining parks wait for the next beat.
+                budget_here = resume_budget_left
                 report = sweep(
                     watch_abs,
                     on_done=trigger.on_done,
                     now=now_ts,
                     lease_ttl_s=lease_ttl,
                     current_boot_id=cur_boot,
-                    free_slots=free_slots,
-                    resume_capacity=resume_capacity,
+                    free_slots=budget_here if budget_here > 0 else 0,
+                    resume_capacity=(
+                        _resume_capacity if budget_here > 0 else None
+                    ),
                 )
+                resumed_n = len(report.capacity_resumed)
+                if resumed_n:
+                    resume_budget_left = max(0, resume_budget_left - resumed_n)
                 reaped_n = len(report.reaped)
                 flagged_n = len(report.flagged_live)
                 promoted_n = len(report.promoted_deferred)

@@ -835,6 +835,79 @@ def test_reconcile_sweeps_multiple_triggers_reaps_and_promotes(tmp_path):
     assert "reconcile beta" in out.getvalue()
 
 
+def test_reconcile_capacity_resume_budget_caps_stall(tmp_path):
+    """I1: reconcile resumes at most RECONCILE_CAPACITY_RESUME_BUDGET capacity parks
+    per beat even when free_slots > budget — bounds the synchronous full-pipeline stall.
+    """
+    from cairn.kernel.proc import RunResult, RunnerBase
+    from cairn.kernel.queue_drain import RECONCILE_CAPACITY_RESUME_BUDGET
+    from cairn.kernel.queue_ledger import claim, retire, write_pointer, pointer_path
+    from cairn.kernel.types import classify_exit
+    from fstestkit import _CannedHandle
+
+    assert RECONCILE_CAPACITY_RESUME_BUDGET == 1
+
+    ws = _workspace_two_triggers(tmp_path)
+    # Slots ON so free_slots >> budget (would otherwise resume all parks).
+    (ws / "cairn.toml").write_text(
+        '[workspace]\nname = "t"\n[factory]\nmax_agents = 8\n',
+        encoding="utf-8",
+    )
+    watch = ws / "inbox" / "a"
+    n_parks = 3
+    for i in range(n_parks):
+        run_dir = ws / "runs" / f"cap-{i}"
+        run_dir.mkdir(parents=True)
+        (run_dir / "run.json").write_text('{"status":"halted"}', encoding="utf-8")
+        (run_dir / "trail.jsonl").write_text(
+            json.dumps({"seq": 1, "event": "run-halt", "data": {"exit_code": 8}}) + "\n",
+            encoding="utf-8",
+        )
+        item = watch / f"c{i}.json"
+        item.write_text("payload", encoding="utf-8")
+        claimed = claim(watch, item)
+        assert claimed is not None
+        write_pointer(
+            pointer_path(claimed.parent, claimed.name),
+            run_dir=run_dir,
+            child_pid=11,
+        )
+        parked = retire(
+            watch,
+            claimed,
+            outcome=classify_exit(8),
+            on_done="done",
+            exit_code=8,
+            child_pid=11,
+            run_dir=run_dir,
+        )
+        assert parked is not None
+
+    resume_calls: list[list[str]] = []
+
+    class RecordingRunner(RunnerBase):
+        def spawn(self, argv, *, input=None, cwd=None):
+            resume_calls.append(list(argv))
+            return _CannedHandle(RunResult(returncode=8, stdout="", stderr=""))
+
+    out = io.StringIO()
+    err = io.StringIO()
+    report = reconcile_workspace(
+        ws,
+        now=NOW,
+        out=out,
+        err=err,
+        runner=RecordingRunner(),
+        cairn_bin="cairn",
+    )
+    assert not report.already_running
+    # Only the reconcile budget fires — remaining parks wait for the next beat.
+    assert len(resume_calls) == RECONCILE_CAPACITY_RESUME_BUDGET
+    assert all(c[:2] == ["cairn", "resume"] for c in resume_calls)
+    waiting = list((watch / ".waiting").iterdir()) if (watch / ".waiting").is_dir() else []
+    assert sum(1 for p in waiting if p.is_file()) == n_parks  # still waiting (exit 8)
+
+
 def test_reconcile_single_flight(tmp_path):
     ws = _workspace_two_triggers(tmp_path)
     held = threading.Event()
