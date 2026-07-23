@@ -1597,7 +1597,7 @@ class RetryRefused:
     """Retry declined because a newer/live rev owns the identity (no state change)."""
 
     message: str
-    identity: str
+    identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1623,17 +1623,69 @@ def _live_item_for_identity(watch_abs: Path, identity: str) -> Path | None:
     return None
 
 
-def _identity_owned_reason(watch_abs: Path, item: ItemId) -> str | None:
-    """If a newer/live rev owns ``item.identity``, return a refusal diagnostic.
+def _failed_revs_for_identity(watch_abs: Path, identity: str) -> set[str]:
+    """Revs of grammar-conforming items currently parked in ``.failed/`` for ``identity``.
 
-    Ownership surfaces (FACTORY-PLAN T3 failed-retry rule / W4 SG3):
+    Used by the supersession heuristic: a tombstoned newer rev that is *not* still
+    in ``.failed/`` can only have reached that state via DONE (``.failed/`` is only
+    vacated by retry re-homing, not by a reaper — review C1 / W4-T1 r1).
+    """
+    failed = Path(watch_abs) / ".failed"
+    if not failed.is_dir():
+        return set()
+    found: set[str] = set()
+    for p in failed.iterdir():
+        if not p.is_file():
+            continue
+        other = parse_item_name(p.name)
+        if other is not None and other.identity == identity:
+            found.add(other.rev)
+    return found
+
+
+def _newer_done_supersession_reason(watch_abs: Path, item: ItemId) -> str | None:
+    """Refuse retry when a strictly-newer rev of the identity already SUCCEEDED.
+
+    Tombstones today do not encode outcome class (DONE and FAILED both write the
+    same empty ``.done/tombstones/<identity>-r<rev>`` marker). Heuristic:
+
+    for every tombstoned rev confidently > ``item.rev``, if that rev is **not**
+    still present as a ``.failed/`` item, it can only have been terminal-DONE —
+    the newer work supersedes this failure. A newer rev that itself FAILED leaves
+    both a tombstone and a ``.failed/`` entry, so it does **not** supersede
+    (nothing delivered) — older-rev retry stays allowed.
+
+    Scans all tombstones (not only the highest) so DONE-at-r20 + FAILED-at-r30
+    still refuses an older r10 retry.
+    """
+    failed_revs = _failed_revs_for_identity(watch_abs, item.identity)
+    for t_rev in _tombstone_revs(watch_abs, item.identity):
+        order = rev_order(t_rev, item.rev)
+        if order is None or order <= 0:
+            continue  # not confidently newer
+        if t_rev in failed_revs:
+            continue  # newer rev also FAILED — does not supersede
+        return (
+            f"identity {item.identity}: a newer rev {t_rev} already succeeded "
+            f"— this failure is superseded"
+        )
+    return None
+
+
+def _identity_owned_reason(watch_abs: Path, item: ItemId) -> str | None:
+    """If a newer/live/succeeded rev owns ``item.identity``, return a refusal diagnostic.
+
+    Ownership surfaces (FACTORY-PLAN T3 failed-retry rule / W4 SG3 + r1 C1):
     - a live item in ``.claim/`` or ``.waiting/`` for the same identity
     - a ``.deferred/`` entry whose rev is confidently newer (or incomparable —
       fail-safe refuse so two revs never run)
+    - a tombstoned newer rev that already SUCCEEDED (no matching ``.failed/``
+      entry — see :func:`_newer_done_supersession_reason`)
     - a held reservation (checked by the caller via :func:`reserve_identity`)
 
     Equal/older deferred alone does not refuse (already-delivered park will be
     mopped/dropped; retry of the failed rev is still the right re-entry).
+    A newer rev that itself FAILED does not supersede.
     """
     live = _live_item_for_identity(watch_abs, item.identity)
     if live is not None:
@@ -1654,6 +1706,9 @@ def _identity_owned_reason(watch_abs: Path, item: ItemId) -> str | None:
                     f"(deferred r{deferred_item.rev}) — retry declined; "
                     f"the newer work supersedes this failure"
                 )
+    superseded = _newer_done_supersession_reason(watch_abs, item)
+    if superseded is not None:
+        return superseded
     return None
 
 
@@ -1690,8 +1745,18 @@ def prepare_failed_retry(
     failed_lane = watch_abs / ".failed"
     failed_path = failed_lane / item_name
     if not failed_path.is_file():
-        # Distinguish "not failed" (lives elsewhere) from "does not exist".
-        for lane in (".claim", ".waiting", ".done"):
+        # Distinguish concurrent re-home / wrong lane / missing.
+        claim_alt = watch_abs / ".claim" / item_name
+        if claim_alt.is_file():
+            # Winner of a concurrent retry already re-homed (I1) — clean refuse.
+            return RetryRefused(
+                message=(
+                    f"item {item_name!r} already retried / claimed by a "
+                    f"concurrent retry"
+                ),
+                identity=None,
+            )
+        for lane in (".waiting", ".done"):
             alt = watch_abs / lane / item_name
             if alt.is_file():
                 return RetryError(
@@ -1737,6 +1802,7 @@ def prepare_failed_retry(
 
     parsed = parse_item_name(item_name)
     identity: str | None = None
+    reserved = False
     if identity_mode == "strict":
         if parsed is None:
             return RetryError(
@@ -1758,21 +1824,60 @@ def prepare_failed_retry(
                 ),
                 identity=identity,
             )
+        reserved = True
+
+    # Concurrent double-retry (esp. identity:off, no reservation serialisation):
+    # if another retry already re-homed this item, refuse cleanly (I1).
+    claim_dest = watch_abs / ".claim" / item_name
+    if not failed_path.is_file():
+        if reserved and identity is not None:
+            release_reservation(watch_abs, identity, fs=fs)
+        if claim_dest.is_file():
+            return RetryRefused(
+                message=(
+                    f"item {item_name!r} already retried / claimed by a "
+                    f"concurrent retry"
+                ),
+                identity=identity,
+            )
+        return RetryError(
+            message=f"no failed item named {item_name!r} under {watch_abs}"
+        )
 
     # Pointer-first re-home into .claim/ (same T5 discipline as retire).
     dest_lane = watch_abs / ".claim"
     dest_lane.mkdir(parents=True, exist_ok=True)
     dest_ptr = pointer_path(dest_lane, item_name)
-    _relocate_pointer(
-        src_ptr,
-        dest_ptr,
-        run_dir=str(run_dir),
-        outcome=None,  # live again — outcome unknown until re-retire
-        exit_code=None,
-        child_pid=rec.get("child_pid") if isinstance(rec.get("child_pid"), int) else None,
-        fs=fs,
-    )
-    placed = _place(failed_path, dest_lane, item_name, fs=fs)
+    try:
+        _relocate_pointer(
+            src_ptr,
+            dest_ptr,
+            run_dir=str(run_dir),
+            outcome=None,  # live again — outcome unknown until re-retire
+            exit_code=None,
+            child_pid=(
+                rec.get("child_pid")
+                if isinstance(rec.get("child_pid"), int)
+                else None
+            ),
+            fs=fs,
+        )
+        placed = _place(failed_path, dest_lane, item_name, fs=fs)
+    except FileNotFoundError:
+        # Lost race: winner hardlinked then unlinked the source (I1). `_place`
+        # only treats FileExistsError same-inode as lost-race; FileNotFoundError
+        # on the vanished source would otherwise escape uncaught from CLI.
+        if reserved and identity is not None:
+            # Winner holds the item (and for strict, its own reservation). Drop
+            # the reservation we acquired so we don't orphan it.
+            release_reservation(watch_abs, identity, fs=fs)
+        return RetryRefused(
+            message=(
+                f"item {item_name!r} already retried / claimed by a concurrent "
+                f"retry"
+            ),
+            identity=identity,
+        )
     return RetryPrepared(
         claim_path=placed,
         run_dir=run_dir,
@@ -2110,8 +2215,11 @@ def retire(
     Returns the final item path, or ``None`` when the item was deleted (``on_done=delete``).
 
     ``receipt_rev`` (W4 SG2): explicit delivered/checked rev for deferred
-    promotion. When omitted, :func:`read_receipt_rev` is consulted for the run;
-    when that too is None, promotion falls back to the item's filename rev.
+    promotion on the **DONE** path only. When omitted on DONE,
+    :func:`read_receipt_rev` is consulted for the run; when that too is None,
+    promotion falls back to the item's filename rev. **FAILED** retires always
+    ignore receipts and compare deferred against ``item.rev`` (a failed run did
+    not deliver — W4-T1 r1 I2).
     """
     watch_abs = Path(watch_abs)
     claim_path = Path(claim_path)
@@ -2122,9 +2230,6 @@ def retire(
         src_ptr, run_dir=run_dir, exit_code=exit_code, child_pid=child_pid
     )
     outcome_s = outcome.outcome.value
-    # Resolve receipt once for terminal identity release (WAITING keeps reservation).
-    if receipt_rev is None and run_dir_s:
-        receipt_rev = read_receipt_rev(run_dir_s)
 
     if outcome.outcome is OutcomeClass.WAITING:
         # Waiting parks retain the reciprocal gc pin (judgment still pending).
@@ -2162,14 +2267,18 @@ def retire(
         # T3 pin-release: terminal ledger placement FIRST, then clear pin.
         if run_dir_s:
             clear_queue_pin(Path(run_dir_s), fs=fs)
-        # T1: release identity reservation + promote deferred (terminal only).
+        # T1: release identity + promote deferred. FAILED never delivered, so
+        # ignore any receipt artifact on the run (I2) — compare against item.rev.
         release_identity_on_terminal(
-            watch_abs, name, receipt_rev=receipt_rev, fs=fs
+            watch_abs, name, receipt_rev=None, fs=fs
         )
         return placed
 
     # DONE — terminal: item to .done/ (or delete), drop live pointer, always tombstone.
     assert outcome.outcome is OutcomeClass.DONE
+    # Receipt only meaningful on successful delivery (SG2 / I2).
+    if receipt_rev is None and run_dir_s:
+        receipt_rev = read_receipt_rev(run_dir_s)
     if src_ptr.is_file():
         # Final pointer content first (crash window leaves evidence), then item, then drop.
         write_pointer(

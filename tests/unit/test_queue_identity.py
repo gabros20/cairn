@@ -1247,8 +1247,9 @@ def test_retry_non_failed_item_errors(tmp_path):
     claimed = claim(watch, a)
     assert claimed is not None
     result = prepare_failed_retry(watch, claimed.name, identity_mode="strict")
-    assert isinstance(result, RetryError)
-    assert ".failed" in result.message
+    # Item already in .claim/ (live or concurrent re-home) — clean refuse, not crash.
+    assert isinstance(result, (RetryError, RetryRefused))
+    assert "claim" in result.message.lower() or "concurrent" in result.message.lower()
 
 
 def test_retry_vs_redrop_tombstone_still_dedupes(tmp_path):
@@ -1278,3 +1279,162 @@ def test_retry_vs_redrop_tombstone_still_dedupes(tmp_path):
     r = admit_strict(watch, redrop)
     assert r.disposition == "skip"
     assert not redrop.exists()
+
+
+# --------------------------------------------------------------------------- #
+# W4-T1 r1 — C1 supersession, I1 concurrent race, I2 FAILED ignores receipt
+# --------------------------------------------------------------------------- #
+
+
+def test_retry_refused_when_newer_rev_already_succeeded(tmp_path):
+    """C1: older FAILED rev + newer DONE tombstone → retry REFUSED."""
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    run_old = _validated_run(runs, "r1-old")
+    name10 = _park_failed(watch, 1, "github", "42", "10", run_dir=run_old)
+
+    # Newer rev admits, claims, succeeds (DONE) — terminal, no live traces left.
+    a20 = _drop(watch, 1, "github", "42", "20")
+    assert admit_strict(watch, a20).disposition == "admit"
+    claimed20 = claim(watch, a20)
+    assert claimed20 is not None
+    run_new = _validated_run(runs, "r1-new")
+    write_pointer(pointer_path(claimed20.parent, claimed20.name), run_dir=run_new)
+    retire(
+        watch,
+        claimed20,
+        outcome=_done(),
+        on_done="done",
+        exit_code=0,
+        run_dir=run_new,
+    )
+    assert (watch / ".done" / "tombstones" / "github-42-r20").is_file()
+    assert not reservation_path(watch, "github-42").exists()
+    assert not (watch / ".failed" / "p1-github-42-r20.json").exists()
+
+    result = prepare_failed_retry(watch, name10, identity_mode="strict")
+    assert isinstance(result, RetryRefused)
+    assert "already succeeded" in result.message
+    assert "20" in result.message
+    assert (watch / ".failed" / name10).is_file()  # untouched
+    assert not (watch / ".claim" / name10).exists()
+
+
+def test_retry_allowed_when_newer_rev_also_failed(tmp_path):
+    """C1: older FAILED + newer also in .failed/ → retry of older still ALLOWED."""
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    run10 = _validated_run(runs, "both-fail-10")
+    name10 = _park_failed(watch, 1, "github", "42", "10", run_dir=run10)
+    run20 = _validated_run(runs, "both-fail-20")
+    name20 = _park_failed(watch, 1, "github", "42", "20", run_dir=run20)
+    assert (watch / ".failed" / name10).is_file()
+    assert (watch / ".failed" / name20).is_file()
+
+    result = prepare_failed_retry(watch, name10, identity_mode="strict")
+    assert isinstance(result, RetryPrepared), getattr(result, "message", result)
+    assert result.identity == "github-42"
+    assert result.claim_path.is_file()
+    # Newer failed item still parked; we only re-homed the older one.
+    assert (watch / ".failed" / name20).is_file()
+
+
+def test_retry_concurrent_off_mode_loser_refuses_cleanly(tmp_path):
+    """I1: two retries of one identity:off item — one prepares, other cleanly refuses."""
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    run_dir = _validated_run(runs, "race-off")
+    name = "event-race.json"
+    item = watch / name
+    item.write_text('{"x": 1}', encoding="utf-8")
+    claimed = claim(watch, item)
+    assert claimed is not None
+    write_pointer(pointer_path(claimed.parent, claimed.name), run_dir=run_dir)
+    retire(
+        watch,
+        claimed,
+        outcome=_failed(),
+        on_done="done",
+        exit_code=1,
+        run_dir=run_dir,
+    )
+    assert (watch / ".failed" / name).is_file()
+
+    first = prepare_failed_retry(watch, name, identity_mode="off")
+    assert isinstance(first, RetryPrepared)
+    second = prepare_failed_retry(watch, name, identity_mode="off")
+    assert isinstance(second, RetryRefused)
+    assert "concurrent retry" in second.message
+    # Exactly one claim; no double re-home.
+    assert first.claim_path.is_file()
+    assert not (watch / ".failed" / name).exists()
+
+
+def test_failed_retire_ignores_receipt_compares_item_rev(tmp_path):
+    """I2: FAILED retire with a receipt present still promotes against item.rev."""
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    # Live item rev 10; run has a leftover/spurious receipt claiming rev 50.
+    a = _drop(watch, 1, "github", "42", "10")
+    assert admit_strict(watch, a).disposition == "admit"
+    claimed = claim(watch, a)
+    assert claimed is not None
+    run_dir = _validated_run(runs, "failed-with-receipt", receipt_rev="50")
+    write_pointer(pointer_path(claimed.parent, claimed.name), run_dir=run_dir)
+
+    # Deferred rev 30: > item.rev(10) → promote; ≤ receipt(50) would drop if trusted.
+    deferred = watch / ".deferred"
+    deferred.mkdir()
+    (deferred / "github-42").write_text(
+        _item_body(1, "github", "42", "30"), encoding="utf-8"
+    )
+
+    retire(
+        watch,
+        claimed,
+        outcome=_failed(),
+        on_done="done",
+        exit_code=1,
+        run_dir=run_dir,
+        receipt_rev="50",  # explicit too — still ignored on FAILED path
+    )
+    # Must promote r30 (item.rev baseline), not drop as ≤ receipt 50.
+    assert (watch / "p1-github-42-r30.json").is_file()
+    assert not (deferred / "github-42").exists()
+
+
+def test_done_retire_still_uses_receipt_after_i2(tmp_path):
+    """I2 regression: DONE path still receipt-checked (SG2 holds)."""
+    watch = tmp_path / "inbox"
+    watch.mkdir()
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    a = _drop(watch, 1, "github", "42", "10")
+    assert admit_strict(watch, a).disposition == "admit"
+    claimed = claim(watch, a)
+    run_dir = _validated_run(runs, "done-receipt", receipt_rev="20")
+    write_pointer(pointer_path(claimed.parent, claimed.name), run_dir=run_dir)
+
+    deferred = watch / ".deferred"
+    deferred.mkdir()
+    (deferred / "github-42").write_text(
+        _item_body(1, "github", "42", "20"), encoding="utf-8"
+    )
+    retire(
+        watch,
+        claimed,
+        outcome=_done(),
+        on_done="done",
+        exit_code=0,
+        run_dir=run_dir,
+    )
+    assert not (watch / "p1-github-42-r20.json").exists()
+    assert (watch / ".done" / "tombstones" / "github-42-r20").is_file()
