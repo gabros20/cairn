@@ -46,7 +46,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterator
@@ -393,12 +393,16 @@ def walk(
     gate_presets: dict[str, str],
     now: datetime,
     validator_timeout_s: int | None = None,
+    gate_preset_by: dict[str, str] | None = None,
 ) -> ExitCode:
     """Walk ``plan`` against ``run_dir`` to completion or the first halt.
 
     Idempotent per node, so calling it again on the same run dir *is* resume. The whole
     walk holds the run's advisory lock; a concurrent holder makes this return
     ``ExitCode.EXECUTOR`` with a stderr message rather than interleaving.
+
+    ``gate_preset_by`` threads ledger provenance for presets (``"flag"`` vs
+    ``"lane:<name>"``); absent → every preset records ``by: "flag"`` (today's shape).
     """
     run_dir = Path(run_dir)
     try:
@@ -412,6 +416,7 @@ def walk(
                 composer=composer,
                 interactive=interactive,
                 gate_presets=gate_presets,
+                gate_preset_by=dict(gate_preset_by or {}),
                 now=now,
                 timeout=validator_timeout_s
                 if validator_timeout_s is not None
@@ -434,6 +439,7 @@ class _Walk:
     gate_presets: dict[str, str]
     now: datetime
     timeout: int
+    gate_preset_by: dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # One RLock serializes every trail append AND every run.json mutation, so N parallel
@@ -782,6 +788,7 @@ class _Walk:
                 self.run_dir,
                 interactive=self.interactive,
                 presets=self.gate_presets,
+                preset_by=self.gate_preset_by,
                 emit=self._emit,
                 now=datetime.now(timezone.utc),
             )

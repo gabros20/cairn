@@ -188,6 +188,9 @@ def _run_one(
         "--origin",
         f"trigger:{trigger.name}",
     ]
+    # W5: per-trigger autonomy lane → child cairn run --lane <name>
+    if trigger.lane:
+        argv += ["--lane", trigger.lane]
     handle = runner.spawn(argv, cwd=workspace_dir)
     pid = handle.pid
     # Record pid into the claim pointer before wait returns (T5 / W3 lease prep).

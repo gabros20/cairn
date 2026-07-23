@@ -281,3 +281,34 @@ def test_same_run_id_in_different_dirs_get_distinct_keys_and_dont_cross_verify(t
 
     reasons = [d["data"].get("reason") for e, d in rec.events if e == "gate-tamper"]
     assert reasons == ["mac-mismatch"]
+
+
+def test_lane_preset_writes_by_lane_name(tmp_path: Path) -> None:
+    """A lane-driven preset threads by:\"lane:<name>\" (additive by: vocabulary)."""
+    rec = _Recorder()
+
+    choice = resolve_gate(
+        _gate(default=""),
+        tmp_path,
+        interactive=False,
+        presets={"tone": "formal"},
+        preset_by={"tone": "lane:dark"},
+        emit=rec,
+        now=NOW,
+    )
+
+    assert choice == "formal"
+    payload = json.loads(gate_path(tmp_path, "tone").read_text(encoding="utf-8"))
+    assert re.fullmatch(r"[0-9a-f]{64}", payload.pop("mac"))
+    assert payload == {"choice": "formal", "by": "lane:dark", "at": "2026-07-03T11:04:00.000Z"}
+    assert [e for e, _ in rec.events] == ["gate-answered"]
+
+
+def test_flag_preset_still_writes_by_flag_when_preset_by_omitted(tmp_path: Path) -> None:
+    """D7: plain --gate path unchanged — by:\"flag\" when preset_by is absent."""
+    rec = _Recorder()
+    choice = resolve_gate(
+        _gate(), tmp_path, interactive=False, presets={"tone": "formal"}, emit=rec, now=NOW
+    )
+    assert choice == "formal"
+    assert json.loads(gate_path(tmp_path, "tone").read_text(encoding="utf-8"))["by"] == "flag"

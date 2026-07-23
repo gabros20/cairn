@@ -1542,3 +1542,240 @@ def test_defaultless_gate_nested_in_loop_teaching_lint(tmp_path):
     hit = [m for m in msgs if "nested" in m and "schedules.yaml" in m]
     assert hit, f"expected nested-gate teaching lint; got: {msgs}"
     assert "park" in hit[0].lower()
+
+
+# --------------------------------------------------------------------------- #
+# W5 — autonomy lanes: grammar, oracle lint, empty-lane rule, max_headless.
+# --------------------------------------------------------------------------- #
+
+
+def _lanes_ws(tmp_path: Path, pipeline_yaml: str) -> Path:
+    """Workspace with schema + validator fixtures for lane oracle-lint tests."""
+    return _write_ws(tmp_path, pipeline_yaml)
+
+
+def _lane_pipeline(
+    *,
+    art_a: str = "schema: schemas/s.json",
+    lanes: str,
+    gate_default: str = "",
+    with_loop: bool = False,
+) -> str:
+    """Minimal pipeline with one gate (reads: a) and optional loop + lanes block.
+
+    Option keys are quoted so YAML 1.1 does not coerce yes/no to booleans.
+    """
+    default_line = f"    default: {gate_default}\n" if gate_default else ""
+    opts = '    options: { "yes": Y, "no": N }\n'
+    if with_loop:
+        steps = (
+            "steps:\n"
+            "  - { step: one, run: 'echo', produces: [a] }\n"
+            "  - gate: approve\n"
+            "    reads: [a]\n"
+            "    ask: ok?\n"
+            f"{opts}"
+            f"{default_line}"
+            "  - loop: lp\n"
+            "    max: { interactive: 3, headless: 2 }\n"
+            "    body:\n"
+            '      - { step: cycle, run: \'echo\', produces: [b] }\n'
+        )
+        arts = (
+            "artifacts:\n"
+            f"  a: {{ path: a.json, {art_a} }}\n"
+            '  b: { path: "b-{cycle}.json", schema: schemas/s.json }\n'
+        )
+    else:
+        steps = (
+            "steps:\n"
+            "  - { step: one, run: 'echo', produces: [a] }\n"
+            "  - gate: approve\n"
+            "    reads: [a]\n"
+            "    ask: ok?\n"
+            f"{opts}"
+            f"{default_line}"
+        )
+        arts = f"artifacts:\n  a: {{ path: a.json, {art_a} }}\n"
+    return (
+        "pipeline: p\n"
+        "version: 1\n"
+        'run_id: "p-{date}"\n'
+        f"{arts}"
+        f"{lanes}"
+        f"{steps}"
+    )
+
+
+_DARK_YES = 'lanes:\n  dark:\n    gates: { approve: "yes" }\n'
+
+
+def test_lanes_valid_block_parses(tmp_path):
+    yaml_text = _lane_pipeline(
+        art_a="validator: validators/v.py",
+        lanes=(
+            "lanes:\n"
+            "  lit: {}\n"
+            "  dark:\n"
+            '    gates: { approve: "yes" }\n'
+            "    loops: { max_headless: 5 }\n"
+        ),
+        with_loop=True,
+    )
+    p = plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+    assert set(p.lanes) == {"lit", "dark"}
+    assert p.lanes["lit"].gates == {}
+    assert p.lanes["lit"].max_headless is None
+    assert p.lanes["dark"].gates == {"approve": "yes"}
+    assert p.lanes["dark"].max_headless == 5
+
+
+def test_lanes_lit_empty_ok(tmp_path):
+    yaml_text = _lane_pipeline(
+        art_a="schema: schemas/s.json",
+        lanes="lanes:\n  lit: {}\n",
+    )
+    p = plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+    assert p.lanes["lit"].gates == {}
+
+
+def test_lanes_empty_non_lit_is_config_error(tmp_path):
+    yaml_text = _lane_pipeline(
+        art_a="validator: validators/v.py",
+        lanes="lanes:\n  dark: {}\n",
+    )
+    with pytest.raises(ConfigError, match=r"lane 'dark' presets no gates"):
+        plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+
+
+def test_lanes_empty_gates_key_non_lit_is_config_error(tmp_path):
+    yaml_text = _lane_pipeline(
+        art_a="validator: validators/v.py",
+        lanes="lanes:\n  dark:\n    gates: {}\n",
+    )
+    with pytest.raises(ConfigError, match=r"lane 'dark' presets no gates"):
+        plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+
+
+def test_lanes_unknown_gate_name_is_config_error(tmp_path):
+    yaml_text = _lane_pipeline(
+        art_a="validator: validators/v.py",
+        lanes='lanes:\n  dark:\n    gates: { nope: "yes" }\n',
+    )
+    with pytest.raises(ConfigError, match=r"unknown gate 'nope'"):
+        plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+
+
+def test_lanes_bad_option_key_is_config_error(tmp_path):
+    yaml_text = _lane_pipeline(
+        art_a="validator: validators/v.py",
+        lanes='lanes:\n  dark:\n    gates: { approve: "maybe" }\n',
+    )
+    with pytest.raises(ConfigError, match=r"choice 'maybe' is not one of"):
+        plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+
+
+def test_lanes_oracle_lint_schema_only_reads_is_error(tmp_path):
+    yaml_text = _lane_pipeline(
+        art_a="schema: schemas/s.json",
+        lanes=_DARK_YES,
+    )
+    with pytest.raises(ConfigError, match=r"has no validator — a dark decision needs a hard oracle"):
+        plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+
+
+def test_lanes_oracle_lint_with_validator_ok(tmp_path):
+    yaml_text = _lane_pipeline(
+        art_a="validator: validators/v.py",
+        lanes=_DARK_YES,
+    )
+    p = plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+    assert p.lanes["dark"].gates == {"approve": "yes"}
+
+
+def test_lanes_oracle_lint_schema_plus_validator_ok(tmp_path):
+    yaml_text = _lane_pipeline(
+        art_a="schema: schemas/s.json, validator: validators/v.py",
+        lanes=_DARK_YES,
+    )
+    p = plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+    assert p.lanes["dark"].gates["approve"] == "yes"
+
+
+def test_resolve_lane_unknown_names_declared(tmp_path):
+    from cairn.kernel.plan import resolve_lane
+
+    yaml_text = _lane_pipeline(
+        art_a="validator: validators/v.py",
+        lanes='lanes:\n  lit: {}\n  dark:\n    gates: { approve: "yes" }\n',
+    )
+    p = plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+    with pytest.raises(ConfigError, match=r"unknown lane 'neon'.*dark"):
+        resolve_lane(p, "neon", {})
+
+
+def test_resolve_lane_merges_presets_and_provenance(tmp_path):
+    from cairn.kernel.plan import resolve_lane
+
+    yaml_text = _lane_pipeline(
+        art_a="validator: validators/v.py",
+        lanes=_DARK_YES,
+    )
+    p = plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+    out, presets, by = resolve_lane(p, "dark", {})
+    assert presets == {"approve": "yes"}
+    assert by == {"approve": "lane:dark"}
+    assert out is p  # no max_headless → same plan object
+
+
+def test_resolve_lane_flag_conflict_is_config_error(tmp_path):
+    from cairn.kernel.plan import resolve_lane
+
+    yaml_text = _lane_pipeline(
+        art_a="validator: validators/v.py",
+        lanes=_DARK_YES,
+    )
+    p = plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+    with pytest.raises(ConfigError, match=r"lane 'dark' presets gate 'approve'='yes' but --gate sets it to 'no'"):
+        resolve_lane(p, "dark", {"approve": "no"})
+
+
+def test_resolve_lane_flag_same_value_ok_flag_wins_provenance(tmp_path):
+    from cairn.kernel.plan import resolve_lane
+
+    yaml_text = _lane_pipeline(
+        art_a="validator: validators/v.py",
+        lanes=_DARK_YES,
+    )
+    p = plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+    _, presets, by = resolve_lane(p, "dark", {"approve": "yes"})
+    assert presets == {"approve": "yes"}
+    assert by == {"approve": "flag"}
+
+
+def test_resolve_lane_max_headless_override(tmp_path):
+    from cairn.kernel.plan import resolve_lane
+
+    yaml_text = _lane_pipeline(
+        art_a="validator: validators/v.py",
+        lanes=(
+            "lanes:\n"
+            "  dark:\n"
+            '    gates: { approve: "yes" }\n'
+            "    loops: { max_headless: 7 }\n"
+        ),
+        with_loop=True,
+    )
+    p = plan(_lanes_ws(tmp_path, yaml_text), "p", {}, now=NOW)
+    loop = _node(p, "lp")
+    assert isinstance(loop, LoopNode) and loop.max_headless == 2  # authored
+    out, _, _ = resolve_lane(p, "dark", {})
+    out_loop = _node(out, "lp")
+    assert isinstance(out_loop, LoopNode) and out_loop.max_headless == 7
+
+
+def test_no_lanes_block_is_empty_and_identical_behavior(tmp_path):
+    """D7: a pipeline with no lanes: is byte-identical to today's shape (lanes == {})."""
+    steps = "  - { step: one, run: 'echo', produces: [a] }\n"
+    p = _plan_p(tmp_path, steps)
+    assert p.lanes == {}

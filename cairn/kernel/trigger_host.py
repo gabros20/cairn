@@ -61,6 +61,8 @@ _TRIGGER_KEYS = frozenset({
     "max_item_bytes",
     # W3 liveness (T13): claim leases — default ON only for concurrency>1
     "lease",
+    # W5 autonomy lane: optional name → child `cairn run --lane <name>`
+    "lane",
 })
 _ON_DONE_VALUES = frozenset({"done", "delete"})
 _ORDER_VALUES = frozenset({"name", "aged"})
@@ -127,6 +129,10 @@ class Trigger:
 
     ``lease`` (T13): stored as seconds or the sentinels ``LEASE_TTL_DEFAULT`` /
     ``LEASE_TTL_OFF``. Resolve with :func:`cairn.kernel.queue_ledger.effective_lease_ttl`.
+
+    ``lane`` (W5): optional autonomy-profile name. When set, the host-watcher argv
+    and each child ``cairn run`` receive ``--lane <name>`` (the pipeline must declare
+    that lane). Absent = today's behavior (no lane selection).
     """
 
     name: str
@@ -146,6 +152,7 @@ class Trigger:
     max_item_bytes: int | None = None  # None → DEFAULT_MAX_ITEM_BYTES when strict
     # LEASE_TTL_DEFAULT (-1) = policy; LEASE_TTL_OFF (0) = off; >0 = explicit ttl.
     lease_ttl_s: int = LEASE_TTL_DEFAULT
+    lane: str | None = None
 
 
 def _fail(message: str, file: Path) -> NoReturn:
@@ -284,6 +291,16 @@ def _parse_trigger(name: str, entry: Any, workspace_dir: Path, file: Path) -> Tr
 
     lease_ttl_s = _parse_lease(name, entry, file)
 
+    lane: str | None = None
+    if "lane" in entry:
+        raw_lane = entry["lane"]
+        if not isinstance(raw_lane, str) or not raw_lane.strip():
+            _fail(
+                f"trigger {name!r}: 'lane' must be a non-empty string, got {raw_lane!r}",
+                file,
+            )
+        lane = raw_lane.strip()
+
     return Trigger(
         name=name,
         pipeline=pipeline,
@@ -301,6 +318,7 @@ def _parse_trigger(name: str, entry: Any, workspace_dir: Path, file: Path) -> Tr
         identity=identity,
         max_item_bytes=max_item_bytes,
         lease_ttl_s=lease_ttl_s,
+        lane=lane,
     )
 
 
@@ -429,8 +447,16 @@ def _trigger_argv(trigger: Trigger, workspace_dir: Path, cairn_bin: str) -> list
     host watcher only ever knows a directory changed, so the argv can't and shouldn't
     encode which file. This also means editing ``triggers.yaml`` (pipeline, param, glob,
     on_done) changes behavior without re-sync, the same property SCHEDULING.md documents
-    for ``cairn schedule run <name>``."""
-    return [cairn_bin, "trigger", "run", trigger.name, "--workspace", str(workspace_dir)]
+    for ``cairn schedule run <name>``.
+
+    When the trigger declares ``lane:``, append ``--lane <name>`` so the host-watcher
+    unit documents the autonomy profile (the drain also reads ``Trigger.lane`` from
+    triggers.yaml when spawning each child ``cairn run``).
+    """
+    argv = [cairn_bin, "trigger", "run", trigger.name, "--workspace", str(workspace_dir)]
+    if trigger.lane:
+        argv += ["--lane", trigger.lane]
+    return argv
 
 
 def _assert_render_safe(what: str, value: str) -> None:

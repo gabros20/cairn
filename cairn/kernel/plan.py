@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import difflib
 import re
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -180,13 +180,32 @@ class ToolRequirement:
     targets: tuple[str, ...]
 
 
+# The reserved park-everything autonomy profile. Empty ``gates:`` is only legal on this
+# name — a dark lane that presets nothing is a plan-time error (FACTORY-PLAN §8).
+PARK_LANE = "lit"
+
+
+@dataclass(frozen=True)
+class LaneProfile:
+    """One named autonomy profile from the pipeline's ``lanes:`` block (FACTORY-PLAN §8).
+
+    ``gates`` maps gate name → option key (resolved into the existing gate-preset path at
+    selection time). ``max_headless`` is an optional override applied to every loop node's
+    ``max_headless`` when this lane is selected (``loops: {max_headless: N}`` in YAML).
+    """
+
+    gates: dict[str, str]
+    max_headless: int | None = None
+
+
 @dataclass(frozen=True)
 class Plan:
     """The emitted, executable plan. ``nodes`` is the ``--from``/``--to`` slice; dataflow and
     references are verified over the whole pipeline before slicing. ``resolved_models`` maps a
     step id → ``(executor, model, effort)`` for every agent step *in range*. ``tool_requirements``
     is the range-scoped subset of ``[tools]`` (see :class:`ToolRequirement`) — the hard-stop set
-    ``cairn run`` verifies before it mints or walks anything."""
+    ``cairn run`` verifies before it mints or walks anything. ``lanes`` is the optional autonomy
+    profile table (absent/empty = today's behavior)."""
 
     pipeline: str
     version: int
@@ -201,6 +220,7 @@ class Plan:
     resolved_models: dict[str, tuple[str, str, str | None]]
     skipped: tuple[PlanSkip, ...] = ()
     tool_requirements: tuple[ToolRequirement, ...] = ()
+    lanes: dict[str, LaneProfile] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------- #
@@ -1565,6 +1585,170 @@ def _iter_gates(nodes: list[Node] | tuple[Node, ...]):
             yield from _iter_gates(node.body)
 
 
+def _parse_lanes(
+    raw: Any,
+    *,
+    gates_by_name: dict[str, GateNode],
+    artifacts: dict[str, ArtifactDecl],
+    file: str,
+) -> dict[str, LaneProfile]:
+    """Parse + validate the top-level ``lanes:`` block (FACTORY-PLAN §8 / W5-T1).
+
+    Rules (all plan-time ConfigErrors):
+    - each profile is a mapping with optional ``gates`` / ``loops``
+    - gate names must exist as gate nodes; option keys must be on that gate
+    - empty ``gates`` is legal only for the reserved park lane (``lit``)
+    - every artifact a preset gate ``reads`` must carry a ``validator:`` (oracle lint —
+      schema-only is not enough for a dark decision)
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        _err("lanes: must be a mapping of lane-name → profile", file)
+    if not raw:
+        return {}
+
+    profiles: dict[str, LaneProfile] = {}
+    for lane_name, profile in raw.items():
+        name = str(lane_name)
+        if not isinstance(profile, dict):
+            _err(f"lane {name!r}: profile must be a mapping", file)
+        for key in profile:
+            if key not in ("gates", "loops"):
+                _err(
+                    f"lane {name!r}: unknown key {key!r} (allowed: gates, loops)",
+                    file,
+                )
+
+        gates_raw = profile.get("gates", {}) or {}
+        if not isinstance(gates_raw, dict):
+            _err(f"lane {name!r}: gates must be a mapping of gate-name → option-key", file)
+        if not gates_raw and name != PARK_LANE:
+            _err(
+                f"lane '{name}' presets no gates — a dark lane that decides nothing is a lie; "
+                f"use lit or add presets.",
+                file,
+            )
+
+        gates: dict[str, str] = {}
+        for gname_raw, choice_raw in gates_raw.items():
+            gname = str(gname_raw)
+            choice = str(choice_raw)
+            gate = gates_by_name.get(gname)
+            if gate is None:
+                known = sorted(gates_by_name)
+                _err(
+                    f"lane {name!r}: unknown gate {gname!r} "
+                    f"(pipeline gates: {known})",
+                    file,
+                )
+            options = [k for k, _ in gate.options]
+            if choice not in options:
+                _err(
+                    f"lane {name!r}: gate {gname!r}: choice {choice!r} is not one of {options}",
+                    file,
+                )
+            # Oracle lint: every reads-artifact needs a validator (not schema-only).
+            for art_name in gate.reads:
+                decl = artifacts.get(art_name)
+                if decl is None or decl.validator is None:
+                    _err(
+                        f"lane '{name}' presets gate '{gname}' but its evidence "
+                        f"'{art_name}' has no validator — a dark decision needs a hard "
+                        f"oracle, not just a schema.",
+                        file,
+                    )
+            gates[gname] = choice
+
+        max_headless: int | None = None
+        loops_raw = profile.get("loops")
+        if loops_raw is not None:
+            if not isinstance(loops_raw, dict):
+                _err(f"lane {name!r}: loops must be a mapping", file)
+            for key in loops_raw:
+                if key != "max_headless":
+                    _err(
+                        f"lane {name!r}: loops: unknown key {key!r} "
+                        f"(allowed: max_headless)",
+                        file,
+                    )
+            if "max_headless" in loops_raw:
+                mh = loops_raw["max_headless"]
+                if isinstance(mh, bool) or not isinstance(mh, int) or mh < 0:
+                    _err(
+                        f"lane {name!r}: loops.max_headless must be a non-negative integer",
+                        file,
+                    )
+                max_headless = mh
+
+        profiles[name] = LaneProfile(gates=gates, max_headless=max_headless)
+    return profiles
+
+
+def _apply_max_headless(nodes: tuple[Node, ...], max_headless: int) -> tuple[Node, ...]:
+    """Return a copy of ``nodes`` with every LoopNode's ``max_headless`` set to ``max_headless``."""
+    out: list[Node] = []
+    for node in nodes:
+        if isinstance(node, LoopNode):
+            body = _apply_max_headless(node.body, max_headless)
+            out.append(replace(node, max_headless=max_headless, body=body))
+        else:
+            out.append(node)
+    return tuple(out)
+
+
+def resolve_lane(
+    plan_obj: Plan,
+    lane: str | None,
+    flag_presets: dict[str, str] | None = None,
+) -> tuple[Plan, dict[str, str], dict[str, str]]:
+    """Resolve ``--lane`` + ``--gate`` into (plan, presets, preset_by) for the walk.
+
+    * No lane selected → plan unchanged; presets are exactly the flag presets;
+      every flag preset is tagged ``by: "flag"``.
+    * Lane selected → its ``gates:`` merge into presets; each lane-only preset is
+      tagged ``by: "lane:<name>"``. When a flag and the lane both set the same gate:
+      same value is fine (flag wins provenance → ``"flag"``); different values raise
+      ConfigError (no silent conflict).
+    * Lane ``loops.max_headless`` rewrites every loop node's ``max_headless`` on the
+      returned plan (does not mutate ``plan_obj``).
+
+    An unknown lane name raises ConfigError naming the declared lanes.
+    """
+    flag_presets = dict(flag_presets or {})
+    if not lane:
+        preset_by = {g: "flag" for g in flag_presets}
+        return plan_obj, flag_presets, preset_by
+
+    if lane not in plan_obj.lanes:
+        declared = sorted(plan_obj.lanes) or ["(none)"]
+        _err(
+            f"unknown lane {lane!r}; declared lanes: {', '.join(declared)}"
+        )
+
+    profile = plan_obj.lanes[lane]
+    lane_presets = dict(profile.gates)
+    presets: dict[str, str] = dict(lane_presets)
+    preset_by: dict[str, str] = {g: f"lane:{lane}" for g in lane_presets}
+
+    for gname, fchoice in flag_presets.items():
+        if gname in presets and presets[gname] != fchoice:
+            _err(
+                f"lane {lane!r} presets gate {gname!r}={presets[gname]!r} but "
+                f"--gate sets it to {fchoice!r}"
+            )
+        presets[gname] = fchoice
+        preset_by[gname] = "flag"  # operator flag wins provenance on overlap
+
+    out_plan = plan_obj
+    if profile.max_headless is not None:
+        out_plan = replace(
+            plan_obj,
+            nodes=_apply_max_headless(plan_obj.nodes, profile.max_headless),
+        )
+    return out_plan, presets, preset_by
+
+
 def _lint_defaultless_scheduled_gates(
     nodes: list[Node],
     *,
@@ -1719,7 +1903,9 @@ def _tool_requirements(
 # The public entry points.
 # --------------------------------------------------------------------------- #
 
-_KNOWN_TOP_LEVEL = {"pipeline", "version", "params", "dims", "run_id", "artifacts", "guards", "steps"}
+_KNOWN_TOP_LEVEL = {
+    "pipeline", "version", "params", "dims", "run_id", "artifacts", "guards", "steps", "lanes",
+}
 
 
 def plan(
@@ -1815,6 +2001,22 @@ def plan(
 
     emitted, resolved_models = _emit(active, executor, step_executors, config, from_node, to_node, str(pfile))
 
+    # Autonomy lanes (W5): parse after nodes exist so gate-name / option / oracle lint can
+    # reference the full gate tree + artifact decls. Absent/empty lanes → {} (today's shape).
+    gates_by_name = {g.name: g for g in _iter_gates(active)}
+    # Also include gates that plan-time expansion dropped (raw tree) so a lane can still
+    # name them; validate option keys against any still-active gate of that name, else skip
+    # option checks only when the gate was dropped entirely. _gather already collected names;
+    # re-walk active first, then re-parse dropped gates is overkill — lanes may only target
+    # gates present in the expanded tree (including nested). Conditional gates that stayed
+    # active with when_runtime are included.
+    lanes = _parse_lanes(
+        doc.get("lanes"),
+        gates_by_name=gates_by_name,
+        artifacts=artifact_decls,
+        file=str(pfile),
+    )
+
     # claude-F10: honest enforcement — warn (never error) when a guard's declared enforce
     # layers yield no effective pre-execution block for THIS plan's resolved executor(s), or
     # when agent steps run wholly unguarded. Only in range guards + resolved_models are used.
@@ -1852,6 +2054,7 @@ def plan(
         resolved_models=resolved_models,
         skipped=tuple(skips),
         tool_requirements=tool_requirements,
+        lanes=lanes,
     )
 
 

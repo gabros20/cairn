@@ -271,3 +271,43 @@ def test_multiple_triggers(tmp_path):
     )
     triggers = load_triggers(ws)
     assert set(triggers) == {"handle-reply", "handle-webhook"}
+
+
+def test_load_trigger_lane_field(tmp_path):
+    ws = _workspace(
+        tmp_path,
+        """
+        handle-reply:
+          pipeline: handle-reply
+          watch: inbox/replies/
+          lane: dark
+        """,
+    )
+    t = load_triggers(ws)["handle-reply"]
+    assert t.lane == "dark"
+
+
+def test_load_trigger_lane_absent_is_none(tmp_path):
+    ws = _workspace(
+        tmp_path,
+        """
+        handle-reply:
+          pipeline: handle-reply
+          watch: inbox/replies/
+        """,
+    )
+    assert load_triggers(ws)["handle-reply"].lane is None
+
+
+def test_load_trigger_lane_empty_is_error(tmp_path):
+    ws = _workspace(
+        tmp_path,
+        """
+        handle-reply:
+          pipeline: handle-reply
+          watch: inbox/replies/
+          lane: ""
+        """,
+    )
+    with pytest.raises(ConfigError, match=r"'lane' must be a non-empty string"):
+        load_triggers(ws)

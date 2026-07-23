@@ -56,6 +56,7 @@ from cairn.kernel.plan import (
     StepNode,
     _iter_gates,
     plan as build_plan,
+    resolve_lane,
 )
 from cairn.kernel.proc import SubprocessRunner as _SubprocessRunner
 from cairn.kernel.gckit import write_queue_pin
@@ -436,6 +437,7 @@ def _drive(
     gate_presets: dict[str, str],
     now: datetime,
     stub_mode: bool = False,
+    gate_preset_by: dict[str, str] | None = None,
 ) -> int:
     if stub_mode:
         from cairn.executors.shell import ShellExecutor
@@ -458,6 +460,7 @@ def _drive(
         composer=composer,
         interactive=interactive,
         gate_presets=gate_presets,
+        gate_preset_by=gate_preset_by,
         now=now,
     )
     _print_walk_result(code, run_dir)
@@ -542,10 +545,18 @@ def _cmd_run(args: argparse.Namespace) -> int:
 
     interactive = (not args.headless) and sys.stdin.isatty()
     try:
+        # W5: --lane resolves into the existing gate-preset path + optional max_headless
+        # override. Conflict with --gate on the same gate (different value) is a ConfigError.
+        p, gate_presets, gate_preset_by = resolve_lane(
+            p, getattr(args, "lane", None), _kv(args.gate)
+        )
         return _drive(
             p, run_dir, ws, config,
-            interactive=interactive, gate_presets=_kv(args.gate), now=now, stub_mode=stub_mode,
+            interactive=interactive, gate_presets=gate_presets, now=now, stub_mode=stub_mode,
+            gate_preset_by=gate_preset_by,
         )
+    except ConfigError as exc:
+        return _print_config_error(exc)
     except CairnError as exc:
         print(f"cairn: {exc}", file=sys.stderr)
         return int(ExitCode.EXECUTOR)
@@ -2448,6 +2459,12 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--executor")
     sp.add_argument("--step-executor", action="append", metavar="STEP=X", help="per-step executor (repeatable)")
     sp.add_argument("--gate", action="append", metavar="NAME=CHOICE", help="preset a gate choice (repeatable)")
+    sp.add_argument(
+        "--lane",
+        metavar="NAME",
+        help="select a pipeline autonomy lane (resolves its gates: into presets; "
+             "conflicts with --gate on the same gate raise ConfigError)",
+    )
     sp.add_argument("--headless", action="store_true")
     sp.add_argument("--to")
     sp.add_argument("--from", dest="from_node")
@@ -2621,6 +2638,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="accepted, ignored — a fired trigger's child run is already --headless by "
              "construction; present so the documented cron-fallback schedules.yaml entry "
              "(`run: [trigger, run, <name>, --headless]`, TRIGGERS.md §3) is copy-paste invocable",
+    )
+    sp.add_argument(
+        "--lane",
+        metavar="NAME",
+        help="accepted, ignored — a trigger's lane: is declared in triggers.yaml and "
+             "appended to the host-watcher argv; the drain reads it from the Trigger",
     )
     sp.set_defaults(func=_cmd_trigger)
 

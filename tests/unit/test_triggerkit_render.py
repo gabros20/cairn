@@ -221,3 +221,22 @@ def test_render_trigger_launchd_rejects_injection_payload_in_name_bypassing_load
     trig = Trigger(name=evil_name, pipeline="p", watch="inbox")
     with pytest.raises(ConfigError, match="trigger name"):
         render_trigger_launchd(trig, WS, "cairn", ws_id=WID)
+
+
+def test_trigger_argv_appends_lane_when_set():
+    from cairn.kernel.trigger_host import _trigger_argv
+
+    trig = _trigger(lane="dark")
+    argv = _trigger_argv(trig, WS, "cairn")
+    assert argv == [
+        "cairn", "trigger", "run", "handle-reply",
+        "--workspace", str(WS),
+        "--lane", "dark",
+    ]
+
+
+def test_trigger_argv_omits_lane_when_absent():
+    from cairn.kernel.trigger_host import _trigger_argv
+
+    argv = _trigger_argv(_trigger(), WS, "cairn")
+    assert "--lane" not in argv

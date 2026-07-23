@@ -2247,3 +2247,97 @@ def test_now_returns_aware_utc():
 
     dt = _now()
     assert dt.tzinfo is timezone.utc
+
+
+# --------------------------------------------------------------------------- #
+# W5 — autonomy lanes: --lane selection, conflict, ledger provenance.
+# --------------------------------------------------------------------------- #
+
+
+def _write_lane_pipeline(ws: Path) -> None:
+    """Pipeline with a validator-bearing gate so a dark lane plans + runs headless."""
+    (ws / "pipelines" / "laned.yaml").write_text(
+        "pipeline: laned\n"
+        "version: 1\n"
+        'run_id: "laned-{date}"\n'
+        "artifacts:\n"
+        "  greeting:\n"
+        "    path: greeting.json\n"
+        "    schema: schemas/greeting.json\n"
+        "    validator: validators/nonempty.py\n"
+        "  message:\n"
+        "    path: message.txt\n"
+        "    validator: validators/nonempty.py\n"
+        "lanes:\n"
+        "  lit: {}\n"
+        "  dark:\n"
+        "    gates:\n"
+        "      tone: formal\n"
+        "steps:\n"
+        "  - step: greet\n"
+        "    run: >-\n"
+        "      python3 -c \"import json, sys;\n"
+        "      json.dump({'name': 'Ada'}, open(sys.argv[1], 'w'))\"\n"
+        "      \"{artifact:greeting}\"\n"
+        "    produces: [greeting]\n"
+        "  - gate: tone\n"
+        "    reads: [greeting]\n"
+        "    ask: tone?\n"
+        "    options:\n"
+        "      friendly: warm\n"
+        "      formal: polished\n"
+        "  - step: compose\n"
+        "    run: >-\n"
+        "      python3 -c \"open('{artifact:message}', 'w').write('{gate:tone}'.capitalize() + chr(10))\"\n"
+        "    needs: [greeting, tone]\n"
+        "    produces: [message]\n",
+        encoding="utf-8",
+    )
+
+
+def test_run_lane_dark_auto_answers_gate_and_records_lane_provenance(hello_ws, monkeypatch):
+    monkeypatch.chdir(hello_ws)
+    _write_lane_pipeline(hello_ws)
+    assert main(["run", "laned", "--headless", "--lane", "dark"]) == 0
+    rd = _run_dir(hello_ws, "laned")
+    decision = json.loads((rd / "gates" / "tone.json").read_text())
+    assert decision["choice"] == "formal"
+    assert decision["by"] == "lane:dark"
+    assert (rd / "message.txt").read_text().startswith("Formal")
+
+
+def test_run_lane_unknown_is_config_error(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    _write_lane_pipeline(hello_ws)
+    rc = main(["run", "laned", "--headless", "--lane", "neon"])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "unknown lane" in err and "neon" in err
+    assert "dark" in err  # names declared lanes
+
+
+def test_run_lane_gate_conflict_is_config_error(hello_ws, monkeypatch, capsys):
+    monkeypatch.chdir(hello_ws)
+    _write_lane_pipeline(hello_ws)
+    rc = main(["run", "laned", "--headless", "--lane", "dark", "--gate", "tone=friendly"])
+    err = capsys.readouterr().err
+    assert rc == int(ExitCode.CONFIG)
+    assert "lane 'dark'" in err and "tone" in err and "friendly" in err
+
+
+def test_run_flag_preset_still_writes_by_flag(hello_ws, monkeypatch):
+    """D7: --gate without --lane still records by:\"flag\"."""
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless", "--gate", "tone=formal"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    decision = json.loads((rd / "gates" / "tone.json").read_text())
+    assert decision["choice"] == "formal" and decision["by"] == "flag"
+
+
+def test_run_no_lane_no_lanes_block_unchanged(hello_ws, monkeypatch):
+    """D7: hello has no lanes: + no --lane → default headless path (by:\"default\")."""
+    monkeypatch.chdir(hello_ws)
+    assert main(["run", "hello", "--headless"]) == 0
+    rd = _run_dir(hello_ws, "hello-world")
+    decision = json.loads((rd / "gates" / "tone.json").read_text())
+    assert decision["by"] == "default"

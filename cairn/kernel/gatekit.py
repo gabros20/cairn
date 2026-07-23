@@ -15,6 +15,7 @@ legitimately resolved cannot flip downstream control flow or a rendered command.
 
     authenticated answer on disk → skip (return the recorded choice)
     preset (``--gate name=choice``) → write ``by: "flag"``
+    preset from a lane (``--lane``) → write ``by: "lane:<name>"`` (additive ``by:`` vocabulary)
     interactive → emit ``gate-pending``, run the TTY menu, write ``by: "tty"``
     headless with a default → write ``by: "default"``
     headless without a default → emit ``gate-pending`` and raise GateNeedsHuman (exit 6)
@@ -72,12 +73,17 @@ def resolve_gate(
     now,
     prompt: Callable[[str], str] | None = None,
     out=None,
+    preset_by: dict[str, str] | None = None,
 ) -> str:
     """Resolve ``gate`` against ``run_dir``, returning the chosen option key.
 
     ``emit(event, node=…, data=…)`` is the walker's locked trail emitter. ``prompt`` and
     ``out`` exist for testing the TTY path; production passes neither (real ``input`` /
     ``sys.stdout``). A headless gate with a falsy ``default`` raises GateNeedsHuman.
+
+    ``preset_by`` is an optional gate-name → ledger ``by:`` string map. A plain ``--gate``
+    flag defaults to ``"flag"``; a lane-driven preset threads ``"lane:<name>"`` (additive
+    to the ``by:`` vocabulary — the field shape is unchanged so recorded MACs stay valid).
     """
     path = gate_path(run_dir, gate.name)
     options = [key for key, _ in gate.options]
@@ -96,7 +102,8 @@ def resolve_gate(
             raise ConfigError(
                 f"gate {gate.name!r}: preset choice {choice!r} is not one of {options}"
             )
-        return _commit(run_dir, path, gate, choice, "flag", emit, now)
+        by = (preset_by or {}).get(gate.name, "flag")
+        return _commit(run_dir, path, gate, choice, by, emit, now)
 
     if interactive:
         emit("gate-pending", node=gate.name, data={"question": gate.ask, "options": options})
