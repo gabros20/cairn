@@ -96,6 +96,55 @@ def test_unknown_top_level_key_is_a_warning_not_an_error(tmp_path):
     assert any(f.level == "warning" and "mystery" in f.message for f in cfg.warnings)
 
 
+# ---- [factory] max_agents / slot_wait (W6-T1) ----
+
+
+def test_factory_absent_means_slots_off():
+    cfg = load_config(GOOD)
+    assert cfg.factory.max_agents is None
+    assert cfg.factory.slot_wait_s == 900  # default; irrelevant while OFF
+
+
+def test_factory_max_agents_parses(tmp_path):
+    (tmp_path / "cairn.toml").write_text(
+        '[workspace]\nname = "w"\n[factory]\nmax_agents = 3\nslot_wait = "5m"\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.factory.max_agents == 3
+    assert cfg.factory.slot_wait_s == 300
+
+
+def test_factory_max_agents_zero_raises(tmp_path):
+    (tmp_path / "cairn.toml").write_text(
+        '[workspace]\nname = "w"\n[factory]\nmax_agents = 0\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_config(tmp_path)
+    assert "max_agents" in str(exc.value)
+
+
+def test_factory_max_agents_negative_raises(tmp_path):
+    (tmp_path / "cairn.toml").write_text(
+        '[workspace]\nname = "w"\n[factory]\nmax_agents = -1\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError) as exc:
+        load_config(tmp_path)
+    assert "max_agents" in str(exc.value)
+
+
+def test_factory_unknown_key_warns(tmp_path):
+    (tmp_path / "cairn.toml").write_text(
+        '[workspace]\nname = "w"\n[factory]\nmax_agents = 1\nmachine_pool = true\n',
+        encoding="utf-8",
+    )
+    cfg = load_config(tmp_path)
+    assert cfg.factory.max_agents == 1
+    assert any(f.level == "warning" and "machine_pool" in f.message for f in cfg.warnings)
+
+
 # ---- value-type validation (review MINOR 1) ----
 
 

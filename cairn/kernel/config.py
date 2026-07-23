@@ -29,6 +29,7 @@ _KNOWN_TOP_LEVEL = {
     "secrets",
     "sinks",
     "requires",
+    "factory",
 }
 
 
@@ -283,6 +284,21 @@ class SecretConfig:
 
 
 @dataclass(frozen=True)
+class FactoryConfig:
+    """``[factory]`` workspace knobs (FACTORY-PLAN §9 / W6).
+
+    ``max_agents`` absent (None) ⇒ agent-slot pool OFF ⇒ unbounded concurrent
+    agent spawns (byte-identical to pre-W6). When set, a positive int bounds
+    concurrent AGENT-step invokes via the numbered O_EXCL slot pool.
+    ``slot_wait_s`` is how long an agent step waits for a free slot before
+    parking ``CAPACITY(8)`` (default 15m); only meaningful when slots are ON.
+    """
+
+    max_agents: int | None = None
+    slot_wait_s: int = 900
+
+
+@dataclass(frozen=True)
 class Config:
     workspace: Workspace
     defaults: Defaults
@@ -292,6 +308,7 @@ class Config:
     sinks: dict[str, dict[str, Any]]
     requires: str | None
     warnings: list[Finding]
+    factory: FactoryConfig = field(default_factory=FactoryConfig)
 
 
 # --------------------------------------------------------------------------- #
@@ -481,6 +498,29 @@ def _parse_secret(name: str, raw: Any, file: Path) -> SecretConfig:
     return SecretConfig(name=name, needed_by=list(table.get("needed_by", [])))
 
 
+def _parse_factory(raw: Any, file: Path, warnings: list[Finding]) -> FactoryConfig:
+    """Parse optional ``[factory]``. Absent table → slots OFF (max_agents=None)."""
+    if raw is None:
+        return FactoryConfig()
+    table = _require_table(raw, "factory", file)
+    _warn_unknown(table, {"max_agents", "slot_wait"}, "factory", warnings)
+
+    max_agents: int | None = None
+    if "max_agents" in table:
+        n = _require_int(table["max_agents"], "factory.max_agents", file)
+        if n < 1:
+            _fail(f"factory.max_agents must be a positive integer, got {n}", file)
+        max_agents = n
+
+    slot_wait_s = 900
+    if "slot_wait" in table:
+        slot_wait_s = _parse_duration_field(table, "slot_wait", "factory", file)
+        if slot_wait_s < 0:
+            _fail(f"factory.slot_wait must be non-negative, got {slot_wait_s!r}", file)
+
+    return FactoryConfig(max_agents=max_agents, slot_wait_s=slot_wait_s)
+
+
 def load_config(workspace_dir: Path) -> Config:
     """Load ``<workspace_dir>/cairn.toml`` into a typed Config.
 
@@ -541,4 +581,5 @@ def load_config(workspace_dir: Path) -> Config:
         sinks=sinks,
         requires=requires,
         warnings=warnings,
+        factory=_parse_factory(raw.get("factory"), file, warnings),
     )

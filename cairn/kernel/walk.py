@@ -54,6 +54,13 @@ from typing import Any, Callable, Iterator
 import cairn
 from cairn.executors.base import ExecTimeout
 from cairn.kernel import durafs
+from cairn.kernel.agent_slots import (
+    DEFAULT_POLL_S,
+    release_slot,
+    refresh_slot,
+    slots_dir_for,
+    wait_acquire_slot,
+)
 from cairn.kernel.artifacts import (
     DEFAULT_VALIDATOR_TIMEOUT_S,
     done,
@@ -646,8 +653,16 @@ class _Walk:
                 network=step.network,
                 redactor=self._redactor,
             )
+            # Agent-slot pool (W6): hold a numbered O_EXCL slot to spawn an agent
+            # step. Wait is BEFORE invoke so step.timeout_s is untouched. run:/
+            # manual: never acquire. Absent [factory] max_agents ⇒ OFF (D7).
+            slot_name: str | None = None
+            if step.kind != "run":
+                slot_name = self._acquire_agent_slot(step, attempt=attempt, cycle=cycle)
             try:
-                with self._heartbeat(step.id, attempt, cycle, log_path):
+                with self._heartbeat(
+                    step.id, attempt, cycle, log_path, slot_name=slot_name
+                ):
                     result = executor.invoke(inv)
             except ExecTimeout as exc:
                 self._emit("timeout", node=step.id, attempt=attempt, cycle=cycle, data={"error": str(exc)})
@@ -655,6 +670,9 @@ class _Walk:
             except CairnError as exc:
                 self._emit("step-fail", node=step.id, attempt=attempt, cycle=cycle, data={"error": str(exc)})
                 raise _Halt(ExitCode.EXECUTOR, step.id, f"executor failure: {exc}") from exc
+            finally:
+                if slot_name is not None:
+                    release_slot(slots_dir_for(self.workspace_dir), slot_name)
 
             block = result.step or {}
             # Defensive belt: parse_step_sentinel schema-validates learnings before returning a
@@ -1428,11 +1446,78 @@ class _Walk:
         with self._lock:
             update_run(self.run_dir, lambda doc: doc.__setitem__("status", status))
 
+    # -- agent slots (FACTORY-PLAN §9 / W6) --------------------------------- #
+
+    def _slot_now(self) -> float:
+        """Wall clock for slot wait/acquire. Tests inject a fake via assignment."""
+        return time.time()
+
+    def _slot_sleep(self, seconds: float) -> None:
+        """Sleep during slot wait. Tests inject a fake via assignment."""
+        time.sleep(seconds)
+
+    def _acquire_agent_slot(
+        self, step: StepNode, *, attempt: int, cycle: int | None
+    ) -> str | None:
+        """Acquire a factory agent slot for an agent step, or raise CAPACITY.
+
+        Returns None when slots are OFF (no ``[factory] max_agents``). The wait
+        happens here — before ``executor.invoke`` — so it is outside
+        ``step.timeout_s``. Wait expiry parks the run via ``ExitCode.CAPACITY``.
+        """
+        max_agents = self.config.factory.max_agents
+        if max_agents is None:
+            return None
+
+        slots_dir = slots_dir_for(self.workspace_dir)
+        wait_s = float(self.config.factory.slot_wait_s)
+        waited = {"emitted": False}
+
+        def on_wait_start() -> None:
+            if waited["emitted"]:
+                return
+            waited["emitted"] = True
+            self._emit(
+                "agent-slot-wait",
+                node=step.id,
+                attempt=attempt,
+                cycle=cycle,
+                data={
+                    "max_agents": max_agents,
+                    "wait_s": wait_s,
+                    "slots_dir": str(slots_dir),
+                },
+            )
+
+        slot = wait_acquire_slot(
+            slots_dir,
+            max_agents,
+            pid=os.getpid(),
+            wait_s=wait_s,
+            now=self._slot_now,
+            sleep=self._slot_sleep,
+            poll_s=DEFAULT_POLL_S,
+            on_wait_start=on_wait_start,
+        )
+        if slot is None:
+            raise _Halt(
+                ExitCode.CAPACITY,
+                step.id,
+                f"no agent slot within {wait_s:g}s — capacity",
+            )
+        return slot
+
     # -- heartbeat (liveness — OBSERVABILITY §1) ---------------------------- #
 
     @contextmanager
     def _heartbeat(
-        self, node: str, attempt: int, cycle: int | None, log_path: Path
+        self,
+        node: str,
+        attempt: int,
+        cycle: int | None,
+        log_path: Path,
+        *,
+        slot_name: str | None = None,
     ) -> Iterator[None]:
         """Emit a periodic ``heartbeat`` while a blocking step runs.
 
@@ -1443,17 +1528,32 @@ class _Walk:
         first beat waits a full interval, so a step that finishes faster emits none. The
         thread is daemon and joined on exit — it can never outlive the step — and every beat
         goes through the same single-writer trail lock as any other event.
+
+        When ``slot_name`` is set (W6 agent-slot held), each beat also refreshes the
+        slot's heartbeat timestamp so a live holder is never reaped as stale.
         """
         interval = self.config.defaults.heartbeat_s
-        if not interval or interval <= 0:
+        # Slot refresh needs a beat loop even when trail heartbeats are off — a tiny
+        # interval keeps the slot live without emitting trail events when heartbeat_s
+        # is unset. When both are off (no slot), zero-cost yield.
+        if (not interval or interval <= 0) and not slot_name:
             yield
             return
 
         stop = threading.Event()
         started = time.monotonic()
+        # Trail heartbeats only when configured; slot refresh uses the same cadence
+        # (or 30s when trail heartbeats are off but a slot is held).
+        beat_interval = interval if interval and interval > 0 else 30.0
+        emit_trail = bool(interval and interval > 0)
+        slots_dir = slots_dir_for(self.workspace_dir) if slot_name else None
 
         def beat() -> None:
-            while not stop.wait(interval):
+            while not stop.wait(beat_interval):
+                if slot_name is not None and slots_dir is not None:
+                    refresh_slot(slots_dir, slot_name, now=self._slot_now)
+                if not emit_trail:
+                    continue
                 log_bytes, last_line = _tail_log(log_path)
                 if stop.is_set():
                     return  # step finished while we read the log — never emit a stale beat

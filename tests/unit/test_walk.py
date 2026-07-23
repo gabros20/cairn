@@ -1924,3 +1924,191 @@ def test_guard_when_params_read_from_memory_not_forged_run_json(ws: Path, tmp_pa
     assert _walk(ws, plan, run_dir, {"shell": ex}) == ExitCode.OK
     manifest = json.loads(Path(ex.invocations[0].env["CAIRN_SHIM_MANIFEST"]).read_text())
     assert "strict-only" in manifest["guards"]  # still ACTIVE — the forged run.json is ignored
+
+
+# --------------------------------------------------------------------------- #
+# W6 — agent-slot pool (FACTORY-PLAN §9 / local slots)
+# --------------------------------------------------------------------------- #
+
+
+def _enable_slots(ws: Path, *, max_agents: int = 1, slot_wait: str = "0s") -> None:
+    """Append [factory] max_agents to the workspace cairn.toml."""
+    path = ws / "cairn.toml"
+    path.write_text(
+        path.read_text(encoding="utf-8")
+        + f"\n[factory]\nmax_agents = {max_agents}\nslot_wait = {slot_wait!r}\n",
+        encoding="utf-8",
+    )
+
+
+def test_agent_slot_held_during_invoke_and_released_after(ws: Path, tmp_path: Path) -> None:
+    _enable_slots(ws, max_agents=1, slot_wait="15m")
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    slots = ws / "state" / "agents"
+    seen_held: list[bool] = []
+
+    def on_invoke(inv, _n):
+        # Slot must be held for the duration of invoke.
+        held = (slots / "slot-0").is_file()
+        seen_held.append(held)
+        (inv.cwd / "a.txt").write_text("ok")
+        return done_result()
+
+    assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
+    assert seen_held == [True]
+    assert not (slots / "slot-0").is_file()  # released in finally
+
+
+def test_agent_slot_released_on_invoke_failure(ws: Path, tmp_path: Path) -> None:
+    from cairn.executors.base import ExecTimeout
+
+    _enable_slots(ws, max_agents=1)
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    slots = ws / "state" / "agents"
+
+    def on_invoke(inv, _n):
+        assert (slots / "slot-0").is_file()
+        raise ExecTimeout("slow")
+
+    assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.TIMEOUT
+    assert not (slots / "slot-0").is_file()
+
+
+def test_run_step_never_touches_agent_slots(ws: Path, tmp_path: Path) -> None:
+    _enable_slots(ws, max_agents=1)
+    # Pre-create a "full" pool so an agent step would CAPACITY; run: must ignore it.
+    slots = ws / "state" / "agents"
+    slots.mkdir(parents=True)
+    (slots / "slot-0").write_text(
+        json.dumps({"pid": os.getpid(), "acquired_at": 1.0, "heartbeat": 1.0}) + "\n",
+        encoding="utf-8",
+    )
+    plan = make_plan([run_step("r", "true")], {})
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    assert _walk(ws, plan, run_dir, {"shell": ShellExecutor()}) == ExitCode.OK
+    # Still just the pre-seeded slot — walker did not create/remove others.
+    assert list(slots.iterdir()) == [slots / "slot-0"]
+    assert not any(e["event"] == "agent-slot-wait" for e in read_trail(run_dir))
+
+
+def test_no_max_agents_is_byte_identical_no_slots_dir(ws: Path, tmp_path: Path) -> None:
+    # D7: absent [factory] max_agents ⇒ slots OFF; agent step never creates state/agents/.
+    assert "max_agents" not in (ws / "cairn.toml").read_text(encoding="utf-8")
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([agent_step("s", produces=["a"])], arts, resolved_models=models_for("s"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    def on_invoke(inv, _n):
+        (inv.cwd / "a.txt").write_text("ok")
+        return done_result()
+
+    assert _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)}) == ExitCode.OK
+    assert not (ws / "state" / "agents").exists()
+    assert not any(e["event"] == "agent-slot-wait" for e in read_trail(run_dir))
+
+
+def test_wait_expiry_parks_capacity_outside_step_timeout(ws: Path, tmp_path: Path) -> None:
+    # Hold the only slot with this process's live pid; slot_wait=0s ⇒ immediate CAPACITY.
+    # Invoke must never run; step.timeout_s must not be consumed by the wait.
+    _enable_slots(ws, max_agents=1, slot_wait="0s")
+    slots = ws / "state" / "agents"
+    slots.mkdir(parents=True)
+    (slots / "slot-0").write_text(
+        json.dumps({"pid": os.getpid(), "acquired_at": 1.0, "heartbeat": 1.0}) + "\n",
+        encoding="utf-8",
+    )
+    step = agent_step("s", produces=["a"])
+    # Huge step timeout — if the wait burned it, we'd see TIMEOUT not CAPACITY.
+    step = replace(step, timeout_s=3600)
+    arts = {"a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws))}
+    plan = make_plan([step], arts, resolved_models=models_for("s"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+
+    invoked: list[int] = []
+
+    def on_invoke(inv, _n):
+        invoked.append(inv.timeout_s)
+        (inv.cwd / "a.txt").write_text("ok")
+        return done_result()
+
+    # slot_wait=0 ⇒ CAPACITY without any real sleep (wait loop never enters).
+    code = walk(
+        plan,
+        run_dir,
+        workspace_dir=ws,
+        config=load_config(ws),
+        executors={"fake": FakeExecutor(on_invoke)},
+        composer=lambda **kw: "PROMPT",
+        interactive=False,
+        gate_presets={},
+        now=NOW,
+    )
+    assert code == ExitCode.CAPACITY
+    assert invoked == []  # never reached invoke — wait is BEFORE invoke
+    events = list(read_trail(run_dir))
+    assert any(e["event"] == "agent-slot-wait" for e in events)
+    halt = next(e for e in events if e["event"] == "run-halt")
+    assert halt["data"]["exit_code"] == int(ExitCode.CAPACITY)
+    assert "capacity" in halt["data"]["reason"]
+    # Seeded slot still present — we never acquired (and never released) it.
+    assert (slots / "slot-0").is_file()
+
+
+def test_max_agents_one_serializes_parallel_agent_steps(ws: Path, tmp_path: Path) -> None:
+    # max_agents=1 + two parallel agent steps: never both hold a slot at once.
+    _enable_slots(ws, max_agents=1, slot_wait="30s")
+    arts = {
+        "a": ArtifactDecl("a", "a.txt", validator=_nonempty(ws)),
+        "b": ArtifactDecl("b", "b.txt", validator=_nonempty(ws)),
+    }
+    node = ParallelNode(
+        name="pair",
+        on_fail="wait_all",
+        steps=(agent_step("a", produces=["a"]), agent_step("b", produces=["b"])),
+        when_runtime=None,
+    )
+    plan = make_plan([node], arts, resolved_models=models_for("a", "b"))
+    run_dir = bootstrap_run(ws, plan, now=NOW, runs_root=tmp_path / "runs")
+    slots = ws / "state" / "agents"
+    concurrent = 0
+    peak = 0
+    lock = threading.Lock()
+    entered = threading.Event()
+    release = threading.Event()
+    first_in: list[str] = []
+
+    def on_invoke(inv, _n):
+        nonlocal concurrent, peak
+        step_id = inv.env["CAIRN_STEP"]
+        with lock:
+            concurrent += 1
+            peak = max(peak, concurrent)
+            first_in.append(step_id)
+            is_first = len(first_in) == 1
+        if is_first:
+            entered.set()
+            # Hold the slot until the sibling has had a chance to try acquire.
+            assert release.wait(timeout=5)
+        with lock:
+            concurrent -= 1
+        out = inv.cwd / f"{step_id}.txt"
+        out.write_text("ok")
+        return done_result()
+
+    def free_first() -> None:
+        assert entered.wait(timeout=5)
+        # Sibling should be waiting on the slot (or about to); free the first.
+        time.sleep(0.05)
+        release.set()
+
+    helper = threading.Thread(target=free_first, daemon=True)
+    helper.start()
+    code = _walk(ws, plan, run_dir, {"fake": FakeExecutor(on_invoke)})
+    helper.join(timeout=1)
+    assert code == ExitCode.OK
+    assert peak == 1  # never two concurrent invokes under max_agents=1
+    assert not list(slots.glob("slot-*"))  # both released
