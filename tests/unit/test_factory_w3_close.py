@@ -119,7 +119,12 @@ def test_sync_writes_ws_scoped_label(tmp_path):
 
 
 def test_migration_replaces_own_legacy_unit_never_touches_other_ws(tmp_path):
-    """Old-style unit for THIS ws is replaced; a different ws's unit is untouched."""
+    """Own legacy unit migrated; foreign LEGACY-style unit for another ws untouched.
+
+    Plants the foreign unit as ``io.cairn.trigger.<other-name>.plist`` (legacy glob)
+    with a different workspace's ``--workspace`` argv so ``_iter_launchd_trigger_plists``
+    actually scans it and ``_same_workspace`` ownership attribution is exercised (I2).
+    """
     ws_a = _workspace(tmp_path / "a")
     ws_b = tmp_path / "b" / "ws"
     ws_b.mkdir(parents=True)
@@ -131,46 +136,46 @@ def test_migration_replaces_own_legacy_unit_never_touches_other_ws(tmp_path):
     launchd_dir = tmp_path / "launchd"
     launchd_dir.mkdir()
 
-    # Seed legacy (unscoped) units for both workspaces sharing the same stem name.
-    legacy_name = f"{trigger_launchd_label_legacy('handle-reply')}.plist"
-    # Only ONE legacy stem exists in the shared dir — ownership is by --workspace argv.
-    # Seed the unit for ws_a first (ours); also seed a distinct foreign unit for ws_b
-    # under a different filename that still classifies as a trigger for handle-reply
-    # of the other workspace (simulates the pre-W3 collision where only one could win;
-    # with migration we attribute via argv).
-    own_legacy = launchd_dir / legacy_name
-    own_plist = {
-        "Label": trigger_launchd_label_legacy("handle-reply"),
-        "ProgramArguments": [
-            "cairn",
-            "trigger",
-            "run",
-            "handle-reply",
-            "--workspace",
-            str(ws_a.resolve()),
-        ],
-        "WatchPaths": [str(ws_a / "inbox/replies")],
-    }
-    own_legacy.write_bytes(plistlib.dumps(own_plist))
+    # Own legacy unit for handle-reply (this workspace) — will be migrated.
+    own_legacy = launchd_dir / f"{trigger_launchd_label_legacy('handle-reply')}.plist"
+    own_legacy.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": trigger_launchd_label_legacy("handle-reply"),
+                "ProgramArguments": [
+                    "cairn",
+                    "trigger",
+                    "run",
+                    "handle-reply",
+                    "--workspace",
+                    str(ws_a.resolve()),
+                ],
+                "WatchPaths": [str(ws_a / "inbox/replies")],
+            }
+        )
+    )
 
-    # Other workspace's unit under a name that survives (new-style for B, or a
-    # side-by-side planted file with B's workspace in argv at a unique path).
-    other_label = f"io.cairn.deadbeef.trigger.handle-reply"
-    other_plist_path = launchd_dir / f"{other_label}.plist"
-    other_plist = {
-        "Label": other_label,
-        "ProgramArguments": [
-            "cairn",
-            "trigger",
-            "run",
-            "handle-reply",
-            "--workspace",
-            str(ws_b.resolve()),
-        ],
-        "WatchPaths": [str(ws_b / "inbox/replies")],
-    }
-    other_plist_path.write_bytes(plistlib.dumps(other_plist))
-    other_bytes_before = other_plist_path.read_bytes()
+    # Foreign LEGACY-style unit for a DIFFERENT trigger name + DIFFERENT workspace.
+    # Lands in the io.cairn.trigger.*.plist glob; ownership via --workspace must
+    # leave it alone when ws_a syncs.
+    foreign_legacy = launchd_dir / f"{trigger_launchd_label_legacy('foreign-job')}.plist"
+    foreign_legacy.write_bytes(
+        plistlib.dumps(
+            {
+                "Label": trigger_launchd_label_legacy("foreign-job"),
+                "ProgramArguments": [
+                    "cairn",
+                    "trigger",
+                    "run",
+                    "foreign-job",
+                    "--workspace",
+                    str(ws_b.resolve()),
+                ],
+                "WatchPaths": [str(ws_b / "inbox/other")],
+            }
+        )
+    )
+    foreign_bytes_before = foreign_legacy.read_bytes()
 
     runner = FakeRunner()
     sync_triggers(ws_a, backend="launchd", runner=runner, cairn_bin="cairn", launchd_dir=launchd_dir)
@@ -178,10 +183,11 @@ def test_migration_replaces_own_legacy_unit_never_touches_other_ws(tmp_path):
     wid_a = workspace_id(ws_a)
     new_plist = launchd_dir / f"{trigger_launchd_label('handle-reply', wid_a)}.plist"
     assert new_plist.is_file(), "new-style unit for this workspace must be installed"
-    # Legacy for THIS ws must be gone (migrated).
     assert not own_legacy.exists(), "own legacy unit must be replaced/removed"
-    # Other workspace's unit untouched.
-    assert other_plist_path.read_bytes() == other_bytes_before
+    assert foreign_legacy.is_file(), "foreign legacy unit must still exist"
+    assert foreign_legacy.read_bytes() == foreign_bytes_before, (
+        "foreign workspace's legacy unit must be byte-for-byte untouched"
+    )
 
 
 def test_sync_idempotent_second_pass_no_runner_calls(tmp_path):
@@ -416,3 +422,137 @@ def test_cli_unsafe_synced_fs_override_is_documented_on_parser():
     assert ns.unsafe_synced_fs is True
     ns2 = p.parse_args(["factory", "reconcile", "--unsafe-synced-fs"])
     assert ns2.unsafe_synced_fs is True
+
+
+def test_cloud_sync_does_not_false_refuse_unanchored_dropbox_name(tmp_path):
+    """M1: a local dir literally named Dropbox outside $HOME is not cloud-sync."""
+    home = tmp_path / "home"
+    home.mkdir()
+    elsewhere = tmp_path / "mnt" / "external" / "Dropbox" / "scratch" / "watch"
+    elsewhere.mkdir(parents=True)
+    assert is_under_cloud_sync(elsewhere, home=home) is None
+
+
+# --------------------------------------------------------------------------- #
+# Fix wave r1 — C1 beat ownership, C2 registry, I3 exclusive mint, I1 liveness
+# --------------------------------------------------------------------------- #
+
+
+def test_reconcile_beat_removal_only_touches_own_workspace(tmp_path):
+    """C1: two workspaces' beats coexist; emptying ws_a removes ONLY its beat."""
+    ws_a = _workspace(tmp_path / "a")
+    ws_b = _workspace(tmp_path / "b")
+    launchd_dir = tmp_path / "launchd"
+    runner = FakeRunner()
+
+    sync_triggers(ws_a, backend="launchd", runner=runner, cairn_bin="cairn", launchd_dir=launchd_dir)
+    sync_triggers(ws_b, backend="launchd", runner=runner, cairn_bin="cairn", launchd_dir=launchd_dir)
+
+    beat_a = launchd_dir / f"{label_prefix_for(ws_a)}{RECONCILE_BEAT_NAME}.plist"
+    beat_b = launchd_dir / f"{label_prefix_for(ws_b)}{RECONCILE_BEAT_NAME}.plist"
+    assert beat_a.is_file() and beat_b.is_file()
+    assert beat_a.resolve() != beat_b.resolve()
+    b_bytes = beat_b.read_bytes()
+
+    # Empty ws_a's triggers → its beat drops; ws_b's beat must survive.
+    (ws_a / "triggers.yaml").write_text("", encoding="utf-8")
+    sync_triggers(ws_a, backend="launchd", runner=runner, cairn_bin="cairn", launchd_dir=launchd_dir)
+    assert not beat_a.exists(), "ws_a beat must be removed when last trigger is gone"
+    assert beat_b.is_file(), "ws_b beat must survive"
+    assert beat_b.read_bytes() == b_bytes
+
+
+def test_duplicate_uuid_on_copied_workspace_is_reminted(tmp_path):
+    """C2: cp -r of a workspace re-mints on first workspace_id(); labels differ."""
+    import json
+
+    import cairn.kernel.wsid as wsid
+
+    reg = tmp_path / "reg.json"
+    src = tmp_path / "src"
+    src.mkdir()
+    workspace_id(src, _reset=True, registry_path=reg)
+    src_id = workspace_id(src, registry_path=reg)
+    assert (src / ".cairn" / "workspace-id").is_file()
+
+    # Simulate cp -r: same ws-id file, different path.
+    copy = tmp_path / "copy"
+    copy.mkdir()
+    (copy / ".cairn").mkdir()
+    (copy / ".cairn" / "workspace-id").write_text(src_id + "\n", encoding="utf-8")
+    wsid._CACHE.clear()
+
+    copy_id = workspace_id(copy, registry_path=reg)
+    assert copy_id != src_id, "copy must re-mint a distinct UUID"
+    assert (copy / ".cairn" / "workspace-id").read_text(encoding="utf-8").strip() == copy_id
+    # Original unchanged.
+    wsid._CACHE.clear()
+    assert workspace_id(src, registry_path=reg) == src_id
+    # Registry has both.
+    data = json.loads(reg.read_text(encoding="utf-8"))
+    assert src_id in data and copy_id in data
+    assert data[src_id] == str(src.resolve())
+    assert data[copy_id] == str(copy.resolve())
+    # Labels differ.
+    assert trigger_launchd_label("t", src_id) != trigger_launchd_label("t", copy_id)
+
+
+def test_concurrent_first_mint_converges_on_one_uuid(tmp_path):
+    """I3: exclusive_create mint — loser of O_EXCL race adopts the winner's UUID."""
+    from cairn.kernel.durafs import exclusive_create
+    from cairn.kernel.wsid import _mint_exclusive
+
+    path = tmp_path / ".cairn" / "workspace-id"
+    path.parent.mkdir(parents=True)
+    winner = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    assert exclusive_create(path, winner + "\n") is True
+    # Simulated loser: exclusive_create fails (name taken) → re-reads winner.
+    got = _mint_exclusive(path)
+    assert got == winner
+
+    # End-to-end: workspace_id on a pre-created id file adopts it (no second mint).
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / ".cairn").mkdir()
+    (ws / ".cairn" / "workspace-id").write_text(winner + "\n", encoding="utf-8")
+    import cairn.kernel.wsid as wsid
+
+    wsid._CACHE.clear()
+    assert workspace_id(ws, registry_path=tmp_path / "reg.json") == winner
+
+
+def test_audit_in_flight_claim_with_live_lease_is_not_a_violation(tmp_path):
+    """I1: claim without pointer + live drain_pid → audit silent."""
+    import os
+
+    from cairn.kernel.queue_ledger import write_lease
+
+    watch = tmp_path / "inbox"
+    claim = watch / ".claim"
+    claim.mkdir(parents=True)
+    name = "in-flight.json"
+    (claim / name).write_text("{}", encoding="utf-8")
+    # No pointer yet — the claim→spawn window.
+    write_lease(
+        watch,
+        name,
+        drain_pid=os.getpid(),  # THIS process is live
+        child_pid=None,
+        boot_id="boot-test",
+        claimed_at=1.0,
+        ttl_s=3600,
+    )
+    issues = audit_ledger(watch, current_boot_id="boot-test")
+    assert not any("item without pointer" in i for i in issues)
+
+
+def test_audit_orphaned_claim_without_pointer_is_reported(tmp_path):
+    """I1: claim without pointer + dead/absent owner → real violation."""
+    watch = tmp_path / "inbox"
+    claim = watch / ".claim"
+    claim.mkdir(parents=True)
+    name = "orphan.json"
+    (claim / name).write_text("{}", encoding="utf-8")
+    # No lease at all → dead/absent owner.
+    issues = audit_ledger(watch, current_boot_id="boot-test")
+    assert any("item without pointer" in i for i in issues)

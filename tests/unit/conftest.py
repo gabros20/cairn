@@ -16,3 +16,17 @@ def _hermetic_gate_key_state(tmp_path_factory, monkeypatch):
     state = tmp_path_factory.mktemp("xdg-state")
     monkeypatch.setenv("XDG_STATE_HOME", str(state))
     yield
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_workspace_registry(tmp_path_factory):
+    """Isolate the multi-factory workspace UUID registry from the real ``~/.cairn``."""
+    import cairn.kernel.wsid as wsid
+
+    reg = tmp_path_factory.mktemp("ws-registry") / "workspace-registry.json"
+    prev = wsid._REGISTRY_PATH_OVERRIDE
+    wsid._REGISTRY_PATH_OVERRIDE = reg
+    wsid._CACHE.clear()
+    yield
+    wsid._REGISTRY_PATH_OVERRIDE = prev
+    wsid._CACHE.clear()

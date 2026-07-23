@@ -104,8 +104,8 @@ def read_ledger_version(watch_abs: Path) -> int:
     try:
         return int(text.split()[0])
     except ValueError:
-        # Unparseable marker — treat as current so we don't refuse a hand-edited file
-        # forever; stamp will rewrite a clean value on next write.
+        # Unparseable marker — treat as legacy (0) so we don't refuse a hand-edited
+        # file forever; stamp_ledger_version rewrites a clean LEDGER_VERSION on next write.
         return 0
 
 
@@ -147,7 +147,37 @@ def stamp_ledger_version(watch_abs: Path, *, fs: Any = None) -> None:
 # --------------------------------------------------------------------------- #
 
 
-def audit_ledger(watch_abs: Path) -> list[str]:
+def _claim_has_live_owner(
+    watch_abs: Path,
+    item_name: str,
+    *,
+    current_boot_id: str | None = None,
+    kill: Callable[[int, int], None] | None = None,
+) -> bool:
+    """True when ``.claim/<item_name>`` has a lease whose holder is still LIVE.
+
+    Covers the claim→lease→spawn→write_pointer window (T13 C1 / T14 I1): a live
+    drain_pid (or live child_pid) means the missing pointer is an in-flight
+    transient, not an invariant violation. Absent/unreadable lease → False
+    (treat as orphaned for audit purposes).
+    """
+    path = lease_path(watch_abs, item_name)
+    if not path.is_file():
+        return False
+    try:
+        lease = read_lease(path)
+    except (OSError, ValueError, json.JSONDecodeError):
+        return False
+    boot = current_boot_id if current_boot_id is not None else boot_id()
+    return not child_is_dead(lease, current_boot_id=boot, kill=kill)
+
+
+def audit_ledger(
+    watch_abs: Path,
+    *,
+    current_boot_id: str | None = None,
+    kill: Callable[[int, int], None] | None = None,
+) -> list[str]:
     """Return human-readable invariant violations for ``watch_abs`` (empty = clean).
 
     Checks (FACTORY-PLAN T8):
@@ -156,6 +186,11 @@ def audit_ledger(watch_abs: Path) -> list[str]:
        (strict-identity shape — identity:off arbitrary names are skipped)
     3. no identity occupies two live states (``.claim`` and ``.waiting``)
     4. terminal-ledger runs (``.done`` / ``.failed`` pointers) are not queue-pinned
+
+    **Lease liveness (T14 I1):** a ``.claim/`` item without a pointer (or without a
+    reservation) whose lease shows a LIVE owner (drain_pid / child_pid alive, same
+    boot — :func:`child_is_dead`) is an in-flight drain window, NOT a violation.
+    Only a claim with no pointer AND a dead/absent owner is reported.
 
     Over-preserve: returns issues only — never mutates. Callers (doctor, reconcile)
     surface + may quarantine affected identities; they do NOT auto-delete.
@@ -166,6 +201,8 @@ def audit_ledger(watch_abs: Path) -> list[str]:
     issues: list[str] = []
     if not watch_abs.is_dir():
         return issues
+
+    boot = current_boot_id if current_boot_id is not None else boot_id()
 
     # (1) pointer <-> item for each lane
     for lane in _LANES:
@@ -189,6 +226,11 @@ def audit_ledger(watch_abs: Path) -> list[str]:
         # pointer is the normal .done shape. Live lanes + .failed keep both.
         if lane != ".done":
             for name in sorted(items - pointers):
+                # In-flight claim (live lease owner, no pointer yet) is not a violation.
+                if lane == ".claim" and _claim_has_live_owner(
+                    watch_abs, name, current_boot_id=boot, kill=kill
+                ):
+                    continue
                 issues.append(f"item without pointer: {lane}/{name}")
 
     # (2) every grammar-conforming .claim item has a reservation
@@ -200,10 +242,14 @@ def audit_ledger(watch_abs: Path) -> list[str]:
             item = parse_item_name(p.name)
             if item is None:
                 continue  # identity:off / nonconforming — no reservation expected
-            if not reservation_path(watch_abs, item.identity).is_file():
-                issues.append(
-                    f"claim without reservation: {p.name} (identity {item.identity})"
-                )
+            if reservation_path(watch_abs, item.identity).is_file():
+                continue
+            # Live in-flight claim may still be mid-admit; only flag when owner is dead.
+            if _claim_has_live_owner(watch_abs, p.name, current_boot_id=boot, kill=kill):
+                continue
+            issues.append(
+                f"claim without reservation: {p.name} (identity {item.identity})"
+            )
 
     # (3) no identity in two live states
     by_identity: dict[str, list[str]] = {}

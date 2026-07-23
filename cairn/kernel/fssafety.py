@@ -16,18 +16,13 @@ from pathlib import Path
 from cairn.kernel.types import Finding
 
 # Relative-to-home path segments that mark a known cloud-sync root (D2).
-# Matched as path components so ``…/Dropbox/…`` and ``…/Library/Mobile Documents/…``
-# both hit. Injected ``home`` lets tests avoid depending on the real FS layout.
+# ALWAYS anchored under ``home`` (resolved): a directory literally named "Dropbox"
+# elsewhere on the machine must NOT false-refuse (T14 M1).
 _CLOUD_SYNC_HOME_SEGMENTS: tuple[tuple[str, ...], ...] = (
     ("Library", "Mobile Documents"),  # iCloud Drive
     ("Dropbox",),
     ("OneDrive",),
     ("Google Drive",),
-)
-
-# Absolute path prefixes that are cloud-sync regardless of home (Linux clients etc.).
-_CLOUD_SYNC_ABS_PREFIXES: tuple[str, ...] = (
-    "/Library/Mobile Documents",
 )
 
 # Conflict-copy / placeholder basenames inside a ledger/watch dir.
@@ -57,7 +52,6 @@ def is_under_cloud_sync(
         resolved = Path(path).resolve()
     except OSError:
         resolved = Path(path)
-    parts = resolved.parts
 
     if extra_roots:
         for root in extra_roots:
@@ -74,34 +68,25 @@ def is_under_cloud_sync(
     except OSError:
         home_resolved = home_path
 
+    # Match only under home-anchored cloud roots (T14 M1: never match a directory
+    # literally named "Dropbox"/"OneDrive"/… that is NOT under $HOME).
+    home_parts = home_resolved.parts
+    res_parts = resolved.parts
     for segs in _CLOUD_SYNC_HOME_SEGMENTS:
         candidate = home_resolved.joinpath(*segs)
         try:
             cand_r = candidate.resolve()
         except OSError:
             cand_r = candidate
-        # Also match by trailing path-component sequence (injectable / non-existent).
-        if _parts_contain(parts, segs):
-            return f"under cloud-sync root ~/{'/'.join(segs)}"
         if resolved == cand_r or cand_r in resolved.parents:
-            return f"under cloud-sync root {cand_r}"
-
-    resolved_s = str(resolved)
-    for prefix in _CLOUD_SYNC_ABS_PREFIXES:
-        if resolved_s == prefix or resolved_s.startswith(prefix + os.sep):
-            return f"under cloud-sync root {prefix}"
+            return f"under cloud-sync root ~/{'/'.join(segs)}"
+        # Lexical home-anchored match (works when the cloud root dir does not exist
+        # yet — injectable fake homes in tests).
+        need = len(home_parts) + len(segs)
+        if len(res_parts) >= need and res_parts[: len(home_parts)] == home_parts:
+            if res_parts[len(home_parts) : need] == segs:
+                return f"under cloud-sync root ~/{'/'.join(segs)}"
     return None
-
-
-def _parts_contain(parts: tuple[str, ...], segs: tuple[str, ...]) -> bool:
-    """True when ``segs`` appears as consecutive components in ``parts``."""
-    n = len(segs)
-    if n == 0 or n > len(parts):
-        return False
-    for i in range(len(parts) - n + 1):
-        if parts[i : i + n] == segs:
-            return True
-    return False
 
 
 def hardlink_probe(directory: Path) -> bool:

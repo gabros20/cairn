@@ -1118,6 +1118,70 @@ def _iter_systemd_trigger_units(target: Path, wid: str, suffix_glob: str):
             yield path
 
 
+def _beat_unit_paths(
+    workspace_dir: Path,
+    *,
+    backend: str,
+    launchd_dir: Path | None,
+    systemd_dir: Path | None,
+) -> list[Path]:
+    """Paths of the reconcile-beat unit files for this workspace (may not exist yet)."""
+    from cairn.kernel.schedkit import launchd_label, systemd_unit_names
+
+    prefix = label_prefix_for(workspace_dir)
+    wid = workspace_id(workspace_dir)
+    if backend == "launchd":
+        target = _require_dir(launchd_dir, "launchd", "launchd_dir")
+        return [target / f"{launchd_label(RECONCILE_BEAT_NAME, prefix)}.plist"]
+    if backend == "systemd":
+        target = _require_dir(systemd_dir, "systemd", "systemd_dir")
+        service, timer = systemd_unit_names(RECONCILE_BEAT_NAME, ws_id=wid)
+        return [target / service, target / timer]
+    return []
+
+
+def _beat_owned_by_workspace(path: Path, workspace_dir: Path, backend: str) -> bool | None:
+    """Whether an existing beat unit belongs to ``workspace_dir``.
+
+    Returns:
+    - ``True`` — content/argv attributes this unit to this workspace (safe to
+      overwrite or remove)
+    - ``False`` — unit exists and belongs to a *different* workspace (never touch)
+    - ``None`` — absent, unparseable, or no ``--workspace`` signal (treat as
+      unmanaged: install may claim; uninstall must not delete)
+    """
+    if not path.is_file():
+        return None
+    if backend == "launchd":
+        kind, _name, ows = _classify_plist(path)
+    else:
+        # Prefer .service (carries ExecStart/--workspace); .timer has no argv.
+        if path.suffix == ".timer":
+            svc = path.with_suffix(".service")
+            if svc.is_file():
+                kind, _name, ows = _classify_systemd_service(svc)
+            else:
+                return None
+        else:
+            kind, _name, ows = _classify_systemd_service(path)
+    if ows is None:
+        return None
+    return _same_workspace(ows, workspace_dir)
+
+
+def _require_beat_writable(path: Path, workspace_dir: Path, backend: str) -> None:
+    """Refuse to write a beat unit owned by another workspace (C1 / multi-factory)."""
+    owned = _beat_owned_by_workspace(path, workspace_dir, backend)
+    if owned is False:
+        message = (
+            f"refusing to write reconcile beat unit {path}: it already exists and "
+            f"belongs to another workspace (content --workspace argv does not match "
+            f"{workspace_dir}). Multi-factory safety: never overwrite another "
+            "factory's reconcile beat (FACTORY-PLAN §6 W3 / T14 C1)."
+        )
+        raise ConfigError(message, findings=[Finding("error", message)], file=str(path))
+
+
 def _sync_reconcile_beat(
     want: bool,
     workspace_dir: Path,
@@ -1133,6 +1197,10 @@ def _sync_reconcile_beat(
     When any trigger exists (``want=True``), install a calendar timer firing
     ``cairn factory reconcile --workspace <ws>`` every 10m with RunAtLoad/boot.
     When the last trigger is removed, drop the beat. Idempotent.
+
+    **Ownership (T14 C1):** every write/delete is content-verified against this
+    workspace's ``--workspace`` argv — same discipline as trigger units. A beat
+    unit belonging to another factory is never removed or overwritten.
     """
     from cairn.kernel.schedkit import (
         Schedule,
@@ -1144,7 +1212,17 @@ def _sync_reconcile_beat(
     prefix = label_prefix_for(workspace_dir)
     wid = workspace_id(workspace_dir)
     argv = [cairn_bin, "factory", "reconcile", "--workspace", str(workspace_dir)]
+    unit_paths = _beat_unit_paths(
+        workspace_dir,
+        backend=backend,
+        launchd_dir=launchd_dir,
+        systemd_dir=systemd_dir,
+    )
+
     if want:
+        # Pre-pass: refuse if any existing unit is owned by another workspace.
+        for path in unit_paths:
+            _require_beat_writable(path, workspace_dir, backend)
         schedule = Schedule(
             name=RECONCILE_BEAT_NAME,
             cron=RECONCILE_BEAT_CRON,
@@ -1163,16 +1241,32 @@ def _sync_reconcile_beat(
             run_at_load=True,
             ws_id=wid,
         )
-    else:
-        uninstall_named(
-            [RECONCILE_BEAT_NAME],
-            backend,
-            runner=runner,
-            launchd_dir=launchd_dir,
-            systemd_dir=systemd_dir,
-            label_prefix=prefix,
-            ws_id=wid,
-        )
+        return
+
+    # Uninstall: only touch units this workspace owns. A foreign beat at the same
+    # stem (ws8 collision / stale) is left alone — never filename-only delete.
+    for path in unit_paths:
+        owned = _beat_owned_by_workspace(path, workspace_dir, backend)
+        if owned is not True:
+            # Absent, foreign, or unattributed — do not delete.
+            continue
+    # Only call uninstall_named when at least one unit is ours.
+    ours = [
+        p
+        for p in unit_paths
+        if _beat_owned_by_workspace(p, workspace_dir, backend) is True
+    ]
+    if not ours:
+        return
+    uninstall_named(
+        [RECONCILE_BEAT_NAME],
+        backend,
+        runner=runner,
+        launchd_dir=launchd_dir,
+        systemd_dir=systemd_dir,
+        label_prefix=prefix,
+        ws_id=wid,
+    )
 
 
 def remove_trigger(
